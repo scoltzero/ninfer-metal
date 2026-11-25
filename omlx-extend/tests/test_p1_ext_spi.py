@@ -1001,10 +1001,12 @@ class TestExt6AdminCompatAndAutoRoute:
 
 
 class TestExt7OfflineBundleDiscovery:
-    def test_workflow_bundles_ninfer_metal_toml(self):
+    def test_workflow_builds_dmg_only_without_wheel_tarball_bloat(self):
         text = SYNC_WORKFLOW.read_text(encoding="utf-8")
-        assert 'cp omlx-extend/config/ninfer-metal.toml "${SLIM_DIR}/config/"' in text
-        assert 'cp omlx-extend/config/ninfer-metal.toml.example "${SLIM_DIR}/config/"' in text
+        assert "./omlx-extend/scripts/build_omlx_extend_dmg.sh" in text
+        assert "ASSETS=(dist/omlx-extend/*.dmg dist/omlx-extend/*.dmg.sha256)" in text
+        assert "python -m build --wheel" not in text
+        assert "-slim.tar.gz" not in text
 
     def test_workflow_defers_release_until_sync_pr_merged(self):
         import yaml
@@ -1038,9 +1040,8 @@ class TestExt7OfflineBundleDiscovery:
         )
         assert add_idx < commit_idx < push_idx < diff_idx
 
-        # CORE_TAG lookup must exclude omlx-extend-* tags so host releases are never mistaken for cores
-        bundle_step = by_name["Build slim and bundled oMLX-extend release artifacts from monorepo omlx/"]
-        assert 'startswith("omlx-extend-") | not' in bundle_step["run"]
+        bundle_step = by_name["Build macOS oMLX-extend DMG installer"]
+        assert "./omlx-extend/scripts/build_omlx_extend_dmg.sh" in bundle_step["run"]
 
     def test_bundled_offline_archive_discovery_in_launcher_and_sidecar(
         self, tmp_path: Path, monkeypatch

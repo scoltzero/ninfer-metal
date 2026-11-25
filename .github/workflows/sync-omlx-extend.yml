@@ -25,16 +25,12 @@ on:
         description: "Specific upstream jundot/omlx tag (e.g. v0.8.3); leave empty for latest (auto) or current UPSTREAM_VERSION (mix)"
         required: false
         default: ""
-      ninfer_metal_tag:
-        description: "ninfer-metal core release tag to embed in bundled release (empty = latest core release e.g. miv-v0.01)"
-        required: false
-        default: ""
       force_resync:
         description: "Re-sync monorepo omlx/ from upstream tag even if UPSTREAM_VERSION already matches"
         type: boolean
         default: false
       dry_run:
-        description: "Verify sync/patch + pytest + wheel/bundle build without pushing to main, opening PR, tagging, or releasing"
+        description: "Verify sync/patch + pytest + DMG build without pushing to main, opening PR, tagging, or releasing"
         type: boolean
         default: false
 
@@ -222,7 +218,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -e "./omlx[dev]" pytest pytest-asyncio httpx build pyyaml
+          python -m pip install -e "./omlx[dev]" pytest pytest-asyncio httpx pyyaml
           (cd omlx && pytest \
             tests/test_microkernel_manager.py \
             tests/test_m5_sidecar_engine.py \
@@ -231,7 +227,7 @@ jobs:
             -q)
           pytest omlx-extend/tests/test_p1_ext_spi.py omlx-extend/tests/test_sync_and_mix_release.py -q
 
-      - name: Build slim and bundled oMLX-extend release artifacts from monorepo omlx/
+      - name: Build macOS oMLX-extend DMG installer
         id: bundle
         if: steps.sync.outputs.conflict == 'false'
         env:
@@ -243,76 +239,12 @@ jobs:
           OUT_DIR="${PWD}/dist/omlx-extend"
           mkdir -p "${OUT_DIR}"
 
-          # 1) Build oMLX-extend Python wheel directly from monorepo omlx/
-          (cd omlx && python -m build --wheel --outdir "${OUT_DIR}")
-
-          # 2) Assemble slim oMLX-extend bundle (wheel + UPSTREAM_VERSION + config template + SPI patch + scripts)
-          SLIM_DIR="${OUT_DIR}/${EXTEND_TAG}-slim"
-          mkdir -p "${SLIM_DIR}/wheels" "${SLIM_DIR}/config" "${SLIM_DIR}/patches" "${SLIM_DIR}/scripts"
-          cp "${OUT_DIR}"/*.whl "${SLIM_DIR}/wheels/"
-          cp omlx-extend/UPSTREAM_VERSION "${SLIM_DIR}/"
-          cp omlx-extend/config/ninfer-metal.toml "${SLIM_DIR}/config/"
-          cp omlx-extend/config/ninfer-metal.toml.example "${SLIM_DIR}/config/"
-          cp omlx-extend/patches/*.patch "${SLIM_DIR}/patches/"
-          cp omlx-extend/scripts/*.sh "${SLIM_DIR}/scripts/"
-          cp omlx-extend/scripts/*.py "${SLIM_DIR}/scripts/"
-          cp omlx-extend/README.md "${SLIM_DIR}/"
-          SLIM_TAR="${OUT_DIR}/${EXTEND_TAG}-slim.tar.gz"
-          tar -czf "${SLIM_TAR}" -C "${OUT_DIR}" "$(basename "${SLIM_DIR}")"
-          (cd "${OUT_DIR}" && shasum -a 256 "$(basename "${SLIM_TAR}")" > "$(basename "${SLIM_TAR}").sha256")
-
-          # 3) Fetch latest ninfer-metal core tarball (strictly excluding omlx-extend-* tags)
-          CORE_TAG="${{ inputs.ninfer_metal_tag }}"
-          if [[ -z "${CORE_TAG}" ]]; then
-            CORE_TAG="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 --json tagName --jq '[.[] | select((.tagName | startswith("omlx-extend-") | not) and (.tagName | test("^[a-z][a-z0-9]*-v[0-9]+\\.[0-9]+")))] | .[0].tagName // empty' || true)"
-          fi
-
-          BUNDLED_TAR=""
-          if [[ -n "${CORE_TAG}" ]]; then
-            CORE_DL="${OUT_DIR}/core-dl"
-            mkdir -p "${CORE_DL}"
-            if gh release download "${CORE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${CORE_DL}" --pattern "*.tar.gz" --pattern "provider.json"; then
-              CORE_ARCHIVE="$(find "${CORE_DL}" -maxdepth 1 -name "*.tar.gz" | head -n 1)"
-              if [[ -n "${CORE_ARCHIVE}" ]]; then
-                BUNDLE_NAME="${EXTEND_TAG}+ninfer-metal-${CORE_TAG}-macos27-arm64"
-                BUNDLE_DIR="${OUT_DIR}/${BUNDLE_NAME}"
-                cp -R "${SLIM_DIR}" "${BUNDLE_DIR}"
-                PROV_VER_DIR="${BUNDLE_DIR}/Providers/io.ninfer.metal/versions/${CORE_TAG}"
-                mkdir -p "${PROV_VER_DIR}"
-                tar -xzf "${CORE_ARCHIVE}" --strip-components=1 -C "${PROV_VER_DIR}"
-                if [[ -f "${CORE_DL}/provider.json" ]]; then
-                  cp "${CORE_DL}/provider.json" "${PROV_VER_DIR}/provider.json"
-                fi
-                ln -sfn "versions/${CORE_TAG}" "${BUNDLE_DIR}/Providers/io.ninfer.metal/current"
-                BUNDLED_TAR="${OUT_DIR}/${BUNDLE_NAME}.tar.gz"
-                tar -czf "${BUNDLED_TAR}" -C "${OUT_DIR}" "${BUNDLE_NAME}"
-                (cd "${OUT_DIR}" && shasum -a 256 "$(basename "${BUNDLED_TAR}")" > "$(basename "${BUNDLED_TAR}").sha256")
-              fi
-            fi
-          else
-            echo "No ninfer-metal core release found yet; skipping bundled offline tarball."
-          fi
-
-          # 4) Build complete drag-to-install macOS oMLX-extend .dmg (oMLX.app + embedded Python/MLX + custom kernels)
           ./omlx-extend/scripts/build_omlx_extend_dmg.sh \
             --extend-tag "${EXTEND_TAG}" \
             --upstream-tag "${{ steps.upstream.outputs.tag }}" \
             --out-dir "${OUT_DIR}"
 
-          echo "slim_tar=${SLIM_TAR}" >> "$GITHUB_OUTPUT"
-          echo "bundled_tar=${BUNDLED_TAR}" >> "$GITHUB_OUTPUT"
-          echo "core_tag=${CORE_TAG}" >> "$GITHUB_OUTPUT"
           ls -lh "${OUT_DIR}"
-
-      - name: Upload oMLX-extend workflow artifacts
-        if: steps.sync.outputs.conflict == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.upstream.outputs.extend_tag }}
-          path: |
-            dist/omlx-extend/*.whl
-            dist/omlx-extend/*.tar.gz
-            dist/omlx-extend/*.sha256
 
       - name: Commit synced monorepo changes to main (or open sync PR if branch-protected)
         id: commit_sync
@@ -389,7 +321,6 @@ jobs:
           UPSTREAM_TAG="${{ steps.upstream.outputs.tag }}"
           RELEASE_MODE="${{ steps.upstream.outputs.release_mode }}"
           IS_MIX="${{ steps.upstream.outputs.is_mix }}"
-          CORE_TAG="${{ steps.bundle.outputs.core_tag }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -401,14 +332,11 @@ jobs:
             git push origin "refs/tags/${EXTEND_TAG}"
           fi
 
-          ASSETS=(dist/omlx-extend/*.dmg dist/omlx-extend/*.whl dist/omlx-extend/*.tar.gz dist/omlx-extend/*.sha256)
+          ASSETS=(dist/omlx-extend/*.dmg dist/omlx-extend/*.dmg.sha256)
           if [[ "${IS_MIX}" == "true" ]]; then
-            NOTES="Incremental \`oMLX-extend\` mix update (\`${EXTEND_TAG}\`) built on upstream \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` with refreshed Provider SPI patch; all changes carry forward automatically into future upstream syncs."
+            NOTES="Incremental \`oMLX-extend\` macOS app installer (\`${EXTEND_TAG}\`) built on upstream \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` with refreshed Provider SPI patch; all changes carry forward automatically into future upstream syncs."
           else
-            NOTES="Monorepo-synced \`oMLX-extend\` release (\`${EXTEND_TAG}\`) based on \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` (\`omlx/\` + binary-safe Provider SPI patch for \`ninfer-metal\`)."
-          fi
-          if [[ -n "${CORE_TAG}" ]]; then
-            NOTES="${NOTES} Includes bundled offline archive embedding \`ninfer-metal\` \`${CORE_TAG}\`."
+            NOTES="Monorepo-synced \`oMLX-extend\` macOS app installer (\`${EXTEND_TAG}\`) based on \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` (\`oMLX.app\` + Provider SPI v2 + Microkernel Manager)."
           fi
 
           if gh release view "${EXTEND_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
