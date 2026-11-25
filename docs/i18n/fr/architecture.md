@@ -41,8 +41,8 @@ flowchart LR
     Local --> Runtime
     MMH -- "Path B (AF_UNIX NDJSON v2)" --> Sidecar
     Sidecar -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> ExtProviders
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     UI -- "Context L / Concurrency B,C / MTP / DFlash2 / affine4" --> Daemon
     Daemon --> Runtime
@@ -66,7 +66,7 @@ flowchart LR
 
 ## 2. Routage automatique des modèles en O(1) (`oMLX-extend`)
 
-`oMLX-extend` inspecte chaque répertoire de modèle via `detect_adapted(model_dir)` en `< 1 ms` par de simples contrôles du système de fichiers (`model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`), sans lancer de sous-processus :
+`oMLX-extend` inspecte chaque répertoire de modèle via `detect_adapted(model_dir)` en `< 1 ms` par de simples contrôles du système de fichiers (`model.miv` / `model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`), sans lancer de sous-processus :
 
 - **Modèles adaptés** : Routés à la demande vers **`miv Core Backend`** (`mseries_backendd`) dès la première requête (ou lorsqu'ils sont épinglés), en affichant **`miv Core Backend (Auto)`** dans `Model Settings → Advanced Settings`. Désactiver **`Use External Engine`** écrit `external_engine: "stock"` et bascule le modèle vers Stock MLX.
 - **Modèles non adaptés** : Exécutés tels quels par Stock MLX (`BatchedEngine` / `VLMBatchedEngine`), sans processus sidecar, sans surcoût mémoire et sans changement de performances.
@@ -90,7 +90,7 @@ Lorsque des modèles `ninfer-metal`, des microkernels sidecar Voie B et des mod�
 
 ## 4. Conception du moteur Metal 4 (`miv/`)
 
-- **Copie unique des poids pré-tuilés** : La conversion hors ligne `.omlxm5` (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) dessert le Prefill NAX large `64×64`, le décodage QMV `T=1` et la vérification spéculative `BM=8/16/32` depuis une seule allocation résidente (`1.0×` l'empreinte de l'artefact contre `~1.92×` pour un re-tuilage en ligne).
+- **Copie unique des poids pré-tuilés** : La conversion hors ligne `.miv` (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) dessert le Prefill NAX large `64×64`, le décodage QMV `T=1` et la vérification spéculative `BM=8/16/32` depuis une seule allocation résidente (`1.0×` l'empreinte de l'artefact contre `~1.92×` pour un re-tuilage en ligne).
 - **Enregistrement Compute ICB sécurisé** : Tous les segments de buffers indirects restent strictement inférieurs à `2 GiB` (`< 1 GiB` pour les caches auxiliaires compacts) afin d'éviter le débordement des offsets matériels 32 bits. Les allocateurs de commandes en double tampon `ar_pipe_[2]` recouvrent l'encodage hôte et l'exécution GPU.
 - **KV paginé CoW et continuation UMA** : `KvPagePool` gère des pages de `64` tokens à comptage de références (`bf16` et `affine4_g128` `0-ULP` à `0.5625 B/val`). `QwenUmaContinuation` capture et restaure l'état GDN sur 48 couches (`146.81 MiB`) dans un unique command buffer GPU (`0.22–1.62 ms`, zéro `memcpy` CPU), et `rolling_prefix_cache` remplace sur place les ancêtres non épinglés (réutilisation de slab `1×`).
 - **Isolation stricte des calibrations par SKU** : `silicon_tuning.h` charge les profils par SKU (`apple-m5-ultra-64gpu.json`, `apple-m5-ultra-80gpu.json`) indexés par `profile_id` exact et bascule sur des a priori paramétrés pour les puces non mesurées — sans jamais appliquer les constantes mesurées d'un SKU à un autre.
@@ -113,6 +113,6 @@ Les archives du cœur s'installent côte à côte sous `~/Library/Application Su
 ## Références approfondies
 
 - [Architecture de portage v2](../../backend/ninfer-m5-porting-architecture-v2.md)
-- [Format d'artefact `.omlxm5` v1](../../backend/artifact-format-v1.md) et [Contrat de dispatch v1](../../backend/dispatch-contract-v1.md)
+- [Format d'artefact `.miv` v1](../../backend/artifact-format-v1.md) et [Contrat de dispatch v1](../../backend/dispatch-contract-v1.md)
 - [Frontières matériel et logiciel v1](../../foundations/hardware-software-boundaries-v1.md)
 - [Standard de certification du cœur](../../standards/core-certification-standard.md)

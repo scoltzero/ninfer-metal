@@ -81,6 +81,15 @@ void parse_spec_backend_setting(std::string_view value,
       std::string(value));
 }
 
+std::string parse_lora_mode(std::string_view value, std::string_view source) {
+  if (value == "merge" || value == "bypass") {
+    return std::string(value);
+  }
+  throw std::invalid_argument("unsupported " + std::string(source) +
+                              " (expected 'merge' or 'bypass'): " +
+                              std::string(value));
+}
+
 int parse_int_arg(std::string_view value, std::string_view flag_name) {
   int parsed = 0;
   const auto [end, ec] =
@@ -234,11 +243,38 @@ void read_toml_string_or_array(const toml::table &tbl, std::string_view key,
   }
 }
 
+std::optional<std::string> read_toml_optional_string(const toml::table &tbl,
+                                                     std::string_view key) {
+  if (const auto *node = tbl.get(key)) {
+    if (const auto s = node->value<std::string>()) {
+      return *s;
+    }
+    throw std::invalid_argument("TOML key '" + std::string(key) +
+                                "' must be a string");
+  }
+  return std::nullopt;
+}
+
 std::uint64_t gb_to_bytes(double gb) {
   if (!(gb > 0.0) || !std::isfinite(gb)) {
     return 0;
   }
   return static_cast<std::uint64_t>(gb * static_cast<double>(1ULL << 30));
+}
+
+std::string derive_model_id_from_dir(const std::string &model_dir) {
+  if (!model_dir.empty()) {
+    std::filesystem::path p(model_dir);
+    const auto normalized = p.lexically_normal();
+    std::string name = normalized.filename().string();
+    if (name.empty() || name == ".") {
+      name = normalized.parent_path().filename().string();
+    }
+    if (!name.empty()) {
+      return name;
+    }
+  }
+  return "ninfer-metal-model";
 }
 
 void validate_model_config(const ModelServeConfig &model_cfg) {
@@ -250,6 +286,11 @@ void validate_model_config(const ModelServeConfig &model_cfg) {
   }
   if (model_cfg.kv_dtype != "bf16" && model_cfg.kv_dtype != "affine4_g128") {
     throw std::invalid_argument("--kv-dtype must be bf16 or affine4_g128");
+  }
+  if (model_cfg.lora_mode != "merge" && model_cfg.lora_mode != "bypass") {
+    throw std::invalid_argument(
+        "--lora-mode must be 'merge' or 'bypass', got: " +
+        model_cfg.lora_mode);
   }
   if (model_cfg.prefix_cache_gb.has_value() &&
       (*model_cfg.prefix_cache_gb < 0.0 || *model_cfg.prefix_cache_gb > 128.0)) {
@@ -275,6 +316,10 @@ void validate_serve_config(const ServeConfig &config) {
   if (config.kv_dtype != "bf16" && config.kv_dtype != "affine4_g128") {
     throw std::invalid_argument("--kv-dtype must be bf16 or affine4_g128");
   }
+  if (config.lora_mode != "merge" && config.lora_mode != "bypass") {
+    throw std::invalid_argument(
+        "--lora-mode must be 'merge' or 'bypass', got: " + config.lora_mode);
+  }
   if (config.prefix_cache_gb.has_value() &&
       (*config.prefix_cache_gb < 0.0 || *config.prefix_cache_gb > 128.0)) {
     throw std::invalid_argument("--prefix-cache-gb must be in [0, 128]");
@@ -289,12 +334,142 @@ void validate_serve_config(const ServeConfig &config) {
        !std::isfinite(*config.engine_memory_budget_gb))) {
     throw std::invalid_argument("engine.memory_budget_gb must be non-negative");
   }
+  for (const auto &[id, ov] : config.sidecar_models) {
+    (void)id;
+    if (ov.lora_mode.has_value() && *ov.lora_mode != "merge" &&
+        *ov.lora_mode != "bypass") {
+      throw std::invalid_argument(
+          "sidecar.models lora_mode must be 'merge' or 'bypass', got: " +
+          *ov.lora_mode);
+    }
+    if (ov.max_concurrency.has_value() &&
+        (*ov.max_concurrency < 1 || *ov.max_concurrency > 8)) {
+      throw std::invalid_argument("--max-concurrency must be in [1, 8]");
+    }
+    if (ov.max_context.has_value() && *ov.max_context <= 0) {
+      throw std::invalid_argument("--max-context must be positive");
+    }
+    if (ov.kv_dtype.has_value() && *ov.kv_dtype != "bf16" &&
+        *ov.kv_dtype != "affine4_g128") {
+      throw std::invalid_argument("--kv-dtype must be bf16 or affine4_g128");
+    }
+  }
   for (const auto &m : config.models) {
     validate_model_config(m);
   }
 }
 
-ModelServeConfig default_model_from_serve_config(const ServeConfig &config) {
+const SidecarModelOverride *
+find_sidecar_model_override(const ServeConfig &config,
+                            const ModelServeConfig &m) {
+  if (config.sidecar_models.empty()) {
+    return nullptr;
+  }
+  if (!m.id.empty()) {
+    if (const auto it = config.sidecar_models.find(m.id);
+        it != config.sidecar_models.end()) {
+      return &it->second;
+    }
+  }
+  if (!m.model_dir.empty()) {
+    const std::string derived =
+        derive_model_id_from_dir(expand_user_path(m.model_dir));
+    if (const auto it = config.sidecar_models.find(derived);
+        it != config.sidecar_models.end()) {
+      return &it->second;
+    }
+  }
+  return nullptr;
+}
+
+void apply_sidecar_model_override(ModelServeConfig &m,
+                                  const ServeConfig &config,
+                                  bool respect_cli_overrides) {
+  const SidecarModelOverride *ov = find_sidecar_model_override(config, m);
+  if (ov == nullptr) {
+    return;
+  }
+  if (ov->artifact.has_value() &&
+      !(respect_cli_overrides && config.cli_artifact_override)) {
+    m.artifact = *ov->artifact;
+  }
+  if (ov->draft_dir.has_value() &&
+      !(respect_cli_overrides && config.cli_draft_dir_override)) {
+    m.draft_dir = *ov->draft_dir;
+  }
+  if (ov->draft_artifact.has_value() &&
+      !(respect_cli_overrides && config.cli_draft_artifact_override)) {
+    m.draft_artifact = *ov->draft_artifact;
+  }
+  if (ov->mtp_artifact.has_value() &&
+      !(respect_cli_overrides && config.cli_mtp_artifact_override)) {
+    m.mtp_artifact = *ov->mtp_artifact;
+  }
+  if (ov->kernel_dir.has_value() &&
+      !(respect_cli_overrides && config.cli_kernel_dir_override)) {
+    m.kernel_dir = *ov->kernel_dir;
+  }
+  if (ov->lora_adapter.has_value() &&
+      !(respect_cli_overrides && config.cli_lora_adapter_override)) {
+    m.lora_adapter = *ov->lora_adapter;
+  }
+  if (ov->lora_mode.has_value() &&
+      !(respect_cli_overrides && config.cli_lora_mode_override)) {
+    m.lora_mode = *ov->lora_mode;
+  }
+  if (ov->max_concurrency.has_value() &&
+      !(respect_cli_overrides && config.cli_max_concurrency_override)) {
+    m.max_concurrency = *ov->max_concurrency;
+  }
+  if (ov->max_context.has_value() &&
+      !(respect_cli_overrides && config.cli_max_context_override)) {
+    m.max_context = *ov->max_context;
+  }
+  if (ov->kv_dtype.has_value() &&
+      !(respect_cli_overrides && config.cli_kv_dtype_override)) {
+    m.kv_dtype = *ov->kv_dtype;
+  }
+  if (ov->prefill_engine.has_value()) {
+    m.prefill_engine = *ov->prefill_engine;
+  }
+  if (ov->spec_search.has_value()) {
+    m.spec_search = *ov->spec_search;
+  }
+  if (ov->sampling_contract.has_value() &&
+      !(respect_cli_overrides && config.cli_sampling_contract_override)) {
+    m.sampling_contract = *ov->sampling_contract;
+  }
+  if (ov->rolling_prefix_cache.has_value() &&
+      !(respect_cli_overrides && config.cli_rolling_prefix_cache_override)) {
+    m.rolling_prefix_cache = *ov->rolling_prefix_cache;
+  }
+  if (ov->prefix_cache_gb.has_value() &&
+      !(respect_cli_overrides && config.cli_prefix_cache_gb_override)) {
+    m.prefix_cache_gb = *ov->prefix_cache_gb;
+  }
+  if (ov->batch_mode.has_value()) {
+    m.batch_mode = *ov->batch_mode;
+  }
+  if (ov->memory_budget_gb.has_value()) {
+    m.memory_budget_gb = *ov->memory_budget_gb;
+    m.memory_budget_bytes = 0;
+  }
+  if (ov->memory_budget_bytes.has_value()) {
+    m.memory_budget_bytes = *ov->memory_budget_bytes;
+  }
+  if (ov->spec_backend.has_value() &&
+      !(respect_cli_overrides && config.cli_spec_backend_override)) {
+    m.spec_backend = *ov->spec_backend;
+    m.spec_backend_auto = ov->spec_backend_auto.value_or(false);
+  }
+  if (ov->draft_tokens.has_value() &&
+      !(respect_cli_overrides && config.cli_draft_tokens_override)) {
+    m.draft_tokens = *ov->draft_tokens;
+  }
+}
+
+ModelServeConfig default_model_from_serve_config(const ServeConfig &config,
+                                                 bool apply_sidecar_override = true) {
   ModelServeConfig m;
   m.id = config.model_id;
   m.model_dir = config.model_dir;
@@ -305,6 +480,8 @@ ModelServeConfig default_model_from_serve_config(const ServeConfig &config) {
   m.mtp_artifact = config.mtp_artifact;
   m.kernel_dir = config.kernel_dir;
   m.chat_template = config.chat_template;
+  m.lora_adapter = config.lora_adapter;
+  m.lora_mode = config.lora_mode;
   m.max_concurrency = config.max_concurrency;
   m.max_context = config.max_context;
   m.kv_dtype = config.kv_dtype;
@@ -319,6 +496,9 @@ ModelServeConfig default_model_from_serve_config(const ServeConfig &config) {
   m.spec_backend = config.spec_backend;
   m.spec_backend_auto = config.spec_backend_auto;
   m.draft_tokens = config.draft_tokens;
+  if (apply_sidecar_override) {
+    apply_sidecar_model_override(m, config, /*respect_cli_overrides=*/true);
+  }
   return m;
 }
 
@@ -330,6 +510,28 @@ void expand_model_paths(ModelServeConfig &m) {
   m.mtp_artifact = expand_user_path(m.mtp_artifact);
   m.kernel_dir = expand_user_path(m.kernel_dir);
   m.chat_template = expand_user_path(m.chat_template);
+  m.lora_adapter = expand_user_path(m.lora_adapter);
+}
+
+void expand_sidecar_override_paths(SidecarModelOverride &ov) {
+  if (ov.artifact.has_value()) {
+    ov.artifact = expand_user_path(*ov.artifact);
+  }
+  if (ov.draft_dir.has_value()) {
+    ov.draft_dir = expand_user_path(*ov.draft_dir);
+  }
+  if (ov.draft_artifact.has_value()) {
+    ov.draft_artifact = expand_user_path(*ov.draft_artifact);
+  }
+  if (ov.mtp_artifact.has_value()) {
+    ov.mtp_artifact = expand_user_path(*ov.mtp_artifact);
+  }
+  if (ov.kernel_dir.has_value()) {
+    ov.kernel_dir = expand_user_path(*ov.kernel_dir);
+  }
+  if (ov.lora_adapter.has_value()) {
+    ov.lora_adapter = expand_user_path(*ov.lora_adapter);
+  }
 }
 
 void expand_serve_config_paths(ServeConfig &config) {
@@ -344,6 +546,10 @@ void expand_serve_config_paths(ServeConfig &config) {
   config.mtp_artifact = expand_user_path(config.mtp_artifact);
   config.kernel_dir = expand_user_path(config.kernel_dir);
   config.chat_template = expand_user_path(config.chat_template);
+  config.lora_adapter = expand_user_path(config.lora_adapter);
+  for (auto &[_, ov] : config.sidecar_models) {
+    expand_sidecar_override_paths(ov);
+  }
   for (auto &m : config.models) {
     expand_model_paths(m);
   }
@@ -448,19 +654,96 @@ find_existing_config_file(const std::filesystem::path &candidate) {
   return (ec ? candidate : canonical).string();
 }
 
-std::string derive_model_id_from_dir(const std::string &model_dir) {
-  if (!model_dir.empty()) {
-    std::filesystem::path p(model_dir);
-    const auto normalized = p.lexically_normal();
-    std::string name = normalized.filename().string();
-    if (name.empty() || name == ".") {
-      name = normalized.parent_path().filename().string();
-    }
-    if (!name.empty()) {
-      return name;
-    }
+SidecarModelOverride parse_sidecar_model_override(const toml::table &entry,
+                                                  std::string_view section) {
+  SidecarModelOverride ov;
+  if (const auto v = read_toml_optional_string(entry, "artifact")) {
+    ov.artifact = *v;
+  } else if (const auto v2 = read_toml_optional_string(entry, "artifact_path")) {
+    ov.artifact = *v2;
   }
-  return "ninfer-metal-model";
+  if (const auto v = read_toml_optional_string(entry, "draft_dir")) {
+    ov.draft_dir = *v;
+  }
+  if (const auto v = read_toml_optional_string(entry, "draft_artifact")) {
+    ov.draft_artifact = *v;
+  } else if (const auto v2 =
+                 read_toml_optional_string(entry, "draft_artifact_path")) {
+    ov.draft_artifact = *v2;
+  }
+  if (const auto v = read_toml_optional_string(entry, "mtp_artifact")) {
+    ov.mtp_artifact = *v;
+  } else if (const auto v2 =
+                 read_toml_optional_string(entry, "mtp_artifact_path")) {
+    ov.mtp_artifact = *v2;
+  }
+  if (const auto v = read_toml_optional_string(entry, "metallib_dir")) {
+    ov.kernel_dir = *v;
+  } else if (const auto v2 = read_toml_optional_string(entry, "kernel_dir")) {
+    ov.kernel_dir = *v2;
+  }
+  if (const auto v = read_toml_optional_string(entry, "lora_adapter")) {
+    ov.lora_adapter = *v;
+  } else if (const auto v2 = read_toml_optional_string(entry, "lora")) {
+    ov.lora_adapter = *v2;
+  }
+  if (const auto v = read_toml_optional_string(entry, "lora_mode")) {
+    ov.lora_mode = parse_lora_mode(*v, std::string(section) + ".lora_mode");
+  }
+  if (const auto v = entry["max_concurrency"].value<std::int64_t>()) {
+    ov.max_concurrency = static_cast<std::int32_t>(*v);
+  }
+  if (const auto v = entry["max_context"].value<std::int64_t>()) {
+    ov.max_context = static_cast<std::int32_t>(*v);
+  }
+  if (const auto v = read_toml_optional_string(entry, "kv_dtype")) {
+    ov.kv_dtype = *v;
+  }
+  if (const auto v = read_toml_optional_string(entry, "prefill_engine")) {
+    ov.prefill_engine = *v;
+  }
+  if (const auto v = read_toml_optional_string(entry, "spec_search")) {
+    ov.spec_search = *v;
+  }
+  if (const auto v = read_toml_optional_string(entry, "sampling_contract")) {
+    ov.sampling_contract = *v;
+  }
+  read_toml_optional_bool_or_on_off(entry, "rolling_prefix_cache",
+                                    ov.rolling_prefix_cache);
+  read_toml_optional_double(entry, "prefix_cache_gb", ov.prefix_cache_gb);
+  if (const auto v = read_toml_optional_string(entry, "batch_mode")) {
+    ov.batch_mode = *v;
+  }
+  read_toml_optional_double(entry, "memory_budget_gb", ov.memory_budget_gb);
+  if (const auto v = entry["memory_budget_bytes"].value<std::int64_t>()) {
+    if (*v < 0) {
+      throw std::invalid_argument(std::string(section) +
+                                  ".memory_budget_bytes must be non-negative");
+    }
+    ov.memory_budget_bytes = static_cast<std::uint64_t>(*v);
+  }
+  if (const auto v = read_toml_optional_string(entry, "spec_backend")) {
+    SpeculativeBackend sb = SpeculativeBackend::none;
+    bool sb_auto = false;
+    parse_spec_backend_setting(*v, sb, sb_auto);
+    ov.spec_backend = sb;
+    ov.spec_backend_auto = sb_auto;
+  } else if (const auto v2 =
+                 read_toml_optional_string(entry, "speculative_backend")) {
+    SpeculativeBackend sb = SpeculativeBackend::none;
+    bool sb_auto = false;
+    parse_spec_backend_setting(*v2, sb, sb_auto);
+    ov.spec_backend = sb;
+    ov.spec_backend_auto = sb_auto;
+  }
+  if (const auto v = entry["draft_tokens"].value<std::int64_t>()) {
+    if (*v < 0) {
+      throw std::invalid_argument(std::string(section) +
+                                  ".draft_tokens must be non-negative");
+    }
+    ov.draft_tokens = static_cast<std::uint32_t>(*v);
+  }
+  return ov;
 }
 
 } // namespace
@@ -752,6 +1035,14 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     } else if (const auto v2 = (*model)["id"].value<std::string>()) {
       config.model_id = *v2;
     }
+    if (const auto v = read_toml_optional_string(*model, "lora_adapter")) {
+      config.lora_adapter = *v;
+    } else if (const auto v2 = read_toml_optional_string(*model, "lora")) {
+      config.lora_adapter = *v2;
+    }
+    if (const auto v = read_toml_optional_string(*model, "lora_mode")) {
+      config.lora_mode = parse_lora_mode(*v, "TOML model.lora_mode");
+    }
   }
 
   if (const auto *engine = tbl["engine"].as_table()) {
@@ -798,6 +1089,18 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     } else if (const auto v2 = (*engine)["kernel_dir"].value<std::string>()) {
       config.kernel_dir = *v2;
     }
+    if (const auto v = read_toml_optional_string(*engine, "lora_adapter")) {
+      if (!v->empty() || config.lora_adapter.empty()) {
+        config.lora_adapter = *v;
+      }
+    } else if (const auto v2 = read_toml_optional_string(*engine, "lora")) {
+      if (!v2->empty() || config.lora_adapter.empty()) {
+        config.lora_adapter = *v2;
+      }
+    }
+    if (const auto v = read_toml_optional_string(*engine, "lora_mode")) {
+      config.lora_mode = parse_lora_mode(*v, "TOML engine.lora_mode");
+    }
   }
 
   if (const auto *spec = tbl["speculative"].as_table()) {
@@ -823,13 +1126,74 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     }
   }
 
+  if (const auto *sidecar = tbl["sidecar"].as_table()) {
+    if (const auto v = read_toml_optional_string(*sidecar, "lora_adapter")) {
+      if (!v->empty() || config.lora_adapter.empty()) {
+        config.lora_adapter = *v;
+      }
+    } else if (const auto v2 = read_toml_optional_string(*sidecar, "lora")) {
+      if (!v2->empty() || config.lora_adapter.empty()) {
+        config.lora_adapter = *v2;
+      }
+    }
+    if (const auto v = read_toml_optional_string(*sidecar, "lora_mode")) {
+      config.lora_mode = parse_lora_mode(*v, "TOML sidecar.lora_mode");
+    }
+    if (const auto v = (*sidecar)["max_concurrency"].value<std::int64_t>()) {
+      config.max_concurrency = static_cast<std::int32_t>(*v);
+    }
+    if (const auto v = (*sidecar)["max_context"].value<std::int64_t>()) {
+      config.max_context = static_cast<std::int32_t>(*v);
+    }
+    if (const auto v = (*sidecar)["kv_dtype"].value<std::string>()) {
+      config.kv_dtype = *v;
+    }
+    if (const auto v = (*sidecar)["prefill_engine"].value<std::string>()) {
+      config.prefill_engine = *v;
+    }
+    if (const auto v = (*sidecar)["spec_search"].value<std::string>()) {
+      config.spec_search = *v;
+    }
+    if (const auto v = (*sidecar)["sampling_contract"].value<std::string>()) {
+      config.sampling_contract = *v;
+    }
+    read_toml_optional_bool_or_on_off(*sidecar, "rolling_prefix_cache",
+                                      config.rolling_prefix_cache);
+    read_toml_optional_double(*sidecar, "prefix_cache_gb",
+                              config.prefix_cache_gb);
+    if (const auto v = (*sidecar)["batch_mode"].value<std::string>()) {
+      config.batch_mode = *v;
+    }
+    if (const auto v = (*sidecar)["memory_budget_bytes"].value<std::int64_t>()) {
+      if (*v < 0) {
+        throw std::invalid_argument(
+            "TOML sidecar.memory_budget_bytes must be non-negative");
+      }
+      config.memory_budget_bytes = static_cast<std::uint64_t>(*v);
+    }
+    if (const auto *sidecar_models = (*sidecar)["models"].as_table()) {
+      for (const auto &[k, node] : *sidecar_models) {
+        const auto *entry = node.as_table();
+        if (entry == nullptr) {
+          throw std::invalid_argument("TOML [sidecar.models.\"" +
+                                      std::string(k.str()) +
+                                      "\"] must be a table");
+        }
+        SidecarModelOverride ov = parse_sidecar_model_override(
+            *entry, "TOML sidecar.models." + std::string(k.str()));
+        config.sidecar_models[std::string(k.str())] = std::move(ov);
+      }
+    }
+  }
+
   if (const auto *models_arr = tbl["models"].as_array()) {
     for (const auto &item : *models_arr) {
       const auto *entry = item.as_table();
       if (entry == nullptr) {
         throw std::invalid_argument("TOML [[models]] elements must be tables");
       }
-      ModelServeConfig m = default_model_from_serve_config(config);
+      ModelServeConfig m = default_model_from_serve_config(
+          config, /*apply_sidecar_override=*/false);
       m.id.clear();
       m.model_dir.clear();
       m.artifact.clear();
@@ -848,6 +1212,8 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
       } else if (const auto v2 = (*entry)["dir"].value<std::string>()) {
         m.model_dir = *v2;
       }
+      apply_sidecar_model_override(m, config, /*respect_cli_overrides=*/false);
+
       if (const auto v = (*entry)["provider"].value<std::string>()) {
         m.provider = *v;
       }
@@ -879,6 +1245,14 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
       }
       if (const auto v = (*entry)["chat_template"].value<std::string>()) {
         m.chat_template = *v;
+      }
+      if (const auto v = read_toml_optional_string(*entry, "lora_adapter")) {
+        m.lora_adapter = *v;
+      } else if (const auto v2 = read_toml_optional_string(*entry, "lora")) {
+        m.lora_adapter = *v2;
+      }
+      if (const auto v = read_toml_optional_string(*entry, "lora_mode")) {
+        m.lora_mode = parse_lora_mode(*v, "TOML [[models]].lora_mode");
       }
       if (const auto v = (*entry)["max_concurrency"].value<std::int64_t>()) {
         m.max_concurrency = static_cast<std::int32_t>(*v);
@@ -991,6 +1365,8 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     bool kernel_dir = false;
     bool chat_template = false;
     bool model_id = false;
+    bool lora_adapter = false;
+    bool lora_mode = false;
     bool max_concurrency = false;
     bool max_context = false;
     bool kv_dtype = false;
@@ -1038,24 +1414,37 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     } else if (flag == "--artifact") {
       config.artifact = std::string(next_val());
       cli_overrides.artifact = true;
+      config.cli_artifact_override = true;
     } else if (flag == "--draft-dir") {
       config.draft_dir = std::string(next_val());
       cli_overrides.draft_dir = true;
+      config.cli_draft_dir_override = true;
     } else if (flag == "--draft-artifact") {
       config.draft_artifact = std::string(next_val());
       cli_overrides.draft_artifact = true;
+      config.cli_draft_artifact_override = true;
     } else if (flag == "--mtp-artifact") {
       config.mtp_artifact = std::string(next_val());
       cli_overrides.mtp_artifact = true;
+      config.cli_mtp_artifact_override = true;
     } else if (flag == "--metallib-dir" || flag == "--kernel-dir") {
       config.kernel_dir = std::string(next_val());
       cli_overrides.kernel_dir = true;
+      config.cli_kernel_dir_override = true;
     } else if (flag == "--chat-template") {
       config.chat_template = std::string(next_val());
       cli_overrides.chat_template = true;
     } else if (flag == "--model-id") {
       config.model_id = std::string(next_val());
       cli_overrides.model_id = true;
+    } else if (flag == "--lora" || flag == "--lora-adapter") {
+      config.lora_adapter = std::string(next_val());
+      cli_overrides.lora_adapter = true;
+      config.cli_lora_adapter_override = true;
+    } else if (flag == "--lora-mode") {
+      config.lora_mode = parse_lora_mode(next_val(), flag);
+      cli_overrides.lora_mode = true;
+      config.cli_lora_mode_override = true;
     } else if (flag == "--host") {
       config.host = std::string(next_val());
     } else if (flag == "--port") {
@@ -1084,28 +1473,36 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     } else if (flag == "--max-concurrency" || flag == "-c" || flag == "-b") {
       config.max_concurrency = parse_int_arg(next_val(), flag);
       cli_overrides.max_concurrency = true;
+      config.cli_max_concurrency_override = true;
     } else if (flag == "--max-context") {
       config.max_context = parse_int_arg(next_val(), flag);
       cli_overrides.max_context = true;
+      config.cli_max_context_override = true;
     } else if (flag == "--kv-dtype") {
       config.kv_dtype = std::string(next_val());
       cli_overrides.kv_dtype = true;
+      config.cli_kv_dtype_override = true;
     } else if (flag == "--spec-backend") {
       parse_spec_backend_setting(next_val(), config.spec_backend,
                                  config.spec_backend_auto);
       cli_overrides.spec_backend = true;
+      config.cli_spec_backend_override = true;
     } else if (flag == "--draft-tokens") {
       config.draft_tokens = parse_u32_arg(next_val(), flag);
       cli_overrides.draft_tokens = true;
+      config.cli_draft_tokens_override = true;
     } else if (flag == "--rolling-prefix-cache") {
       config.rolling_prefix_cache = parse_on_off(next_val(), flag);
       cli_overrides.rolling_prefix_cache = true;
+      config.cli_rolling_prefix_cache_override = true;
     } else if (flag == "--prefix-cache-gb") {
       config.prefix_cache_gb = parse_double_arg(next_val(), flag);
       cli_overrides.prefix_cache_gb = true;
+      config.cli_prefix_cache_gb_override = true;
     } else if (flag == "--sampling-contract") {
       config.sampling_contract = std::string(next_val());
       cli_overrides.sampling_contract = true;
+      config.cli_sampling_contract_override = true;
     } else if (flag == "--version") {
       config.show_version = true;
     } else if (flag == "--help" || flag == "-h") {
@@ -1151,6 +1548,12 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       if (cli_overrides.model_id && config.models.size() == 1) {
         m.id = config.model_id;
       }
+      if (cli_overrides.lora_adapter) {
+        m.lora_adapter = config.lora_adapter;
+      }
+      if (cli_overrides.lora_mode) {
+        m.lora_mode = config.lora_mode;
+      }
       if (cli_overrides.max_concurrency) {
         m.max_concurrency = config.max_concurrency;
       }
@@ -1184,9 +1587,11 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     config.model_dir = cli_model_dirs.front();
     config.models.clear();
     for (const auto &dir : cli_model_dirs) {
-      ModelServeConfig m = default_model_from_serve_config(config);
+      ModelServeConfig m = default_model_from_serve_config(
+          config, /*apply_sidecar_override=*/false);
       m.model_dir = dir;
       m.id.clear();
+      apply_sidecar_model_override(m, config, /*respect_cli_overrides=*/true);
       config.models.push_back(std::move(m));
     }
   }
@@ -1310,6 +1715,10 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   }
   opts.speculative.backend = resolved.spec_backend;
   opts.speculative.draft_tokens = resolved.draft_tokens;
+  opts.lora_adapter = resolved.lora_adapter;
+  opts.lora_mode = resolved.lora_mode.empty()
+                       ? std::string("merge")
+                       : parse_lora_mode(resolved.lora_mode, "--lora-mode");
 
   const std::string kernel_dir =
       resolve_kernel_dir(resolved.kernel_dir, opts.model_dir);
@@ -1380,7 +1789,7 @@ std::string format_help_string() {
       << "  ninfer-metal-serve --config ninfer-metal.toml [overrides]\n\n"
       << "Configuration:\n"
       << "  --config PATH                    Load TOML config ([server], "
-         "[model], [[models]], [engine], [speculative])\n"
+         "[model], [[models]], [engine], [speculative], [sidecar])\n"
       << "                                   Auto-discovers ninfer-metal.toml "
          "when omitted; CLI flags override TOML\n"
       << "  --no-default-config              Disable automatic ninfer-metal.toml "
@@ -1402,18 +1811,22 @@ std::string format_help_string() {
          "<exe>/../metallib, build fallback)\n"
       << "  --kernel-dir PATH                Alias for --metallib-dir (Metal "
          ".metallib shaders, not SPI providers)\n"
-      << "  --artifact PATH                  Explicit model .omlxm5 (or "
+      << "  --artifact PATH                  Explicit model .miv (or "
          "provider) artifact override\n"
       << "  --draft-dir PATH                 Speculative draft model "
          "directory\n"
-      << "  --draft-artifact PATH            Explicit draft .omlxm5 artifact "
+      << "  --draft-artifact PATH            Explicit draft .miv artifact "
          "override\n"
-      << "  --mtp-artifact PATH              External MTP head .omlxm5 "
+      << "  --mtp-artifact PATH              External MTP head .miv "
          "artifact override\n"
       << "  --chat-template PATH             Explicit Jinja chat template file "
          "override\n"
       << "  --model-id NAME                  Exposed OpenAI model identifier "
-         "(default: model-dir basename)\n\n"
+         "(default: model-dir basename)\n"
+      << "  --lora, --lora-adapter PATH      LoRA adapter directory (HF PEFT "
+         "or mlx-lm safetensors)\n"
+      << "  --lora-mode merge|bypass         LoRA execution mode: merge "
+         "(load-time fusion, default) | bypass\n\n"
       << "HTTP Server & UMA Memory Coordination:\n"
       << "  --host ADDR                      Bind address (default: "
          "127.0.0.1)\n"

@@ -31,11 +31,14 @@ log_level = "info"
 [model]
 # Standalone mode: path to HuggingFace checkpoint directory containing config.json + tokenizer.
 model_dir = ""
-# Optional explicit path to compiled .omlxm5 target artifact (auto-discovered if omitted).
-# artifact_path = "/path/to/model.omlxm5"
-# Optional explicit path to DFlash2 draft model directory and .omlxm5 artifact.
+# Optional explicit path to compiled .miv target artifact (auto-discovered if omitted).
+# artifact_path = "/path/to/model.miv"
+# Optional explicit path to DFlash2 draft model directory and .miv artifact.
 # draft_dir = "/path/to/draft-model"
-# draft_artifact_path = "/path/to/draft.omlxm5"
+# draft_artifact_path = "/path/to/draft.miv"
+# Optional LoRA adapter directory (HuggingFace PEFT or mlx-lm safetensors) and mode ("merge" | "bypass").
+# lora_adapter = "/path/to/lora-adapter"
+# lora_mode = "merge"
 trust_remote_code = false
 
 [engine]
@@ -63,6 +66,11 @@ prefill_engine = "auto"
 # Speculative sampling verification contract: "position_coupled_v1" | "legacy_rejection_v1"
 sampling_contract = "position_coupled_v1"
 
+# Dual-mode LoRA defaults ("merge" = load-time UMA GPU fusion into NAX q8_g64 with 0 inference overhead;
+# "bypass" = runtime low-rank bypass operator injection supporting zero-reload hot-swap).
+lora_adapter = ""
+lora_mode = "merge"
+
 # Explicit Metal 4 / NAX .metallib directory override (auto-discovered from provider bundle if omitted).
 # metallib_dir = "~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/metallib"
 
@@ -80,12 +88,14 @@ draft_tokens = 4
 
 # Optional DFlash2 draft model overrides:
 # draft_dir = "/path/to/Qwen3.8-27B-DFlash2"
-# draft_artifact_path = "/path/to/qwen38-dflash2.omlxm5"
+# draft_artifact_path = "/path/to/qwen38-dflash2.miv"
 
 [sidecar]
 # Sidecar-specific defaults applied when oMLX-extend spawns mseries_backendd.
 # Set explicit memory budget cap in bytes only when overriding oMLX ProcessMemoryEnforcer coordination (0 = auto).
 # memory_budget_bytes = 0
+# lora_adapter = ""
+# lora_mode = "merge"
 
 # Example per-model overrides (keyed by oMLX model_id):
 # [sidecar.models."Qwen3.8-27B-oQ4e-mtp"]
@@ -95,6 +105,8 @@ draft_tokens = 4
 # prefix_cache_gb = 8.0
 # speculative_backend = "mtp"
 # draft_tokens = 3
+# lora_adapter = "/path/to/qwen38-lora"
+# lora_mode = "merge"
 
 # ---------------------------------------------------------------------------
 # Standalone Multi-Microkernel Parallel Serving (ONE HTTP port, ZERO Python)
@@ -108,7 +120,9 @@ draft_tokens = 4
 # id = "Qwen3.8-27B-oQ4e-mtp"
 # model_dir = "/path/to/Qwen3.8-27B-oQ4e-mtp"
 # provider = "auto"                    # Routes Qwen3.5/3.6/3.8 -> in-process miv (io.ninfer.metal)
-# # artifact_path = "/path/to/qwen38.omlxm5"
+# # artifact_path = "/path/to/qwen38.miv"
+# # lora_adapter = "/path/to/qwen38-lora"
+# # lora_mode = "merge"
 # max_concurrency = 4
 # max_context = 65536
 # kv_dtype = "affine4_g128"

@@ -20,6 +20,7 @@ import json
 import math
 import re
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -319,6 +320,100 @@ def adapter_info(path: str | Path) -> AdapterInfo | None:
 def _text_config(config: dict) -> dict:
     text = config.get("text_config")
     return text if isinstance(text, dict) else config
+
+
+def resolve_adapter_path(
+    adapter_ref: str | Path,
+    *,
+    adapters: dict[str, str] | None = None,
+    model_dir: str | Path | None = None,
+    model_dirs: Iterable[str | Path] = (),
+) -> Path:
+    """Resolve an adapter ID or local path to its absolute adapter directory Path."""
+    raw = str(adapter_ref or "").strip()
+    if not raw:
+        raise AdapterError("LoRA adapter path is empty")
+
+    if adapters and raw in adapters:
+        return Path(adapters[raw]).expanduser().resolve()
+
+    cand = Path(raw).expanduser()
+    if cand.is_absolute():
+        return cand.resolve() if cand.exists() else cand
+
+    search_candidates: list[Path] = []
+    if model_dir is not None:
+        mdir = Path(model_dir).expanduser()
+        search_candidates.extend(
+            (
+                mdir / cand,
+                mdir / "adapters" / cand,
+                mdir.parent / cand,
+            )
+        )
+    for root_raw in model_dirs:
+        root = Path(root_raw).expanduser()
+        search_candidates.append(root / cand)
+        if len(cand.parts) == 1 and root.is_dir():
+            try:
+                for sub in sorted(root.iterdir(), key=lambda p: p.name):
+                    if sub.is_dir() and not sub.name.startswith("."):
+                        search_candidates.append(sub / cand.name)
+            except OSError:
+                pass
+
+    for probe in search_candidates:
+        if is_adapter_dir(probe):
+            return probe.resolve()
+
+    if adapters and "/" in raw and cand.name in adapters:
+        return Path(adapters[cand.name]).expanduser().resolve()
+
+    if cand.exists():
+        return cand.resolve()
+    return cand.resolve(strict=False)
+
+
+def estimate_sidecar_lora_bytes(
+    path: str | Path,
+    *,
+    lora_mode: str = "merge",
+) -> int:
+    """Estimate GPU UMA Metal buffer bytes required for an external sidecar LoRA adapter.
+
+    - ``bypass``: resident BF16 ``(A, B)`` low-rank matrices ``2 * r * (K + N)`` per target.
+    - ``merge``: load-time UMA GPU fusion into ``oq_nax_tiled_g64_v1`` ``q8``
+      (``padded_n * padded_k`` codes + ``(padded_k // 64) * padded_n * 4`` BF16 scale/bias)
+      for every adapted projection.
+    """
+    resolved = Path(path).expanduser()
+    if not is_adapter_dir(resolved):
+        return 0
+    mode = str(lora_mode or "merge").strip().lower()
+    try:
+        spec = _read_spec(resolved)
+        pairs = _pairs(spec, _header_shapes(spec.weights))
+    except (AdapterError, OSError, ValueError):
+        info = adapter_info(resolved)
+        if info is None:
+            return 0
+        return max(info.resident_bytes, info.size)
+
+    total = 0
+    for pair in pairs.values():
+        in_dims, r = _a_in_rank(spec, pair["a"][1])
+        out_dims, _ = _b_out_rank(spec, pair["b"][1])
+        if mode == "bypass":
+            raw_bytes = 2 * r * (in_dims + out_dims)
+            total += ((raw_bytes + 255) // 256) * 256
+        else:
+            bn = 32 if out_dims >= 65536 else 16
+            padded_n = ((out_dims + bn - 1) // bn) * bn
+            padded_k = ((in_dims + 63) // 64) * 64
+            nax_codes = padded_n * padded_k
+            nax_sb = (padded_k // 64) * padded_n * 4
+            total += nax_codes + nax_sb
+    return total
 
 
 def compatibility_problem(info: AdapterInfo, model_config: dict) -> str | None:

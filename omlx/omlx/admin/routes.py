@@ -24,9 +24,11 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
 import requests
@@ -53,6 +55,7 @@ from ..engine.m5_sidecar import (
     apply_m5rt_model_settings_update,
     can_convert_to_miv,
     can_convert_to_omlxm5,
+    canonical_external_engine_id,
     convert_model_to_miv,
     convert_model_to_omlxm5,
     detect_model_weight_format_info,
@@ -60,6 +63,7 @@ from ..engine.m5_sidecar import (
     external_engine_dflash_compatibility,
     external_engine_mtp_compatibility,
     find_m5rt_binary,
+    get_external_engine_options_schema,
     get_external_engine_plugin,
     get_external_engine_supported_settings,
     get_external_engines,
@@ -95,7 +99,12 @@ from ..exceptions import (
     ModelUnavailableError,
 )
 from ..logging_config import console_log_level, is_console_handler
-from ..lora_adapters import adapter_info, compatibility_problem, is_adapter_dir
+from ..lora_adapters import (
+    adapter_info,
+    compatibility_problem,
+    is_adapter_dir,
+    resolve_adapter_path,
+)
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -429,7 +438,25 @@ def _draft_usability_problem(
     # The adapter path is its own toggle, so the same rule checks it when named.
     adapter = settings.get("lora_adapter")
     if adapter and "lora_adapter" in touched:
-        info = adapter_info(adapter)
+        pool = None
+        with suppress(Exception):
+            pool = _get_engine_pool() if _get_engine_pool is not None else None
+        raw_adapters = (
+            pool.lora_adapters()
+            if pool is not None and callable(getattr(pool, "lora_adapters", None))
+            else None
+        )
+        adapters_map = raw_adapters if isinstance(raw_adapters, dict) else None
+        raw_model_dirs = getattr(pool, "_model_dirs", ()) if pool is not None else ()
+        model_dirs = raw_model_dirs if isinstance(raw_model_dirs, (list, tuple)) else ()
+        model_dir = getattr(entry, "model_path", None) if entry is not None else None
+        resolved_adapter = resolve_adapter_path(
+            adapter,
+            adapters=adapters_map,
+            model_dir=model_dir,
+            model_dirs=model_dirs,
+        )
+        info = adapter_info(resolved_adapter)
         if info is None:
             return f"No LoRA adapter (adapter_config.json) at {adapter}"
         problem = info.problem
@@ -1134,6 +1161,12 @@ def _dflash_compat_for_model(
     return dflash_compatibility(model_type, model_info.get("engine_type"))
 
 
+def _configured_m5rt_path(global_settings) -> str | None:
+    """Safely read `integrations.m5rt_path` even on partial test doubles."""
+    integrations = getattr(global_settings, "integrations", None)
+    return getattr(integrations, "m5rt_path", None)
+
+
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
     """Each external engine and whether it can serve this model."""
     if model_info.get("engine_type") not in ("batched", "vlm"):
@@ -1167,12 +1200,19 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
                     }
                 )
                 continue
-        if callable(compat_fn):
-            compatible, reason, draft_repo = compat_fn(
-                engine_id, model_info["id"], settings
-            )
+        compat_res = (
+            compat_fn(engine_id, model_info["id"], settings)
+            if callable(compat_fn)
+            else None
+        )
+        if isinstance(compat_res, tuple) and len(compat_res) == 3:
+            compatible, reason, draft_repo = compat_res
         elif engine_id == "splash":
-            target, reason = engine_pool.splash_target(model_info["id"], settings)
+            splash_res = engine_pool.splash_target(model_info["id"], settings)
+            if isinstance(splash_res, tuple) and len(splash_res) == 2:
+                target, reason = splash_res
+            else:
+                target, reason = None, ""
             draft_repo = (
                 engine_pool.splash_draft_to_download(model_info["id"], settings)
                 if target is None
@@ -1189,9 +1229,7 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
             "draft_repo": draft_repo,
         }
         if engine_id == M5RT_ENGINE_ID:
-            m5rt_cfg_path = (
-                global_settings.integrations.m5rt_path if global_settings else None
-            )
+            m5rt_cfg_path = _configured_m5rt_path(global_settings)
             can_conv, _ = can_convert_to_miv(
                 model_info.get("model_path") or "", m5rt_cfg_path, settings
             )
@@ -1215,6 +1253,13 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
         supported = list(get_external_engine_supported_settings(engine_id))
         if supported:
             row["supported_standard_settings"] = supported
+        schema = [dict(s) for s in get_external_engine_options_schema(engine_id)]
+        if schema:
+            row["options_schema"] = schema
+        if engine_id == M5RT_ENGINE_ID:
+            row["provider_id"] = M5RT_PROVIDER_ID
+        elif engine_id in plugins and getattr(plugins[engine_id], "provider_id", None):
+            row["provider_id"] = plugins[engine_id].provider_id
         rows.append(row)
     return rows
 
@@ -2629,11 +2674,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
     if global_settings is not None:
         # The first look at a launcher runs it once; keep that off the loop.
+        integrations = getattr(global_settings, "integrations", None)
         await asyncio.to_thread(
-            find_splash_binary, global_settings.integrations.splash_path
+            find_splash_binary, getattr(integrations, "splash_path", None)
         )
         await asyncio.to_thread(
-            find_m5rt_binary, global_settings.integrations.m5rt_path
+            find_m5rt_binary, _configured_m5rt_path(global_settings)
         )
 
     # Get engine pool status
@@ -2852,9 +2898,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 else active_ext_engine
             ),
             model_settings=settings,
-            configured_m5rt_binary=(
-                global_settings.integrations.m5rt_path if global_settings else None
-            ),
+            configured_m5rt_binary=_configured_m5rt_path(global_settings),
         )
 
         model_data = {
@@ -3041,8 +3085,18 @@ async def list_lora_adapters(model_id: str, is_admin: bool = Depends(require_adm
             if (row := _row(adapter_id, path)) is not None
         ]
         # The saved adapter may live elsewhere or be gone; the picker shows why.
-        if selected and not any(row["path"] == selected for row in rows):
-            row = _row(Path(selected).name, selected) or {
+        if selected and not any(
+            row["path"] == selected or row["id"] == selected for row in rows
+        ):
+            pool = _get_engine_pool()
+            raw_dirs = getattr(pool, "_model_dirs", ()) if pool is not None else ()
+            resolved_selected = resolve_adapter_path(
+                selected,
+                adapters=pool.lora_adapters() if pool is not None else None,
+                model_dir=entry.model_path,
+                model_dirs=raw_dirs if isinstance(raw_dirs, (list, tuple)) else (),
+            )
+            row = _row(Path(selected).name, str(resolved_selected)) or {
                 "id": Path(selected).name,
                 "path": selected,
                 "rank": 0,
@@ -3276,7 +3330,7 @@ async def convert_model_miv(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     global_settings = _get_global_settings() if _get_global_settings else None
-    m5rt_cfg_path = global_settings.integrations.m5rt_path if global_settings else None
+    m5rt_cfg_path = _configured_m5rt_path(global_settings)
     settings_mgr = _get_model_settings_manager() if _get_model_settings_manager else None
     model_settings = (
         settings_mgr.get_settings(model_id) if settings_mgr is not None else None
@@ -3418,6 +3472,9 @@ async def update_model_settings(
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
     )
+    prev_lora_adapter = current_settings.lora_adapter
+    prev_ext_options = copy.deepcopy(current_settings.external_engine_options)
+    prev_m5rt_options = copy.deepcopy(current_settings.m5rt_options)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
@@ -3782,7 +3839,12 @@ async def update_model_settings(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "external_engine" in sent:
-        engine_id = None if is_diffusion_model else request.external_engine or None
+        raw_engine_id = None if is_diffusion_model else request.external_engine or None
+        engine_id = (
+            "stock"
+            if raw_engine_id == "stock"
+            else canonical_external_engine_id(raw_engine_id)
+        )
         if engine_id == "stock" and getattr(entry, "model_format", None) in ("miv", "omlxm5"):
             raise HTTPException(
                 status_code=400,
@@ -3801,10 +3863,15 @@ async def update_model_settings(
                     status_code=400, detail=f"Unknown external engine: {engine_id}"
                 )
             compat_fn = getattr(engine_pool, "external_engine_compatibility", None)
-            if callable(compat_fn):
-                ok, reason, _ = await asyncio.to_thread(
+            compat_res = (
+                await asyncio.to_thread(
                     compat_fn, engine_id, model_id, current_settings
                 )
+                if callable(compat_fn)
+                else None
+            )
+            if isinstance(compat_res, tuple) and len(compat_res) == 3:
+                ok, reason, _ = compat_res
             else:
                 target, reason = await asyncio.to_thread(
                     engine_pool.splash_target, model_id, current_settings
@@ -4101,6 +4168,12 @@ async def update_model_settings(
             model_id,
         )
 
+    ext_options_changed = (
+        prev_ext_options != current_settings.external_engine_options
+        or prev_m5rt_options != current_settings.m5rt_options
+    )
+    lora_changed = prev_lora_adapter != current_settings.lora_adapter
+
     # Auto-unload (and re-load if pinned) when a setting that only takes
     # effect at engine construction time is changed on a loaded model.
     requires_reload = entry.engine is not None and (
@@ -4109,6 +4182,8 @@ async def update_model_settings(
         # catches Qwen ANE controls (and future signature additions) without
         # requiring a second hand-maintained field list here.
         or prev_load_signature != current_load_signature
+        or lora_changed
+        or ext_options_changed
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
         or "dflash_draft_model" in sent
@@ -4256,6 +4331,30 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _effective_external_engine_for_validation(
+    entry, settings: dict[str, Any]
+) -> str | None:
+    """Resolve the effective external engine for conflict validation (None for Stock MLX)."""
+    explicit = settings.get("external_engine")
+    if isinstance(explicit, str) and explicit.strip():
+        cleaned = explicit.strip()
+        if cleaned == "stock":
+            return None
+        return cleaned
+    if getattr(entry, "model_format", None) == "gguf":
+        return "splash"
+    if _get_engine_pool is not None and entry is not None:
+        with suppress(Exception):
+            pool = _get_engine_pool()
+            ext_id_fn = getattr(pool, "external_engine_id", None)
+            model_id = getattr(entry, "model_id", None)
+            if callable(ext_id_fn) and isinstance(model_id, str) and model_id:
+                auto_ext = ext_id_fn(model_id, SimpleNamespace(**settings))
+                if isinstance(auto_ext, str) and auto_ext.strip():
+                    return auto_ext.strip()
+    return None
+
+
 def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
@@ -4265,7 +4364,8 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail="A LoRA adapter applies only to language and VLM models.",
             )
-        conflict = lora_adapter_conflict(settings)
+        eff_ext = _effective_external_engine_for_validation(entry, settings)
+        conflict = lora_adapter_conflict(settings, external_engine=eff_ext)
         if conflict:
             raise HTTPException(
                 status_code=400,
@@ -4350,9 +4450,13 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    # Profiles never carry the helper Mac; A8 checks need the model's own.
-    helper = mgr.get_settings(model_id).prefill_helper_node_id
-    settings = {"prefill_helper_node_id": helper, **(request.settings or {})}
+    # Profiles never carry the helper Mac or external_engine; inherit base model's.
+    base_ms = mgr.get_settings(model_id)
+    settings = {
+        "prefill_helper_node_id": base_ms.prefill_helper_node_id,
+        "external_engine": base_ms.external_engine,
+        **(request.settings or {}),
+    }
     _validate_model_settings(entry, settings)
     # A profile that turns a feature on owns its draft: an exposed profile is
     # applied at request time, so its content must be loadable too. A profile
@@ -4407,10 +4511,15 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    # Profiles never carry the helper Mac; A8 checks need the model's own.
-    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    # Profiles never carry the helper Mac or external_engine; inherit base model's.
+    base_ms = mgr.get_settings(model_id)
     _validate_model_settings(
-        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+        entry,
+        {
+            "prefill_helper_node_id": base_ms.prefill_helper_node_id,
+            "external_engine": base_ms.external_engine,
+            **(request.settings or {}),
+        },
     )
     stored = mgr.get_profile(model_id, name) or {}
     draft_problem = _profile_draft_problem(
@@ -4741,7 +4850,8 @@ async def _apply_settings_snapshot(
     _note_conflict("vlm_mtp", conflicts, skipped)
     candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
     _note_conflict("a8_prefill", conflicts, skipped)
-    candidate, conflicts = resolve_lora_conflicts(candidate)
+    eff_ext = _effective_external_engine_for_validation(entry, candidate)
+    candidate, conflicts = resolve_lora_conflicts(candidate, external_engine=eff_ext)
     for name in conflicts:
         feature = name.removesuffix("_enabled").removesuffix("_node_id")
         _note_conflict(feature, ["lora_adapter"], skipped)
@@ -5231,11 +5341,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     # The first look at a launcher runs it once; keep that off the loop.
+    integrations = getattr(global_settings, "integrations", None)
     await asyncio.to_thread(
-        find_splash_binary, global_settings.integrations.splash_path
+        find_splash_binary, getattr(integrations, "splash_path", None)
     )
     await asyncio.to_thread(
-        find_m5rt_binary, global_settings.integrations.m5rt_path
+        find_m5rt_binary, _configured_m5rt_path(global_settings)
     )
     return _global_settings_response(global_settings)
 
@@ -5324,6 +5435,8 @@ def _external_engines_status(global_settings) -> dict:
             "supported_standard_settings": list(
                 m5_info.get("supported_standard_settings") or ()
             ),
+            "capabilities": list(m5_info.get("capabilities") or ()),
+            "options_schema": list(m5_info.get("options_schema") or ()),
             "reason": m5_info.get("reason") or "",
             "install_hint": m5_info.get("install_hint") or "",
             "models": list(m5_info.get("models") or ()),
@@ -5370,6 +5483,10 @@ def _external_engines_status(global_settings) -> dict:
                 "supported_standard_settings": list(
                     info.get("supported_standard_settings")
                     or plugin.supported_standard_settings
+                ),
+                "capabilities": list(info.get("capabilities") or ()),
+                "options_schema": list(
+                    info.get("options_schema") or plugin.options_schema
                 ),
                 "reason": info.get("reason") or "",
                 "models": list(info.get("models") or ()),
@@ -5554,9 +5671,9 @@ def _global_settings_response(global_settings):
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
-            "m5rt_path": global_settings.integrations.m5rt_path,
+            "m5rt_path": _configured_m5rt_path(global_settings),
             "disabled_microkernels": list(
-                global_settings.integrations.disabled_microkernels
+                getattr(global_settings.integrations, "disabled_microkernels", ()) or ()
             ),
         },
         "external_engines": _external_engines_status(global_settings),

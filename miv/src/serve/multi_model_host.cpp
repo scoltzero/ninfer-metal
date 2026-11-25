@@ -230,6 +230,8 @@ MultiModelHost::load_model(const ModelServeConfig &model_cfg,
   inst.max_context = load_options.max_context;
   inst.max_concurrency = load_options.max_concurrency;
   inst.allocated_budget_bytes = budget_bytes;
+  inst.lora_adapter = load_options.lora_adapter;
+  inst.lora_mode = load_options.lora_mode;
   return add_model(std::move(inst));
 }
 

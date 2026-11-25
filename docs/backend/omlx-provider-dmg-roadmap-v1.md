@@ -77,7 +77,7 @@ oMLX.app
 上游PR不包含：
 
 - M-Series品牌、固定芯片表；
-- `.omlxm5`转换器；
+- `.miv`转换器；
 - oQ/MXFP4 Metal kernel；
 - DFlash2 companion实现；
 - 我们的静态dispatch table。
@@ -126,7 +126,7 @@ Developer ID，只能发布明确标注的开发测试包，不能把ad-hoc签�
 下载DMG → 拖入Applications → 首次向导
        → 检测芯片/内存/Metal能力
        → 选择模型目录
-       → 自动发现或生成.omlxm5
+       → 自动发现或生成.miv
        → Backend默认Auto
        → 启动server与sidecar
 ```

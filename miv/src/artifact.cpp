@@ -296,7 +296,7 @@ void validate_format_contract(const ArtifactObject &object) {
       if (object.shape.size() != 2 ||
           (affine->group_size != 64 && affine->group_size != 128) ||
           (affine->bits != 3 && affine->bits != 4 && affine->bits != 5 &&
-           affine->bits != 6) ||
+           affine->bits != 6 && affine->bits != 8) ||
           object.shape.back() < 512 ||
           (object.shape.back() % affine->group_size) != 0) {
         throw std::runtime_error("artifact affine NAX tiled geometry mismatch");
@@ -312,6 +312,10 @@ void validate_format_contract(const ArtifactObject &object) {
         static_cast<void>(require_plane(
             object, index++, "nax_high1",
             checked_multiply(padded_n, k / 8, "affine Q3 NAX high1")));
+      } else if (affine->bits == 8) {
+        static_cast<void>(require_plane(
+            object, index++, "nax_codes",
+            checked_multiply(padded_n, k, "affine Q8 NAX codes")));
       } else {
         static_cast<void>(require_plane(
             object, index++, "nax_codes",
@@ -1066,6 +1070,9 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
               high[tile_idx * (bn * 8) + rn * 8 + col_in_g / 8]);
           code = ((c_byte >> ((col_in_g & 3U) * 2U)) & 0x03U) |
                  (((h_byte >> (col_in_g & 7U)) & 1U) << 2U);
+        } else if (affine->bits == 8) {
+          code = static_cast<std::uint8_t>(
+              codes[tile_idx * (bn * 64) + rn * 64 + col_in_g]);
         } else {
           const auto c_byte = static_cast<std::uint8_t>(
               codes[tile_idx * (bn * 32) + rn * 32 + col_in_g / 2]);

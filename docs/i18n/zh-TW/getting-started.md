@@ -2,7 +2,7 @@
 
 # 快速上手與設定
 
-本指南說明如何編譯零 MLX 的 `ninfer-metal` 核心（`miv/`）、將模型權重轉換為 `.omlxm5`、一行指令啟動原生 C++20 獨立 OpenAI 伺服器（`ninfer-metal-serve`）、將 **`miv 核心後端`** 整合至 `oMLX-extend`、調整 `ninfer-metal.toml`，以及呼叫底層 CLI 與常駐程式。若使用 `oMLX` macOS 應用程式，可先看 **[`oMLX-extend` 視覺化上手指南](omlx-extend-guide.md)** 的 5 步驟圖解教學。
+本指南說明如何編譯零 MLX 的 `ninfer-metal` 核心（`miv/`）、將模型權重轉換為 `.miv`、一行指令啟動原生 C++20 獨立 OpenAI 伺服器（`ninfer-metal-serve`）、將 **`miv 核心後端`** 整合至 `oMLX-extend`、調整 `ninfer-metal.toml`，以及呼叫底層 CLI 與常駐程式。若使用 `oMLX` macOS 應用程式，可先看 **[`oMLX-extend` 視覺化上手指南](omlx-extend-guide.md)** 的 5 步驟圖解教學。
 
 ---
 
@@ -75,14 +75,14 @@ python3 miv/tools/build_m5_release.py \
         └── tools/
 ```
 
-### 將模型轉換為 `.omlxm5`
+### 將模型轉換為 `.miv`
 
 離線 NAX 預先磚塊化重排會一次性封裝 `MXFP4`（`E2M1 × UE8M0`）或 `oQ` Affine（`q3–q8`、`g64/g128`）權重，讓 Prefill、`T=1` 自回歸解碼與推測驗證共用同一份常駐記憶體副本：
 
 ```bash
 python3 miv/tools/m5_artifact.py convert \
   --source <model_dir> \
-  --output <model_dir>/model.omlxm5 \
+  --output <model_dir>/model.miv \
   --source-repo <repo_id> \
   --nax-pretile
 ```
@@ -101,7 +101,7 @@ python3 miv/tools/m5_artifact.py convert \
 # 指定模型目錄一鍵啟動（預設連接埠 8080，與 oMLX 的 8000 錯開）
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# 省略路徑時，自動選取 ./models 或 oMLX 模型目錄中的第一個 .omlxm5 模型
+# 省略路徑時，自動選取 ./models 或 oMLX 模型目錄中的第一個 .miv 模型
 ./omlx-extend/scripts/start_ninfer_serve.sh
 
 # 加上任意命令列旗標即可覆寫共用預設組態
@@ -190,8 +190,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `--providers-dir PATH` | 自動（`$OMLX_PROVIDERS_DIR`、`~/Library/Application Support/oMLX/Providers`） | **可重複指定**的路徑 B SPI v2 微核心根目錄；掃描 `<dir>/*/current/provider.json`（備援 `<dir>/*/provider.json`） |
 | `--provider MODE` | `auto`（`auto` \| `inproc` \| `<provider_id>`） | 後端路由模式：O(1) 自動對應、程序內 `miv`（`inproc`）或明確指定路徑 B SPI v2 `provider_id` |
 | `--metallib-dir PATH` | 自動偵測 | Metal 4 / NAX `.metallib` 著色器目錄（搜尋順序：`$OMLX_M5_METALLIB_DIR` -> `<exe>/../metallib` -> `<exe>/metallib`）。別名 `--kernel-dir`（指向 Metal 著色器，**不是**路徑 B 微核心；微核心請使用 `--providers-dir`） |
-| `--artifact PATH` | 自動偵測 | 明確指定目標 `.omlxm5`（或對應 Provider）權重檔路徑 |
-| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | 供 `dflash2` / `mtp` 使用的草稿模型目錄或 `.omlxm5` 檔案 |
+| `--artifact PATH` | 自動偵測 | 明確指定目標 `.miv`（或對應 Provider）權重檔路徑 |
+| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | 供 `dflash2` / `mtp` 使用的草稿模型目錄或 `.miv` 檔案 |
 | `--chat-template PATH`、`--model-id NAME` | 自動 | 覆寫 Jinja 聊天範本檔或對外宣告的模型 ID |
 | `--host ADDR`、`--port PORT` | `127.0.0.1`、`8080` | HTTP 繫結位址與連接埠 |
 | `--api-key KEY`、`--cors` / `--no-cors` | `""`、啟用 | 要求 `Authorization: Bearer <KEY>` 驗證；控制 CORS 標頭 |
@@ -220,7 +220,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
 ```
 
-安裝完成 `io.ninfer.metal/current/` 後，`oMLX-extend` 會自動偵測 **`miv 核心後端`**（`mseries_backendd`，依序退回搜尋 `com.omlx.mseries/current/`、`PATH` 或 `build/*/miv/`），並於 **整合 → 外部引擎**（`Integrations → External Engines`）顯示已安裝的路徑 A 與路徑 B 微核心卡片。只要模型目錄含 `model.omlxm5`、`model_pack.json` 或 `omlxm5-manifest.json`，系統即會在首次請求時延遲路由至 **`miv 核心後端`**，未適配模型維持原版 MLX 執行。若要讓已適配模型強制改回原版 MLX，在 **模型設定 → 進階設定** 關閉 **`Use External Engine`** 開關（寫入 `external_engine: "stock"`）即可。
+安裝完成 `io.ninfer.metal/current/` 後，`oMLX-extend` 會自動偵測 **`miv 核心後端`**（`mseries_backendd`，依序退回搜尋 `com.omlx.mseries/current/`、`PATH` 或 `build/*/miv/`），並於 **整合 → 外部引擎**（`Integrations → External Engines`）顯示已安裝的路徑 A 與路徑 B 微核心卡片。只要模型目錄含 `model.miv` / `model.omlxm5`、`model_pack.json` 或 `omlxm5-manifest.json`，系統即會在首次請求時延遲路由至 **`miv 核心後端`**，未適配模型維持原版 MLX 執行。若要讓已適配模型強制改回原版 MLX，在 **模型設定 → 進階設定** 關閉 **`Use External Engine`** 開關（寫入 `external_engine: "stock"`）即可。
 
 macOS 應用程式畫面圖文教學見 **[`oMLX-extend` 視覺化上手指南](omlx-extend-guide.md)**；宿主內部機制與 UI 設定對應詳見 [`omlx-extend/README.md`](../../../omlx-extend/README.md)。
 
@@ -252,7 +252,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 |---|---|---|---|
 | `host` / `port` / `api_key` | `[server]` | `"127.0.0.1"`、`8080`、`""` | 獨立 `ninfer-metal-serve` 設定（`oMLX-extend` AF_UNIX Sidecar 模式忽略）。 |
 | `providers_dir` / `memory_budget_gb` | `[server]` | 字串或陣列，浮點數（GiB） | 路徑 B SPI v2 微核心根目錄（掃描 `<dir>/*/current/provider.json`）與伺服器總 UMA 上限（預設實體記憶體的 `81%`）。 |
-| `model_dir` / `artifact`（`artifact_path`） | `[model]` | 路徑 | 獨立模式模型目錄與選用的明確 `.omlxm5`（或對應 Provider）權重路徑；`artifact` 與 `artifact_path`（以及 `draft_artifact`/`draft_artifact_path`、`metallib_dir`/`kernel_dir`）皆受支援。 |
+| `model_dir` / `artifact`（`artifact_path`） | `[model]` | 路徑 | 獨立模式模型目錄與選用的明確 `.miv`（或對應 Provider）權重路徑；`artifact` 與 `artifact_path`（以及 `draft_artifact`/`draft_artifact_path`、`metallib_dir`/`kernel_dir`）皆受支援。 |
 | `id` / `model_dir` / `provider` / 覆寫項 | `[[models]]` | 表格陣列 | 獨立 `ninfer-metal-serve` 多模型平行託管項目。未指定項目沿用 `[engine]`/`[speculative]` 預設值，並以 `provider = "auto" \| "inproc" \| "<provider_id>"` 選擇後端。 |
 | `max_concurrency` | `[engine]` | `1..8`（純 CLI 預設 `1`，範本 `4`） | 多使用者並發批次槽位（`miv` 文件記為 **`B`**，上游 `ninfer` 記為 **`C`**）。Sidecar 模式下省略時沿用 oMLX 的 `max_concurrent_requests`。 |
 | `max_context` | `[engine]` | `32768`–`262144+`（純 CLI 預設 `32768`，範本 `65536`） | 上下文視窗長度（**`L`**）。Sidecar 模式下對應 oMLX `max_context_window`。 |
@@ -274,7 +274,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 1. **`m5rt_runner`（Token ID 命令列工具）** — 直接接受整數 Token ID，執行單流、批次（`--batch-mode on --max-concurrency 4`）或 DFlash2 推測推論，並以 NDJSON 輸出指標與生成 Token：
    ```bash
    ./build/miv-v001/miv/m5rt_runner \
-     --artifact /path/to/model.omlxm5 \
+     --artifact /path/to/model.miv \
      --config /path/to/config.json \
      --prompt 151644,8948,198,2610,525,264 \
      --max-context 8192 \

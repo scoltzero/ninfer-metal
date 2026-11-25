@@ -189,6 +189,15 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     append("qwen.workspace.gdn_chunk", add(qk_bytes, ctrl_bytes));
   }
   append("zero", 256);
+  append("argmax_partials", 1024ULL);
+  append("rms_sq_buf",
+         std::max<U64>(
+             4096ULL,
+             multiply(add(multiply(U64(c.num_hidden_layers), 2ULL), 16ULL),
+                      32ULL)));
+  append("moe_tg_done_buf",
+         std::max<U64>(512ULL,
+                       multiply(add(U64(c.num_hidden_layers), 16ULL), 32ULL)));
   const U64 logical_pages = (U64(max_context) + 63) / 64;
   const U32 physical_pages = [&]() -> U32 {
     if (logical_pages + 1 > UINT32_MAX)

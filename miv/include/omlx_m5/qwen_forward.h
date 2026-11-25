@@ -22,6 +22,8 @@ namespace omlx::m5 {
 
 class KvPagePool;
 class QwenForward;
+struct QwenMergedLoraOverrides;
+struct QwenBypassLoraRuntime;
 
 // P02-TF controls Linear arithmetic only. Attention/GDN/sampling qualification
 // is separate; selecting this does not claim a whole-Program exact contract.
@@ -299,7 +301,9 @@ public:
               std::string_view kv_dtype = "bf16",
               QwenForward *shared_primary = nullptr,
               bool enable_flash_nax_prefill = false,
-              std::uint32_t kv_pool_pages = 0);
+              std::uint32_t kv_pool_pages = 0,
+              std::shared_ptr<const QwenMergedLoraOverrides> merged_lora = nullptr,
+              std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr);
   ~QwenForward();
   QwenForward(QwenForward &&) noexcept;
   QwenForward &operator=(QwenForward &&) noexcept;
@@ -422,6 +426,9 @@ public:
   // Bind once at installation, before the first forward or checkpoint.
   void bind_execution_identity(std::string);
   [[nodiscard]] std::string_view execution_identity() const;
+  void set_bypass_lora(std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora,
+                       std::string context_execution_identity = {});
+  [[nodiscard]] std::uint64_t lora_scratch_bytes() const noexcept;
   void restore(const QwenContinuation &);
   void restore_shared(const QwenContinuation &,
                       QwenForward *source_owner = nullptr);

@@ -68,7 +68,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashBlockSize
         case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
-        case loraAdapter
+        case loraAdapter, externalEngineLoraMode, externalEngineOptions
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -504,6 +504,7 @@ final class ModelSettingsScreenVM {
     // LoRA adapter folder (empty = none) and the adapters the server found.
     var loraAdapter: String = ""
     var loraAdapters: [LoRAAdapterDTO] = []
+    var externalEngineOptions: [String: [String: AnyCodable]] = [:]
 
     // Profiles
     var profiles: [ProfileDTO] = []
@@ -720,7 +721,7 @@ final class ModelSettingsScreenVM {
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
             return false
-        case .externalEngine:
+        case .externalEngine, .externalEngineLoraMode, .externalEngineOptions:
             return true
         case .embeddingAudioEnabled, .embeddingAudioMaxSeconds:
             return false
@@ -934,6 +935,15 @@ final class ModelSettingsScreenVM {
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
                 self.loraAdapter = s?.loraAdapter ?? ""
+                var mergedExtOpts = s?.externalEngineOptions ?? [:]
+                if let legacyM5 = s?.m5rtOptions, !legacyM5.isEmpty {
+                    var m5Dict = mergedExtOpts["m5rt"] ?? [:]
+                    for (k, v) in legacyM5 {
+                        m5Dict[k] = v
+                    }
+                    mergedExtOpts["m5rt"] = m5Dict
+                }
+                self.externalEngineOptions = mergedExtOpts
                 self.activeProfileName = s?.activeProfileName
             }
             self.profiles = profiles
@@ -1195,6 +1205,8 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         case .loraAdapter:             patch.loraAdapter = loraAdapter
+        case .externalEngineLoraMode, .externalEngineOptions:
+            patch.externalEngineOptions = externalEngineOptions
         }
         if thinkingForced { patch.enableThinking = .some(nil) }
         let targetModelID = modelID
@@ -1463,6 +1475,261 @@ final class ModelSettingsScreenVM {
         return String(localized: "settings.advanced.lora_adapter.sub",
                       defaultValue: "Adapters that do not fit this model are not listed. Applies after the model reloads.",
                       comment: "Sublabel for the LoRA adapter picker")
+    }
+
+    var showsExternalEngineLoraMode: Bool {
+        guard externalEngineSupports("lora_adapter"), !effectiveExternalEngine.isEmpty else {
+            return false
+        }
+        guard let row = model?.externalEngines?.first(where: { $0.id == effectiveExternalEngine }),
+              let schema = row.optionsSchema else {
+            return effectiveExternalEngine == "m5rt"
+        }
+        return schema.contains(where: { ($0["key"]?.value as? String) == "lora_mode" })
+    }
+
+    var externalEngineLoraModeOptions: [(String, String)] {
+        [
+            ("merge", String(localized: "settings.advanced.lora_mode.merge",
+                             defaultValue: "Merge (Load-Time UMA Fusion)",
+                             comment: "LoRA mode option fusing weights at load time")),
+            ("bypass", String(localized: "settings.advanced.lora_mode.bypass",
+                              defaultValue: "Bypass (Runtime BF16 Low-Rank)",
+                              comment: "LoRA mode option applying low-rank BF16 projections at runtime")),
+        ]
+    }
+
+    var externalEngineLoraMode: String {
+        get {
+            let active = effectiveExternalEngine
+            guard !active.isEmpty else { return "merge" }
+            let keys = active == "m5rt"
+                ? ["com.omlx.mseries", "io.ninfer.metal", "ninfer-metal", "m5rt"]
+                : [active]
+            var resolved = "merge"
+            for key in keys {
+                if let val = externalEngineOptions[key]?["lora_mode"]?.value as? String, !val.isEmpty {
+                    resolved = val
+                }
+            }
+            return resolved
+        }
+        set {
+            let active = effectiveExternalEngine
+            guard !active.isEmpty else { return }
+            let keys = active == "m5rt"
+                ? ["com.omlx.mseries", "io.ninfer.metal", "ninfer-metal", "m5rt"]
+                : [active]
+            for key in keys where key != active {
+                if externalEngineOptions[key]?["lora_mode"] != nil {
+                    externalEngineOptions[key]?["lora_mode"] = AnyCodable(newValue)
+                }
+            }
+            var dict = externalEngineOptions[active] ?? [:]
+            dict["lora_mode"] = AnyCodable(newValue)
+            externalEngineOptions[active] = dict
+        }
+    }
+
+    struct ExternalEngineSchemaOption: Identifiable, Equatable {
+        let key: String
+        let label: String
+        let type: String
+        let description: String?
+        let options: [String]
+        let optionLabels: [String: String]
+        let minValue: Double?
+        let maxValue: Double?
+        let defaultValue: AnyCodable?
+
+        var id: String { key }
+    }
+
+    private func optionLookupKeys(for active: String) -> [String] {
+        if active == "m5rt" {
+            return ["com.omlx.mseries", "io.ninfer.metal", "ninfer-metal", "m5rt"]
+        }
+        var keys: [String] = []
+        if let pid = model?.externalEngines?.first(where: { $0.id == active })?.providerId, !pid.isEmpty {
+            keys.append(pid)
+        }
+        if !keys.contains(active) {
+            keys.append(active)
+        }
+        return keys
+    }
+
+    var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
+        let active = effectiveExternalEngine
+        guard !active.isEmpty,
+              let row = model?.externalEngines?.first(where: { $0.id == active }),
+              let schema = row.optionsSchema else {
+            return []
+        }
+        let supportedTypes: Set<String> = ["int", "bool", "bytes_gb", "enum", "string", "float", "number"]
+        return schema.compactMap { entry in
+            guard let key = entry["key"]?.value as? String, !key.isEmpty,
+                  key != "lora_mode",
+                  let type = entry["type"]?.value as? String,
+                  supportedTypes.contains(type) else {
+                return nil
+            }
+            let rawLabel = (entry["label"]?.value as? String) ?? key
+            let desc = entry["description"]?.value as? String
+            let rawOptions: [String] = (entry["options"]?.value as? [AnyCodable])?.compactMap {
+                $0.value as? String
+            } ?? []
+            var optLabels: [String: String] = [:]
+            if let rawMap = entry["option_labels"]?.value as? [String: AnyCodable] {
+                for (k, v) in rawMap {
+                    if let s = v.value as? String {
+                        optLabels[k] = s
+                    }
+                }
+            }
+            func toDouble(_ wrapped: AnyCodable?) -> Double? {
+                if let d = wrapped?.value as? Double { return d }
+                if let i = wrapped?.value as? Int { return Double(i) }
+                return nil
+            }
+            return ExternalEngineSchemaOption(
+                key: key,
+                label: rawLabel,
+                type: type,
+                description: desc,
+                options: rawOptions,
+                optionLabels: optLabels,
+                minValue: toDouble(entry["min"]),
+                maxValue: toDouble(entry["max"]),
+                defaultValue: entry["default"]
+            )
+        }
+    }
+
+    func externalEngineOptionDisplayLabel(_ opt: ExternalEngineSchemaOption) -> String {
+        switch opt.key {
+        case "max_concurrency":
+            return String(localized: "settings.advanced.external_engine.opt.max_concurrency",
+                          defaultValue: "Concurrency (B/C)",
+                          comment: "External engine option label for max concurrent slots")
+        case "rolling_prefix_cache":
+            return String(localized: "settings.advanced.external_engine.opt.rolling_prefix_cache",
+                          defaultValue: "Rolling Prefix Cache",
+                          comment: "External engine option label for rolling prefix cache")
+        case "prefix_cache_gb":
+            return String(localized: "settings.advanced.external_engine.opt.prefix_cache_gb",
+                          defaultValue: "Prefix Cache Budget (GiB)",
+                          comment: "External engine option label for prefix cache memory budget")
+        case "sampling_contract":
+            return String(localized: "settings.advanced.external_engine.opt.sampling_contract",
+                          defaultValue: "Sampling Contract",
+                          comment: "External engine option label for speculative sampling contract")
+        case "artifact_path":
+            return String(localized: "settings.advanced.external_engine.opt.artifact_path",
+                          defaultValue: "Artifact Path",
+                          comment: "External engine option label for custom artifact path")
+        case "draft_artifact_path":
+            return String(localized: "settings.advanced.external_engine.opt.draft_artifact_path",
+                          defaultValue: "Draft Artifact Path",
+                          comment: "External engine option label for custom draft artifact path")
+        default:
+            return opt.label
+        }
+    }
+
+    private func rawExternalEngineOptionValue(for opt: ExternalEngineSchemaOption) -> Any? {
+        let active = effectiveExternalEngine
+        guard !active.isEmpty else { return opt.defaultValue?.value }
+        var resolved: Any? = nil
+        for key in optionLookupKeys(for: active) {
+            if let val = externalEngineOptions[key]?[opt.key]?.value, !(val is NSNull) {
+                resolved = val
+            }
+        }
+        return resolved ?? opt.defaultValue?.value
+    }
+
+    private func writeExternalEngineOptionValue(_ value: any Sendable, forKey optKey: String) {
+        let active = effectiveExternalEngine
+        guard !active.isEmpty else { return }
+        for key in optionLookupKeys(for: active) where key != active {
+            if externalEngineOptions[key]?[optKey] != nil {
+                externalEngineOptions[key]?[optKey] = AnyCodable(value)
+            }
+        }
+        var dict = externalEngineOptions[active] ?? [:]
+        dict[optKey] = AnyCodable(value)
+        externalEngineOptions[active] = dict
+    }
+
+    func externalEngineBoolOption(_ opt: ExternalEngineSchemaOption) -> Bool {
+        if let b = rawExternalEngineOptionValue(for: opt) as? Bool { return b }
+        if let i = rawExternalEngineOptionValue(for: opt) as? Int { return i != 0 }
+        return false
+    }
+
+    func setExternalEngineBoolOption(_ opt: ExternalEngineSchemaOption, _ value: Bool) {
+        writeExternalEngineOptionValue(value, forKey: opt.key)
+    }
+
+    func externalEngineEnumOption(_ opt: ExternalEngineSchemaOption) -> String {
+        if let s = rawExternalEngineOptionValue(for: opt) as? String, !s.isEmpty {
+            return s
+        }
+        return opt.options.first ?? ""
+    }
+
+    func setExternalEngineEnumOption(_ opt: ExternalEngineSchemaOption, _ value: String) {
+        writeExternalEngineOptionValue(value, forKey: opt.key)
+    }
+
+    func externalEngineIntOption(_ opt: ExternalEngineSchemaOption) -> Int {
+        let raw = rawExternalEngineOptionValue(for: opt)
+        if let i = raw as? Int { return i }
+        if let d = raw as? Double { return Int(d.rounded()) }
+        if let s = raw as? String, let i = Int(s) { return i }
+        return Int((opt.minValue ?? 1).rounded())
+    }
+
+    func setExternalEngineIntOption(_ opt: ExternalEngineSchemaOption, _ value: Int) {
+        var clamped = value
+        if let lo = opt.minValue { clamped = max(Int(lo.rounded()), clamped) }
+        if let hi = opt.maxValue { clamped = min(Int(hi.rounded()), clamped) }
+        writeExternalEngineOptionValue(clamped, forKey: opt.key)
+    }
+
+    func externalEngineNumberText(_ opt: ExternalEngineSchemaOption) -> String {
+        let raw = rawExternalEngineOptionValue(for: opt)
+        if let i = raw as? Int { return String(i) }
+        if let d = raw as? Double {
+            return d.rounded() == d ? String(Int(d)) : String(d)
+        }
+        if let s = raw as? String { return s }
+        return ""
+    }
+
+    @discardableResult
+    func setExternalEngineNumberText(_ opt: ExternalEngineSchemaOption, _ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if opt.type == "int" {
+            guard let parsed = Int(trimmed) else { return false }
+            setExternalEngineIntOption(opt, parsed)
+            return true
+        }
+        guard var parsed = Double(trimmed), parsed.isFinite else { return false }
+        if let lo = opt.minValue { parsed = max(lo, parsed) }
+        if let hi = opt.maxValue { parsed = min(hi, parsed) }
+        writeExternalEngineOptionValue(parsed, forKey: opt.key)
+        return true
+    }
+
+    func externalEngineStringOption(_ opt: ExternalEngineSchemaOption) -> String {
+        (rawExternalEngineOptionValue(for: opt) as? String) ?? ""
+    }
+
+    func setExternalEngineStringOption(_ opt: ExternalEngineSchemaOption, _ value: String) {
+        writeExternalEngineOptionValue(value.trimmingCharacters(in: .whitespacesAndNewlines), forKey: opt.key)
     }
 
     static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {

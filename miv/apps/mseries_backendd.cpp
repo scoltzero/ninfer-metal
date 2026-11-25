@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -376,10 +377,46 @@ std::string override_value_to_string(const Json &value,
                               " has an unsupported override value type");
 }
 
-omlx::m5::LoadOptions load_options(const Json &value) {
+std::string expand_user_path(const std::string &path) {
+  if (path.empty() || path.front() != '~') {
+    return path;
+  }
+  if (path.size() == 1 || path[1] == '/') {
+    if (const char *home = std::getenv("HOME"); home && *home) {
+      std::string base(home);
+      if (path.size() > 1 && base.size() > 1 && base.back() == '/') {
+        base.pop_back();
+      }
+      return base + path.substr(1);
+    }
+  }
+  return path;
+}
+
+std::string parse_lora_mode_strict(std::string_view value,
+                                   std::string_view source) {
+  if (value == "merge" || value == "bypass") {
+    return std::string(value);
+  }
+  throw std::invalid_argument("unsupported " + std::string(source) +
+                              " (expected 'merge' or 'bypass'): " +
+                              std::string(value));
+}
+
+struct CliOptions {
+  bool show_version = false;
+  bool show_help = false;
+  bool exit_on_disconnect = false;
+  std::filesystem::path socket_path;
+  std::optional<std::string> default_lora_adapter;
+  std::optional<std::string> default_lora_mode;
+};
+
+omlx::m5::LoadOptions load_options(const Json &value,
+                                   const CliOptions &cli_defaults = {}) {
   omlx::m5::LoadOptions result;
-  result.model_dir = value.value("model_dir", "");
-  result.draft_dir = value.value("draft_dir", "");
+  result.model_dir = expand_user_path(value.value("model_dir", ""));
+  result.draft_dir = expand_user_path(value.value("draft_dir", ""));
   result.max_concurrency = value.value("max_concurrency", 1);
   result.max_context = value.value("max_context", 32768);
   result.kv_dtype = value.value("kv_dtype", "bf16");
@@ -479,6 +516,51 @@ omlx::m5::LoadOptions load_options(const Json &value) {
         static_cast<std::uint64_t>(gb * static_cast<double>(1ULL << 30));
     result.path_overrides.emplace("prefix_cache_bytes", std::to_string(bytes));
   }
+
+  auto read_lora_adapter_key = [&](const char *key) -> std::optional<std::string> {
+    if (!value.contains(key)) {
+      return std::nullopt;
+    }
+    const auto &node = value.at(key);
+    if (node.is_null()) {
+      return std::string{};
+    }
+    if (node.is_string()) {
+      return expand_user_path(node.get<std::string>());
+    }
+    throw std::invalid_argument(std::string(key) + " must be a string or null");
+  };
+
+  if (const auto explicit_lora = read_lora_adapter_key("lora_adapter");
+      explicit_lora.has_value()) {
+    result.lora_adapter = *explicit_lora;
+  } else if (const auto alias_lora = read_lora_adapter_key("lora");
+             alias_lora.has_value()) {
+    result.lora_adapter = *alias_lora;
+  } else if (const auto it = result.path_overrides.find("lora_adapter");
+             it != result.path_overrides.end()) {
+    result.lora_adapter = expand_user_path(it->second);
+  } else if (cli_defaults.default_lora_adapter.has_value()) {
+    result.lora_adapter = *cli_defaults.default_lora_adapter;
+  }
+
+  const std::string fallback_mode =
+      cli_defaults.default_lora_mode.value_or("merge");
+  if (value.contains("lora_mode") && !value.at("lora_mode").is_null()) {
+    if (!value.at("lora_mode").is_string()) {
+      throw std::invalid_argument("lora_mode must be a string");
+    }
+    const std::string raw_mode = value.at("lora_mode").get<std::string>();
+    result.lora_mode = raw_mode.empty()
+                           ? fallback_mode
+                           : parse_lora_mode_strict(raw_mode, "lora_mode");
+  } else if (const auto it = result.path_overrides.find("lora_mode");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.lora_mode = parse_lora_mode_strict(it->second, "lora_mode");
+  } else {
+    result.lora_mode = fallback_mode;
+  }
+
   return result;
 }
 
@@ -612,11 +694,47 @@ Json stats_json(const omlx::m5::StatsReport &value) {
       {"contended_prefill_chunks", value.contended_prefill_chunks},
       {"packed_batch_calls", value.packed_batch_calls},
       {"packed_batch_tokens", value.packed_batch_tokens},
+      {"lora_adapter", value.lora_adapter},
+      {"lora_mode", value.lora_mode},
+      {"lora_buffer_bytes", value.lora_buffer_bytes},
+      {"lora_adapted_layers", value.lora_adapted_layers},
   };
+}
+
+bool base_load_options_equal(const omlx::m5::LoadOptions &a,
+                             const omlx::m5::LoadOptions &b, bool fake_a,
+                             bool fake_b,
+                             const omlx::m5::FakeBackendOptions &fa,
+                             const omlx::m5::FakeBackendOptions &fb) {
+  if (fake_a != fake_b) {
+    return false;
+  }
+  if (fake_a) {
+    if (fa.event_batch_size != fb.event_batch_size ||
+        fa.step_delay_us != fb.step_delay_us ||
+        fa.fail_after_tokens != fb.fail_after_tokens ||
+        fa.fail_before_first != fb.fail_before_first ||
+        fa.vocab_size != fb.vocab_size) {
+      return false;
+    }
+  }
+  return a.model_dir == b.model_dir && a.draft_dir == b.draft_dir &&
+         a.max_concurrency == b.max_concurrency &&
+         a.max_context == b.max_context &&
+         a.speculative.backend == b.speculative.backend &&
+         a.speculative.draft_tokens == b.speculative.draft_tokens &&
+         a.kv_dtype == b.kv_dtype && a.prefill_engine == b.prefill_engine &&
+         a.path_overrides == b.path_overrides &&
+         a.sampling_contract == b.sampling_contract &&
+         a.spec_search == b.spec_search &&
+         a.memory_budget_bytes == b.memory_budget_bytes;
 }
 
 class Session final {
 public:
+  explicit Session(CliOptions cli_options = {})
+      : cli_options_(std::move(cli_options)) {}
+
   Json execute(std::string_view method, const Json &params) {
     if (method == "hello") {
       return {
@@ -630,14 +748,15 @@ public:
           {"pid", static_cast<std::int64_t>(::getpid())},
           {"phys_footprint_bytes", current_phys_footprint_bytes()},
           {"capabilities",
-           {"ar", "mtp", "dflash2", "kv_affine4_g128", "rolling_prefix_cache",
-            "trim_cache", "memory_budget_bytes", "set_scheduler_hint", "cancel",
-            "stats", "capacity", "subscribe_events"}},
+           {"ar", "mtp", "dflash2", "lora", "reload_lora", "kv_affine4_g128",
+            "rolling_prefix_cache", "trim_cache", "memory_budget_bytes",
+            "set_scheduler_hint", "cancel", "stats", "capacity",
+            "subscribe_events"}},
           {"kv_formats", {"bf16", "affine4_g128"}},
           {"supported_standard_settings",
-           {"max_context_window", "mtp_enabled", "mtp_adaptive_max_depth",
-            "mtp_fixed_depth", "dflash_enabled", "dflash_draft_model",
-            "dflash_block_size", "turboquant_kv_enabled",
+           {"max_context_window", "lora_adapter", "mtp_enabled",
+            "mtp_adaptive_max_depth", "mtp_fixed_depth", "dflash_enabled",
+            "dflash_draft_model", "dflash_block_size", "turboquant_kv_enabled",
             "turboquant_kv_scheme"}},
           {"options_schema",
            Json::array({
@@ -667,6 +786,12 @@ public:
                  Json::array({"position_coupled_v1", "legacy_rejection_v1"})},
                 {"default", "legacy_rejection_v1"},
                 {"reload_required", true}},
+               {{"key", "lora_mode"},
+                {"label", "LoRA Mode"},
+                {"type", "enum"},
+                {"options", Json::array({"merge", "bypass"})},
+                {"default", "merge"},
+                {"reload_required", true}},
                {{"key", "artifact_path"},
                 {"label", "Artifact Path"},
                 {"type", "string"},
@@ -681,24 +806,79 @@ public:
       };
     }
     if (method == "load") {
+      // Validate parameters before acquiring or replacing any loaded engine.
+      const auto options = load_options(params, cli_options_);
+      const bool is_fake = params.value("fake", false);
+      const auto fopts =
+          fake_options(params.value("fake_options", Json::object()));
+
+      std::shared_ptr<omlx::m5::Engine> existing_engine;
+      omlx::m5::LoadOptions prev_options;
+      bool prev_fake = false;
+      omlx::m5::FakeBackendOptions prev_fopts;
       {
         std::lock_guard lock(mutex_);
         if (stopping_ || shutdown_) {
           throw std::runtime_error("sidecar is shutting down");
         }
-        if (engine_ != nullptr || loading_) {
-          throw std::logic_error("an engine is already loaded");
+        if (loading_) {
+          throw std::logic_error("an engine load is already in progress");
         }
         loading_ = true;
+        existing_engine = engine_;
+        prev_options = loaded_options_;
+        prev_fake = loaded_fake_;
+        prev_fopts = loaded_fake_options_;
       }
+
+      if (existing_engine != nullptr) {
+        const bool same_base = base_load_options_equal(
+            prev_options, options, prev_fake, is_fake, prev_fopts, fopts);
+        if (same_base && prev_options.lora_adapter == options.lora_adapter &&
+            prev_options.lora_mode == options.lora_mode) {
+          {
+            std::lock_guard lock(mutex_);
+            loading_ = false;
+          }
+          cv_.notify_all();
+          Json res = stats_json(existing_engine->stats());
+          res["hot_reloaded"] = false;
+          return res;
+        }
+        if (same_base &&
+            (options.lora_adapter.empty() || options.lora_mode == "bypass") &&
+            (prev_options.lora_adapter.empty() ||
+             prev_options.lora_mode == "bypass")) {
+          std::string reload_err;
+          if (existing_engine->reload_lora(options.lora_adapter,
+                                           options.lora_mode, &reload_err)) {
+            {
+              std::lock_guard lock(mutex_);
+              loaded_options_ = options;
+              loading_ = false;
+            }
+            cv_.notify_all();
+            Json res = stats_json(existing_engine->stats());
+            res["hot_reloaded"] = true;
+            return res;
+          }
+        }
+        // Full reload fallback (e.g. merge mode or changed base options):
+        // tear down old engine before allocating new UMA Metal buffers.
+        {
+          std::lock_guard lock(mutex_);
+          engine_.reset();
+        }
+        cv_.notify_all();
+        existing_engine->shutdown();
+        existing_engine.reset();
+      }
+
       std::shared_ptr<omlx::m5::Engine> created;
       try {
-        const auto options = load_options(params);
-        if (params.value("fake", false)) {
+        if (is_fake) {
           created = std::shared_ptr<omlx::m5::Engine>(
-              omlx::m5::Engine::create_fake(
-                  options,
-                  fake_options(params.value("fake_options", Json::object()))));
+              omlx::m5::Engine::create_fake(options, fopts));
         } else {
           created = std::shared_ptr<omlx::m5::Engine>(
               omlx::m5::Engine::create(options));
@@ -719,6 +899,9 @@ public:
           stop_immediately = true;
         } else {
           engine_ = created;
+          loaded_options_ = options;
+          loaded_fake_ = is_fake;
+          loaded_fake_options_ = fopts;
         }
       }
       cv_.notify_all();
@@ -726,7 +909,143 @@ public:
         created->shutdown();
         throw std::runtime_error("sidecar is shutting down");
       }
-      return stats_json(created->stats());
+      Json res = stats_json(created->stats());
+      res["hot_reloaded"] = false;
+      return res;
+    }
+    if (method == "reload_lora") {
+      std::string new_adapter;
+      if (params.contains("lora_adapter") && !params.at("lora_adapter").is_null()) {
+        if (!params.at("lora_adapter").is_string()) {
+          throw std::invalid_argument("lora_adapter must be a string or null");
+        }
+        new_adapter = expand_user_path(params.at("lora_adapter").get<std::string>());
+      } else if (params.contains("lora") && !params.at("lora").is_null()) {
+        if (!params.at("lora").is_string()) {
+          throw std::invalid_argument("lora must be a string or null");
+        }
+        new_adapter = expand_user_path(params.at("lora").get<std::string>());
+      }
+
+      std::optional<std::string> explicit_mode;
+      if (params.contains("lora_mode") && !params.at("lora_mode").is_null()) {
+        if (!params.at("lora_mode").is_string()) {
+          throw std::invalid_argument("lora_mode must be a string");
+        }
+        const std::string raw = params.at("lora_mode").get<std::string>();
+        if (!raw.empty()) {
+          explicit_mode = parse_lora_mode_strict(raw, "lora_mode");
+        }
+      }
+
+      std::shared_ptr<omlx::m5::Engine> existing_engine;
+      omlx::m5::LoadOptions prev_options;
+      bool prev_fake = false;
+      omlx::m5::FakeBackendOptions prev_fopts;
+      {
+        std::lock_guard lock(mutex_);
+        if (stopping_ || shutdown_) {
+          throw std::runtime_error("sidecar is shutting down");
+        }
+        if (loading_) {
+          throw std::logic_error("an engine load is already in progress");
+        }
+        if (engine_ == nullptr) {
+          throw std::logic_error("no engine is loaded");
+        }
+        loading_ = true;
+        existing_engine = engine_;
+        prev_options = loaded_options_;
+        prev_fake = loaded_fake_;
+        prev_fopts = loaded_fake_options_;
+      }
+
+      const std::string target_mode = explicit_mode.value_or(
+          (!prev_options.lora_mode.empty() && prev_options.lora_mode == "bypass")
+              ? std::string("bypass")
+              : std::string("merge"));
+
+      const bool can_try_hot =
+          (new_adapter.empty() || target_mode == "bypass") &&
+          (prev_options.lora_adapter.empty() ||
+           prev_options.lora_mode == "bypass");
+      std::string reload_err;
+      if (can_try_hot &&
+          existing_engine->reload_lora(new_adapter, target_mode, &reload_err)) {
+        {
+          std::lock_guard lock(mutex_);
+          loaded_options_.lora_adapter = new_adapter;
+          loaded_options_.lora_mode = target_mode;
+          loading_ = false;
+        }
+        cv_.notify_all();
+        Json res = stats_json(existing_engine->stats());
+        res["hot_reloaded"] = true;
+        return res;
+      }
+
+      // If hot-swap failed for a bypass adapter validation reason (rather than
+      // merge mode requiring full reload), preserve existing_engine and surface
+      // the error cleanly.
+      if (can_try_hot && target_mode == "bypass" && !new_adapter.empty() &&
+          reload_err.find("full") == std::string::npos &&
+          reload_err.find("reload") == std::string::npos) {
+        {
+          std::lock_guard lock(mutex_);
+          loading_ = false;
+        }
+        cv_.notify_all();
+        throw std::runtime_error(reload_err.empty() ? "reload_lora failed"
+                                                    : reload_err);
+      }
+
+      omlx::m5::LoadOptions updated_options = prev_options;
+      updated_options.lora_adapter = new_adapter;
+      updated_options.lora_mode = target_mode;
+      {
+        std::lock_guard lock(mutex_);
+        engine_.reset();
+      }
+      cv_.notify_all();
+      existing_engine->shutdown();
+      existing_engine.reset();
+
+      std::shared_ptr<omlx::m5::Engine> created;
+      try {
+        if (prev_fake) {
+          created = std::shared_ptr<omlx::m5::Engine>(
+              omlx::m5::Engine::create_fake(updated_options, prev_fopts));
+        } else {
+          created = std::shared_ptr<omlx::m5::Engine>(
+              omlx::m5::Engine::create(updated_options));
+        }
+      } catch (...) {
+        {
+          std::lock_guard lock(mutex_);
+          loading_ = false;
+        }
+        cv_.notify_all();
+        throw;
+      }
+      bool stop_immediately = false;
+      {
+        std::lock_guard lock(mutex_);
+        loading_ = false;
+        if (stopping_ || shutdown_) {
+          stop_immediately = true;
+        } else {
+          engine_ = created;
+          loaded_options_ = updated_options;
+        }
+      }
+      cv_.notify_all();
+      if (stop_immediately) {
+        created->shutdown();
+        throw std::runtime_error("sidecar is shutting down");
+      }
+      Json res = stats_json(created->stats());
+      res["hot_reloaded"] = false;
+      return res;
     }
     if (method == "shutdown") {
       shutdown();
@@ -853,10 +1172,14 @@ private:
     return engine_;
   }
 
+  CliOptions cli_options_;
   mutable std::mutex mutex_;
   std::mutex shutdown_call_mutex_;
   std::condition_variable cv_;
   std::shared_ptr<omlx::m5::Engine> engine_;
+  omlx::m5::LoadOptions loaded_options_;
+  bool loaded_fake_ = false;
+  omlx::m5::FakeBackendOptions loaded_fake_options_;
   bool loading_ = false;
   bool stopping_ = false;
   bool shutdown_ = false;
@@ -1039,49 +1362,94 @@ FileDescriptor listen_socket(const std::filesystem::path &path) {
   return socket;
 }
 
-struct CliOptions {
-  bool show_version = false;
-  bool exit_on_disconnect = false;
-  std::filesystem::path socket_path;
-};
+std::string format_daemon_help() {
+  return "Usage: mseries-backendd [--exit-on-disconnect] "
+         "[--lora|--lora-adapter PATH] [--lora-mode merge|bypass] "
+         "--socket PATH\n"
+         "       mseries-backendd --version | --help\n\n"
+         "Options:\n"
+         "  --socket PATH                AF_UNIX socket path (or positional PATH)\n"
+         "  --exit-on-disconnect         Exit when all active clients disconnect\n"
+         "  --lora, --lora-adapter PATH  Default LoRA adapter directory for load RPC\n"
+         "  --lora-mode merge|bypass     Default LoRA execution mode (default: merge)\n"
+         "  --version                    Print daemon & protocol version and exit\n"
+         "  --help, -h                   Show this help message and exit\n";
+}
 
 CliOptions parse_cli(int argc, char **argv) {
   CliOptions options;
-  if (argc == 2 && std::string_view(argv[1]) == "--version") {
-    options.show_version = true;
-    return options;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view arg(argv[i]);
+    if (arg == "--version") {
+      options.show_version = true;
+      return options;
+    }
+    if (arg == "--help" || arg == "-h") {
+      options.show_help = true;
+      return options;
+    }
   }
 
   bool have_socket = false;
   for (int i = 1; i < argc; ++i) {
-    const std::string_view arg(argv[i]);
-    if (arg == "--exit-on-disconnect") {
+    const std::string_view raw(argv[i]);
+    std::string_view flag = raw;
+    std::optional<std::string_view> inline_val;
+    if (raw.starts_with("--")) {
+      const auto eq = raw.find('=');
+      if (eq != std::string_view::npos) {
+        flag = raw.substr(0, eq);
+        inline_val = raw.substr(eq + 1);
+      }
+    }
+    const auto next_val = [&]() -> std::string {
+      if (inline_val.has_value()) {
+        return std::string(*inline_val);
+      }
+      if (i + 1 >= argc) {
+        throw std::invalid_argument(std::string(flag) + " requires a value");
+      }
+      return std::string(argv[++i]);
+    };
+
+    if (flag == "--exit-on-disconnect") {
       options.exit_on_disconnect = true;
       continue;
     }
-    if (arg == "--socket") {
-      if (i + 1 >= argc || have_socket) {
+    if (flag == "--socket") {
+      if (have_socket) {
         throw std::invalid_argument(
-            "usage: mseries-backendd [--exit-on-disconnect] --socket PATH | "
-            "--version");
+            "usage: mseries-backendd [--exit-on-disconnect] "
+            "[--lora|--lora-adapter PATH] [--lora-mode merge|bypass] "
+            "--socket PATH | --version");
       }
-      options.socket_path = argv[++i];
+      options.socket_path = expand_user_path(next_val());
       have_socket = true;
       continue;
     }
-    if (!arg.empty() && arg.front() != '-' && !have_socket) {
-      options.socket_path = arg;
+    if (flag == "--lora" || flag == "--lora-adapter") {
+      options.default_lora_adapter = expand_user_path(next_val());
+      continue;
+    }
+    if (flag == "--lora-mode") {
+      options.default_lora_mode = parse_lora_mode_strict(next_val(), flag);
+      continue;
+    }
+    if (!raw.empty() && raw.front() != '-' && !have_socket) {
+      options.socket_path = expand_user_path(std::string(raw));
       have_socket = true;
       continue;
     }
     throw std::invalid_argument(
-        "usage: mseries-backendd [--exit-on-disconnect] --socket PATH | "
-        "--version");
+        "usage: mseries-backendd [--exit-on-disconnect] "
+        "[--lora|--lora-adapter PATH] [--lora-mode merge|bypass] "
+        "--socket PATH | --version");
   }
   if (!have_socket || options.socket_path.empty()) {
     throw std::invalid_argument(
-        "usage: mseries-backendd [--exit-on-disconnect] --socket PATH | "
-        "--version");
+        "usage: mseries-backendd [--exit-on-disconnect] "
+        "[--lora|--lora-adapter PATH] [--lora-mode merge|bypass] "
+        "--socket PATH | --version");
   }
   return options;
 }
@@ -1102,7 +1470,7 @@ int run(const CliOptions &options) {
   auto listener = listen_socket(options.socket_path);
   SocketPathGuard socket_guard(options.socket_path);
 
-  Session session;
+  Session session(options);
   std::mutex workers_mutex;
   std::condition_variable workers_cv;
   std::unordered_map<std::uint64_t, std::thread> active_workers;
@@ -1213,6 +1581,10 @@ int main(int argc, char **argv) {
                 << " semver=" << NINFER_METAL_SEMVER
                 << " core_abi=" << NINFER_METAL_CORE_ABI
                 << ") protocol=" << kProtocolVersion << '\n';
+      return 0;
+    }
+    if (options.show_help) {
+      std::cout << format_daemon_help();
       return 0;
     }
     return run(options);

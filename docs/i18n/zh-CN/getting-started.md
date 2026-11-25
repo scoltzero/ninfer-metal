@@ -2,7 +2,7 @@
 
 # 快速入门与配置
 
-本文说明如何编译零 MLX 的 `ninfer-metal` 核心（`miv/`）、将权重转换为 `.omlxm5`、一行命令启动原生 C++20 独立 OpenAI 服务（`ninfer-metal-serve`）、将 **`miv 核心后端`** 接入 `oMLX-extend`、调整 `ninfer-metal.toml`，以及调用底层 CLI 和守护进程。如果使用 `oMLX` macOS 应用，先看 **[`oMLX-extend` 可视化上手指南](omlx-extend-guide.md)** 的 5 步截图说明。
+本文说明如何编译零 MLX 的 `ninfer-metal` 核心（`miv/`）、将权重转换为 `.miv`、一行命令启动原生 C++20 独立 OpenAI 服务（`ninfer-metal-serve`）、将 **`miv 核心后端`** 接入 `oMLX-extend`、调整 `ninfer-metal.toml`，以及调用底层 CLI 和守护进程。如果使用 `oMLX` macOS 应用，先看 **[`oMLX-extend` 可视化上手指南](omlx-extend-guide.md)** 的 5 步截图说明。
 
 ---
 
@@ -75,14 +75,14 @@ python3 miv/tools/build_m5_release.py \
         └── tools/
 ```
 
-### 将模型转换为 `.omlxm5`
+### 将模型转换为 `.miv`
 
 离线 NAX 预重排会把 `MXFP4`（`E2M1 × UE8M0`）或 `oQ` Affine（`q3–q8`、`g64/g128`）权重一次性打包，使预填、`T=1` 自回归解码与投机校验共用同一份驻留内存副本：
 
 ```bash
 python3 miv/tools/m5_artifact.py convert \
   --source <model_dir> \
-  --output <model_dir>/model.omlxm5 \
+  --output <model_dir>/model.miv \
   --source-repo <repo_id> \
   --nax-pretile
 ```
@@ -101,7 +101,7 @@ python3 miv/tools/m5_artifact.py convert \
 # 指定模型目录一键启动（默认端口 8080，避开 oMLX 的 8000 端口）
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# 省略路径时，自动选取 ./models 或 oMLX 模型目录中的首个 .omlxm5 模型
+# 省略路径时，自动选取 ./models 或 oMLX 模型目录中的首个 .miv 模型
 ./omlx-extend/scripts/start_ninfer_serve.sh
 
 # 追加任意命令行参数即可覆盖共享默认配置
@@ -190,8 +190,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `--providers-dir PATH` | 自动（`$OMLX_PROVIDERS_DIR`、`~/Library/Application Support/oMLX/Providers`） | **可重复传入**的路径 B SPI v2 微内核根目录；扫描 `<dir>/*/current/provider.json`（回退 `<dir>/*/provider.json`） |
 | `--provider MODE` | `auto`（`auto` \| `inproc` \| `<provider_id>`） | 后端路由模式：O(1) 自动匹配、进程内 `miv`（`inproc`）或指定路径 B SPI v2 `provider_id` |
 | `--metallib-dir PATH` | 自动发现 | Metal 4 / NAX `.metallib` 着色器目录（查找顺序：`$OMLX_M5_METALLIB_DIR` -> `<exe>/../metallib` -> `<exe>/metallib`）。别名 `--kernel-dir`（指向 Metal 着色器，**不是**路径 B 微内核；微内核使用 `--providers-dir`） |
-| `--artifact PATH` | 自动发现 | 显式指定目标 `.omlxm5`（或对应 Provider）权重文件路径 |
-| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | 用于 `dflash2` / `mtp` 的草稿模型目录或 `.omlxm5` 文件 |
+| `--artifact PATH` | 自动发现 | 显式指定目标 `.miv`（或对应 Provider）权重文件路径 |
+| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | 用于 `dflash2` / `mtp` 的草稿模型目录或 `.miv` 文件 |
 | `--chat-template PATH`、`--model-id NAME` | 自动 | 覆盖 Jinja 聊天模板文件或对外暴露的模型 ID |
 | `--host ADDR`、`--port PORT` | `127.0.0.1`、`8080` | HTTP 监听地址与端口 |
 | `--api-key KEY`、`--cors` / `--no-cors` | `""`、开启 | 开启 `Authorization: Bearer <KEY>` 鉴权；控制 CORS 响应头 |
@@ -220,7 +220,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
 ```
 
-安装好 `io.ninfer.metal/current/` 后，`oMLX-extend` 会自动发现 **`miv 核心后端`**（`mseries_backendd`，按顺序回退查找 `com.omlx.mseries/current/`、`PATH` 或 `build/*/miv/`），并在 **集成 → 外部引擎**（`Integrations → External Engines`）中展示已安装的路径 A 与路径 B 微内核卡片。目录内含 `model.omlxm5`、`model_pack.json` 或 `omlxm5-manifest.json` 的模型会懒加载路由到 **`miv 核心后端`**，未适配模型原样留在 Stock MLX。若要让已适配模型改跑原生 MLX，在 **模型设置 → 高级设置** 关闭 **`Use External Engine`** 开关（写入 `external_engine: "stock"`）即可。
+安装好 `io.ninfer.metal/current/` 后，`oMLX-extend` 会自动发现 **`miv 核心后端`**（`mseries_backendd`，按顺序回退查找 `com.omlx.mseries/current/`、`PATH` 或 `build/*/miv/`），并在 **集成 → 外部引擎**（`Integrations → External Engines`）中展示已安装的路径 A 与路径 B 微内核卡片。目录内含 `model.miv` / `model.omlxm5`、`model_pack.json` 或 `omlxm5-manifest.json` 的模型会懒加载路由到 **`miv 核心后端`**，未适配模型原样留在 Stock MLX。若要让已适配模型改跑原生 MLX，在 **模型设置 → 高级设置** 关闭 **`Use External Engine`** 开关（写入 `external_engine: "stock"`）即可。
 
 macOS 应用界面图文指引见 **[`oMLX-extend` 可视化上手指南](omlx-extend-guide.md)**；宿主内部机制与 UI 设置映射见 [`omlx-extend/README.md`](../../../omlx-extend/README.md)。
 
@@ -252,7 +252,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 |---|---|---|---|
 | `host` / `port` / `api_key` | `[server]` | `"127.0.0.1"`、`8080`、`""` | 独立 `ninfer-metal-serve` 服务参数（`oMLX-extend` AF_UNIX Sidecar 模式忽略）。 |
 | `providers_dir` / `memory_budget_gb` | `[server]` | 字符串或数组，浮点数（GiB） | 路径 B SPI v2 微内核根目录（扫描 `<dir>/*/current/provider.json`）与服务端总 UMA 上限（默认物理内存的 `81%`）。 |
-| `model_dir` / `artifact`（`artifact_path`） | `[model]` | 路径 | 独立服务模型目录及可选的显式 `.omlxm5`（或对应 Provider）权重路径；`artifact` 与 `artifact_path`（以及 `draft_artifact`/`draft_artifact_path`、`metallib_dir`/`kernel_dir`）均支持。 |
+| `model_dir` / `artifact`（`artifact_path`） | `[model]` | 路径 | 独立服务模型目录及可选的显式 `.miv`（或对应 Provider）权重路径；`artifact` 与 `artifact_path`（以及 `draft_artifact`/`draft_artifact_path`、`metallib_dir`/`kernel_dir`）均支持。 |
 | `id` / `model_dir` / `provider` / 覆盖项 | `[[models]]` | 表数组 | 独立 `ninfer-metal-serve` 多模型并行托管条目。未填写项继承 `[engine]`/`[speculative]` 默认值，通过 `provider = "auto" \| "inproc" \| "<provider_id>"` 选择后端。 |
 | `max_concurrency` | `[engine]` | `1..8`（裸 CLI 默认 `1`，模板 `4`） | 多用户并发批槽位数（`miv` 文档记作 **`B`**，上游 `ninfer` 记作 **`C`**）。Sidecar 模式下留空则继承 oMLX 的 `max_concurrent_requests`。 |
 | `max_context` | `[engine]` | `32768`–`262144+`（裸 CLI 默认 `32768`，模板 `65536`） | 上下文窗口长度（**`L`**）。Sidecar 模式下映射自 oMLX `max_context_window`。 |
@@ -274,7 +274,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 1. **`m5rt_runner`（Token ID 命令行工具）** — 直接输入整型 Token ID，执行单流、批处理（`--batch-mode on --max-concurrency 4`）或 DFlash2 投机推理，以 NDJSON 输出指标与生成 Token：
    ```bash
    ./build/miv-v001/miv/m5rt_runner \
-     --artifact /path/to/model.omlxm5 \
+     --artifact /path/to/model.miv \
      --config /path/to/config.json \
      --prompt 151644,8948,198,2610,525,264 \
      --max-context 8192 \

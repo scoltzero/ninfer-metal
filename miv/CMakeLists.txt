@@ -88,6 +88,7 @@ add_library(
   src/hw_counters.mm
   src/kv_page_pool.cpp
   src/layer_schedule.cpp
+  src/lora.cpp
   src/materialization.cpp
   src/metal.mm
   src/model_config.cpp
@@ -194,6 +195,10 @@ add_test(
 add_executable(
   omlx_m5_b0_artifact_tests
   tests/b0_artifact_tests.cpp)
+target_include_directories(
+  omlx_m5_b0_artifact_tests
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(
   omlx_m5_b0_artifact_tests
   PRIVATE
@@ -2092,6 +2097,11 @@ omlx_m5_compile_metallib(omlx_m5_mtp_forward_metallib
   "omlx_m5_mtp_forward.metallib" "15.0")
 add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_mtp_forward_metallib)
 
+omlx_m5_compile_metallib(omlx_m5_lora_metallib
+  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/lora.metal"
+  "omlx_m5_lora.metallib" "15.0")
+add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_lora_metallib)
+
 add_dependencies(mseries_backendd omlx_m5_qwen_forward_resources)
 if(TARGET omlx_m5_native)
   add_dependencies(omlx_m5_native omlx_m5_qwen_forward_resources)
@@ -2257,6 +2267,16 @@ if(TARGET omlx_m5_mxfp4_nax_metallib)
     omlx_m5_bf16_nax_metallib)
 endif()
 add_test(NAME omlx_m5_step2_wide_nax COMMAND $<TARGET_FILE:omlx_m5_step2_wide_nax_tests>
+  "${OMLX_M5_METAL_OUTPUT_DIR}")
+
+add_executable(omlx_m5_lora_dual_mode_tests tests/lora_dual_mode_tests.cpp)
+target_include_directories(omlx_m5_lora_dual_mode_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(omlx_m5_lora_dual_mode_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(omlx_m5_lora_dual_mode_tests PRIVATE omlx_m5_runtime)
+add_dependencies(omlx_m5_lora_dual_mode_tests omlx_m5_qwen_forward_resources)
+add_test(NAME omlx_m5_lora_dual_mode COMMAND $<TARGET_FILE:omlx_m5_lora_dual_mode_tests>
   "${OMLX_M5_METAL_OUTPUT_DIR}")
 
 if(OMLX_M5_BUILD_MLX_FIXTURES)

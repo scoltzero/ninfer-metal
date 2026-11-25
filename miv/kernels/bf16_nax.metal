@@ -1517,3 +1517,77 @@ inline void bf16_nax_swiglu_bm_impl(
 
 OMLX_M5_BF16_NAX_BM_SUITE(128)
 OMLX_M5_BF16_NAX_BM_SUITE(64)
+
+struct Bf16LoraUpAccumParams {
+  uint n;
+  uint r_valid;
+  uint r_stride_b;
+  uint rows; // word 3 (dynamic token patch index)
+  uint tmp_stride;
+  uint tmp_col_offset;
+  uint y_stride;
+  uint y_col_offset;
+  float scale;
+};
+
+// Metal 4 NAX cooperative matmul2d up-projection + in-place BF16 scaled accumulate
+// for Mode B ("bypass") Prefill / Verify (T >= 16).
+[[max_total_threads_per_threadgroup(128)]]
+kernel void omlx_m5_lora_up_accum_bf16_nax(
+    device const bfloat *tmp [[buffer(0)]],
+    device const bfloat *b [[buffer(1)]],
+    device bfloat *y [[buffer(2)]],
+    constant Bf16LoraUpAccumParams &p [[buffer(3)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  constexpr uint BM = 16u;
+  constexpr uint BN = 16u;
+  constexpr uint BK = 16u;
+  constexpr uint NSG = 4u;
+  const uint rb = tg.y * BM;
+  const uint n0 = (tg.x * NSG + sg) * BN;
+  if (rb >= p.rows || n0 >= p.n || p.r_stride_b == 0u) {
+    return;
+  }
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, BK, false, true, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> a_parent(
+      (device bfloat *)(tmp + ulong(rb) * p.tmp_stride),
+      dextents<int32_t, 2>(p.tmp_stride, p.rows - rb));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> b_parent(
+      (device bfloat *)(b + ulong(n0) * p.r_stride_b),
+      dextents<int32_t, 2>(p.r_stride_b, p.n - n0));
+
+  auto a_init = a_parent.slice(p.tmp_col_offset, 0);
+  auto b_init = b_parent.slice(0, 0);
+  auto prod = op.template get_destination_cooperative_tensor<
+      decltype(a_init), decltype(b_init), float>();
+  const uint elems = prod.get_capacity();
+  for (uint i = 0u; i < elems; ++i) {
+    prod[i] = 0.0f;
+  }
+
+  const uint blocks = p.r_stride_b / BK;
+  for (uint blk = 0u; blk < blocks; ++blk) {
+    const uint k_off = blk * BK;
+    auto a_tile = a_parent.slice(p.tmp_col_offset + k_off, 0);
+    auto b_tile = b_parent.slice(k_off, 0);
+    op.run(a_tile, b_tile, prod);
+  }
+
+  for (uint i = 0u; i < elems; ++i) {
+    if (prod.is_valid_element(i)) {
+      const auto idx = prod.get_multidimensional_index(i);
+      const uint col = n0 + uint(idx[0]);
+      const uint row = rb + uint(idx[1]);
+      if (row < p.rows && col < p.n) {
+        const ulong dst = ulong(row) * p.y_stride + p.y_col_offset + col;
+        y[dst] = bfloat(fma(p.scale, prod[i], float(y[dst])));
+      }
+    }
+  }
+}

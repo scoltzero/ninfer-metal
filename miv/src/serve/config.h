@@ -3,6 +3,7 @@
 #include "omlx_m5/types.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -20,6 +21,8 @@ struct ModelServeConfig {
   std::string mtp_artifact;
   std::string kernel_dir;
   std::string chat_template;
+  std::string lora_adapter;
+  std::string lora_mode = "merge";
 
   std::int32_t max_concurrency = 1;
   std::int32_t max_context = 32768;
@@ -36,6 +39,32 @@ struct ModelServeConfig {
   SpeculativeBackend spec_backend = SpeculativeBackend::none;
   bool spec_backend_auto = false;
   std::uint32_t draft_tokens = 0;
+};
+
+struct SidecarModelOverride {
+  std::optional<std::string> artifact;
+  std::optional<std::string> draft_dir;
+  std::optional<std::string> draft_artifact;
+  std::optional<std::string> mtp_artifact;
+  std::optional<std::string> kernel_dir;
+  std::optional<std::string> lora_adapter;
+  std::optional<std::string> lora_mode;
+
+  std::optional<std::int32_t> max_concurrency;
+  std::optional<std::int32_t> max_context;
+  std::optional<std::string> kv_dtype;
+  std::optional<std::string> prefill_engine;
+  std::optional<std::string> spec_search;
+  std::optional<std::string> sampling_contract;
+  std::optional<bool> rolling_prefix_cache;
+  std::optional<double> prefix_cache_gb;
+  std::optional<std::string> batch_mode;
+  std::optional<double> memory_budget_gb;
+  std::optional<std::uint64_t> memory_budget_bytes;
+
+  std::optional<SpeculativeBackend> spec_backend;
+  std::optional<bool> spec_backend_auto;
+  std::optional<std::uint32_t> draft_tokens;
 };
 
 struct ServeConfig {
@@ -65,6 +94,25 @@ struct ServeConfig {
   std::string kernel_dir;
   std::string chat_template;
   std::string model_id;
+  std::string lora_adapter;
+  std::string lora_mode = "merge";
+
+  // Tracks explicit CLI overrides so CLI > per-model ([sidecar.models] / [[models]]) > top-level TOML
+  bool cli_lora_adapter_override = false;
+  bool cli_lora_mode_override = false;
+  bool cli_max_concurrency_override = false;
+  bool cli_max_context_override = false;
+  bool cli_kv_dtype_override = false;
+  bool cli_spec_backend_override = false;
+  bool cli_draft_tokens_override = false;
+  bool cli_rolling_prefix_cache_override = false;
+  bool cli_prefix_cache_gb_override = false;
+  bool cli_sampling_contract_override = false;
+  bool cli_artifact_override = false;
+  bool cli_draft_dir_override = false;
+  bool cli_draft_artifact_override = false;
+  bool cli_mtp_artifact_override = false;
+  bool cli_kernel_dir_override = false;
 
   // [engine]
   std::int32_t max_concurrency = 1;
@@ -83,6 +131,9 @@ struct ServeConfig {
   SpeculativeBackend spec_backend = SpeculativeBackend::none;
   bool spec_backend_auto = false;
   std::uint32_t draft_tokens = 0;
+
+  // [sidecar.models."<id>"] per-model overrides
+  std::map<std::string, SidecarModelOverride> sidecar_models;
 
   // [[models]] multi-model array (or repeatable --model-dir CLI entries)
   std::vector<ModelServeConfig> models;
@@ -108,7 +159,7 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config);
 std::string expand_user_path(const std::string &path);
 
 // Resolves `spec_backend_auto` (`speculative.backend = "auto"`) against
-// companion artifacts (`dflash2/` -> dflash2, `mtp.omlxm5` / embedded MTP ->
+// companion artifacts (`dflash2/` -> dflash2, `mtp.miv` / embedded MTP ->
 // mtp, else none).
 void resolve_auto_speculative(ModelServeConfig &model_cfg);
 

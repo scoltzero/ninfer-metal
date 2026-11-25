@@ -461,6 +461,12 @@ void EngineRouter::set_scheduler_hint(const SchedulerHint &hint) {
   backend_->set_scheduler_hint(hint);
 }
 
+bool EngineRouter::reload_lora(const std::string &lora_adapter,
+                               const std::string &lora_mode,
+                               std::string *error) {
+  return backend_->reload_lora(lora_adapter, lora_mode, error);
+}
+
 std::uint64_t EngineRouter::resident_memory_bytes() const {
   return backend_->resident_memory_bytes();
 }

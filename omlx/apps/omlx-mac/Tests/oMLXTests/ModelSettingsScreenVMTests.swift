@@ -1113,6 +1113,110 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(pureModel.weightFormatBadgeLabel, ".miv")
         XCTAssertEqual(pureModel.resolvedEngineId, "m5rt")
     }
+
+    func testExternalEngineLoRACapabilityAndLoraModeRoundTrip() {
+        var model = makeModel(id: "Qwen3.6-LoRA", configModelType: "qwen3_5")
+        model.autoExternalEngine = "m5rt"
+        model.externalEngines = [
+            ExternalEngineOption(
+                id: "splash",
+                label: "Splash",
+                compatible: true,
+                reason: ""
+            ),
+            ExternalEngineOption(
+                id: "m5rt",
+                label: "miv Core Backend",
+                compatible: true,
+                reason: "",
+                supportedStandardSettings: ["max_context_window", "lora_adapter"],
+                providerId: "io.ninfer.metal",
+                optionsSchema: [["key": AnyCodable("lora_mode"), "type": AnyCodable("enum")]]
+            ),
+        ]
+
+        let vm = ModelSettingsScreenVM()
+        vm.model = model
+        vm.externalEngine = ""
+        vm.externalEngineOptions = ["ninfer-metal": ["lora_mode": AnyCodable("bypass")]]
+
+        XCTAssertEqual(vm.effectiveExternalEngine, "m5rt")
+        XCTAssertTrue(vm.externalEngineSupports("lora_adapter"))
+        XCTAssertTrue(vm.showsExternalEngineLoraMode)
+        XCTAssertEqual(vm.externalEngineLoraMode, "bypass")
+
+        vm.externalEngineLoraMode = "merge"
+        XCTAssertEqual(vm.externalEngineLoraMode, "merge")
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["lora_mode"]?.value as? String, "merge")
+        XCTAssertEqual(vm.externalEngineOptions["ninfer-metal"]?["lora_mode"]?.value as? String, "merge")
+
+        vm.externalEngine = "splash"
+        XCTAssertFalse(vm.externalEngineSupports("lora_adapter"))
+        XCTAssertFalse(vm.showsExternalEngineLoraMode)
+    }
+
+    func testExternalEngineGeneralOptionsExposeConcurrencyAndSamplingContract() {
+        let vm = ModelSettingsScreenVM()
+        let m5Opt = ExternalEngineOption(
+            id: "m5rt",
+            label: "miv Core Backend (ninfer-metal)",
+            compatible: true,
+            reason: nil,
+            supportedStandardSettings: ["max_context_window", "dflash_enabled", "lora_adapter"],
+            providerId: "io.ninfer.metal",
+            optionsSchema: [
+                [
+                    "key": AnyCodable("max_concurrency"),
+                    "label": AnyCodable("Concurrency (B/C)"),
+                    "type": AnyCodable("int"),
+                    "min": AnyCodable(1),
+                    "max": AnyCodable(8),
+                    "default": AnyCodable(1),
+                ],
+                [
+                    "key": AnyCodable("rolling_prefix_cache"),
+                    "label": AnyCodable("Rolling Prefix Cache"),
+                    "type": AnyCodable("bool"),
+                    "default": AnyCodable(true),
+                ],
+                [
+                    "key": AnyCodable("lora_mode"),
+                    "label": AnyCodable("LoRA Mode"),
+                    "type": AnyCodable("enum"),
+                    "options": AnyCodable([AnyCodable("merge"), AnyCodable("bypass")]),
+                    "default": AnyCodable("merge"),
+                ],
+                [
+                    "key": AnyCodable("sampling_contract"),
+                    "label": AnyCodable("Sampling Contract"),
+                    "type": AnyCodable("enum"),
+                    "options": AnyCodable([AnyCodable("position_coupled_v1"), AnyCodable("legacy_rejection_v1")]),
+                    "default": AnyCodable("position_coupled_v1"),
+                ],
+            ]
+        )
+        var model = makeModel(id: "Qwen3.8-27B-mxfp4", configModelType: "qwen3_5")
+        model.externalEngines = [m5Opt]
+        model.autoExternalEngine = "m5rt"
+        vm.model = model
+        vm.externalEngine = ""
+        vm.externalEngineOptions = ["m5rt": ["max_concurrency": AnyCodable(4), "sampling_contract": AnyCodable("legacy_rejection_v1")]]
+
+        let general = vm.externalEngineGeneralOptions
+        XCTAssertEqual(general.map(\.key), ["max_concurrency", "rolling_prefix_cache", "sampling_contract"])
+        XCTAssertEqual(vm.externalEngineIntOption(general[0]), 4)
+        XCTAssertEqual(vm.externalEngineBoolOption(general[1]), true)
+        XCTAssertEqual(vm.externalEngineEnumOption(general[2]), "legacy_rejection_v1")
+
+        vm.setExternalEngineIntOption(general[0], 1)
+        vm.setExternalEngineBoolOption(general[1], false)
+        vm.setExternalEngineEnumOption(general[2], "position_coupled_v1")
+        XCTAssertEqual(vm.externalEngineIntOption(general[0]), 1)
+        XCTAssertEqual(vm.externalEngineBoolOption(general[1]), false)
+        XCTAssertEqual(vm.externalEngineEnumOption(general[2]), "position_coupled_v1")
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["max_concurrency"]?.value as? Int, 1)
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
+    }
 }
 
 /// Serves one model with Lightning MTP on and rejects its settings writes

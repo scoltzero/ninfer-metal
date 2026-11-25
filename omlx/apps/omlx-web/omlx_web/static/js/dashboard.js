@@ -1930,7 +1930,7 @@
             loraAdapterOptions() {
                 const current = this.modelSettings.lora_adapter;
                 // A saved path outside the model folders still shows as selected.
-                if (current && !this.loraAdapters.some(a => a.path === current)) {
+                if (current && !this.loraAdapters.some(a => a.path === current || a.id === current)) {
                     return [{ id: current, path: current, problem: null }, ...this.loraAdapters];
                 }
                 return this.loraAdapters;
@@ -1943,7 +1943,7 @@
             },
             selectedLoraAdapter() {
                 const current = this.modelSettings.lora_adapter;
-                return current ? this.loraAdapters.find(a => a.path === current) || null : null;
+                return current ? this.loraAdapters.find(a => a.path === current || a.id === current) || null : null;
             },
             loraAdapterProblem() {
                 return this.selectedLoraAdapter()?.problem || '';
@@ -2362,6 +2362,16 @@
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
+                    external_engine_options: (() => {
+                        if (isDiffusion) return {};
+                        const ext = (s.external_engine_options && typeof s.external_engine_options === 'object')
+                            ? JSON.parse(JSON.stringify(s.external_engine_options))
+                            : {};
+                        if (s.m5rt_options && typeof s.m5rt_options === 'object') {
+                            ext.m5rt = { ...(ext.m5rt || {}), ...JSON.parse(JSON.stringify(s.m5rt_options)) };
+                        }
+                        return ext;
+                    })(),
                     external_engines: model?.external_engines || [],
                     auto_external_engine: model?.auto_external_engine || '',
                     supported_standard_settings: model?.supported_standard_settings || [],
@@ -3743,6 +3753,9 @@
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
+                if (!isDiffusion && ms.external_engine_options && typeof ms.external_engine_options === 'object' && Object.keys(ms.external_engine_options).length > 0) {
+                    payload.external_engine_options = ms.external_engine_options;
+                }
                 // Sent only where the toggle shows, so a hidden setting stays unset.
                 if (ms.deepseek_v41_ced_prefill_supported) {
                     payload.deepseek_v41_ced_prefill_enabled = !!ms.deepseek_v41_ced_prefill_enabled;
@@ -3790,6 +3803,7 @@
                         specprefill_keep_pct: null,
                         specprefill_threshold: null,
                         external_engine: null,
+                        external_engine_options: null,
                         dflash_enabled: false,
                         dflash_draft_model: null,
                         dflash_draft_quant_enabled: false,
@@ -4927,6 +4941,159 @@
                 if (!this.effectiveExternalEngine()) return false;
                 const supported = this.externalEngineSupportedSettings();
                 return !settingKeys.some(k => supported.includes(k));
+            },
+
+            activeExternalEngineEntry() {
+                const active = this.effectiveExternalEngine();
+                if (!active) return null;
+                return (this.modelSettings.external_engines || []).find(e => e.id === active) || null;
+            },
+
+            externalEngineOptionKeys(engineId) {
+                if (!engineId) return [];
+                if (engineId === 'm5rt') {
+                    return ['com.omlx.mseries', 'io.ninfer.metal', 'ninfer-metal', 'm5rt'];
+                }
+                const entry = (this.modelSettings.external_engines || []).find(e => e.id === engineId);
+                const keys = [];
+                if (entry?.provider_id) keys.push(entry.provider_id);
+                if (!keys.includes(engineId)) keys.push(engineId);
+                return keys;
+            },
+
+            externalEngineLoraModeSchema() {
+                const entry = this.activeExternalEngineEntry();
+                const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
+                return schema.find(s => s && s.key === 'lora_mode' && s.type === 'enum') || null;
+            },
+
+            externalEngineGeneralOptionsSchema() {
+                const entry = this.activeExternalEngineEntry();
+                const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
+                return schema.filter(
+                    s => s && typeof s === 'object' && s.key && s.key !== 'lora_mode'
+                        && ['int', 'bool', 'bytes_gb', 'enum', 'string', 'float', 'number'].includes(s.type)
+                );
+            },
+
+            externalEngineOptionLabel(item) {
+                if (!item || !item.key) return '';
+                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
+                if (zh) {
+                    const zhLabels = {
+                        max_concurrency: '并发槽位 (B/C)',
+                        rolling_prefix_cache: '滚动前缀缓存',
+                        prefix_cache_gb: '前缀缓存预算 (GiB)',
+                        sampling_contract: '采样协议 (Sampling Contract)',
+                        artifact_path: '权重产物路径 (.miv)',
+                        draft_artifact_path: '草稿产物路径 (.miv)',
+                    };
+                    if (zhLabels[item.key]) return zhLabels[item.key];
+                }
+                return item.label || item.key;
+            },
+
+            externalEngineEnumOptionLabel(item, opt) {
+                if (item && item.option_labels && typeof item.option_labels === 'object' && item.option_labels[opt]) {
+                    return item.option_labels[opt];
+                }
+                return opt;
+            },
+
+            getExternalEngineOption(item) {
+                if (!item || !item.key) return '';
+                const active = this.effectiveExternalEngine();
+                const fallback = item.default !== undefined && item.default !== null
+                    ? item.default
+                    : (item.type === 'bool' ? false : '');
+                if (!active) return fallback;
+                const opts = this.modelSettings.external_engine_options || {};
+                let found = undefined;
+                for (const key of this.externalEngineOptionKeys(active)) {
+                    if (opts[key] && typeof opts[key] === 'object' && opts[key][item.key] !== undefined && opts[key][item.key] !== null) {
+                        found = opts[key][item.key];
+                    }
+                }
+                const resolved = found !== undefined ? found : fallback;
+                if (item.type === 'bool') return Boolean(resolved);
+                if (item.type === 'int' || item.type === 'bytes_gb' || item.type === 'float' || item.type === 'number') {
+                    return resolved === '' ? '' : Number(resolved);
+                }
+                return resolved === null || resolved === undefined ? '' : String(resolved);
+            },
+
+            setExternalEngineOption(item, rawValue) {
+                if (!item || !item.key) return;
+                const active = this.effectiveExternalEngine();
+                if (!active) return;
+                let value = rawValue;
+                if (item.type === 'bool') {
+                    value = Boolean(rawValue);
+                } else if (item.type === 'int') {
+                    const parsed = parseInt(rawValue, 10);
+                    if (!Number.isFinite(parsed)) return;
+                    let clamped = parsed;
+                    if (typeof item.min === 'number') clamped = Math.max(item.min, clamped);
+                    if (typeof item.max === 'number') clamped = Math.min(item.max, clamped);
+                    value = clamped;
+                } else if (item.type === 'bytes_gb' || item.type === 'float' || item.type === 'number') {
+                    const parsed = Number(rawValue);
+                    if (!Number.isFinite(parsed)) return;
+                    let clamped = parsed;
+                    if (typeof item.min === 'number') clamped = Math.max(item.min, clamped);
+                    if (typeof item.max === 'number') clamped = Math.min(item.max, clamped);
+                    value = clamped;
+                } else {
+                    value = rawValue === null || rawValue === undefined ? '' : String(rawValue);
+                }
+                if (!this.modelSettings.external_engine_options || typeof this.modelSettings.external_engine_options !== 'object') {
+                    this.modelSettings.external_engine_options = {};
+                }
+                const opts = this.modelSettings.external_engine_options;
+                for (const key of this.externalEngineOptionKeys(active)) {
+                    if (key !== active && opts[key] && typeof opts[key] === 'object' && (item.key in opts[key])) {
+                        opts[key] = { ...opts[key], [item.key]: value };
+                    }
+                }
+                opts[active] = { ...(opts[active] || {}), [item.key]: value };
+            },
+
+            externalEngineLoraModeOptionLabel(opt) {
+                const schema = this.externalEngineLoraModeSchema();
+                if (schema && schema.option_labels && typeof schema.option_labels === 'object' && schema.option_labels[opt]) {
+                    return schema.option_labels[opt];
+                }
+                return opt;
+            },
+
+            getExternalEngineLoraMode() {
+                const active = this.effectiveExternalEngine();
+                const schema = this.externalEngineLoraModeSchema();
+                const fallback = schema?.default || 'merge';
+                if (!active) return fallback;
+                const opts = this.modelSettings.external_engine_options || {};
+                let found = '';
+                for (const key of this.externalEngineOptionKeys(active)) {
+                    if (opts[key] && typeof opts[key] === 'object' && opts[key].lora_mode) {
+                        found = String(opts[key].lora_mode);
+                    }
+                }
+                return found || fallback;
+            },
+
+            setExternalEngineLoraMode(value) {
+                const active = this.effectiveExternalEngine();
+                if (!active) return;
+                if (!this.modelSettings.external_engine_options || typeof this.modelSettings.external_engine_options !== 'object') {
+                    this.modelSettings.external_engine_options = {};
+                }
+                const opts = this.modelSettings.external_engine_options;
+                for (const key of this.externalEngineOptionKeys(active)) {
+                    if (key !== active && opts[key] && typeof opts[key] === 'object' && 'lora_mode' in opts[key]) {
+                        opts[key] = { ...opts[key], lora_mode: value };
+                    }
+                }
+                opts[active] = { ...(opts[active] || {}), lora_mode: value };
             },
 
             externalEngineDraftRepo() {

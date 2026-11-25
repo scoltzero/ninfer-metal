@@ -2,7 +2,7 @@
 
 # Démarrage et configuration
 
-Ce guide couvre la compilation du cœur `ninfer-metal` sans MLX (`miv/`), la conversion des poids au format `.omlxm5`, le lancement en une commande du serveur OpenAI autonome en C++20 (`ninfer-metal-serve`), l'intégration de **`miv Core Backend`** avec `oMLX-extend`, la personnalisation de `ninfer-metal.toml` et l'appel des binaires CLI et démon bas niveau. Si tu utilises l'application macOS `oMLX`, commence par le **[Guide visuel d'`oMLX-extend`](omlx-extend-guide.md)** pour un parcours illustré en 5 étapes.
+Ce guide couvre la compilation du cœur `ninfer-metal` sans MLX (`miv/`), la conversion des poids au format `.miv`, le lancement en une commande du serveur OpenAI autonome en C++20 (`ninfer-metal-serve`), l'intégration de **`miv Core Backend`** avec `oMLX-extend`, la personnalisation de `ninfer-metal.toml` et l'appel des binaires CLI et démon bas niveau. Si tu utilises l'application macOS `oMLX`, commence par le **[Guide visuel d'`oMLX-extend`](omlx-extend-guide.md)** pour un parcours illustré en 5 étapes.
 
 ---
 
@@ -75,14 +75,14 @@ Extrais l'archive sur n'importe quel Mac Apple M5+ sous macOS 27+ et lance `inst
         └── tools/
 ```
 
-### Convertir un modèle vers `.omlxm5`
+### Convertir un modèle vers `.miv`
 
 Le pré-tuilage NAX hors ligne prépare les poids `MXFP4` (`E2M1 × UE8M0`) ou `oQ` Affine (`q3–q8`, `g64/g128`) une seule fois afin que le Prefill, le décodage AR `T=1` et la vérification spéculative partagent une unique copie résidente en mémoire :
 
 ```bash
 python3 miv/tools/m5_artifact.py convert \
   --source <model_dir> \
-  --output <model_dir>/model.omlxm5 \
+  --output <model_dir>/model.miv \
   --source-repo <repo_id> \
   --nax-pretile
 ```
@@ -101,7 +101,7 @@ Démarre `ninfer-metal-serve` immédiatement sans rédiger de fichier de configu
 # Lancement en 1 clic avec un répertoire de modèle précis (port 8080 par défaut, distinct du port 8000 d'oMLX)
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# Ou omettre le répertoire pour sélectionner automatiquement le premier modèle .omlxm5 dans ./models ou le dossier des modèles d'oMLX
+# Ou omettre le répertoire pour sélectionner automatiquement le premier modèle .miv dans ./models ou le dossier des modèles d'oMLX
 ./omlx-extend/scripts/start_ninfer_serve.sh
 
 # Passer n'importe quelle option CLI supplémentaire pour surcharger la configuration partagée par défaut
@@ -204,12 +204,12 @@ Lorsque `--config` est omis, `ninfer-metal-serve` charge automatiquement [`omlx-
 |---|---|---|
 | `--config PATH` | auto-découvert | Charge un `ninfer-metal.toml` explicite (`[server]`, `[model]`, `[[models]]`, `[engine]`, `[speculative]`) ; les options CLI priment sur le TOML |
 | `--no-default-config` | désactivé | Ignore la découverte automatique de `ninfer-metal.toml` et démarre avec les valeurs compilées minimales |
-| `--model-dir PATH` | requis (ou via TOML) | Répertoire du modèle contenant `config.json`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` et `model.omlxm5`. Répétable pour héberger plusieurs modèles en parallèle sur un même port |
+| `--model-dir PATH` | requis (ou via TOML) | Répertoire du modèle contenant `config.json`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` et `model.miv`. Répétable pour héberger plusieurs modèles en parallèle sur un même port |
 | `--providers-dir PATH` | auto (`$OMLX_PROVIDERS_DIR`, `~/Library/Application Support/oMLX/Providers`) | Répertoire racine de sidecars de microkernels SPI v2 Voie B (répétable) ; parcourt `<dir>/*/current/provider.json` (repli `<dir>/*/provider.json`) |
 | `--provider MODE` | `auto` (`auto` \| `inproc` \| `<provider_id>`) | Sélection du backend : routage automatique O(1) (`auto`), `miv` in-process (`inproc`) ou `<provider_id>` SPI v2 explicite |
 | `--metallib-dir PATH` (alias `--kernel-dir`) | auto-détecté | Répertoire des shaders Metal 4 / NAX `.metallib` précompilés (`$OMLX_M5_METALLIB_DIR` -> `<exe>/../metallib` -> `<exe>/metallib`). Désigne des shaders Metal et non des fournisseurs de microkernels SPI v2 |
-| `--artifact PATH` | auto-détecté | Chemin explicite de l'artefact `.omlxm5` cible (ou du fournisseur) |
-| `--draft-dir PATH`, `--draft-artifact PATH`, `--mtp-artifact PATH` | — | Répertoire du modèle brouillon ou artefact `.omlxm5` pour `dflash2` / `mtp` |
+| `--artifact PATH` | auto-détecté | Chemin explicite de l'artefact `.miv` cible (ou du fournisseur) |
+| `--draft-dir PATH`, `--draft-artifact PATH`, `--mtp-artifact PATH` | — | Répertoire du modèle brouillon ou artefact `.miv` pour `dflash2` / `mtp` |
 | `--chat-template PATH`, `--model-id NAME` | auto | Remplace le fichier de template Jinja ou l'identifiant de modèle exposé |
 | `--host ADDR`, `--port PORT` | `127.0.0.1`, `8080` | Adresse et port d'écoute HTTP |
 | `--api-key KEY`, `--cors` / `--no-cors` | `""`, activé | Exige `Authorization: Bearer <KEY>` ; contrôle les en-têtes CORS |
@@ -238,7 +238,7 @@ Ce monorepo suit directement l'hôte `omlx/` patché aux côtés d'`omlx-extend/
 ./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
 ```
 
-Une fois `io.ninfer.metal/current/` installé, `oMLX-extend` détecte automatiquement **`miv Core Backend`** (`mseries_backendd`, avec repli sur `com.omlx.mseries/current/`, `PATH` ou `build/*/miv/`) et affiche les microkernels Voie A et Voie B installés sous **`Integrations → External Engines`**. Tout répertoire de modèle contenant `model.omlxm5`, `model_pack.json` ou `omlxm5-manifest.json` est routé à la demande vers **`miv Core Backend`** ; les modèles non adaptés restent sur Stock MLX sans modification. Désactive **`Use External Engine`** dans **`Model Settings → Advanced Settings`** (écrit `external_engine: "stock"`) pour forcer Stock MLX sur un modèle adapté.
+Une fois `io.ninfer.metal/current/` installé, `oMLX-extend` détecte automatiquement **`miv Core Backend`** (`mseries_backendd`, avec repli sur `com.omlx.mseries/current/`, `PATH` ou `build/*/miv/`) et affiche les microkernels Voie A et Voie B installés sous **`Integrations → External Engines`**. Tout répertoire de modèle contenant `model.miv` / `model.omlxm5`, `model_pack.json` ou `omlxm5-manifest.json` est routé à la demande vers **`miv Core Backend`** ; les modèles non adaptés restent sur Stock MLX sans modification. Désactive **`Use External Engine`** dans **`Model Settings → Advanced Settings`** (écrit `external_engine: "stock"`) pour forcer Stock MLX sur un modèle adapté.
 
 Pour un parcours illustré de l'application macOS `oMLX`, voir le **[Guide visuel d'`oMLX-extend`](omlx-extend-guide.md)**. Voir [`omlx-extend/README.md`](../../../omlx-extend/README.md) pour le fonctionnement interne de l'hôte et la correspondance des réglages d'interface.
 
@@ -270,7 +270,7 @@ En mode sidecar `oMLX-extend`, les réglages UI par modèle (`external_engine_op
 |---|---|---|---|
 | `host` / `port` / `api_key` | `[server]` | `"127.0.0.1"`, `8080`, `""` | Réglages autonomes de `ninfer-metal-serve` (ignorés par le sidecar AF_UNIX `oMLX-extend`). |
 | `providers_dir` / `memory_budget_gb` | `[server]` | Chemin (chaîne ou tableau), flottant GiB | Répertoires de fournisseurs SPI v2 Voie B et plafond global du budget UMA serveur (par défaut `81%` de la RAM physique). |
-| `model_dir` / `artifact` (ou `artifact_path`) | `[model]` / `[[models]]` | Chemins | Répertoire du modèle autonome et chemin explicite optionnel vers `.omlxm5` (`artifact` et `artifact_path` sont tous deux acceptés, comme `draft_artifact`/`draft_artifact_path` et `metallib_dir`). Utilise `[[models]]` pour héberger plusieurs modèles en parallèle. |
+| `model_dir` / `artifact` (ou `artifact_path`) | `[model]` / `[[models]]` | Chemins | Répertoire du modèle autonome et chemin explicite optionnel vers `.miv` (`artifact` et `artifact_path` sont tous deux acceptés, comme `draft_artifact`/`draft_artifact_path` et `metallib_dir`). Utilise `[[models]]` pour héberger plusieurs modèles en parallèle. |
 | `max_concurrency` | `[engine]` | `1..8` (CLI nue `1`, modèle TOML `4`) | Emplacements de batch concurrents multi-utilisateurs (**`B`** dans la doc `miv`, **`C`** dans `ninfer` upstream). Hérite de `max_concurrent_requests` d'oMLX s'il est omis en mode sidecar. |
 | `max_context` | `[engine]` | `32768`–`262144+` (CLI nue `32768`) | Longueur de fenêtre de contexte (**`L`**). Mappé depuis `max_context_window` d'oMLX en mode sidecar. |
 | `kv_dtype` | `[engine]` | `"bf16"` \| `"affine4_g128"` | `affine4_g128` occupe `0.5625 B/val` avec parité `0-ULP` vérifiée à `64K+`. `int8_g64` est absent dans `miv-v0.01`. |
@@ -291,7 +291,7 @@ Au-delà de `ninfer-metal-serve` et d'`oMLX-extend`, `miv/` expose quatre surfac
 1. **`m5rt_runner` (CLI par ID de tokens)** — Exécute l'inférence mono-flux, par lots (`--batch-mode on --max-concurrency 4`) ou spéculative DFlash2 à partir d'ID entiers de tokens et émet des métriques/tokens au format NDJSON :
    ```bash
    ./build/miv-v001/miv/m5rt_runner \
-     --artifact /path/to/model.omlxm5 \
+     --artifact /path/to/model.miv \
      --config /path/to/config.json \
      --prompt 151644,8948,198,2610,525,264 \
      --max-context 8192 \

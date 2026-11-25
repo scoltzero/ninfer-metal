@@ -2,7 +2,7 @@
 
 # Getting Started & Configuration
 
-This guide covers building the zero-MLX `ninfer-metal` core (`miv/`), converting weights to `.omlxm5`, launching the standalone C++20 OpenAI server (`ninfer-metal-serve`) in one command, integrating **`miv Core Backend`** with `oMLX-extend`, customizing `ninfer-metal.toml`, and calling the low-level CLI and daemon binaries. If you use the `oMLX` macOS app, start with the **[`oMLX-extend` Visual Guide](omlx-extend-guide.md)** for a 5-step screenshot walkthrough.
+This guide covers building the zero-MLX `ninfer-metal` core (`miv/`), converting weights to `.miv`, launching the standalone C++20 OpenAI server (`ninfer-metal-serve`) in one command, integrating **`miv Core Backend`** with `oMLX-extend`, customizing `ninfer-metal.toml`, and calling the low-level CLI and daemon binaries. If you use the `oMLX` macOS app, start with the **[`oMLX-extend` Visual Guide](omlx-extend-guide.md)** for a 5-step screenshot walkthrough.
 
 ---
 
@@ -75,14 +75,14 @@ Unpack the archive on any Apple M5+ Mac running macOS 27+ and run `install.sh` (
         └── tools/
 ```
 
-### Convert a Model to `.omlxm5`
+### Convert a Model to `.miv`
 
-Offline NAX pre-tiling packs `MXFP4` (`E2M1 × UE8M0`) or `oQ` Affine (`q3–q8`, `g64/g128`) weights once so Prefill, `T=1` AR decode, and speculative verify share one resident memory copy:
+Offline NAX pre-tiling packs `MXFP4` (`mxfp4_e2m1_g32_e8m0_v1` -> `mx_nax_tiled_bk128_v1`), `oQ` Affine `q3–q6`, and 8-bit `affine8` (`oq_affine_q8_g64_bf16_v1` / `oq_affine_q8_g128_bf16_v1` -> `oq_nax_tiled_g64_v1` with `nax_codes` + `nax_sb` and zero `nax_high*` planes, including per-layer mixed `MXFP4 + affine8` checkpoints) once so Prefill, `T=1` AR decode, and speculative verify share one zero-copy resident memory copy:
 
 ```bash
 python3 miv/tools/m5_artifact.py convert \
   --source <model_dir> \
-  --output <model_dir>/model.omlxm5 \
+  --output <model_dir>/model.miv \
   --source-repo <repo_id> \
   --nax-pretile
 ```
@@ -101,12 +101,15 @@ Start `ninfer-metal-serve` right away without hand-writing a config file. The la
 # 1-click launch with a specific model directory (default port 8080, separate from oMLX port 8000)
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# Or omit the model directory to auto-pick the first .omlxm5 model in ./models or oMLX's models folder
+# Or omit the model directory to auto-pick the first .miv model in ./models or oMLX's models folder
 ./omlx-extend/scripts/start_ninfer_serve.sh
 
-# Pass any extra CLI flag to override the shared default config
+# Pass any extra CLI flag (including --lora / --lora-mode) to override the shared default config
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B --port 8081 --kv-dtype bf16
+./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B --lora /path/to/my-lora --lora-mode merge
 ```
+
+`start_ninfer_serve.sh` also honors `NINFER_LORA_ADAPTER` and `NINFER_LORA_MODE` environment overrides when `--lora` / `--lora-mode` are not passed explicitly.
 
 ### Direct CLI Overrides or Custom `ninfer-metal.toml`
 
@@ -124,6 +127,12 @@ Running `ninfer-metal-serve` directly also auto-loads the shared default `ninfer
   --rolling-prefix-cache on \
   --prefix-cache-gb 4.0
 
+# Launch with a HuggingFace PEFT or mlx-lm LoRA adapter (zero offline conversion)
+./build/miv-v001/miv/ninfer-metal-serve \
+  --model-dir /path/to/Qwen3.8-27B \
+  --lora /path/to/adapter-dir \
+  --lora-mode merge
+
 # Launch with explicit DFlash2 speculative decoding (or rely on speculative.backend = "auto")
 ./build/miv-v001/miv/ninfer-metal-serve \
   --model-dir /path/to/Qwen3.8-27B \
@@ -135,6 +144,17 @@ Running `ninfer-metal-serve` directly also auto-loads the shared default `ninfer
 # Load a specific config file (CLI flags override TOML values)
 ./build/miv-v001/miv/ninfer-metal-serve --config ~/.config/ninfer-metal/ninfer-metal.toml
 ```
+
+### Native Dual-Mode LoRA (`merge` vs `bypass`, Zero Conversion)
+
+`ninfer-metal` loads standard **HuggingFace PEFT** (`adapter_config.json` + `adapter_model.safetensors`) and **`mlx-lm`** (`adapter_config.json` + `adapters.safetensors`) adapter directories directly in pure C++20/Metal 4 with **zero offline weight conversion** (supporting `r`/`rank`, `lora_alpha`/`alpha`, `scale`, `use_rslora`, `rank_pattern`, `alpha_pattern`, `fan_in_fan_out`, and `BF16`/`FP16`/`FP32` safetensors):
+
+| Mode (`--lora-mode` / `lora_mode`) | Execution & UMA Behavior | Best For |
+|---|---|---|
+| **`"merge"`** *(default)* | **Mode A — Load-Time UMA GPU Fusion**: Keeps on-disk `.miv` completely read-only; unpacks only LoRA-targeted base projections (`MXFP4` or `oQ` Affine `q4`/`q6`/`q8`) on GPU at load time, fuses $W_{\text{eff}} = W_{\text{base}} + \text{scale} \cdot (B A)$ in `FP32`, and quantizes + NAX-pretiles directly into resident UMA buffers as `oq_nax_tiled_g64_v1` `q8` in `AffineNaxCache` (**`0` extra runtime kernel dispatches**). | Maximum steady-state decode & prefill throughput for a fixed adapter |
+| **`"bypass"`** | **Mode B — Runtime BF16 Low-Rank Injection**: Leaves base `Mxfp4NaxCache` / `AffineNaxCache` untouched, stores `(A, B, scale)` as resident `BF16` Metal buffers, and injects `y += scale * ((x @ A^T) @ B^T)` at linear projection dispatch points with **zero re-quantization drift** and fast `reload_lora` adapter hot-swapping without reloading base weights. | Zero re-quantization drift evaluation and rapid multi-adapter switching |
+
+Both modes stay exact under `mtp` and `dflash2` speculative target verification and report `lora_adapter`, `lora_mode`, `lora_buffer_bytes`, and `lora_adapted_layers` in `/health`, `/v1/models`, and sidecar `stats` (accounted against `memory_budget_bytes`).
 
 ### Running Multiple Microkernels in Parallel (`[[models]]` / `--providers-dir`)
 
@@ -170,9 +190,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | Endpoint | Behavior |
 |---|---|
-| `GET /health` | Readiness JSON (`status`, `model`, `models[]`, `gpu_contended`, `memory_budget_bytes`, `version`) |
+| `GET /health` | Readiness JSON (`status`, `model`, `models[]`, `gpu_contended`, `memory_budget_bytes`, `lora_adapter`, `lora_mode`, `lora_buffer_bytes`, `lora_adapted_layers`, `version`) |
 | `GET /metrics` | Prometheus text exposition (aggregate + per-model `model`/`provider`/`backend_mode` series: `requests_total`, `active_requests`, `generated_tokens_total`, UMA/cache stats) |
-| `GET /v1/models`, `GET /v1/models/:id` | OpenAI model listing with `max_model_len`, `provider_id`, and `backend_mode` |
+| `GET /v1/models`, `GET /v1/models/:id` | OpenAI model listing with `max_model_len`, `provider_id`, `backend_mode`, and active LoRA metadata (`lora_adapter`, `lora_mode`, `lora_buffer_bytes`, `lora_adapted_layers`) |
 | `POST /v1/chat/completions` | Routes by JSON `"model"` (`404 model_not_found` on unknown ID; single-model omission defaults to sole model); sync JSON and streaming SSE (`chat.completion.chunk`), `<think>...</think>` to `reasoning_content`, Qwen XML and JSON `<tool_call>` parsing, `stop` strings, `usage`, `stream_options.include_usage`, `[DONE]` |
 | `POST /v1/completions` | Raw text completion routed by JSON `"model"` (sync JSON, streaming SSE, `usage`, `[DONE]`) |
 
@@ -190,8 +210,10 @@ When `--config` is omitted, `ninfer-metal-serve` auto-loads [`omlx-extend/config
 | `--providers-dir PATH` | auto (`$OMLX_PROVIDERS_DIR`, `~/Library/Application Support/oMLX/Providers`) | **Repeatable** root directory of Path B SPI v2 microkernel sidecars; scans `<dir>/*/current/provider.json` (fallback `<dir>/*/provider.json`) |
 | `--provider MODE` | `auto` (`auto` \| `inproc` \| `<provider_id>`) | Backend routing mode: O(1) auto-resolution, in-process `miv` (`inproc`), or explicit Path B SPI v2 `provider_id` |
 | `--metallib-dir PATH` | auto-discovered | Metal 4 / NAX `.metallib` shader directory (`$OMLX_M5_METALLIB_DIR` -> `<exe>/../metallib` -> `<exe>/metallib`). Alias: `--kernel-dir` (points to Metal shaders, **not** Path B microkernels — use `--providers-dir` for microkernels) |
-| `--artifact PATH` | auto-discovered | Explicit target `.omlxm5` (or provider) artifact path |
-| `--draft-dir PATH`, `--draft-artifact PATH`, `--mtp-artifact PATH` | — | Draft model directory or `.omlxm5` artifact for `dflash2` / `mtp` |
+| `--artifact PATH` | auto-discovered | Explicit target `.miv` (or provider) artifact path |
+| `--lora PATH`, `--lora-adapter PATH` | `""` (disabled) | HuggingFace PEFT (`adapter_model.safetensors`) or `mlx-lm` (`adapters.safetensors`) LoRA directory (expands `~/`, zero conversion) |
+| `--lora-mode MODE` | `merge` (`merge` \| `bypass`) | LoRA execution mode: load-time GPU `q8` fusion (`merge`, 0 runtime overhead) or BF16 low-rank runtime injection (`bypass`, fast hot-swap) |
+| `--draft-dir PATH`, `--draft-artifact PATH`, `--mtp-artifact PATH` | — | Draft model directory or `.miv` artifact for `dflash2` / `mtp` |
 | `--chat-template PATH`, `--model-id NAME` | auto | Override Jinja chat template file or advertised model ID |
 | `--host ADDR`, `--port PORT` | `127.0.0.1`, `8080` | HTTP bind address and port |
 | `--api-key KEY`, `--cors` / `--no-cors` | `""`, enabled | Require `Authorization: Bearer <KEY>`; control CORS headers |
@@ -220,7 +242,7 @@ This monorepo tracks the patched `omlx/` host directly alongside `omlx-extend/` 
 ./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
 ```
 
-Once `io.ninfer.metal/current/` is installed, `oMLX-extend` auto-discovers **`miv Core Backend`** (`mseries_backendd`, falling back to `com.omlx.mseries/current/`, `PATH`, or `build/*/miv/`) and displays installed Path A and Path B microkernels under **`Integrations → External Engines`**. Any model directory containing `model.omlxm5`, `model_pack.json`, or `omlxm5-manifest.json` routes lazily to **`miv Core Backend`**; unadapted models stay on Stock MLX unchanged. Flip **`Use External Engine`** off in **`Model Settings → Advanced Settings`** (writes `external_engine: "stock"`) to force Stock MLX for an adapted model.
+Once `io.ninfer.metal/current/` is installed, `oMLX-extend` auto-discovers **`miv Core Backend`** (`mseries_backendd`, falling back to `com.omlx.mseries/current/`, `PATH`, or `build/*/miv/`) and displays installed Path A and Path B microkernels under **`Integrations → External Engines`**. Any model directory containing `model.miv` (or legacy `model.omlxm5`), `model_pack.json`, `omlxm5-manifest.json`, or convertible Qwen `.safetensors` routes lazily to **`miv Core Backend`** (auto-repacking `.safetensors → model.miv` on first Load); unadapted models stay on Stock MLX unchanged. Because `io.ninfer.metal` declares `"lora"` in `capabilities` and `"lora_adapter"` in `supported_standard_settings` (with `lora_mode` `"merge" | "bypass"`, `reload_required: true` exposed in `options_schema` under `external_engine_options`), standard `oMLX` LoRA selection works directly on `miv Core Backend` while external providers that do not declare `"lora_adapter"` preserve conflict checks. Flip **`Use External Engine`** off in **`Model Settings → Advanced Settings`** (writes `external_engine: "stock"`) to force Stock MLX for an adapted model.
 
 For a screenshot walkthrough of the `oMLX` macOS app, see **[`oMLX-extend` Visual Guide](omlx-extend-guide.md)**. For host internals and UI setting mappings, see [`omlx-extend/README.md`](../omlx-extend/README.md).
 
@@ -244,7 +266,7 @@ mkdir -p ~/.config/ninfer-metal
 cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 ```
 
-In `oMLX-extend` sidecar mode, per-model UI settings (`external_engine_options["ninfer-metal"]`) override `[sidecar.models."<name>"]` in TOML, which override the shared `[engine]` / `[speculative]` defaults. In standalone `ninfer-metal-serve`, CLI flags always override TOML values.
+In `oMLX-extend` sidecar mode, per-model UI settings (`lora_adapter` and `external_engine_options["ninfer-metal"]`) override `[sidecar.models."<id>"]` in TOML, which override the shared `[model]` / `[engine]` / `[sidecar]` / `[speculative]` defaults. Across all hosts, LoRA settings (`lora_adapter` and `lora_mode`) follow strict **`CLI > per-model (`[[models]]` / `[sidecar.models."<id>"]` / `external_engine_options`) > top-level TOML (`[model]` / `[engine]` / `[sidecar]`)`** precedence.
 
 ### Core Knobs
 
@@ -252,8 +274,9 @@ In `oMLX-extend` sidecar mode, per-model UI settings (`external_engine_options["
 |---|---|---|---|
 | `host` / `port` / `api_key` | `[server]` | `"127.0.0.1"`, `8080`, `""` | Standalone `ninfer-metal-serve` settings (ignored by `oMLX-extend` AF_UNIX sidecar). |
 | `providers_dir` / `memory_budget_gb` | `[server]` | string or array, float (GiB) | Path B SPI v2 provider roots (scans `<dir>/*/current/provider.json`) and server-wide UMA cap (default `81%` RAM). |
-| `model_dir` / `artifact` (`artifact_path`) | `[model]` | Paths | Standalone model directory and optional explicit `.omlxm5` (or provider) artifact path; both `artifact` and `artifact_path` (plus `draft_artifact`/`draft_artifact_path` and `metallib_dir`/`kernel_dir`) are accepted. |
-| `id` / `model_dir` / `provider` / overrides | `[[models]]` | Array of tables | Multi-model parallel hosting in standalone `ninfer-metal-serve`. Each entry inherits unset `[engine]`/`[speculative]` defaults and sets `provider = "auto" \| "inproc" \| "<provider_id>"`. |
+| `model_dir` / `artifact` (`artifact_path`) | `[model]` | Paths | Standalone model directory and optional explicit `.miv` (or provider) artifact path; both `artifact` and `artifact_path` (plus `draft_artifact`/`draft_artifact_path` and `metallib_dir`/`kernel_dir`) are accepted. |
+| `lora_adapter` / `lora_mode` | `[model]`, `[engine]`, `[sidecar]`, `[sidecar.models."<id>"]`, `[[models]]` | `""` (path), `"merge"` \| `"bypass"` (default `"merge"`) | Direct HuggingFace PEFT or `mlx-lm` adapter directory and mode (`"merge"` load-time UMA `q8` fusion vs `"bypass"` BF16 low-rank injection). Precedence: `CLI > per-model > TOML`. |
+| `id` / `model_dir` / `provider` / overrides | `[[models]]` | Array of tables | Multi-model parallel hosting in standalone `ninfer-metal-serve`. Each entry inherits unset `[engine]`/`[speculative]` defaults (including `lora_adapter` / `lora_mode`) and sets `provider = "auto" \| "inproc" \| "<provider_id>"`. |
 | `max_concurrency` | `[engine]` | `1..8` (CLI default `1`, template `4`) | Multi-user concurrent batch slots (**`B`** in `miv` docs, **`C`** in upstream `ninfer`). Inherits oMLX `max_concurrent_requests` when omitted in sidecar mode. |
 | `max_context` | `[engine]` | `32768`–`262144+` (CLI default `32768`, template `65536`) | Context window length (**`L`**). Maps from oMLX `max_context_window` in sidecar mode. |
 | `kv_dtype` | `[engine]` | `"bf16"` \| `"affine4_g128"` | `affine4_g128` stores `0.5625 B/val` with verified `0-ULP` parity at `64K+`. `int8_g64` is absent in `miv-v0.01`. |
@@ -271,16 +294,18 @@ Default config: [`omlx-extend/config/ninfer-metal.toml`](../omlx-extend/config/n
 
 Beyond `ninfer-metal-serve` and `oMLX-extend`, `miv/` exposes four lower-level integration surfaces:
 
-1. **`m5rt_runner` (token-ID CLI)** — Runs single-stream, batched (`--batch-mode on --max-concurrency 4`), or DFlash2 speculative inference from integer token IDs and emits NDJSON metrics/tokens:
+1. **`m5rt_runner` (token-ID CLI)** — Runs single-stream, batched (`--batch-mode on --max-concurrency 4`), DFlash2 speculative, or LoRA-adapted (`--lora <adapter_dir>`, alias `--lora-adapter`, with `--lora-mode <merge|bypass>`) inference from integer token IDs and emits NDJSON metrics/tokens:
    ```bash
    ./build/miv-v001/miv/m5rt_runner \
-     --artifact /path/to/model.omlxm5 \
+     --artifact /path/to/model.miv \
      --config /path/to/config.json \
+     --lora /path/to/adapter-dir \
+     --lora-mode merge \
      --prompt 151644,8948,198,2610,525,264 \
      --max-context 8192 \
      --max-new-tokens 128
    ```
-2. **`mseries_backendd` (AF_UNIX NDJSON RPC v2 daemon)** — Persistent token-ID engine server supporting `hello`, `load`, `submit`, `cancel`, `subscribe_events`, `trim_cache`, `set_scheduler_hint`, and `shutdown`:
+2. **`mseries_backendd` (AF_UNIX NDJSON RPC v2 daemon)** — Persistent token-ID engine server supporting `hello`, `load` (including `"lora_adapter"` and `"lora_mode": "merge" | "bypass"`, with fast `reload_lora` hot-swap in `bypass` mode), `submit`, `cancel`, `subscribe_events`, `trim_cache`, `set_scheduler_hint`, `stats`, and `shutdown`, plus CLI defaults `--lora` (`--lora-adapter`) and `--lora-mode <merge|bypass>`:
    ```bash
    ./build/miv-v001/miv/mseries_backendd --socket /tmp/ninfer-metal.sock --exit-on-disconnect
    ```

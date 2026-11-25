@@ -58,7 +58,7 @@ All numbers below come from physical Apple M5 Ultra machines running isolated su
 - Zero-copy GPU prefix continuation (`0.73–1.62 ms` restore at `64K`), in-place rolling UMA prefix reuse, and batched `affine4_g128` NAX attention for concurrent sessions.
 
 ### `oMLX-extend` `omlx-extend-v0.8.3` (macOS App & Sidecar)
-- Registers **`miv Core Backend`** over an `AF_UNIX` sidecar (`mseries_backendd`): adapted `.omlxm5` models route automatically in O(1), while standard MLX models stay on Stock MLX without spawning extra processes.
+- Registers **`miv Core Backend`** over an `AF_UNIX` sidecar (`mseries_backendd`): adapted `.miv` (and legacy `.omlxm5`) models route automatically in O(1), while standard MLX models stay on Stock MLX without spawning extra processes.
 - Native macOS UI adds `Integrations → External Engines` cards for `miv Core Backend` and Path B microkernels, per-model engine badges, an Auto / Stock MLX picker, and capability-driven controls for `64K+` context, `MTP`, `DFlash2`, and `affine4_g128` KV cache.
 - Coordinates UMA budgets, idle cache trimming, and contention-aware chunked prefill between sidecar and MLX models, with atomic symlink updates under `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/`.
 
@@ -75,7 +75,7 @@ All numbers below come from physical Apple M5 Ultra machines running isolated su
 | Hardware | Apple Silicon `MTLGPUFamilyApple10+` (Apple M5 / M5 Pro / M5 Max / M5 Ultra, 64-GPU & 80-GPU) |
 | OS & Toolchain | macOS 27+ (no Xcode needed at runtime; Xcode 27+ / macOS 27 SDK to build from source) |
 | Models | **Qwen3.5 / Qwen3.6 / Qwen3.8 Hybrid** (3:1 GDN + GQA; Dense 0.8B–27B and 256×8 MoE, e.g. 35B-A3B) |
-| Weight Formats | Offline NAX pre-tiled `.omlxm5`: `MXFP4` (`E2M1 × UE8M0`) and `oQ` Affine (`q3–q8`, `g64 / g128`) |
+| Weight Formats | Offline NAX pre-tiled `.miv` (legacy `.omlxm5` compatible): `MXFP4` (`E2M1 × UE8M0`) and `oQ` Affine (`q3–q8`, `g64 / g128`) |
 | KV Cache | `bf16` and `affine4_g128` (`0.5625 B/val`, `0-ULP` verified across `2K–64K`) |
 | Speculative Decoding | Pure AR (`none`), embedded `Native MTP`, and `DFlash2` (single-stream and `B=2..4` batched) |
 | Serving Interfaces | OpenAI HTTP/SSE endpoints in `ninfer-metal-serve`; OpenAI + Anthropic endpoints and macOS GUI in `oMLX-extend` |

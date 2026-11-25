@@ -57,6 +57,14 @@ public:
     return {};
   }
   virtual void set_scheduler_hint(const SchedulerHint & /*hint*/) {}
+  [[nodiscard]] virtual bool reload_lora(const std::string & /*lora_adapter*/,
+                                         const std::string & /*lora_mode*/,
+                                         std::string *error = nullptr) {
+    if (error != nullptr) {
+      *error = "backend does not support runtime LoRA reload";
+    }
+    return false;
+  }
 };
 
 } // namespace omlx::m5::detail

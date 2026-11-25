@@ -1682,14 +1682,16 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
           "expected repo omlx-extend/config/ninfer-metal.toml, got: " +
               auto_cfg.config_path);
     check(auto_cfg.host == "127.0.0.1" && auto_cfg.port == 8080 &&
-              auto_cfg.cors == true && auto_cfg.max_concurrency == 4 &&
+              auto_cfg.cors == true && auto_cfg.max_concurrency == 1 &&
               auto_cfg.max_context == 65536 &&
-              auto_cfg.kv_dtype == "affine4_g128" &&
+              auto_cfg.kv_dtype == "bf16" &&
               auto_cfg.rolling_prefix_cache.has_value() &&
               *auto_cfg.rolling_prefix_cache == true &&
               auto_cfg.prefix_cache_gb.has_value() &&
               *auto_cfg.prefix_cache_gb == 4.0 &&
-              auto_cfg.sampling_contract == "legacy_rejection_v1" &&
+              auto_cfg.sampling_contract == "position_coupled_v1" &&
+              auto_cfg.lora_adapter.empty() &&
+              auto_cfg.lora_mode == "merge" &&
               auto_cfg.spec_backend_auto == true && auto_cfg.draft_tokens == 0,
           "default omlx-extend/config/ninfer-metal.toml values mismatch");
     const std::string expected_providers =
@@ -1708,7 +1710,7 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
         "--max-concurrency",
         "2",
         "--kv-dtype",
-        "bf16",
+        "affine4_g128",
         "--spec-backend",
         "none",
         "--rolling-prefix-cache",
@@ -1716,7 +1718,7 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
     });
     check(overridden.config_auto_discovered && overridden.port == 9099 &&
               overridden.max_concurrency == 2 &&
-              overridden.kv_dtype == "bf16" &&
+              overridden.kv_dtype == "affine4_g128" &&
               overridden.spec_backend == SpeculativeBackend::none &&
               !overridden.spec_backend_auto &&
               overridden.rolling_prefix_cache.has_value() &&
@@ -3904,6 +3906,675 @@ void test_test7_mock_spi_provider_compat(
   }
 }
 
+void test_lora_cli_toml_precedence_and_observability(
+    const std::filesystem::path &models_root,
+    const std::filesystem::path &mock_bin) {
+  const auto tmp_root =
+      std::filesystem::temp_directory_path() /
+      ("ninfer_lora_serve_test_" +
+       std::to_string(static_cast<std::uint64_t>(::getpid())));
+  std::error_code ec;
+  std::filesystem::remove_all(tmp_root, ec);
+  std::filesystem::create_directories(tmp_root);
+
+  const char *orig_home_raw = std::getenv("HOME");
+  const std::optional<std::string> orig_home =
+      orig_home_raw != nullptr ? std::optional<std::string>(orig_home_raw)
+                               : std::nullopt;
+  const auto fake_home = tmp_root / "home";
+  std::filesystem::create_directories(fake_home);
+  ::setenv("HOME", fake_home.c_str(), 1);
+
+  struct EnvAndDirGuard {
+    std::filesystem::path dir;
+    std::optional<std::string> home;
+    ~EnvAndDirGuard() {
+      if (home.has_value()) {
+        ::setenv("HOME", home->c_str(), 1);
+      } else {
+        ::unsetenv("HOME");
+      }
+      std::error_code rm_ec;
+      std::filesystem::remove_all(dir, rm_ec);
+    }
+  } guard{tmp_root, orig_home};
+
+  auto parse_cli_vec = [](std::vector<std::string> args) -> ServeConfig {
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto &a : args) {
+      argv.push_back(a.data());
+    }
+    return parse_serve_config(static_cast<int>(argv.size()), argv.data());
+  };
+
+  // 1) --help documents --lora, --lora-adapter, --lora-mode, and [sidecar]
+  {
+    const std::string help = format_help_string();
+    check(help.find("--lora") != std::string::npos &&
+              help.find("--lora-adapter") != std::string::npos &&
+              help.find("--lora-mode") != std::string::npos &&
+              help.find("[sidecar]") != std::string::npos,
+          "ninfer-metal-serve --help missing LoRA flags or [sidecar]");
+  }
+
+  // 2) CLI flags (--lora, --lora-adapter, --lora-mode) + ~/ expansion + default mode
+  {
+    const auto c1 = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--no-default-config",
+        "--model-dir",
+        "~/models/qwen",
+        "--lora",
+        "~/adapters/peft-a",
+    });
+    check(c1.lora_adapter == (fake_home / "adapters/peft-a").string(),
+          "--lora ~/ expansion mismatch: " + c1.lora_adapter);
+    check(c1.lora_mode == "merge", "default --lora-mode must be merge");
+    const auto lo1 = to_load_options(c1);
+    check(lo1.lora_adapter == (fake_home / "adapters/peft-a").string() &&
+              lo1.lora_mode == "merge",
+          "to_load_options(ServeConfig) LoRA fields mismatch");
+
+    const auto c2 = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--no-default-config",
+        "--model-dir=/tmp/qwen",
+        "--lora-adapter=~/adapters/mlx-b",
+        "--lora-mode=bypass",
+    });
+    check(c2.lora_adapter == (fake_home / "adapters/mlx-b").string() &&
+              c2.lora_mode == "bypass",
+          "--lora-adapter= / --lora-mode= parsing mismatch");
+    const auto resolved2 = resolve_model_configs(c2);
+    check(resolved2.size() == 1 &&
+              resolved2[0].lora_adapter ==
+                  (fake_home / "adapters/mlx-b").string() &&
+              resolved2[0].lora_mode == "bypass",
+          "resolve_model_configs LoRA fields mismatch");
+    const auto lo2 = to_load_options(resolved2[0]);
+    check(lo2.lora_adapter == (fake_home / "adapters/mlx-b").string() &&
+              lo2.lora_mode == "bypass",
+          "to_load_options(ModelServeConfig) LoRA fields mismatch");
+  }
+
+  // 3) Invalid --lora-mode rejected across CLI and all TOML sections
+  {
+    for (const char *bad_mode : {"invalid", "quant", ""}) {
+      bool threw = false;
+      try {
+        (void)parse_cli_vec({
+            "ninfer-metal-serve",
+            "--no-default-config",
+            "--lora-mode",
+            bad_mode,
+        });
+      } catch (const std::invalid_argument &ex) {
+        const std::string msg = ex.what();
+        threw = msg.find("merge") != std::string::npos &&
+                msg.find("bypass") != std::string::npos;
+      }
+      check(threw, std::string("CLI failed to reject invalid --lora-mode '") +
+                       bad_mode + "'");
+    }
+
+    const std::array<std::string, 5> bad_tomls = {
+        "[model]\nmodel_dir = \"/tmp/m\"\nlora_mode = \"bad\"\n",
+        "[engine]\nlora_mode = \"bad\"\n",
+        "[sidecar]\nlora_mode = \"bad\"\n",
+        "[sidecar.models.\"m1\"]\nlora_mode = \"bad\"\n",
+        "[[models]]\nmodel_dir = \"/tmp/m1\"\nlora_mode = \"bad\"\n",
+    };
+    for (std::size_t idx = 0; idx < bad_tomls.size(); ++idx) {
+      const auto p = tmp_root / ("bad_lora_" + std::to_string(idx) + ".toml");
+      {
+        std::ofstream out(p);
+        out << bad_tomls[idx];
+      }
+      bool threw = false;
+      try {
+        ServeConfig cfg;
+        load_serve_toml_file(p.string(), cfg);
+      } catch (const std::invalid_argument &ex) {
+        const std::string msg = ex.what();
+        threw = msg.find("merge") != std::string::npos &&
+                msg.find("bypass") != std::string::npos;
+      }
+      check(threw, "TOML section index " + std::to_string(idx) +
+                       " failed to reject invalid lora_mode");
+    }
+  }
+
+  // 4) TOML sections ([model], [engine], [sidecar], [sidecar.models."<id>"],
+  //    [[models]]) and exact precedence:
+  //    CLI > per-model ([[models]] / [sidecar.models."<id>"]) > top-level TOML
+  {
+    // 4a) [model] sets lora_adapter, [engine] template has lora_adapter = ""
+    //     -> [model]'s non-empty lora_adapter is preserved; [sidecar.models."m-one"]
+    //     overrides top-level for m-one; CLI overrides [sidecar.models."m-one"]!
+    const auto single_toml = tmp_root / "single_precedence.toml";
+    {
+      std::ofstream out(single_toml);
+      out << "[model]\n"
+          << "model_dir = \"~/models/m-one\"\n"
+          << "lora_adapter = \"~/loras/from-model\"\n"
+          << "lora_mode = \"merge\"\n\n"
+          << "[engine]\n"
+          << "lora_adapter = \"\"\n"
+          << "lora_mode = \"merge\"\n\n"
+          << "[sidecar]\n"
+          << "lora_adapter = \"~/loras/from-sidecar\"\n"
+          << "lora_mode = \"merge\"\n\n"
+          << "[sidecar.models.\"m-one\"]\n"
+          << "lora_adapter = \"~/loras/from-sidecar-model\"\n"
+          << "lora_mode = \"bypass\"\n";
+    }
+
+    // Without CLI --lora: [sidecar.models."m-one"] wins over [sidecar]/[engine]/[model]
+    const auto cfg_no_cli = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        single_toml.string(),
+    });
+    check(cfg_no_cli.lora_adapter ==
+              (fake_home / "loras/from-sidecar").string(),
+          "top-level [sidecar] lora_adapter not captured");
+    const auto res_no_cli = resolve_model_configs(cfg_no_cli);
+    check(res_no_cli.size() == 1 &&
+              res_no_cli[0].lora_adapter ==
+                  (fake_home / "loras/from-sidecar-model").string() &&
+              res_no_cli[0].lora_mode == "bypass",
+          "[sidecar.models.\"m-one\"] failed to override top-level TOML: " +
+              res_no_cli[0].lora_adapter + " mode=" + res_no_cli[0].lora_mode);
+    const auto lo_no_cli = to_load_options(cfg_no_cli);
+    check(lo_no_cli.lora_adapter ==
+              (fake_home / "loras/from-sidecar-model").string() &&
+              lo_no_cli.lora_mode == "bypass",
+          "to_load_options(ServeConfig) did not apply [sidecar.models] override");
+
+    // With CLI --lora and --lora-mode: CLI beats [sidecar.models."m-one"]!
+    const auto cfg_cli_win = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        single_toml.string(),
+        "--lora",
+        "~/loras/from-cli",
+        "--lora-mode",
+        "merge",
+    });
+    const auto res_cli_win = resolve_model_configs(cfg_cli_win);
+    check(res_cli_win.size() == 1 &&
+              res_cli_win[0].lora_adapter ==
+                  (fake_home / "loras/from-cli").string() &&
+              res_cli_win[0].lora_mode == "merge",
+          "CLI --lora/--lora-mode failed to beat [sidecar.models]");
+
+    // 4b) [model] non-empty lora_adapter preserved when [engine] has default ""
+    const auto model_only_toml = tmp_root / "model_only_lora.toml";
+    {
+      std::ofstream out(model_only_toml);
+      out << "[model]\n"
+          << "model_dir = \"/tmp/plain-m\"\n"
+          << "lora_adapter = \"~/loras/model-sec\"\n"
+          << "lora_mode = \"bypass\"\n\n"
+          << "[engine]\n"
+          << "lora_adapter = \"\"\n";
+    }
+    const auto cfg_model_only = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        model_only_toml.string(),
+    });
+    check(cfg_model_only.lora_adapter ==
+              (fake_home / "loras/model-sec").string() &&
+              cfg_model_only.lora_mode == "bypass",
+          "[model] lora_adapter/lora_mode not preserved when [engine] has empty adapter");
+
+    // 4c) Multi-model [[models]] + [sidecar.models."<id>"] + [engine] + CLI
+    const auto multi_toml = tmp_root / "multi_lora.toml";
+    {
+      std::ofstream out(multi_toml);
+      out << "[engine]\n"
+          << "lora_adapter = \"~/loras/engine-global\"\n"
+          << "lora_mode = \"merge\"\n\n"
+          << "[sidecar.models.\"m-sidecar-ov\"]\n"
+          << "lora_adapter = \"~/loras/sidecar-per-model\"\n"
+          << "lora_mode = \"bypass\"\n\n"
+          << "[[models]]\n"
+          << "id = \"m-inherit-engine\"\n"
+          << "model_dir = \"/tmp/m-inherit-engine\"\n\n"
+          << "[[models]]\n"
+          << "id = \"m-sidecar-ov\"\n"
+          << "model_dir = \"/tmp/m-sidecar-ov\"\n\n"
+          << "[[models]]\n"
+          << "id = \"m-explicit\"\n"
+          << "model_dir = \"/tmp/m-explicit\"\n"
+          << "lora_adapter = \"~/loras/models-explicit\"\n"
+          << "lora_mode = \"bypass\"\n";
+    }
+    const auto cfg_multi = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        multi_toml.string(),
+    });
+    const auto m_list = resolve_model_configs(cfg_multi);
+    check(m_list.size() == 3, "expected 3 models in multi_lora.toml");
+    check(m_list[0].lora_adapter ==
+              (fake_home / "loras/engine-global").string() &&
+              m_list[0].lora_mode == "merge",
+          "[[models]][0] failed to inherit [engine] LoRA defaults");
+    check(m_list[1].lora_adapter ==
+              (fake_home / "loras/sidecar-per-model").string() &&
+              m_list[1].lora_mode == "bypass",
+          "[[models]][1] failed to apply [sidecar.models.\"m-sidecar-ov\"]");
+    check(m_list[2].lora_adapter ==
+              (fake_home / "loras/models-explicit").string() &&
+              m_list[2].lora_mode == "bypass",
+          "[[models]][2] failed to apply explicit [[models]] LoRA fields");
+
+    // CLI override propagates across all [[models]] entries (including clearing via --lora "")
+    const auto cfg_multi_cli = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        multi_toml.string(),
+        "--lora-adapter",
+        "~/loras/cli-all",
+        "--lora-mode",
+        "bypass",
+    });
+    for (const auto &m : resolve_model_configs(cfg_multi_cli)) {
+      check(m.lora_adapter == (fake_home / "loras/cli-all").string() &&
+                m.lora_mode == "bypass",
+            "CLI --lora-adapter/--lora-mode did not override [[models]] entry " +
+                m.id);
+    }
+
+    const auto cfg_multi_clear = parse_cli_vec({
+        "ninfer-metal-serve",
+        "--config",
+        multi_toml.string(),
+        "--lora",
+        "",
+    });
+    for (const auto &m : resolve_model_configs(cfg_multi_clear)) {
+      check(m.lora_adapter.empty(),
+            "CLI --lora '' failed to clear TOML lora_adapter on " + m.id);
+    }
+  }
+
+  // 5) HTTP /v1/models, /v1/models/:id, and /health observability + live reload_lora
+  {
+    auto assets = build_synthetic_assets();
+    ServeConfig config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.model_id = "qwen-lora-http";
+    config.max_concurrency = 2;
+    config.max_context = 4096;
+    config.lora_adapter = "/tmp/peft-lora-v1";
+    config.lora_mode = "bypass";
+
+    LoadOptions load_opts;
+    load_opts.max_concurrency = 2;
+    load_opts.max_context = 4096;
+    load_opts.lora_adapter = "/tmp/peft-lora-v1";
+    load_opts.lora_mode = "bypass";
+
+    FakeBackendOptions fake_opts;
+    fake_opts.vocab_size = assets.vocab_size;
+
+    std::shared_ptr<Engine> engine(Engine::create_fake(load_opts, fake_opts));
+    auto router = std::make_shared<EngineRouter>(engine, assets.eos_ids);
+    ServeHttpServer server(config, router, assets.tokenizer,
+                           assets.chat_template);
+    const int port = server.bind();
+    check(port > 0, "LoRA HTTP test bind failed");
+    std::thread server_thread([&] { server.listen_after_bind(); });
+    const auto cleanup_http = [&] {
+      server.stop();
+      if (server_thread.joinable()) {
+        server_thread.join();
+      }
+      router->stop();
+    };
+
+    try {
+      httplib::Client client("127.0.0.1", port);
+      client.set_read_timeout(10, 0);
+
+      auto check_lora_endpoints = [&](const std::string &exp_adapter,
+                                      const std::string &exp_mode,
+                                      std::uint64_t exp_bytes,
+                                      std::uint32_t exp_layers) {
+        auto r_models = client.Get("/v1/models");
+        check(r_models && r_models->status == 200, "/v1/models failed");
+        const auto m0 = Json::parse(r_models->body).at("data").at(0);
+        check(m0.at("lora_adapter") == exp_adapter &&
+                  m0.at("lora_mode") == exp_mode &&
+                  m0.at("lora_buffer_bytes").get<std::uint64_t>() == exp_bytes &&
+                  m0.at("lora_adapted_layers").get<std::uint32_t>() ==
+                      exp_layers,
+              "/v1/models LoRA metadata mismatch: " + m0.dump());
+
+        auto r_single = client.Get("/v1/models/qwen-lora-http");
+        check(r_single && r_single->status == 200,
+              "/v1/models/qwen-lora-http failed");
+        const auto ms = Json::parse(r_single->body);
+        check(ms.at("lora_adapter") == exp_adapter &&
+                  ms.at("lora_mode") == exp_mode &&
+                  ms.at("lora_buffer_bytes").get<std::uint64_t>() == exp_bytes &&
+                  ms.at("lora_adapted_layers").get<std::uint32_t>() ==
+                      exp_layers,
+              "/v1/models/:id LoRA metadata mismatch: " + ms.dump());
+
+        auto r_health = client.Get("/health");
+        check(r_health && r_health->status == 200, "/health failed");
+        const auto hj = Json::parse(r_health->body);
+        check(hj.at("lora_adapter") == exp_adapter &&
+                  hj.at("lora_mode") == exp_mode &&
+                  hj.at("lora_buffer_bytes").get<std::uint64_t>() == exp_bytes &&
+                  hj.at("lora_adapted_layers").get<std::uint32_t>() ==
+                      exp_layers,
+              "/health top-level LoRA metadata mismatch: " + hj.dump());
+        const auto &hm0 = hj.at("models").at(0);
+        check(hm0.at("lora_adapter") == exp_adapter &&
+                  hm0.at("lora_mode") == exp_mode &&
+                  hm0.at("lora_buffer_bytes").get<std::uint64_t>() ==
+                      exp_bytes &&
+                  hm0.at("lora_adapted_layers").get<std::uint32_t>() ==
+                      exp_layers,
+              "/health models[0] LoRA metadata mismatch: " + hm0.dump());
+      };
+
+      check_lora_endpoints("/tmp/peft-lora-v1", "bypass", 65536ULL, 1U);
+
+      // Hot-swap bypass adapter while HTTP server is live!
+      std::string err;
+      check(router->reload_lora("/tmp/peft-lora-v2", "bypass", &err),
+            "EngineRouter::reload_lora(v2) failed: " + err);
+      check_lora_endpoints("/tmp/peft-lora-v2", "bypass", 65536ULL, 1U);
+
+      // Unload bypass adapter to empty!
+      check(router->reload_lora("", "bypass", &err),
+            "EngineRouter::reload_lora('') failed: " + err);
+      check_lora_endpoints("", "", 0ULL, 0U);
+    } catch (...) {
+      cleanup_http();
+      throw;
+    }
+    cleanup_http();
+  }
+
+  // 6) UdsSidecarBackend SPI v2 load / stats / reload_lora payload forwarding
+  {
+    const std::string py_shebang =
+        (::access("/usr/bin/python3", X_OK) == 0) ? "#!/usr/bin/python3\n"
+                                                  : "#!/usr/bin/env python3\n";
+    const auto lora_sc_script = tmp_root / "lora_spi_sidecar.py";
+    const auto audit_json = tmp_root / "lora_spi_audit.json";
+    {
+      std::ofstream out(lora_sc_script);
+      out << py_shebang
+          << "import json, os, socket, sys, threading\n"
+          << "AUDIT = " << Json(audit_json.string()).dump() << "\n"
+          << "sock_path = None\n"
+          << "args = sys.argv[1:]\n"
+          << "for i, a in enumerate(args):\n"
+          << "    if a == '--socket' and i + 1 < len(args):\n"
+          << "        sock_path = args[i + 1]\n"
+          << "if os.path.exists(sock_path):\n"
+          << "    os.unlink(sock_path)\n"
+          << "srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+          << "srv.bind(sock_path)\n"
+          << "srv.listen(8)\n"
+          << "state = {'lora_adapter': '', 'lora_mode': '', 'lora_buffer_bytes': 0, 'lora_adapted_layers': 0, 'loads': [], 'reloads': []}\n"
+          << "stop_ev = threading.Event()\n"
+          << "lock = threading.Lock()\n"
+          << "def send_json(c, o):\n"
+          << "    c.sendall((json.dumps(o) + '\\n').encode('utf-8'))\n"
+          << "def save_audit():\n"
+          << "    with open(AUDIT, 'w', encoding='utf-8') as f:\n"
+          << "        json.dump(state, f)\n"
+          << "def handle(c):\n"
+          << "    buf = b''\n"
+          << "    try:\n"
+          << "        while not stop_ev.is_set():\n"
+          << "            ch = c.recv(4096)\n"
+          << "            if not ch:\n"
+          << "                break\n"
+          << "            buf += ch\n"
+          << "            while b'\\n' in buf:\n"
+          << "                line, buf = buf.split(b'\\n', 1)\n"
+          << "                req = json.loads(line.decode('utf-8'))\n"
+          << "                rid, m, p = req['id'], req['method'], req.get('params', {})\n"
+          << "                if m == 'hello':\n"
+          << "                    send_json(c, {'id': rid, 'ok': True, 'result': {'protocol_version': 2, 'provider_id': 'io.test.lora-sc', 'capabilities': ['lora', 'reload_lora', 'subscribe_events']}})\n"
+          << "                elif m == 'load':\n"
+          << "                    with lock:\n"
+          << "                        la = p.get('lora_adapter', '')\n"
+          << "                        lm = p.get('lora_mode', 'merge')\n"
+          << "                        state['loads'].append({'lora_adapter': la, 'lora_mode': lm})\n"
+          << "                        state['lora_adapter'] = la\n"
+          << "                        state['lora_mode'] = lm if la else ''\n"
+          << "                        state['lora_buffer_bytes'] = 131072 if la else 0\n"
+          << "                        state['lora_adapted_layers'] = 28 if la else 0\n"
+          << "                        save_audit()\n"
+          << "                        send_json(c, {'id': rid, 'ok': True, 'result': dict(state)})\n"
+          << "                elif m == 'reload_lora':\n"
+          << "                    with lock:\n"
+          << "                        la = p.get('lora_adapter', '')\n"
+          << "                        lm = p.get('lora_mode', 'bypass')\n"
+          << "                        state['reloads'].append({'lora_adapter': la, 'lora_mode': lm})\n"
+          << "                        state['lora_adapter'] = la\n"
+          << "                        state['lora_mode'] = lm if la else ''\n"
+          << "                        state['lora_buffer_bytes'] = 262144 if la else 0\n"
+          << "                        state['lora_adapted_layers'] = 14 if la else 0\n"
+          << "                        save_audit()\n"
+          << "                        send_json(c, {'id': rid, 'ok': True, 'result': dict(state)})\n"
+          << "                elif m == 'stats':\n"
+          << "                    with lock:\n"
+          << "                        send_json(c, {'id': rid, 'ok': True, 'result': dict(state, backend_kind='lora_sc')})\n"
+          << "                elif m == 'capacity':\n"
+          << "                    send_json(c, {'id': rid, 'ok': True, 'result': {'max_concurrency': 1, 'active_requests': 0, 'queued_requests': 0, 'accepting': True}})\n"
+          << "                elif m == 'subscribe_events':\n"
+          << "                    send_json(c, {'id': rid, 'ok': True, 'result': {'subscribed': True}})\n"
+          << "                    c.settimeout(0.1)\n"
+          << "                    while not stop_ev.is_set():\n"
+          << "                        try:\n"
+          << "                            if not c.recv(1):\n"
+          << "                                break\n"
+          << "                        except socket.timeout:\n"
+          << "                            continue\n"
+          << "                        except Exception:\n"
+          << "                            break\n"
+          << "                    try:\n"
+          << "                        send_json(c, {'event': {'kind': 'eof'}})\n"
+          << "                    except Exception:\n"
+          << "                        pass\n"
+          << "                    return\n"
+          << "                elif m == 'shutdown':\n"
+          << "                    send_json(c, {'id': rid, 'ok': True, 'result': {'shutdown': True}})\n"
+          << "                    stop_ev.set()\n"
+          << "                    return\n"
+          << "    finally:\n"
+          << "        c.close()\n"
+          << "srv.settimeout(0.1)\n"
+          << "while not stop_ev.is_set():\n"
+          << "    try:\n"
+          << "        conn, _ = srv.accept()\n"
+          << "        threading.Thread(target=handle, args=(conn,), daemon=True).start()\n"
+          << "    except socket.timeout:\n"
+          << "        continue\n"
+          << "srv.close()\n";
+    }
+    ::chmod(lora_sc_script.c_str(), 0755);
+
+    UdsSidecarOptions sc_opts;
+    sc_opts.provider_id = "io.test.lora-sc";
+    sc_opts.binary_path = lora_sc_script;
+    sc_opts.load_options.model_dir = "/tmp/model-sc";
+    sc_opts.load_options.lora_adapter = "/tmp/sc-lora-init";
+    sc_opts.load_options.lora_mode = "bypass";
+
+    UdsSidecarBackend sc(sc_opts);
+    const auto st1 = sc.stats();
+    check(st1.lora_adapter == "/tmp/sc-lora-init" &&
+              st1.lora_mode == "bypass" && st1.lora_buffer_bytes == 131072ULL &&
+              st1.lora_adapted_layers == 28U,
+          "UdsSidecarBackend initial LoRA stats mismatch");
+
+    std::string sc_err;
+    check(sc.reload_lora("/tmp/sc-lora-hot", "bypass", &sc_err),
+          "UdsSidecarBackend::reload_lora failed: " + sc_err);
+    const auto st2 = sc.stats();
+    check(st2.lora_adapter == "/tmp/sc-lora-hot" &&
+              st2.lora_mode == "bypass" && st2.lora_buffer_bytes == 262144ULL &&
+              st2.lora_adapted_layers == 14U,
+          "UdsSidecarBackend hot-reloaded LoRA stats mismatch");
+    sc.shutdown();
+
+    const Json audit = Json::parse(read_file_text(audit_json));
+    check(audit.at("loads").size() == 1 &&
+              audit.at("loads")[0].at("lora_adapter") == "/tmp/sc-lora-init" &&
+              audit.at("loads")[0].at("lora_mode") == "bypass",
+          "UdsSidecarBackend load payload did not forward LoRA params: " +
+              audit.dump());
+    check(audit.at("reloads").size() == 1 &&
+              audit.at("reloads")[0].at("lora_adapter") == "/tmp/sc-lora-hot" &&
+              audit.at("reloads")[0].at("lora_mode") == "bypass",
+          "UdsSidecarBackend reload_lora payload mismatch: " + audit.dump());
+  }
+
+  // 7) Launcher script start_ninfer_serve.sh --lora / NINFER_LORA_* & validation
+  const auto launcher_script = std::filesystem::path(models_root).parent_path() /
+                               "omlx-extend" / "scripts" /
+                               "start_ninfer_serve.sh";
+  if (std::filesystem::is_regular_file(launcher_script)) {
+    const auto fake_serve_bin = tmp_root / "fake-ninfer-serve";
+    {
+      std::ofstream out(fake_serve_bin);
+      out << "#!/bin/sh\nexit 0\n";
+    }
+    ::chmod(fake_serve_bin.c_str(), 0755);
+    const auto dummy_model = tmp_root / "dummy-model";
+    std::filesystem::create_directories(dummy_model);
+
+    auto run_bash = [&](const std::string &cmd) -> std::pair<int, std::string> {
+      FILE *pipe = ::popen((cmd + " 2>&1").c_str(), "r");
+      check(pipe != nullptr, "popen failed");
+      std::string output;
+      std::array<char, 512> buf{};
+      while (std::fgets(buf.data(), static_cast<int>(buf.size()), pipe) !=
+             nullptr) {
+        output += buf.data();
+      }
+      const int rc = ::pclose(pipe);
+      const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : rc;
+      return {code, output};
+    };
+
+    // Help output
+    {
+      const auto [code, out] =
+          run_bash("bash \"" + launcher_script.string() + "\" --help");
+      check(code == 0 && out.find("--lora") != std::string::npos &&
+                out.find("--lora-mode") != std::string::npos,
+            "start_ninfer_serve.sh --help missing --lora/--lora-mode: " + out);
+    }
+    // Env vars NINFER_LORA_ADAPTER & NINFER_LORA_MODE with ~/ expansion
+    {
+      const auto [code, out] = run_bash(
+          "NINFER_METAL_SERVE_BIN=\"" + fake_serve_bin.string() +
+          "\" NINFER_LORA_ADAPTER=\"~/env-lora\" NINFER_LORA_MODE=bypass "
+          "bash \"" +
+          launcher_script.string() + "\" --dry-run --no-default-config \"" +
+          dummy_model.string() + "\"");
+      check(code == 0 &&
+                out.find("--lora " + (fake_home / "env-lora").string()) !=
+                    std::string::npos &&
+                out.find("--lora-mode bypass") != std::string::npos,
+            "start_ninfer_serve.sh env NINFER_LORA_* failed: " + out);
+    }
+    // CLI overrides env vars
+    {
+      const auto [code, out] = run_bash(
+          "NINFER_METAL_SERVE_BIN=\"" + fake_serve_bin.string() +
+          "\" NINFER_LORA_ADAPTER=\"~/env-lora\" NINFER_LORA_MODE=bypass "
+          "bash \"" +
+          launcher_script.string() +
+          "\" --dry-run --no-default-config --lora-adapter \"~/cli-lora\" "
+          "--lora-mode merge \"" +
+          dummy_model.string() + "\"");
+      check(code == 0 &&
+                out.find("--lora-adapter " +
+                         (fake_home / "cli-lora").string()) !=
+                    std::string::npos &&
+                out.find("--lora-mode merge") != std::string::npos &&
+                out.find("env-lora") == std::string::npos,
+            "start_ninfer_serve.sh CLI failed to override NINFER_LORA_*: " +
+                out);
+    }
+    // Invalid --lora-mode rejected with clear error
+    {
+      const auto [code, out] = run_bash(
+          "NINFER_METAL_SERVE_BIN=\"" + fake_serve_bin.string() + "\" bash \"" +
+          launcher_script.string() + "\" --dry-run --lora-mode invalid \"" +
+          dummy_model.string() + "\"");
+      check(code != 0 && out.find("merge") != std::string::npos &&
+                out.find("bypass") != std::string::npos,
+            "start_ninfer_serve.sh failed to reject invalid --lora-mode: " +
+                out);
+    }
+  }
+
+  // 8) Verify sibling CLI binaries (m5rt_runner & mseries_backendd) --help and
+  //    invalid --lora-mode rejection if built alongside mock_bin.
+  if (!mock_bin.empty()) {
+    const auto bin_dir = mock_bin.parent_path();
+    auto run_cmd = [](const std::string &cmd) -> std::pair<int, std::string> {
+      FILE *pipe = ::popen((cmd + " 2>&1").c_str(), "r");
+      check(pipe != nullptr, "popen failed");
+      std::string output;
+      std::array<char, 512> buf{};
+      while (std::fgets(buf.data(), static_cast<int>(buf.size()), pipe) !=
+             nullptr) {
+        output += buf.data();
+      }
+      const int rc = ::pclose(pipe);
+      const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : rc;
+      return {code, output};
+    };
+
+    const auto runner_bin = bin_dir / "m5rt_runner";
+    if (::access(runner_bin.c_str(), X_OK) == 0) {
+      const auto [hc, hout] = run_cmd("\"" + runner_bin.string() + "\" --help");
+      check(hc == 0 && hout.find("--lora") != std::string::npos &&
+                hout.find("--lora-adapter") != std::string::npos &&
+                hout.find("--lora-mode") != std::string::npos,
+            "m5rt_runner --help missing LoRA flags: " + hout);
+      const auto [bc, bout] =
+          run_cmd("\"" + runner_bin.string() + "\" --lora-mode invalid");
+      check(bc != 0 && bout.find("merge") != std::string::npos &&
+                bout.find("bypass") != std::string::npos,
+            "m5rt_runner failed to reject invalid --lora-mode: " + bout);
+    }
+
+    const auto daemon_bin = bin_dir / "mseries_backendd";
+    if (::access(daemon_bin.c_str(), X_OK) == 0) {
+      const auto [hc, hout] = run_cmd("\"" + daemon_bin.string() + "\" --help");
+      check(hc == 0 && hout.find("--lora") != std::string::npos &&
+                hout.find("--lora-adapter") != std::string::npos &&
+                hout.find("--lora-mode") != std::string::npos,
+            "mseries_backendd --help missing LoRA flags: " + hout);
+      const auto [bc, bout] = run_cmd("\"" + daemon_bin.string() +
+                                      "\" --lora-mode invalid --socket /tmp/x");
+      check(bc != 0 && bout.find("merge") != std::string::npos &&
+                bout.find("bypass") != std::string::npos,
+            "mseries_backendd failed to reject invalid --lora-mode: " + bout);
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -3950,6 +4621,15 @@ int main(int argc, char **argv) {
     test_mivr14_mivr15_mivr16_p2_fixes();
     std::cout << "[serve_e2e] PASS: MIVR-14/15/16 padding output tokens, "
                  "SSE Keep-Alive connection reuse & bare trailing <tool_call>\n";
+
+    const std::filesystem::path opt_mock_bin =
+        (argc > 2 && std::string_view(argv[2]).size() > 0)
+            ? std::filesystem::path(argv[2])
+            : std::filesystem::path{};
+    test_lora_cli_toml_precedence_and_observability(models_root, opt_mock_bin);
+    std::cout << "[serve_e2e] PASS: LoRA CLI flags, TOML precedence across "
+                 "[model]/[engine]/[sidecar]/[sidecar.models]/[[models]], "
+                 "/v1/models + /health observability & SPI v2 forwarding\n";
 
     if (argc > 2 && std::string_view(argv[2]).size() > 0) {
       const std::filesystem::path mock_bin(argv[2]);

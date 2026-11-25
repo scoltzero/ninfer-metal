@@ -2,7 +2,7 @@
 
 # Visueller Leitfaden zu `oMLX-extend`
 
-`oMLX-extend` erweitert die `oMLX`-macOS-App auf Apple-M5+-Macs (`macOS 27+`) um **`miv Core Backend (ninfer-metal)`** und Community-Metal-4-Microkernel aus Pfad B. Angepasste `.omlxm5`-Modelle nutzen automatisch die native Metal-4-NAX-Ausführung, während reguläre MLX-Modelle unverändert auf Stock MLX weiterlaufen.
+`oMLX-extend` erweitert die `oMLX`-macOS-App auf Apple-M5+-Macs (`macOS 27+`) um **`miv Core Backend (ninfer-metal)`** und Community-Metal-4-Microkernel aus Pfad B. Angepasste `.miv`-Modelle nutzen automatisch die native Metal-4-NAX-Ausführung, während reguläre MLX-Modelle unverändert auf Stock MLX weiterlaufen.
 
 Gehe die folgenden fünf Ansichten durch, um die Installation zu prüfen, das Engine-Routing zu kontrollieren, schnelle Decode-Funktionen einzuschalten und den eigenständigen Server ohne manuell geschriebene Konfigurationsdatei zu starten.
 
@@ -34,7 +34,7 @@ Wechsle zur Ansicht **`Models`**, um zu sehen, wie `oMLX` jedes Modell auf deine
 ![Ansicht Models mit aktiven Engine-Badges und Bibliothekskennzeichnungen](../../assets/omlx-mac/models-overview.png)
 
 - **Active Models**: Jedes geladene Modell zeigt direkt neben **`Loaded`** ein Engine-Badge (`miv Core`, den Namen deines Pfad-B-Microkernels oder `MLX`).
-- **Model Library**: Modelle mit `.omlxm5`-Gewichten tragen eine hervorgehobene Kennzeichnung (`miv Core · Auto`, ein Pfad-B-Microkernel oder `Stock MLX`, falls externes Routing deaktiviert wurde).
+- **Model Library**: Modelle mit `.miv`-Gewichten tragen eine hervorgehobene Kennzeichnung (`miv Core · Auto`, ein Pfad-B-Microkernel oder `Stock MLX`, falls externes Routing deaktiviert wurde).
 - **Unangepasste Modelle bleiben unberührt**: Reguläre MLX-Checkpoints haben kein externes Engine-Badge und laufen ohne Sidecar-Prozesse über Stock MLX. Du kannst `miv Core Backend`-, Pfad-B- und Stock-MLX-Modelle parallel unter einem gemeinsamen Unified-Memory-Limit geladen halten.
 
 ---
@@ -45,8 +45,8 @@ Klicke in der **Model Library** auf ein angepasstes Modell und öffne **`Advance
 
 ![Model Settings Advanced mit automatischem Routing an miv Core Backend](../../assets/omlx-mac/engine-routing-auto.png)
 
-- **`Use External Engine`** ist für angepasste `.omlxm5`-Modelle standardmäßig **ON**, mit **`miv Core Backend (Auto)`** im Auswahlmenü (die Kopfzeile von Model Settings zeigt ebenfalls das aktive Engine-Badge).
-- **Jederzeit zurück zu Stock MLX wechseln**: Schalte **`Use External Engine`** auf **OFF**. `oMLX` speichert `external_engine: "stock"` und zeigt *"Using Stock MLX (auto-route overridden)"*, ohne deine `.omlxm5`-Gewichte zu löschen. Schalte wieder auf **ON**, um zum Auto-Routing zurückzukehren.
+- **`Use External Engine`** ist für angepasste `.miv`-Modelle standardmäßig **ON**, mit **`miv Core Backend (Auto)`** im Auswahlmenü (die Kopfzeile von Model Settings zeigt ebenfalls das aktive Engine-Badge).
+- **Jederzeit zurück zu Stock MLX wechseln**: Schalte **`Use External Engine`** auf **OFF**. `oMLX` speichert `external_engine: "stock"` und zeigt *"Using Stock MLX (auto-route overridden)"*, ohne deine `.miv`-Gewichte zu löschen. Schalte wieder auf **ON**, um zum Auto-Routing zurückzukehren.
 - **Andere Engine auswählen**: Ist für dasselbe Modell ein kompatibler Pfad-B-Microkernel oder Splash installiert, wähle ihn direkt im Dropdown aus.
 
 ---
@@ -96,7 +96,7 @@ Um den eigenständigen OpenAI-kompatiblen Server auf Port `8080` (getrennt von `
 # Direkt auf ein angepasstes Modellverzeichnis zeigen
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# Oder den Pfad weglassen, um automatisch das erste .omlxm5-Modell in ./models oder im oMLX-Modellordner zu wählen
+# Oder den Pfad weglassen, um automatisch das erste .miv-Modell in ./models oder im oMLX-Modellordner zu wählen
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@ Um den eigenständigen OpenAI-kompatiblen Server auf Port `8080` (getrennt von `
 
 ## Nächste Schritte
 
-- **[Einstieg & Konfiguration](getting-started.md)** — Aus dem Quellcode bauen, Checkpoints nach `.omlxm5` konvertieren und alle CLI-Flags von `ninfer-metal-serve` nachschlagen.
+- **[Einstieg & Konfiguration](getting-started.md)** — Aus dem Quellcode bauen, Checkpoints nach `.miv` konvertieren und alle CLI-Flags von `ninfer-metal-serve` nachschlagen.
 - **[Architektur & Koexistenz](architecture.md)** — Wie O(1)-Routing, Provider SPI v2 und gemeinsame UMA-Speicherbudgets unter der Haube arbeiten.
 - **[Microkernel Foundry](microkernel-foundry.md)** — Neue Pfad-A- oder Pfad-B-Modellfamilien für Apple M5+ hinzufügen.

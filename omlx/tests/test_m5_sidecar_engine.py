@@ -308,6 +308,15 @@ class _MockUdsSidecarServer:
                     await self._send_ok(writer, rpc_id, res)
                 elif method == "load":
                     self.load_params.append(dict(params))
+                    lora_path = str(params.get("lora_adapter") or "")
+                    lora_mode = str(params.get("lora_mode") or "merge")
+                    lora_buf = (4 * 1024 * 1024 if lora_mode == "bypass" else 16 * 1024 * 1024) if lora_path else 0
+                    self._mock_lora_state = {
+                        "lora_adapter": lora_path,
+                        "lora_mode": lora_mode,
+                        "lora_buffer_bytes": lora_buf,
+                        "lora_adapted_layers": 2 if lora_path else 0,
+                    }
                     await self._send_ok(
                         writer,
                         rpc_id,
@@ -320,6 +329,34 @@ class _MockUdsSidecarServer:
                             "prefix_restored_tokens": 64,
                             "pid": os.getpid(),
                             "phys_footprint_bytes": self.resident_bytes,
+                            **self._mock_lora_state,
+                        },
+                    )
+                elif method == "reload_lora":
+                    if not getattr(self, "support_reload_lora", True):
+                        await self._send_err(writer, rpc_id, "unknown sidecar method")
+                        continue
+                    lora_path = str(params.get("lora_adapter") or "")
+                    lora_mode = str(params.get("lora_mode") or "merge")
+                    lora_buf = (4 * 1024 * 1024 if lora_mode == "bypass" else 16 * 1024 * 1024) if lora_path else 0
+                    self._mock_lora_state = {
+                        "lora_adapter": lora_path,
+                        "lora_mode": lora_mode,
+                        "lora_buffer_bytes": lora_buf,
+                        "lora_adapted_layers": 2 if lora_path else 0,
+                    }
+                    if not hasattr(self, "reload_lora_calls"):
+                        self.reload_lora_calls = []
+                    self.reload_lora_calls.append(dict(params))
+                    await self._send_ok(
+                        writer,
+                        rpc_id,
+                        {
+                            "reloaded": True,
+                            "hot_reloaded": lora_mode == "bypass",
+                            "pid": os.getpid(),
+                            "phys_footprint_bytes": self.resident_bytes,
+                            **self._mock_lora_state,
                         },
                     )
                 elif method == "capacity":
@@ -332,10 +369,16 @@ class _MockUdsSidecarServer:
                             "queued_requests": 0,
                             "accepting": True,
                             "pid": os.getpid(),
-                            "phys_footprint_bytes": 128 * 1024 * 1024,
+                            "phys_footprint_bytes": self.resident_bytes,
                         },
                     )
                 elif method == "stats":
+                    lora_state = getattr(self, "_mock_lora_state", {
+                        "lora_adapter": "",
+                        "lora_mode": "merge",
+                        "lora_buffer_bytes": 0,
+                        "lora_adapted_layers": 0,
+                    })
                     await self._send_ok(
                         writer,
                         rpc_id,
@@ -352,7 +395,8 @@ class _MockUdsSidecarServer:
                             "prefix_evictions": 0,
                             "prefix_restored_tokens": 64,
                             "pid": os.getpid(),
-                            "phys_footprint_bytes": 128 * 1024 * 1024,
+                            "phys_footprint_bytes": self.resident_bytes,
+                            **lora_state,
                         },
                     )
                 elif method == "submit":
@@ -1471,6 +1515,8 @@ class TestMivV001SettingsCoexistenceAndUI:
             fake=False,
         )
 
+        monkeypatch.setenv("NINFER_METAL_CONFIG", str(tmp_path / "no-shared.toml"))
+        monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
         gs = GlobalSettings(base_path=tmp_path / "base")
         gs.scheduler.max_concurrent_requests = 4
 
@@ -2522,12 +2568,12 @@ class TestPathBMultiMicrokernelSidecars:
             memory_budget_bytes=8 << 30,
             model_id="Qwen3.8-SharedDefault",
         )
-        assert opts.max_concurrency == 4
+        assert opts.max_concurrency == 1
         assert opts.max_context == 65536
-        assert opts.kv_dtype == "affine4_g128"
+        assert opts.kv_dtype == "bf16"
         assert opts.rolling_prefix_cache is True
         assert opts.prefix_cache_bytes == 4 * (1 << 30)
-        assert opts.sampling_contract == "legacy_rejection_v1"
+        assert opts.sampling_contract == "position_coupled_v1"
         # speculative.backend = "auto" on plain model resolves cleanly to "none" without error
         assert opts.speculative_backend == "none"
         assert opts.draft_tokens == 0
@@ -2879,6 +2925,8 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             (providers_root / "io.community.llama-metal" / "current").symlink_to(llama_ver)
 
             monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(providers_root))
+            monkeypatch.setattr(m5_mod, "_DEFAULT_ARTIFACT_CACHE_RELPATH", tmp_path / "isolated_repo_cache")
+            monkeypatch.delenv("OMLX_M5RT_ARTIFACT_DIR", raising=False)
             monkeypatch.delenv("OMLX_M5RT_BIN", raising=False)
             monkeypatch.delenv("NINFER_METAL_BIN", raising=False)
             monkeypatch.setattr(m5_mod.importlib.metadata, "entry_points", lambda group=None: [])
@@ -2968,6 +3016,245 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             assert (llama_unrepacked / "model.safetensors").is_file()
         finally:
             await miv_sock_srv.close()
+
+
+def _write_test_peft_lora(adapter_dir: Path, *, hidden: int = 128, rank: int = 8) -> Path:
+    import struct as _struct
+
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": rank,
+                "lora_alpha": 16,
+                "base_model_name_or_path": "Qwen/Qwen3.5-Test",
+                "target_modules": ["q_proj", "v_proj"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    tensors = {}
+    offset = 0
+    for layer_idx in (0, 1):
+        for proj in ("q_proj", "v_proj"):
+            for suffix, shape in (("lora_A.weight", [rank, hidden]), ("lora_B.weight", [hidden, rank])):
+                nbytes = shape[0] * shape[1] * 2
+                tensors[f"base_model.model.model.layers.{layer_idx}.self_attn.{proj}.{suffix}"] = {
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + nbytes],
+                }
+                offset += nbytes
+    header_bytes = json.dumps(tensors).encode("utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(
+        _struct.pack("<Q", len(header_bytes)) + header_bytes + (b"\x00" * offset)
+    )
+    return adapter_dir
+
+
+class TestSidecarLoRAIntegration:
+    """SPI v2 LoRA forwarding, admin auth, reload triggers, and UMA memory accounting."""
+
+    @pytest.mark.asyncio
+    async def test_lora_forwarding_modes_reload_and_memory_enforcer_accounting(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from omlx.lora_adapters import estimate_sidecar_lora_bytes
+        from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+        from omlx.settings import SubKeyEntry
+
+        model_dir = _write_test_model(tmp_path / "models" / "Qwen3.5-LoRA")
+        adapter_a = _write_test_peft_lora(tmp_path / "models" / "lora-alpha", hidden=128, rank=8)
+        adapter_b = _write_test_peft_lora(tmp_path / "external_loras" / "lora-beta", hidden=128, rank=4)
+
+        fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", version="miv-v0.01", protocol=2)
+        metallib_dir = tmp_path / "metallib"
+        metallib_dir.mkdir()
+        (metallib_dir / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+
+        # Shared ninfer-metal.toml sets default lora_adapter = "" and lora_mode = "merge"
+        toml_cfg = tmp_path / "ninfer-metal.toml"
+        toml_cfg.write_text(
+            '[engine]\nlora_adapter = ""\nlora_mode = "merge"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("NINFER_METAL_CONFIG", str(toml_cfg))
+        monkeypatch.setenv("OMLX_M5RT_BIN", str(fake_bin))
+        monkeypatch.setenv("OMLX_M5RT_METALLIB_DIR", str(metallib_dir))
+
+        gs = GlobalSettings(base_path=tmp_path / "base")
+        gs.auth.api_key = "admin-secret-key"
+        gs.auth.sub_keys = [SubKeyEntry(key="sub-inference-only-key", name="sub1")]
+        monkeypatch.setattr("omlx.engine_pool.get_global_settings", lambda: gs)
+
+        pool = EnginePool()
+        pool.discover_models([str(tmp_path / "models")])
+        assert "lora-alpha" in pool.lora_adapters()
+        settings_mgr = ModelSettingsManager(tmp_path / "base")
+        pool._settings_manager = settings_mgr
+
+        # 1) Memory estimate & budget incorporate LoRA UMA footprint (merge > bypass > base)
+        target, reason = pool.m5rt_target("Qwen3.5-LoRA", ModelSettings())
+        assert reason == "" and target is not None
+
+        est_base = pool._entry_runtime_resident_size(
+            pool._entries["Qwen3.5-LoRA"],
+            ModelSettings(external_engine="m5rt"),
+        )
+        est_bypass = pool._entry_runtime_resident_size(
+            pool._entries["Qwen3.5-LoRA"],
+            ModelSettings(
+                external_engine="m5rt",
+                lora_adapter="lora-alpha",
+                external_engine_options={"ninfer-metal": {"lora_mode": "bypass"}},
+            ),
+        )
+        est_merge = pool._entry_runtime_resident_size(
+            pool._entries["Qwen3.5-LoRA"],
+            ModelSettings(
+                external_engine="m5rt",
+                lora_adapter="lora-alpha",
+                external_engine_options={"ninfer-metal": {"lora_mode": "merge"}},
+            ),
+        )
+        expected_bypass_lora = estimate_sidecar_lora_bytes(adapter_a, lora_mode="bypass")
+        expected_merge_lora = estimate_sidecar_lora_bytes(adapter_a, lora_mode="merge")
+        assert expected_bypass_lora > 0
+        assert expected_merge_lora > expected_bypass_lora
+        assert est_bypass == est_base + expected_bypass_lora
+        assert est_merge == est_base + expected_merge_lora
+
+        # 2) Start sidecar against _MockUdsSidecarServer: verify resolved absolute path + lora_mode
+        sock_path = Path(f"/tmp/omlx-lora-{os.getpid()}.sock")
+        uds_srv = _MockUdsSidecarServer(sock_path)
+        await uds_srv.start()
+        try:
+            ms_bypass = ModelSettings(
+                external_engine="ninfer-metal",
+                lora_adapter="lora-alpha",
+                external_engine_options={"ninfer-metal": {"lora_mode": "bypass"}},
+            )
+            eng = pool._external_engine_for(
+                pool._entries["Qwen3.5-LoRA"], ms_bypass, "batched"
+            )
+            assert isinstance(eng, M5SidecarEngine)
+            assert eng._options.lora_adapter == str(adapter_a.resolve())
+            assert eng._options.lora_mode == "bypass"
+            assert eng._options.memory_budget_bytes == est_bypass
+
+            monkeypatch.setattr(m5_mod, "_short_socket_path", lambda _eid=None: sock_path)
+            fake_proc = SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None, wait=lambda: 0)
+            monkeypatch.setattr(m5_mod.subprocess, "Popen", lambda *a, **kw: fake_proc)
+            monkeypatch.setattr(m5_mod, "list_process_group_pids", lambda _pid: [os.getpid()])
+            monkeypatch.setattr(m5_mod, "get_phys_footprint", lambda _pid: 16 * 1024 * 1024)
+
+            # Set a smaller sidecar base footprint so mmap weights + reported lora_buffer_bytes sets floor
+            uds_srv.resident_bytes = 8 * 1024 * 1024
+            await eng.start()
+            try:
+                assert uds_srv.load_params[-1]["lora_adapter"] == str(adapter_a.resolve())
+                assert uds_srv.load_params[-1]["lora_mode"] == "bypass"
+
+                stats = eng.get_stats()
+                assert stats["lora_adapter"] == str(adapter_a.resolve())
+                assert stats["lora_mode"] == "bypass"
+                assert stats["lora_buffer_bytes"] == 4 * 1024 * 1024
+                assert stats["lora_adapted_layers"] == 2
+
+                # ProcessMemoryEnforcer includes external sidecar weights + lora_buffer_bytes
+                pool._entries["Qwen3.5-LoRA"].engine = eng
+                enforcer = ProcessMemoryEnforcer(engine_pool=pool)
+                monkeypatch.setattr("omlx.process_memory_enforcer.get_phys_footprint", lambda: 32 * 1024 * 1024)
+                monkeypatch.setattr("omlx.process_memory_enforcer.mx.get_active_memory", lambda: 0)
+                monkeypatch.setattr("omlx.process_memory_enforcer.mx.get_cache_memory", lambda: 0)
+                monkeypatch.setattr("omlx.process_memory_enforcer.unreleased_graphics_bytes", lambda *_a, **_kw: 0)
+                expected_sidecar_mem = max(
+                    16 * 1024 * 1024,
+                    max(8 * 1024 * 1024, eng._weights_bytes() + 4 * 1024 * 1024),
+                )
+                assert eng.process_memory_bytes() == expected_sidecar_mem
+                assert enforcer._current_usage_bytes() == 32 * 1024 * 1024 + expected_sidecar_mem
+
+                # When sidecar footprint drops below mmap weights + 16 MiB LoRA, floor dominates
+                monkeypatch.setattr(m5_mod, "get_phys_footprint", lambda _pid: 2 * 1024 * 1024)
+
+                # 3) reload_lora RPC updates active adapter, mode, and lora_buffer_bytes (4 MiB -> 16 MiB)
+                reload_res = await eng.reload_lora(adapter_b, lora_mode="merge")
+                assert reload_res["lora_adapter"] == str(adapter_b.resolve())
+                assert reload_res["lora_mode"] == "merge"
+                assert eng.lora_memory_bytes() == 16 * 1024 * 1024
+                assert eng.process_memory_bytes() == eng._weights_bytes() + 16 * 1024 * 1024
+                assert enforcer._current_usage_bytes() == 32 * 1024 * 1024 + eng._weights_bytes() + 16 * 1024 * 1024
+
+                # Fallback when daemon does not implement reload_lora -> re-calls load RPC
+                uds_srv.support_reload_lora = False
+                prev_loads = len(uds_srv.load_params)
+                await eng.reload_lora("lora-alpha", lora_mode="bypass", lora_adapters=pool.lora_adapters())
+                assert len(uds_srv.load_params) == prev_loads + 1
+                assert uds_srv.load_params[-1]["lora_adapter"] == str(adapter_a.resolve())
+                assert uds_srv.load_params[-1]["lora_mode"] == "bypass"
+            finally:
+                pool._entries["Qwen3.5-LoRA"].engine = None
+                eng._process = None
+                await eng.stop()
+        finally:
+            await uds_srv.close()
+
+        # 4) Admin HTTP permission checks: main admin key allowed, sub-key and unauth rejected (401)
+        from omlx.admin import auth as admin_auth
+
+        monkeypatch.setattr(srv._server_state, "global_settings", gs)
+        monkeypatch.setattr(srv._server_state, "api_key", gs.auth.api_key)
+        monkeypatch.setattr(srv._server_state, "bind_host", "127.0.0.1")
+        monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+        monkeypatch.setattr(srv._server_state, "settings_manager", settings_mgr)
+        monkeypatch.setattr(admin_auth, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: settings_mgr)
+        monkeypatch.setattr(admin_routes, "_get_server_state", lambda: srv._server_state)
+
+        transport = httpx.ASGITransport(app=srv.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            # Unauthenticated -> 401
+            r_unauth = await client.put(
+                "/admin/api/models/Qwen3.5-LoRA/settings",
+                json={"lora_adapter": "lora-alpha"},
+            )
+            assert r_unauth.status_code == 401
+
+            # Inference sub-key -> 401 on both PUT settings and GET lora-adapters
+            sub_headers = {"Authorization": "Bearer sub-inference-only-key"}
+            r_sub_put = await client.put(
+                "/admin/api/models/Qwen3.5-LoRA/settings",
+                headers=sub_headers,
+                json={"lora_adapter": "lora-alpha"},
+            )
+            assert r_sub_put.status_code == 401
+            r_sub_get = await client.get(
+                "/admin/api/models/Qwen3.5-LoRA/lora-adapters",
+                headers=sub_headers,
+            )
+            assert r_sub_get.status_code == 401
+
+            # Main admin key -> 200 for setting lora_adapter + lora_mode (merge & bypass)
+            admin_headers = {"Authorization": "Bearer admin-secret-key"}
+            for opt_key, mode in (("ninfer-metal", "merge"), ("io.ninfer.metal", "bypass"), ("m5rt", "merge")):
+                r_ok = await client.put(
+                    "/admin/api/models/Qwen3.5-LoRA/settings",
+                    headers=admin_headers,
+                    json={
+                        "external_engine": "ninfer-metal",
+                        "lora_adapter": "lora-alpha",
+                        "external_engine_options": {opt_key: {"lora_mode": mode}},
+                    },
+                )
+                assert r_ok.status_code == 200, r_ok.text
+                body = r_ok.json()
+                assert body["settings"]["external_engine"] == "m5rt"
+                assert body["settings"]["lora_adapter"] == "lora-alpha"
+                assert body["settings"]["external_engine_options"][opt_key]["lora_mode"] == mode
 
 
 class TestDFlash2WhitelistAndAutoRepack:
@@ -3261,7 +3548,7 @@ class TestDFlash2WhitelistAndAutoRepack:
                 assert (df_27b / "model.miv").is_file()
                 lp = miv_sock_srv.load_params[-1]
                 assert lp["kv_dtype"] == "affine4_g128"
-                assert lp["speculative"]["backend"] == "dflash2"
+                assert lp["speculative"] == {"backend": "dflash2", "draft_tokens": 7}
                 assert Path(lp["path_overrides"]["artifact"]) == (qwen_27b / "model.miv").resolve()
                 assert Path(lp["path_overrides"]["draft_artifact"]) == (df_27b / "model.miv").resolve()
             finally:

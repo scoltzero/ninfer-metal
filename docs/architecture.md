@@ -44,8 +44,8 @@ flowchart LR
     MultiHost -- "memory_budget_bytes / trim_cache / gpu_contended" --> UdsClient
     InProc --> Runtime
     UdsClient -- "AF_UNIX NDJSON RPC v2" --> SidecarB
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Router -- "Path B manifest match" --> SidecarB
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     Enforcer -- "UMA budget & contention hints" --> SidecarB
@@ -70,7 +70,7 @@ flowchart LR
 
 ## 2. O(1) Auto Model Routing (`oMLX-extend`)
 
-`oMLX-extend` inspects each model directory with `detect_adapted(model_dir)` in `< 1 ms` using filesystem checks (`model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`) with zero subprocess spawn:
+`oMLX-extend` inspects each model directory with `detect_adapted(model_dir)` in `< 1 ms` using filesystem checks (`model.miv`, legacy `model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`) with zero subprocess spawn:
 
 - **Adapted models**: Route lazily to **`miv Core Backend`** (`mseries_backendd`) on first request (or when pinned), showing **`miv Core Backend (Auto)`** in `Model Settings → Advanced Settings`. Flipping **`Use External Engine`** off writes `external_engine: "stock"` and opts the model back into Stock MLX.
 - **Unadapted models**: Run unmodified through Stock MLX (`BatchedEngine` / `VLMBatchedEngine`) with zero sidecar processes, zero extra memory, and zero performance change.
@@ -94,7 +94,7 @@ When multiple engines run on the same Apple Silicon machine — either sidecar m
 
 ## 4. Metal 4 Engine Design (`miv/`)
 
-- **Single pre-tiled weight copy**: Offline `.omlxm5` conversion (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) serves wide `64×64` Prefill NAX, `T=1` QMV decode, and `BM=8/16/32` speculative verify from one resident allocation (`1.0×` artifact footprint vs `~1.92×` for online re-tiling).
+- **Single pre-tiled weight copy**: Offline `.miv` conversion (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) serves wide `64×64` Prefill NAX, `T=1` QMV decode, and `BM=8/16/32` speculative verify from one resident allocation (`1.0×` artifact footprint vs `~1.92×` for online re-tiling).
 - **Safe Compute ICB recording**: All indirect buffer segments stay strictly below `2 GiB` (`< 1 GiB` for auxiliary compact caches) to prevent 32-bit hardware offset wraparound. Double-buffered `ar_pipe_[2]` command allocators overlap host encoding with GPU execution.
 - **Paged CoW KV & UMA continuation**: `KvPagePool` manages `64`-token reference-counted pages (`bf16` and `0-ULP` `affine4_g128` at `0.5625 B/val`). `QwenUmaContinuation` snapshots and restores 48-layer GDN state (`146.81 MiB`) in a single GPU command buffer (`0.22–1.62 ms`, zero CPU `memcpy`), and `rolling_prefix_cache` supersedes unpinned ancestors in place (`1×` slab reuse).
 - **Strict SKU calibration isolation**: `silicon_tuning.h` loads per-SKU profiles (`apple-m5-ultra-64gpu.json`, `apple-m5-ultra-80gpu.json`) keyed by exact `profile_id` and falls back to parameterized priors on unmeasured chips — never applying one SKU's measured constants to another.
@@ -117,6 +117,6 @@ Core tarballs install side-by-side under `~/Library/Application Support/oMLX/Pro
 ## Deep-Dive References
 
 - [Porting Architecture v2](backend/ninfer-m5-porting-architecture-v2.md)
-- [`.omlxm5` Artifact Format v1](backend/artifact-format-v1.md) & [Dispatch Contract v1](backend/dispatch-contract-v1.md)
+- [`.miv` Artifact Format v1](backend/artifact-format-v1.md) & [Dispatch Contract v1](backend/dispatch-contract-v1.md)
 - [Hardware & Software Boundaries v1](foundations/hardware-software-boundaries-v1.md)
 - [Core Certification Standard](standards/core-certification-standard.md)

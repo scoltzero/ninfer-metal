@@ -1,7 +1,7 @@
 # Qwen3.6 Dense/MoE format extension v1
 
 > 状态：完成并冻结
-> 原则：复用`.omlxm5` v1容器；按固定checkpoint保留速度优先的原始压缩表示
+> 原则：复用`.miv` v1容器；按固定checkpoint保留速度优先的原始压缩表示
 > 范围：Qwen3.6‑27B Dense、Qwen3.6‑35B‑A3B MoE；oQ affine与MXFP4
 
 ## 1. 固定输入

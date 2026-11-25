@@ -1059,3 +1059,155 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
     for path in sorted(i18n_dir.glob("*.json")):
         catalog = json.loads(path.read_text())
         assert key in catalog, f"{path.name} is missing {key}"
+
+
+def test_lora_adapter_and_lora_mode_capability_aware_external_engine_ui():
+    """LoRA dropdown stays unlocked for LoRA-capable external engines and exposes lora_mode."""
+    html = _model_settings_template()
+    lora_section = _section(
+        html,
+        "<!-- LoRA Adapter -->",
+        "<!-- Embedding audio input (EmbeddingGemma 2) -->",
+    )
+    assert "externalEngineBlocksSetting('lora_adapter')" in lora_section
+    assert "externalEngineLoraModeSchema()" in lora_section
+    assert "setExternalEngineLoraMode($event.target.value)" in lora_section
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+"""
+        + _dashboard_script()
+        + """
+const app = dashboard();
+const m5EngineRow = {
+    id: 'm5rt',
+    provider_id: 'io.ninfer.metal',
+    label: 'miv Core Backend (ninfer-metal)',
+    compatible: true,
+    supported_standard_settings: ['max_context_window', 'mtp_enabled', 'lora_adapter'],
+    options_schema: [
+        {
+            key: 'lora_mode',
+            label: 'LoRA Mode',
+            type: 'enum',
+            options: ['merge', 'bypass'],
+            option_labels: {merge: 'Merge', bypass: 'Bypass'},
+            default: 'merge',
+            reload_required: true,
+        },
+    ],
+};
+const splashRow = {
+    id: 'splash',
+    label: 'Splash',
+    compatible: true,
+};
+
+// 1) m5rt supports lora_adapter and exposes lora_mode across ninfer-metal / m5rt keys
+app.modelSettings = app.buildModelSettingsState(
+    {external_engines: [splashRow, m5EngineRow], auto_external_engine: 'm5rt'},
+    {lora_adapter: '/models/my-lora', external_engine_options: {'ninfer-metal': {lora_mode: 'bypass'}}}
+);
+assert.equal(app.effectiveExternalEngine(), 'm5rt');
+assert.equal(app.externalEngineBlocksSetting('lora_adapter'), false);
+assert.equal(app.getExternalEngineLoraMode(), 'bypass');
+app.setExternalEngineLoraMode('merge');
+assert.equal(app.getExternalEngineLoraMode(), 'merge');
+const m5Payload = app.buildModelSettingsPayload(app.modelSettings);
+assert.equal(m5Payload.lora_adapter, '/models/my-lora');
+assert.equal(m5Payload.external_engine_options.m5rt.lora_mode, 'merge');
+assert.equal(m5Payload.external_engine_options['ninfer-metal'].lora_mode, 'merge');
+
+// 2) Splash does NOT declare lora_adapter -> blocked in UI
+app.modelSettings = app.buildModelSettingsState(
+    {external_engines: [splashRow, m5EngineRow]},
+    {external_engine: 'splash'}
+);
+assert.equal(app.effectiveExternalEngine(), 'splash');
+assert.equal(app.externalEngineBlocksSetting('lora_adapter'), true);
+assert.equal(app.externalEngineLoraModeSchema(), null);
+
+// 3) Stock MLX override unlocks lora_adapter and hides external lora_mode
+app.modelSettings = app.buildModelSettingsState(
+    {external_engines: [splashRow, m5EngineRow], auto_external_engine: 'm5rt'},
+    {external_engine: 'stock'}
+);
+assert.equal(app.effectiveExternalEngine(), '');
+assert.equal(app.externalEngineBlocksSetting('lora_adapter'), false);
+assert.equal(app.externalEngineLoraModeSchema(), null);
+"""
+    )
+    result = subprocess.run(
+        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_external_engine_general_options_schema_controls_concurrency_and_sampling_contract():
+    template = _model_settings_template()
+    assert "externalEngineGeneralOptionsSchema()" in template
+    assert "setExternalEngineOption(opt, $event.target.value)" in template
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+"""
+        + _dashboard_script()
+        + """
+const app = dashboard();
+const m5EngineRow = {
+    id: 'm5rt',
+    provider_id: 'io.ninfer.metal',
+    label: 'miv Core Backend (ninfer-metal)',
+    compatible: true,
+    options_schema: [
+        {key: 'max_concurrency', label: 'Concurrency (B/C)', type: 'int', min: 1, max: 8, default: 1},
+        {key: 'rolling_prefix_cache', label: 'Rolling Prefix Cache', type: 'bool', default: true},
+        {key: 'prefix_cache_gb', label: 'Prefix Cache Budget (GiB)', type: 'bytes_gb', min: 0, max: 128, default: 4},
+        {key: 'lora_mode', label: 'LoRA Mode', type: 'enum', options: ['merge', 'bypass'], default: 'merge'},
+        {key: 'sampling_contract', label: 'Sampling Contract', type: 'enum', options: ['position_coupled_v1', 'legacy_rejection_v1'], default: 'position_coupled_v1'},
+    ],
+};
+
+// Legacy m5rt_options seeds initial state and lora_mode is excluded from general list
+app.modelSettings = app.buildModelSettingsState(
+    {external_engines: [m5EngineRow], auto_external_engine: 'm5rt'},
+    {m5rt_options: {max_concurrency: 4, sampling_contract: 'legacy_rejection_v1'}}
+);
+const general = app.externalEngineGeneralOptionsSchema();
+assert.deepEqual(general.map(o => o.key), ['max_concurrency', 'rolling_prefix_cache', 'prefix_cache_gb', 'sampling_contract']);
+assert.equal(app.getExternalEngineOption(general[0]), 4);
+assert.equal(app.getExternalEngineOption(general[1]), true);
+assert.equal(app.getExternalEngineOption(general[3]), 'legacy_rejection_v1');
+
+// Updating clamps int and persists to external_engine_options payload
+app.setExternalEngineOption(general[0], '1');
+app.setExternalEngineOption(general[1], false);
+app.setExternalEngineOption(general[3], 'position_coupled_v1');
+assert.equal(app.getExternalEngineOption(general[0]), 1);
+assert.equal(app.getExternalEngineOption(general[1]), false);
+assert.equal(app.getExternalEngineOption(general[3]), 'position_coupled_v1');
+const payload = app.buildModelSettingsPayload(app.modelSettings);
+assert.equal(payload.external_engine_options.m5rt.max_concurrency, 1);
+assert.equal(payload.external_engine_options.m5rt.rolling_prefix_cache, false);
+assert.equal(payload.external_engine_options.m5rt.sampling_contract, 'position_coupled_v1');
+"""
+    )
+    result = subprocess.run(
+        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+

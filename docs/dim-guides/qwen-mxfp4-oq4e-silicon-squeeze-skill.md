@@ -98,7 +98,7 @@ description: >-
 | **FFN（Dense vs MoE）** | Dense `SwiGLU(H, F)`；稀疏 MoE：`E` 专家选 `top_k` + `shared_expert` + `shared_gate`，中间维 `F_moe` | Dense 双投影重复读激活与写中间态；MoE CPU 同步分桶或逐专家串行派发开销巨大 | Dense 始终双指针融合 `gate+up+SiLU`；MoE Prefill 走零同步 GPU 流式分桶 + `compact32` 4-SG 切分，`T=1` 压至极致 **3-dispatch** |
 | **超大词表输出头** | `lm_head`：`[V, H]`（如 `V = 248,320`） | 输出维极大（$V \ge 65536$），且单核扫描词表采样耗时达数百微秒 | $N \ge 65536$ 离线固定采用 `BN_stored = 32`；`T=1` 融合 `final_norm` 前奏直读预重排块 + 多 TG 两阶段并行 `Argmax` |
 
-### 2.2 Compute ICB `< 2 GiB` 分段铁律、子图参数隔离与单份 `.omlxm5` 零拷贝复用
+### 2.2 Compute ICB `< 2 GiB` 分段铁律、子图参数隔离与单份 `.miv` 零拷贝复用
 
 - **查什么**：核查所有绑定进 `MTLIndirectComputeCommand` 的 `MTLBuffer` 段内最大字节偏移、多子图合并录制时的常量去重表状态，以及磁盘模型制品的物理块布局。
 - **为什么卡住**：
@@ -107,7 +107,7 @@ description: >-
 - **怎么改运行时与离线制品**：
   1. **硬性分段上限**：不可变模型权重池单段容量钳定为 **`2 GiB`（`2,147,483,648 B`）**；加载期生成的辅助紧凑段（`Q5High1Cache`、`sb_tiled`）钳定为 **`1 GiB`**；多槽并发 KV 页池采用跨槽共享 `SharedKvArenaPool`，确保任意绑定视图段内偏移严格 `< 2 GiB`。
   2. **子图边界清空常量缓存与双槽乒乓流水**：在子图切换处强制调用 `Encoder::dynamic_parameters.clear()` 隔离动态参数槽；异步解码管线维护双槽 `ar_pipe_[2]`（各自持有独立 `MTL4CommandAllocator` 与预录 ICB），步间无锁交替提交以彻底隐藏主机编码延迟。
-  3. **单份 `.omlxm5` 离线预重排跨三态零拷贝复用**：转换期通过 `tools/m5_artifact.py convert --nax-pretile` 生成唯一不可变 `mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1` 布局（`N < 65536` 取 `BN_stored = 16`，`N >= 65536` 取 `BN_stored = 32`）。由于内存中连续 `4` 个 `BN_stored = 16` 物理块天然构成连续的 `BN_logical = 64` 宽块，同一份 `mmap`/上传权重可在 **`T=1` 纯 AR 直读 QMV**、**`BM=8` 耦合验证 NAX** 与 **`BM=64, BN=64, SK=1` 宽块预填 NAX** 之间实现 **0 字节重排拷贝切换**。
+  3. **单份 `.miv` 离线预重排跨三态零拷贝复用**：转换期通过 `tools/m5_artifact.py convert --nax-pretile` 生成唯一不可变 `mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1` 布局（`N < 65536` 取 `BN_stored = 16`，`N >= 65536` 取 `BN_stored = 32`）。由于内存中连续 `4` 个 `BN_stored = 16` 物理块天然构成连续的 `BN_logical = 64` 宽块，同一份 `mmap`/上传权重可在 **`T=1` 纯 AR 直读 QMV**、**`BM=8` 耦合验证 NAX** 与 **`BM=64, BN=64, SK=1` 宽块预填 NAX** 之间实现 **0 字节重排拷贝切换**。
 - **用什么物理比例验收**：进程权重常驻内存从双份驻留的 $1.92 \times M_{\text{artifact}}$ 压降至 **$1.00 \times M_{\text{artifact}}$（物理内存占用立减 `~48%`）**，且严格满足统一内存安全准入不等式（$W_{\text{ws}} \approx 0.81 R$，$H_{\text{os}}$ 为系统与 ICB 预留余量）：
   $$W_{\text{shared}}(\text{pretiled}) + B \times S_{\text{slot}}(L) + P_{\text{cache}} \le W_{\text{ws}} - H_{\text{os}}$$
 
@@ -245,8 +245,8 @@ description: >-
 ### 4.1 第一步：根除 `1/4` 速率 `uitofp` ALU 瓶颈，以 IEEE-754 位铸造直读预重排块
 
 - **查什么**：在 `T=1` 纯自回归（算术强度仅 `~2–4 FLOP/Byte` $\ll I_{\text{ridge}}$）下，检查 QMV 内核是否加载了行主序副本（看 RSS 是否翻倍），并反汇编或用计数器检查预重排直读核是否因整数转浮点指令（`uitofp` / `sitofp`）导致有效带宽远低于 $B_{\text{DRAM}}$。
-- **为什么卡住**：若为迁就传统行主序 QMV 而额外驻留一份未重排权重，物理内存直接暴涨近一倍；而直接在 `.omlxm5` 预重排块（`BN_stored = 16 / 32`）上解包 4/5/6/8-bit 码字时，若手写 `float(q)` 或 `half(q)`，会撞上 **Apple GPU 整数转浮点指令（`uitofp`）仅 `1/4` FMA 发射速率的微架构瓶颈**——每 lane 解包 16 个权重即阻塞数十个 ALU 周期，把内存受限算子硬生生卡在 **`~20%–65%` $B_{\text{DRAM}}$** 的 ALU 天花板上。
-- **怎么改算子（Metal `27.0` 零 `uitofp` IEEE-754 位模式重解释，直接读取 `.omlxm5` 预重排平面）**：
+- **为什么卡住**：若为迁就传统行主序 QMV 而额外驻留一份未重排权重，物理内存直接暴涨近一倍；而直接在 `.miv` 预重排块（`BN_stored = 16 / 32`）上解包 4/5/6/8-bit 码字时，若手写 `float(q)` 或 `half(q)`，会撞上 **Apple GPU 整数转浮点指令（`uitofp`）仅 `1/4` FMA 发射速率的微架构瓶颈**——每 lane 解包 16 个权重即阻塞数十个 ALU 周期，把内存受限算子硬生生卡在 **`~20%–65%` $B_{\text{DRAM}}$** 的 ALU 天花板上。
+- **怎么改算子（Metal `27.0` 零 `uitofp` IEEE-754 位模式重解释，直接读取 `.miv` 预重排平面）**：
   1. **`MXFP4`（`E2M1`）零 `uitofp` 次正规数安全无分支解码（`row_exact.metal` / `moe_nax.metal`）**：
      将 3-bit 幅值 `(nib & 7u)` 左移 `9` 位直接拼成 IEEE-754 `half` 位模式（其中 `nib = 1` 即 `0.5` 映射为精确 FP16 次正规数 `0x0200 = 2^{-15}`，其余映射为正规数 $2^{E-15}(1 + M/2)$），经全速 `fcvt` 升 `float` 后乘以 $16384.0 = 2^{14}$ 精确还原全部 `{0, 0.5, 1, 1.5, 2, 3, 4, 6}`，零分支、零查表、零 FTZ 截断：
      ```metal
@@ -276,7 +276,7 @@ description: >-
 
 - **查什么**：审计 `oQ4e` 混合精度模型在 `T=1` 下每步实际读取的物理字节数（是否含对齐填充废位）、`scale/bias` 元数据的跨 lane 访存步幅（是否跨缓存行/跨页），以及压缩码字的加载指令位宽。
 - **为什么卡住**：
-  1. `.omlxm5` 为兼容硬件 NAX 的 `uint2b_format` 张量描述符，将 `Q5` 的第 5 个 bit 填充存储为 2-bit `nax_high2`（`256 B/tile`），导致 `T=1` 每步白读一倍全零填充位；
+  1. `.miv` 为兼容硬件 NAX 的 `uint2b_format` 张量描述符，将 `Q5` 的第 5 个 bit 填充存储为 2-bit `nax_high2`（`256 B/tile`），导致 `T=1` 每步白读一倍全零填充位；
   2. 原始 `nax_sb` 按 `[groups, padded_n]` 存储，`KL32` 内核中单条 SIMD32 指令的 32 个 lane 横跨 `8` 个连续 group（`g_sub = lane >> 2 ∈ [0..7]`），相邻组 lane 访问地址跨度高达 `padded_n × 4 B`（大投影与词表头跨度达数十 KiB 至近 MiB），每次仅需 `16 B` 有效元数据却拉取整条 `128 B` 缓存行并打穿 TLB，造成 **`8×–16×` 跨页缓存行放大**；
   3. 使用 `1 B` `uchar` 逐字节加载压缩码会阻塞 LSU 合并队列。
 - **怎么改内存平面与加载指令**：

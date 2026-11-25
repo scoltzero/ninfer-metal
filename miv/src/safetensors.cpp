@@ -346,6 +346,31 @@ SafeTensorModel SafeTensorModel::open(const std::filesystem::path &model_dir,
   return SafeTensorModel(std::move(impl));
 }
 
+SafeTensorModel
+SafeTensorModel::open_file(const std::filesystem::path &file_path) {
+  const auto canonical_file = std::filesystem::weakly_canonical(file_path);
+  if (!std::filesystem::is_regular_file(canonical_file)) {
+    throw std::runtime_error("safetensors file does not exist: " +
+                             file_path.string());
+  }
+  auto impl = std::make_unique<Impl>();
+  impl->model_dir = canonical_file.parent_path();
+  const auto shard_name = canonical_file.filename().string();
+  impl->shards.emplace_back(canonical_file);
+  const auto &shard = impl->shards.back();
+  impl->total_shard_bytes = shard.file.size();
+  for (const auto &[tensor_name, raw_info] : shard.tensors) {
+    auto info = raw_info;
+    info.shard = shard_name;
+    impl->total_tensor_bytes += info.nbytes;
+    impl->tensors.emplace(
+        tensor_name,
+        Impl::Locator{.info = std::move(info), .shard_index = 0});
+  }
+  impl->declared_total_size = impl->total_tensor_bytes;
+  return SafeTensorModel(std::move(impl));
+}
+
 SafeTensorModel::SafeTensorModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 SafeTensorModel::SafeTensorModel(SafeTensorModel &&) noexcept = default;

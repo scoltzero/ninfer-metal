@@ -106,6 +106,7 @@
     "ar",
     "mtp",
     "dflash2",
+    "lora",
     "kv_affine4_g128",
     "rolling_prefix_cache",
     "trim_cache",
@@ -129,7 +130,8 @@
     "dflash_draft_model",
     "dflash_block_size",
     "turboquant_kv_enabled",
-    "turboquant_kv_scheme"
+    "turboquant_kv_scheme",
+    "lora_adapter"
   ],
   "options_schema": [
     {
@@ -158,6 +160,22 @@
       "reload_required": true
     },
     {
+      "key": "lora_mode",
+      "label": "LoRA Mode",
+      "type": "enum",
+      "options": [
+        "merge",
+        "bypass"
+      ],
+      "option_labels": {
+        "merge": "Merge (Load-Time UMA Fusion)",
+        "bypass": "Bypass (Runtime BF16 Low-Rank)"
+      },
+      "description": "Merge fuses LoRA into 8-bit NAX tiles at load time with zero runtime overhead; Bypass injects low-rank BF16 projections at runtime with fast hot-swap.",
+      "default": "merge",
+      "reload_required": true
+    },
+    {
       "key": "sampling_contract",
       "label": "Sampling Contract",
       "type": "enum",
@@ -165,7 +183,12 @@
         "position_coupled_v1",
         "legacy_rejection_v1"
       ],
-      "default": "legacy_rejection_v1",
+      "option_labels": {
+        "position_coupled_v1": "Position Coupled v1 (GPU Fast Path)",
+        "legacy_rejection_v1": "Legacy Rejection v1"
+      },
+      "description": "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback.",
+      "default": "position_coupled_v1",
       "reload_required": true
     },
     {

@@ -10,7 +10,7 @@
 | 规范文件 | 适用范围 |
 |---|---|
 | [`ninfer-m5-porting-architecture-v2.md`](ninfer-m5-porting-architecture-v2.md) | NInfer (`ebdc67e5`) → Apple M5 系列（`miv/`）七大子系统移植架构规范与确定性奇偶矩阵 |
-| [`artifact-format-v1.md`](artifact-format-v1.md) | `.omlxm5` 容器规范（16 KiB 页对齐、ARMv8 HW CRC32、离线 NAX 预重排 `mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g{64,128}_v1`） |
+| [`artifact-format-v1.md`](artifact-format-v1.md) | `.miv` 容器规范（16 KiB 页对齐、ARMv8 HW CRC32、离线 NAX 预重排 `mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g{64,128}_v1`） |
 | [`dispatch-contract-v1.md`](dispatch-contract-v1.md) | `KernelKey`、数值等价组（`row_exact_group`）与静态路由表 Schema |
 | [`quantization-kernel-strategy-v1.md`](quantization-kernel-strategy-v1.md) | MXFP4、oQ Affine（`q3/q4/q5/q6/q8 × g64/g128`）与 `FOSCAR` `Affine4Group128` KV 内核策略 |
 | [`qwen36-format-extension-v1.md`](qwen36-format-extension-v1.md) | Qwen3.6 / Qwen3.8 Dense & MoE 源矩阵与混合精度格式扩展 |

@@ -1,12 +1,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "omlx_m5/engine.h"
@@ -20,10 +22,39 @@
 namespace {
 using namespace omlx::m5;
 using Json = nlohmann::json;
+
+std::string expand_user_path(const std::string &path) {
+  if (path.empty() || path.front() != '~') {
+    return path;
+  }
+  if (path.size() == 1 || path[1] == '/') {
+    if (const char *home = std::getenv("HOME"); home && *home) {
+      std::string base(home);
+      if (path.size() > 1 && base.size() > 1 && base.back() == '/') {
+        base.pop_back();
+      }
+      return base + path.substr(1);
+    }
+  }
+  return path;
+}
+
+std::string parse_lora_mode(std::string_view value, std::string_view flag) {
+  if (value == "merge" || value == "bypass") {
+    return std::string(value);
+  }
+  throw std::invalid_argument("unsupported " + std::string(flag) +
+                              " (expected 'merge' or 'bypass'): " +
+                              std::string(value));
+}
+
 struct Options {
+  bool show_help = false;
   std::filesystem::path artifact, config, draft_artifact, draft_config;
   std::filesystem::path libraries =
       std::filesystem::path(OMLX_M5_QWEN_AR_METALLIB_PATH).parent_path();
+  std::string lora_adapter;
+  std::string lora_mode = "merge";
   std::vector<std::int32_t> prompt;
   std::int32_t max_context = 1024, max_new = 16, repeat = 1;
   std::optional<std::size_t> cancel_after;
@@ -37,6 +68,35 @@ struct Options {
 };
 void emit(const Json &value) {
   std::cout << value.dump() << '\n' << std::flush;
+}
+std::string format_runner_help() {
+  std::ostringstream oss;
+  oss << "Usage: m5rt_runner --artifact PATH --config PATH [options]\n\n"
+      << "Options:\n"
+      << "  --artifact PATH                  Model .miv / .omlxm5 artifact\n"
+      << "  --config PATH                    Model config.json path\n"
+      << "  --kernel-directory PATH          Metal .metallib shader directory\n"
+      << "  --lora, --lora-adapter PATH      LoRA adapter directory (HF PEFT or mlx-lm)\n"
+      << "  --lora-mode merge|bypass         LoRA execution mode (default: merge)\n"
+      << "  --prompt ID,ID,...               Comma-separated prompt token IDs\n"
+      << "  --max-context N                  Max sequence context (>= 1024)\n"
+      << "  --max-new-tokens N               Tokens to generate (default: 16)\n"
+      << "  --repeat N                       Repeat generation N times\n"
+      << "  --max-concurrency N              Concurrent slots 1..8 (default: 1)\n"
+      << "  --batch-mode on|off              Enable batched step execution\n"
+      << "  --spec-backend none|dflash2      Speculative decoding backend\n"
+      << "  --draft-tokens N                 Speculative draft depth\n"
+      << "  --draft-artifact PATH            DFlash2 draft artifact\n"
+      << "  --draft-config PATH              DFlash2 draft config.json\n"
+      << "  --sampling-contract NAME         Sampling contract\n"
+      << "  --temperature FLOAT              Sampling temperature\n"
+      << "  --top-k N                        Sampling top-k\n"
+      << "  --top-p FLOAT                    Sampling top-p\n"
+      << "  --seed N                         RNG seed\n"
+      << "  --cancel-after N                 Cancel after N tokens\n"
+      << "  --plan-only                      Emit memory allocation plan only\n"
+      << "  --help, -h                       Show this help message and exit\n";
+  return oss.str();
 }
 std::uint64_t integer(const std::string &value) {
   std::size_t used = 0;
@@ -56,18 +116,37 @@ std::int32_t i32(const std::string &value) {
 Options parse(int argc, char **argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
-    std::string key(argv[i]);
+    std::string raw(argv[i]);
+    if (raw == "--help" || raw == "-h") {
+      o.show_help = true;
+      return o;
+    }
+    std::string key = raw;
+    std::optional<std::string> inline_val;
+    if (raw.starts_with("--")) {
+      const auto eq = raw.find('=');
+      if (eq != std::string::npos) {
+        key = raw.substr(0, eq);
+        inline_val = raw.substr(eq + 1);
+      }
+    }
     auto value = [&]() -> std::string {
+      if (inline_val.has_value())
+        return *inline_val;
       if (++i == argc)
         throw std::invalid_argument("missing value for " + key);
       return argv[i];
     };
     if (key == "--artifact")
-      o.artifact = value();
+      o.artifact = expand_user_path(value());
     else if (key == "--config")
-      o.config = value();
+      o.config = expand_user_path(value());
     else if (key == "--kernel-directory")
-      o.libraries = value();
+      o.libraries = expand_user_path(value());
+    else if (key == "--lora" || key == "--lora-adapter")
+      o.lora_adapter = expand_user_path(value());
+    else if (key == "--lora-mode")
+      o.lora_mode = parse_lora_mode(value(), key);
     else if (key == "--linear-route-ab")
       o.linear_route_ab = value();
     else if (key == "--m4-short-routes")
@@ -76,8 +155,8 @@ Options parse(int argc, char **argv) {
       o.sampling_contract=value();
     else if (key == "--spec-backend")o.spec_backend=value();
     else if (key == "--draft-tokens")o.draft_tokens=i32(value());
-    else if (key == "--draft-artifact")o.draft_artifact=value();
-    else if (key == "--draft-config")o.draft_config=value();
+    else if (key == "--draft-artifact")o.draft_artifact=expand_user_path(value());
+    else if (key == "--draft-config")o.draft_config=expand_user_path(value());
     else if (key == "--max-concurrency")o.max_concurrency=i32(value());
     else if (key == "--batch-mode") {auto mode=value();if(mode!="on" && mode!="off")throw std::invalid_argument("batch-mode must be on or off");o.batch_enabled=mode=="on";}
     else if (key == "--batch-projection-prototype") {auto mode=value();if(mode!="on" && mode!="off")throw std::invalid_argument("batch projection prototype must be on or off");o.projection_prototype=mode=="on";}
@@ -185,13 +264,21 @@ Json stats_json(const StatsReport &s) {
           {"ar_gpu_timed_steps", s.ar_gpu_timed_steps},
           {"ar_prefill_gpu_ms", s.ar_prefill_gpu_ms},
           {"ar_decode_gpu_ms", s.ar_decode_gpu_ms},
-          {"fallback_reason", s.fallback_reason}};
+          {"fallback_reason", s.fallback_reason},
+          {"lora_adapter", s.lora_adapter},
+          {"lora_mode", s.lora_mode},
+          {"lora_buffer_bytes", s.lora_buffer_bytes},
+          {"lora_adapted_layers", s.lora_adapted_layers}};
 }
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     auto o = parse(argc, argv);
+    if (o.show_help) {
+      std::cout << format_runner_help();
+      return 0;
+    }
     auto config = load_qwen_model_config(o.config);
     if (o.plan_only) {
       auto context = MetalContext::create();
@@ -229,6 +316,8 @@ int main(int argc, char **argv) {
     load.model_dir = o.config.parent_path().string();
     load.max_context = o.max_context;
     load.max_concurrency=o.max_concurrency;
+    load.lora_adapter = o.lora_adapter;
+    load.lora_mode = o.lora_mode;
     if(o.spec_backend=="dflash2") {
       load.draft_dir=o.draft_config.parent_path().string();
       load.speculative={.backend=SpeculativeBackend::dflash2,.draft_tokens=std::uint32_t(o.draft_tokens)};

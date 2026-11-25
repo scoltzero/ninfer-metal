@@ -2,7 +2,7 @@
 
 # `oMLX-extend` 視覺化上手指南
 
-`oMLX-extend` 為 Apple M5+（`macOS 27+`）上的 `oMLX` macOS 應用程式加入 **`miv 核心後端（ninfer-metal）`** 與社群路徑 B Metal 4 微核心。已轉換 `.omlxm5` 權重的模型會自動交由原生 Metal 4 NAX 執行，未適配的模型照常在原版 MLX 上運作。
+`oMLX-extend` 為 Apple M5+（`macOS 27+`）上的 `oMLX` macOS 應用程式加入 **`miv 核心後端（ninfer-metal）`** 與社群路徑 B Metal 4 微核心。已轉換 `.miv` 權重的模型會自動交由原生 Metal 4 NAX 執行，未適配的模型照常在原版 MLX 上運作。
 
 跟著以下 5 個畫面逐步確認，就能檢查微核心狀態、辨識每個模型使用的引擎、開啟推測加速與 4-bit KV 量化，並直接共用預設設定檔一鍵啟動獨立伺服器。
 
@@ -34,7 +34,7 @@
 ![Models 畫面引擎狀態徽章與模型庫標籤](../../assets/omlx-mac/models-overview.png)
 
 - **執行中模型**（`Active Models`）：每個已載入模型在綠色 **`Loaded`** 旁都會顯示引擎徽章（`miv Core`、路徑 B 微核心名稱或 `MLX`）。
-- **模型庫**（`Model Library`）：含 `.omlxm5` 權重的模型會亮出對應標籤（`miv Core · Auto`、路徑 B 微核心，或關閉外部路由後的 `Stock MLX`）。
+- **模型庫**（`Model Library`）：含 `.miv` 權重的模型會亮出對應標籤（`miv Core · Auto`、路徑 B 微核心，或關閉外部路由後的 `Stock MLX`）。
 - **未適配模型不受影響**：一般 MLX 模型不帶外部引擎徽章，維持原版 MLX 運作且不啟動任何 Sidecar 程序。`miv 核心後端`、路徑 B 微核心與原版 MLX 模型可在同一個統一記憶體上限下並存載入。
 
 ---
@@ -45,8 +45,8 @@
 
 ![Model Settings Advanced 自動路由至 miv 核心後端](../../assets/omlx-mac/engine-routing-auto.png)
 
-- 已適配 `.omlxm5` 的模型會自動將 **使用外部引擎**（`Use External Engine`）開關設為**開啟**，下拉選單預設為 **`miv Core Backend (Auto)`**（上一層模型設定頁首亦會顯示目前引擎徽章）。
-- **隨時切回原版 MLX**：把 **`Use External Engine`** 開關**關閉**。`oMLX` 會寫入 `external_engine: "stock"` 並顯示 *"Using Stock MLX (auto-route overridden)"*，不會刪除磁碟上的 `.omlxm5` 檔案；重新打開開關即可恢復自動路由。
+- 已適配 `.miv` 的模型會自動將 **使用外部引擎**（`Use External Engine`）開關設為**開啟**，下拉選單預設為 **`miv Core Backend (Auto)`**（上一層模型設定頁首亦會顯示目前引擎徽章）。
+- **隨時切回原版 MLX**：把 **`Use External Engine`** 開關**關閉**。`oMLX` 會寫入 `external_engine: "stock"` 並顯示 *"Using Stock MLX (auto-route overridden)"*，不會刪除磁碟上的 `.miv` 檔案；重新打開開關即可恢復自動路由。
 - **改選其他引擎**：若同一個模型也安裝了相容的路徑 B 微核心或 Splash，直接從同一個下拉選單切換即可。
 
 ---
@@ -93,10 +93,10 @@
 想在連接埠 `8080` 啟動獨立 OpenAI 相容伺服器（與 `oMLX` 的 `8000` 互不衝突），只需一行指令：
 
 ```bash
-# 指定已轉換的 .omlxm5 模型目錄
+# 指定已轉換的 .miv 模型目錄
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# 省略路徑時，自動選取 ./models 或 oMLX 模型目錄中的第一個 .omlxm5 模型
+# 省略路徑時，自動選取 ./models 或 oMLX 模型目錄中的第一個 .miv 模型
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@
 
 ## 下一步
 
-- **[快速上手與設定](getting-started.md)** — 從原始碼編譯、轉換 `.omlxm5` 權重以及檢視全部 `ninfer-metal-serve` 命令列旗標。
+- **[快速上手與設定](getting-started.md)** — 從原始碼編譯、轉換 `.miv` 權重以及檢視全部 `ninfer-metal-serve` 命令列旗標。
 - **[架構與多模型共存](architecture.md)** — 了解 O(1) 自動路由、Provider SPI v2 與共用 UMA 記憶體預算的內部機制。
 - **[微核心工坊](microkernel-foundry.md)** — 為 Apple M5+ 貢獻新的路徑 A 或路徑 B 模型家族微核心。

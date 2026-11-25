@@ -44,6 +44,7 @@ class SafeTensorModel final {
 public:
   static SafeTensorModel open(const std::filesystem::path &model_dir,
                               std::string_view expected_revision = {});
+  static SafeTensorModel open_file(const std::filesystem::path &file_path);
 
   SafeTensorModel(SafeTensorModel &&) noexcept;
   SafeTensorModel &operator=(SafeTensorModel &&) noexcept;

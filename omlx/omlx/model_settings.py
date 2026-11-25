@@ -57,15 +57,62 @@ _LORA_CONFLICTS = (
 )
 
 
-def lora_adapter_conflict(settings: dict) -> str | None:
+def _external_engine_supported_settings_for_conflict(
+    engine_id: str | None,
+) -> tuple[str, ...]:
+    """Return `supported_standard_settings` declared by `engine_id` (empty for stock/unknown)."""
+    if not engine_id or engine_id == "stock":
+        return ()
+    try:
+        from .engine.m5_sidecar import get_external_engine_supported_settings
+
+        return tuple(get_external_engine_supported_settings(str(engine_id)))
+    except Exception:
+        return ()
+
+
+def _effective_conflict_external_engine(
+    settings: dict, external_engine: str | None = None
+) -> str | None:
+    raw = (
+        external_engine
+        if external_engine is not None
+        else settings.get("external_engine")
+    )
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned == "stock":
+        return None
+    return cleaned
+
+
+def lora_adapter_conflict(
+    settings: dict, *, external_engine: str | None = None
+) -> str | None:
     """Name the first enabled setting that cannot run with a LoRA adapter."""
+    eff_ext = _effective_conflict_external_engine(settings, external_engine)
+    ext_supported = (
+        _external_engine_supported_settings_for_conflict(eff_ext) if eff_ext else ()
+    )
+    ext_supports_lora = bool(eff_ext and "lora_adapter" in ext_supported)
     for key, label in _LORA_CONFLICTS:
+        if key == "external_engine":
+            if eff_ext and not ext_supports_lora:
+                return label
+            continue
+        if key == "dflash_enabled" and settings.get(key):
+            if ext_supports_lora and "dflash_enabled" in ext_supported:
+                continue
+            return label
         if settings.get(key):
             return label
     return None
 
 
-def resolve_lora_conflicts(data: dict) -> tuple:
+def resolve_lora_conflicts(
+    data: dict, *, external_engine: str | None = None
+) -> tuple:
     """Clear the settings a LoRA adapter cannot run with; returns (data, names).
 
     The adapter wins because it shapes output content while the others change
@@ -74,7 +121,24 @@ def resolve_lora_conflicts(data: dict) -> tuple:
     """
     if not data.get("lora_adapter"):
         return data, []
-    names = [key for key, _ in _LORA_CONFLICTS if data.get(key)]
+    eff_ext = _effective_conflict_external_engine(data, external_engine)
+    ext_supported = (
+        _external_engine_supported_settings_for_conflict(eff_ext) if eff_ext else ()
+    )
+    ext_supports_lora = bool(eff_ext and "lora_adapter" in ext_supported)
+    names: list[str] = []
+    for key, _ in _LORA_CONFLICTS:
+        if key == "external_engine":
+            if data.get("external_engine") and eff_ext and not ext_supports_lora:
+                names.append(key)
+            continue
+        if key == "dflash_enabled" and data.get(key):
+            if ext_supports_lora and "dflash_enabled" in ext_supported:
+                continue
+            names.append(key)
+            continue
+        if data.get(key):
+            names.append(key)
     if not names:
         return data, []
     resolved = dict(data)

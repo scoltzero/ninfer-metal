@@ -10,7 +10,7 @@ set -euo pipefail
 # Automatically discovers:
 #   - `ninfer-metal-serve` binary (release bundle -> installed provider -> repo build -> $PATH)
 #   - Shared `ninfer-metal.toml` ($NINFER_METAL_CONFIG -> cwd -> ~/.config -> bundle/repo default)
-#   - First local model containing `model.omlxm5` when MODEL_DIR is omitted and TOML has no model_dir/[[models]]
+#   - First local model containing `model.miv` (or legacy `model.omlxm5`) when MODEL_DIR is omitted and TOML has no model_dir/[[models]]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -27,6 +27,10 @@ CLI_CONFIG=""
 CLI_HOST=""
 CLI_PORT=""
 CLI_PROVIDERS_DIR=""
+CLI_LORA_ADAPTER=""
+CLI_HAS_LORA_ADAPTER=0
+CLI_LORA_MODE=""
+CLI_HAS_LORA_MODE=0
 PASSTHROUGH_ARGS=()
 
 print_usage() {
@@ -36,11 +40,25 @@ Usage: $0 [MODEL_DIR] [extra ninfer-metal-serve args...]
 
 1-Click launcher for ninfer-metal-serve using the shared ninfer-metal.toml config.
 Options handled by launcher:
-  MODEL_DIR          Optional positional model directory (sets --model-dir MODEL_DIR)
-  --dry-run          Print resolved binary, config, model, endpoint, and command without starting
-  -h, --help         Show this launcher usage message
+  MODEL_DIR                        Optional positional model directory (sets --model-dir MODEL_DIR)
+  --lora, --lora-adapter DIR       LoRA adapter directory (or set \$NINFER_LORA_ADAPTER)
+  --lora-mode merge|bypass         LoRA execution mode: merge (default) | bypass (or set \$NINFER_LORA_MODE)
+  --dry-run                        Print resolved binary, config, model, endpoint, and command without starting
+  -h, --help                       Show this launcher usage message
 All other flags (e.g. --port, --host, --config, --max-concurrency, --kv-dtype) pass through to ninfer-metal-serve.
 EOF
+}
+
+validate_lora_mode() {
+  local mode="$1"
+  local src="$2"
+  case "${mode}" in
+    merge|bypass) ;;
+    *)
+      echo "ERROR: ${src} must be 'merge' or 'bypass' (got '${mode}')" >&2
+      exit 2
+      ;;
+  esac
 }
 
 expand_tilde() {
@@ -146,6 +164,40 @@ while [[ $# -gt 0 ]]; do
       PASSTHROUGH_ARGS+=("$1")
       shift
       ;;
+    --lora|--lora-adapter)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: $1 requires a path" >&2
+        exit 2
+      fi
+      CLI_HAS_LORA_ADAPTER=1
+      CLI_LORA_ADAPTER="$(expand_tilde "$2")"
+      PASSTHROUGH_ARGS+=("$1" "${CLI_LORA_ADAPTER}")
+      shift 2
+      ;;
+    --lora=*|--lora-adapter=*)
+      CLI_HAS_LORA_ADAPTER=1
+      CLI_LORA_ADAPTER="$(expand_tilde "${1#*=}")"
+      PASSTHROUGH_ARGS+=("${1%%=*}=${CLI_LORA_ADAPTER}")
+      shift
+      ;;
+    --lora-mode)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: $1 requires merge or bypass" >&2
+        exit 2
+      fi
+      validate_lora_mode "$2" "--lora-mode"
+      CLI_HAS_LORA_MODE=1
+      CLI_LORA_MODE="$2"
+      PASSTHROUGH_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --lora-mode=*)
+      CLI_LORA_MODE="${1#--lora-mode=}"
+      validate_lora_mode "${CLI_LORA_MODE}" "--lora-mode"
+      CLI_HAS_LORA_MODE=1
+      PASSTHROUGH_ARGS+=("$1")
+      shift
+      ;;
     --cors)
       if [[ $# -ge 2 ]]; then
         case "$2" in
@@ -202,6 +254,10 @@ done
 if [[ "${SHOW_HELP}" -eq 1 ]]; then
   print_usage
   exit 0
+fi
+
+if [[ "${CLI_HAS_LORA_MODE}" -eq 0 && -n "${NINFER_LORA_MODE:-}" ]]; then
+  validate_lora_mode "${NINFER_LORA_MODE}" "NINFER_LORA_MODE"
 fi
 
 # 1. Auto-discover `ninfer-metal-serve` binary.
@@ -467,6 +523,13 @@ if [[ "${NEED_MODEL_FLAG}" -eq 1 ]]; then
   elif [[ -n "${AUTO_MODEL_DIR}" ]]; then
     CMD+=("--model-dir" "${AUTO_MODEL_DIR}")
   fi
+fi
+if [[ "${CLI_HAS_LORA_ADAPTER}" -eq 0 && -n "${NINFER_LORA_ADAPTER:-}" ]]; then
+  CMD+=("--lora" "$(expand_tilde "${NINFER_LORA_ADAPTER}")")
+fi
+if [[ "${CLI_HAS_LORA_MODE}" -eq 0 && -n "${NINFER_LORA_MODE:-}" ]]; then
+  validate_lora_mode "${NINFER_LORA_MODE}" "NINFER_LORA_MODE"
+  CMD+=("--lora-mode" "${NINFER_LORA_MODE}")
 fi
 if [[ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
   CMD+=("${PASSTHROUGH_ARGS[@]}")

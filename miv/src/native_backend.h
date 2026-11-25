@@ -30,6 +30,9 @@ public:
   [[nodiscard]] TrimCacheReport
   trim_cache(std::uint64_t target_free_bytes) override;
   void set_scheduler_hint(const SchedulerHint &hint) override;
+  [[nodiscard]] bool reload_lora(const std::string &lora_adapter,
+                                 const std::string &lora_mode,
+                                 std::string *error = nullptr) override;
 
 private:
   friend class NativeTask;

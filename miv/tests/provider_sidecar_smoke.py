@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import socket
 import subprocess
@@ -12,6 +13,30 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+try:
+    import pytest as _pytest
+except ImportError:
+    _pytest = None
+
+
+if _pytest is not None:
+
+    @_pytest.fixture(name="daemon")
+    def _pytest_daemon_fixture() -> Path:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            repo_root / "build/release/miv/mseries_backendd",
+            repo_root / "build/serve-check/miv/mseries_backendd",
+            repo_root / "build/miv-v001/miv/mseries_backendd",
+        ]
+        for cand in candidates:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return cand.resolve()
+        for found in sorted((repo_root / "build").glob("*/miv/mseries_backendd")):
+            if found.is_file() and os.access(found, os.X_OK):
+                return found.resolve()
+        _pytest.skip("mseries_backendd binary not built yet")
 
 
 class Client:
@@ -376,6 +401,7 @@ def run_session(
                 "ar",
                 "mtp",
                 "dflash2",
+                "lora",
                 "kv_affine4_g128",
                 "rolling_prefix_cache",
                 "trim_cache",
@@ -385,6 +411,7 @@ def run_session(
             ):
                 assert cap in hello["capabilities"], (cap, hello["capabilities"])
             assert hello["kv_formats"] == ["bf16", "affine4_g128"]
+            assert "lora_adapter" in hello["supported_standard_settings"]
             assert "mtp_enabled" in hello["supported_standard_settings"]
             assert "turboquant_kv_scheme" in hello["supported_standard_settings"]
             schema_by_key = {item["key"]: item for item in hello["options_schema"]}
@@ -393,6 +420,10 @@ def run_session(
             assert schema_by_key["prefix_cache_gb"]["min"] == 0
             assert schema_by_key["prefix_cache_gb"]["max"] == 128
             assert schema_by_key["sampling_contract"]["default"] == "legacy_rejection_v1"
+            assert schema_by_key["lora_mode"]["type"] == "enum"
+            assert schema_by_key["lora_mode"]["options"] == ["merge", "bypass"]
+            assert schema_by_key["lora_mode"]["default"] == "merge"
+            assert schema_by_key["lora_mode"]["reload_required"] is True
             assert schema_by_key["artifact_path"]["type"] == "string"
             assert schema_by_key["artifact_path"]["default"] == ""
             assert schema_by_key["draft_artifact_path"]["type"] == "string"
@@ -469,6 +500,176 @@ def run_session(
             assert not socket_path.exists()
 
 
+def test_lora_cli_and_spi_hot_reload(daemon: Path) -> None:
+    """Verify CLI --lora/--lora-mode flags, invalid mode rejection, stats observability,
+    bypass zero-reload hot-swap (load re-invocation + reload_lora), and merge full-reload fallback."""
+    help_out = subprocess.check_output([str(daemon), "--help"], text=True)
+    assert "--lora" in help_out and "--lora-adapter" in help_out and "--lora-mode" in help_out, help_out
+
+    bad_cli = subprocess.run(
+        [str(daemon), "--lora-mode", "invalid", "--socket", "/tmp/unused.sock"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert bad_cli.returncode != 0
+    assert "merge" in bad_cli.stderr and "bypass" in bad_cli.stderr, bad_cli.stderr
+
+    with tempfile.TemporaryDirectory(prefix="omlx-mseries-lora-") as temporary:
+        temp_path = Path(temporary)
+        fake_home = temp_path / "home"
+        fake_home.mkdir()
+        socket_path = temp_path / "provider.sock"
+
+        env = dict(os.environ)
+        env["HOME"] = str(fake_home)
+
+        process = subprocess.Popen(
+            [
+                str(daemon),
+                "--lora",
+                "~/adapters/cli-init",
+                "--lora-mode",
+                "bypass",
+                "--socket",
+                str(socket_path),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        control = Client(socket_path)
+        event_conn = Client(socket_path)
+        try:
+            hello = control.call("hello")
+            assert "lora" in hello["capabilities"]
+            assert "reload_lora" in hello["capabilities"]
+            assert "lora_adapter" in hello["supported_standard_settings"]
+
+            # 1) Initial load with omitted lora_adapter inherits CLI --lora (with ~/ expanded) & --lora-mode=bypass
+            expected_cli_adapter = str(fake_home / "adapters/cli-init")
+            load1 = control.call("load", {"fake": True, "max_context": 1024})
+            assert load1["lora_adapter"] == expected_cli_adapter, load1
+            assert load1["lora_mode"] == "bypass", load1
+            assert load1["lora_buffer_bytes"] > 0, load1
+            assert load1["lora_adapted_layers"] == 1, load1
+            assert load1["hot_reloaded"] is False, load1
+
+            # Keep subscribe_events open across both bypass hot-swaps AND merge full engine reload!
+            assert event_conn.call("subscribe_events", {"poll_interval_us": 20_000}) == {
+                "subscribed": True
+            }
+            events_lock = threading.Lock()
+            finished_reqs: set[int] = set()
+            finished_cv = threading.Condition(events_lock)
+            saw_eof = threading.Event()
+
+            def pump_sub() -> None:
+                while True:
+                    line = event_conn.reader.readline()
+                    if not line:
+                        break
+                    ev = json.loads(line)["event"]
+                    if ev["kind"] == "eof":
+                        saw_eof.set()
+                        break
+                    if ev["kind"] == "finished":
+                        with finished_cv:
+                            finished_reqs.add(ev["request_id"])
+                            finished_cv.notify_all()
+
+            pump = threading.Thread(target=pump_sub, daemon=True)
+            pump.start()
+
+            def wait_req_done(req_id: int) -> None:
+                deadline = time.monotonic() + 10.0
+                with finished_cv:
+                    while req_id not in finished_reqs:
+                        rem = deadline - time.monotonic()
+                        assert rem > 0, f"timed out waiting for request {req_id}"
+                        finished_cv.wait(timeout=rem)
+
+            # 2) Invalid lora_mode in RPC is rejected without harming loaded engine
+            try:
+                control.call("load", {"fake": True, "max_context": 1024, "lora_mode": "bogus"})
+            except RuntimeError as err:
+                assert "merge" in str(err) and "bypass" in str(err), err
+            else:
+                raise AssertionError("expected invalid lora_mode in load RPC to fail")
+
+            assert control.call("stats")["lora_adapter"] == expected_cli_adapter
+
+            # 3) Re-calling load with changed bypass adapter triggers fast hot-swap (hot_reloaded=True)
+            adapter_b = str(fake_home / "adapters/bypass-b")
+            load2 = control.call(
+                "load",
+                {
+                    "fake": True,
+                    "max_context": 1024,
+                    "lora_adapter": "~/adapters/bypass-b",
+                    "lora_mode": "bypass",
+                },
+            )
+            assert load2["hot_reloaded"] is True, load2
+            assert load2["lora_adapter"] == adapter_b, load2
+            assert load2["lora_mode"] == "bypass", load2
+            assert load2["lora_buffer_bytes"] > 0 and load2["lora_adapted_layers"] == 1
+
+            r1 = control.call("submit", {"prompt_tokens": [1, 2], "max_new_tokens": 4})["request_id"]
+            wait_req_done(r1)
+
+            # 4) Explicit reload_lora RPC also hot-swaps bypass adapter & clears to empty
+            adapter_c = str(temp_path / "adapter-c")
+            rel_c = control.call(
+                "reload_lora", {"lora_adapter": adapter_c, "lora_mode": "bypass"}
+            )
+            assert rel_c["hot_reloaded"] is True and rel_c["lora_adapter"] == adapter_c
+            st_c = control.call("stats")
+            assert st_c["lora_adapter"] == adapter_c and st_c["lora_mode"] == "bypass"
+
+            rel_clear = control.call(
+                "load",
+                {"fake": True, "max_context": 1024, "lora_adapter": "", "lora_mode": "bypass"},
+            )
+            assert rel_clear["hot_reloaded"] is True, rel_clear
+            assert rel_clear["lora_adapter"] == "" and rel_clear["lora_mode"] == ""
+            assert rel_clear["lora_buffer_bytes"] == 0 and rel_clear["lora_adapted_layers"] == 0
+
+            # 5) Switching to lora_mode="merge" falls back cleanly to full Engine reload
+            #    while keeping subscribe_events alive!
+            adapter_merge = str(temp_path / "adapter-merge")
+            load_merge = control.call(
+                "load",
+                {
+                    "fake": True,
+                    "max_context": 1024,
+                    "lora_adapter": adapter_merge,
+                    "lora_mode": "merge",
+                },
+            )
+            assert load_merge["hot_reloaded"] is False, load_merge
+            assert load_merge["lora_adapter"] == adapter_merge, load_merge
+            assert load_merge["lora_mode"] == "merge", load_merge
+            assert load_merge["lora_buffer_bytes"] > 0 and load_merge["lora_adapted_layers"] == 1
+
+            r2 = control.call("submit", {"prompt_tokens": [5, 6], "max_new_tokens": 4})["request_id"]
+            wait_req_done(r2)
+
+            control.call("shutdown")
+            assert saw_eof.wait(timeout=5.0), "expected eof after shutdown"
+            pump.join(timeout=5.0)
+        finally:
+            control.close()
+            event_conn.close()
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            assert process.returncode == 0, (stdout, stderr)
+
+
 def main() -> int:
     if len(sys.argv) != 7:
         raise SystemExit(
@@ -484,6 +685,7 @@ def main() -> int:
     test_pipelined_jsonl_and_reconnect(daemon)
     test_dual_connection_subscribe_and_cancel(daemon)
     test_stale_socket_recovery_and_signals(daemon)
+    test_lora_cli_and_spi_hot_reload(daemon)
 
     run_session(
         daemon,

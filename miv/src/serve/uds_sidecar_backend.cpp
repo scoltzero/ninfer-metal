@@ -667,6 +667,8 @@ struct UdsSidecarBackend::Impl {
         {"spec_search", lo.spec_search},
         {"sampling_contract", lo.sampling_contract},
         {"memory_budget_bytes", lo.memory_budget_bytes},
+        {"lora_adapter", lo.lora_adapter},
+        {"lora_mode", lo.lora_mode.empty() ? std::string("merge") : lo.lora_mode},
         {"speculative",
          {
              {"backend",
@@ -1133,6 +1135,11 @@ StatsReport UdsSidecarBackend::stats() const {
   st.contended_prefill_chunks = read_u64_field(res, "contended_prefill_chunks");
   st.artifact_id = res.value("artifact_id", std::string{});
   st.kernel_family = res.value("kernel_family", std::string{});
+  st.lora_adapter = res.value("lora_adapter", std::string{});
+  st.lora_mode = res.value("lora_mode", std::string{});
+  st.lora_buffer_bytes = read_u64_field(res, "lora_buffer_bytes");
+  st.lora_adapted_layers =
+      static_cast<std::uint32_t>(read_u64_field(res, "lora_adapted_layers"));
   return st;
 }
 
@@ -1158,6 +1165,35 @@ void UdsSidecarBackend::set_scheduler_hint(const SchedulerHint &hint) {
   }
   (void)impl_->control_call("set_scheduler_hint",
                             {{"gpu_contended", hint.gpu_contended}});
+}
+
+bool UdsSidecarBackend::reload_lora(const std::string &lora_adapter,
+                                    const std::string &lora_mode,
+                                    std::string *error) {
+  if (impl_->shutdown_requested.load(std::memory_order_acquire)) {
+    if (error != nullptr) {
+      *error = "sidecar is shutting down";
+    }
+    return false;
+  }
+  try {
+    const std::string mode =
+        lora_mode.empty() ? std::string("bypass") : lora_mode;
+    const Json res = impl_->control_call(
+        "reload_lora", {{"lora_adapter", lora_adapter}, {"lora_mode", mode}});
+    if (const auto phys = read_u64_field(res, "phys_footprint_bytes");
+        phys > 0) {
+      impl_->resident_bytes.store(phys, std::memory_order_relaxed);
+    }
+    impl_->options.load_options.lora_adapter = lora_adapter;
+    impl_->options.load_options.lora_mode = mode;
+    return true;
+  } catch (const std::exception &ex) {
+    if (error != nullptr) {
+      *error = ex.what();
+    }
+    return false;
+  }
 }
 
 std::uint64_t UdsSidecarBackend::resident_memory_bytes() const {

@@ -165,14 +165,23 @@ public:
                  : (bits == 5u || bits == 6u)   ? plane(w, "nax_high2")
                                                 : zero;
       const Ref src_sb = plane(w, "nax_sb");
+      Ref pre_sb_tiled{};
+      for (const auto &pl : w.planes) {
+        if (pl.kind == "nax_sb_tiled" && pl.buffer != nullptr && pl.bytes > 0) {
+          pre_sb_tiled = Ref{pl.buffer, pl.offset, pl.bytes};
+          break;
+        }
+      }
       pending_pretiled_.push_back(
           {w.object_id,
            TiledAffineWeight{plane(w, "nax_codes"), high, src_sb, n, k, bn,
                              padded_n,
                              affine_nax_split_k(n, k, target_split_k_), bits,
-                             gs}});
-      pending_sb_transposes_.push_back(
-          {w.object_id, src_sb, padded_n, k / 64u, bn});
+                             gs, pre_sb_tiled, {}}});
+      if (pre_sb_tiled.buffer == nullptr) {
+        pending_sb_transposes_.push_back(
+            {w.object_id, src_sb, padded_n, k / 64u, bn});
+      }
       if (bits == 5u && high.buffer != nullptr) {
         pending_h1_compacts_.push_back(
             {w.object_id, high, mul(padded_n, k / 8u)});

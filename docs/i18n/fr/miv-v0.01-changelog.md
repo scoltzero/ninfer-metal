@@ -58,7 +58,7 @@ Toutes les mesures ci-dessous proviennent de machines Apple M5 Ultra physiques e
 - Continuation de préfixes GPU zéro copie (restauration en `0.73–1.62 ms` à `64K`), réutilisation glissante sur place des préfixes UMA et attention NAX `affine4_g128` par lots pour les sessions concurrentes.
 
 ### `oMLX-extend` `omlx-extend-v0.8.3` (Application macOS et Sidecar)
-- Enregistre **`miv Core Backend`** via un sidecar `AF_UNIX` (`mseries_backendd`) : les modèles `.omlxm5` adaptés sont routés automatiquement en O(1), tandis que les modèles MLX standard restent sur Stock MLX sans lancer de processus supplémentaire.
+- Enregistre **`miv Core Backend`** via un sidecar `AF_UNIX` (`mseries_backendd`) : les modèles `.miv` adaptés sont routés automatiquement en O(1), tandis que les modèles MLX standard restent sur Stock MLX sans lancer de processus supplémentaire.
 - L'interface macOS native ajoute dans `Integrations → External Engines` les cartes `miv Core Backend` et microkernels Voie B, des badges de moteur par modèle, un sélecteur Auto / Stock MLX et des réglages guidés par capacités pour le contexte `64K+`, `MTP`, `DFlash2` et le cache KV `affine4_g128`.
 - Coordonne budgets UMA, purge des caches inactifs et préremplissage fragmenté sensible à la contention entre sidecar et modèles MLX, avec mises à jour atomiques par lien symbolique sous `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/`.
 
@@ -75,7 +75,7 @@ Toutes les mesures ci-dessous proviennent de machines Apple M5 Ultra physiques e
 | Matériel | Apple Silicon `MTLGPUFamilyApple10+` (Apple M5 / M5 Pro / M5 Max / M5 Ultra, 64-GPU et 80-GPU) |
 | OS et outils | macOS 27+ (sans Xcode à l'exécution ; Xcode 27+ / macOS 27 SDK pour compiler depuis les sources) |
 | Modèles | **Qwen3.5 / Qwen3.6 / Qwen3.8 Hybrid** (3:1 GDN + GQA ; Dense 0.8B–27B et MoE 256×8, ex. 35B-A3B) |
-| Formats de poids | `.omlxm5` pré-tuilé NAX hors ligne : `MXFP4` (`E2M1 × UE8M0`) et `oQ` Affine (`q3–q8`, `g64 / g128`) |
+| Formats de poids | `.miv` pré-tuilé NAX hors ligne : `MXFP4` (`E2M1 × UE8M0`) et `oQ` Affine (`q3–q8`, `g64 / g128`) |
 | Cache KV | `bf16` et `affine4_g128` (`0.5625 B/val`, vérifié `0-ULP` sur `2K–64K`) |
 | Décodage spéculatif | AR pur (`none`), `Native MTP` intégré et `DFlash2` (mono-flux et lots `B=2..4`) |
 | Interfaces de service | Endpoints OpenAI HTTP/SSE dans `ninfer-metal-serve` ; endpoints OpenAI + Anthropic et GUI macOS dans `oMLX-extend` |

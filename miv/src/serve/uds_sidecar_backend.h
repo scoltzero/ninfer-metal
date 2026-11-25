@@ -41,6 +41,9 @@ public:
   [[nodiscard]] TrimCacheReport
   trim_cache(std::uint64_t target_free_bytes = 0) override;
   void set_scheduler_hint(const SchedulerHint &hint) override;
+  [[nodiscard]] bool reload_lora(const std::string &lora_adapter,
+                                 const std::string &lora_mode = "bypass",
+                                 std::string *error = nullptr) override;
   [[nodiscard]] std::uint64_t resident_memory_bytes() const override;
   void shutdown() override;
 

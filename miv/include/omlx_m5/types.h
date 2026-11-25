@@ -38,6 +38,8 @@ struct LoadOptions {
   std::string sampling_contract = "legacy_rejection_v1";
   std::string spec_search = "auto";
   std::uint64_t memory_budget_bytes = 0;
+  std::string lora_adapter;
+  std::string lora_mode = "merge";
 };
 
 struct TrimCacheReport {
@@ -171,6 +173,10 @@ struct StatsReport {
   std::uint64_t contended_prefill_chunks = 0;
   std::uint64_t packed_batch_calls = 0;
   std::uint64_t packed_batch_tokens = 0;
+  std::string lora_adapter;
+  std::string lora_mode;
+  std::uint64_t lora_buffer_bytes = 0;
+  std::uint32_t lora_adapted_layers = 0;
 };
 
 struct FakeBackendOptions {

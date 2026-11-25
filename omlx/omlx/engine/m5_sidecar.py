@@ -37,6 +37,11 @@ from ..api.utils import (
     detect_and_strip_partial,
 )
 from ..exceptions import InvalidRequestError, ModelLoadingError
+from ..lora_adapters import (
+    estimate_sidecar_lora_bytes,
+    fingerprint as lora_fingerprint,
+    resolve_adapter_path,
+)
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -53,7 +58,12 @@ M5RT_DEFAULT_VERSION = "miv-v0.01"
 M5RT_PROVIDER_ID = "io.ninfer.metal"
 M5RT_LEGACY_PROVIDER_ID = "com.omlx.mseries"
 M5RT_BUILTIN_PROVIDER_IDS = frozenset({M5RT_PROVIDER_ID, M5RT_LEGACY_PROVIDER_ID})
-M5RT_OPTION_KEYS = (M5RT_ENGINE_ID, "ninfer-metal", M5RT_PROVIDER_ID, M5RT_LEGACY_PROVIDER_ID)
+M5RT_OPTION_KEYS = (
+    M5RT_LEGACY_PROVIDER_ID,
+    M5RT_PROVIDER_ID,
+    "ninfer-metal",
+    M5RT_ENGINE_ID,
+)
 M5RT_SUPPORTED_TOPOLOGIES: tuple[str, ...] = (
     "qwen35_hybrid_dense_v1",
     "qwen36_hybrid_moe256_k8_shared_v1",
@@ -136,6 +146,21 @@ M5RT_DEFAULT_CONVERTER: dict[str, Any] = {
     "default_args": ["--nax-pretile"],
     "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
 }
+M5RT_DEFAULT_CAPABILITIES: tuple[str, ...] = (
+    "ar",
+    "mtp",
+    "dflash2",
+    "lora",
+    "kv_affine4_g128",
+    "rolling_prefix_cache",
+    "trim_cache",
+    "memory_budget_bytes",
+    "set_scheduler_hint",
+    "cancel",
+    "stats",
+    "capacity",
+    "subscribe_events",
+)
 M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
     "max_context_window",
     "mtp_enabled",
@@ -146,6 +171,79 @@ M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
     "dflash_block_size",
     "turboquant_kv_enabled",
     "turboquant_kv_scheme",
+    "lora_adapter",
+)
+M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
+    {
+        "key": "max_concurrency",
+        "label": "Concurrency (B/C)",
+        "type": "int",
+        "min": 1,
+        "max": 8,
+        "default": 1,
+        "reload_required": True,
+    },
+    {
+        "key": "rolling_prefix_cache",
+        "label": "Rolling Prefix Cache",
+        "type": "bool",
+        "default": True,
+        "reload_required": True,
+    },
+    {
+        "key": "prefix_cache_gb",
+        "label": "Prefix Cache Budget (GiB)",
+        "type": "bytes_gb",
+        "min": 0,
+        "max": 128,
+        "default": 4,
+        "reload_required": True,
+    },
+    {
+        "key": "lora_mode",
+        "label": "LoRA Mode",
+        "type": "enum",
+        "options": ["merge", "bypass"],
+        "option_labels": {
+            "merge": "Merge (Load-Time UMA Fusion)",
+            "bypass": "Bypass (Runtime BF16 Low-Rank)",
+        },
+        "description": (
+            "Merge fuses LoRA into 8-bit NAX tiles at load time with zero runtime overhead; "
+            "Bypass injects low-rank BF16 projections at runtime with fast hot-swap."
+        ),
+        "default": "merge",
+        "reload_required": True,
+    },
+    {
+        "key": "sampling_contract",
+        "label": "Sampling Contract",
+        "type": "enum",
+        "options": ["position_coupled_v1", "legacy_rejection_v1"],
+        "option_labels": {
+            "position_coupled_v1": "Position Coupled v1 (GPU Fast Path)",
+            "legacy_rejection_v1": "Legacy Rejection v1",
+        },
+        "description": (
+            "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback."
+        ),
+        "default": "position_coupled_v1",
+        "reload_required": True,
+    },
+    {
+        "key": "artifact_path",
+        "label": "Artifact Path",
+        "type": "string",
+        "default": "",
+        "reload_required": True,
+    },
+    {
+        "key": "draft_artifact_path",
+        "label": "Draft Artifact Path",
+        "type": "string",
+        "default": "",
+        "reload_required": True,
+    },
 )
 M5RT_INSTALL_HINT = (
     "miv Core Backend (ninfer-metal) daemon (mseries_backendd) not found; set integrations.m5rt_path, "
@@ -184,6 +282,7 @@ VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
 VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane"})
 VALID_SAMPLING_CONTRACTS = frozenset({"legacy_rejection_v1", "position_coupled_v1"})
 VALID_SPEC_BACKENDS = frozenset({"auto", "none", "dflash2", "mtp"})
+VALID_LORA_MODES = frozenset({"merge", "bypass"})
 
 
 # -- External engine plugin discovery ------------------------------------------
@@ -320,28 +419,113 @@ def get_external_engines() -> dict[str, str]:
     return engines
 
 
-def get_external_engine_plugin(engine_id: str) -> ExternalEnginePlugin | None:
-    """Return a discovered external engine plugin by ID, or None."""
-    if not engine_id or engine_id in EXTERNAL_ENGINES:
+def canonical_external_engine_id(engine_id: str | None) -> str | None:
+    """Normalize built-in or SPI `provider_id` / alias keys to canonical `engine_id`."""
+    if not engine_id:
         return None
-    return discover_external_engine_plugins().get(engine_id)
+    cleaned = str(engine_id).strip()
+    if not cleaned:
+        return None
+    if cleaned == "stock":
+        return "stock"
+    if cleaned in M5RT_OPTION_KEYS:
+        return M5RT_ENGINE_ID
+    if cleaned == "splash":
+        return "splash"
+    plugins = discover_external_engine_plugins()
+    if cleaned in plugins:
+        return cleaned
+    for pid_key, plugin in plugins.items():
+        if plugin.provider_id == cleaned:
+            return pid_key
+    manifest = _spi_provider_manifest_for_engine(cleaned)
+    if isinstance(manifest, dict):
+        eid = str(manifest.get("engine_id") or manifest.get("provider_id") or cleaned).strip()
+        if eid:
+            return eid
+    return cleaned
+
+
+def get_external_engine_plugin(engine_id: str) -> ExternalEnginePlugin | None:
+    """Return a discovered external engine plugin by ID or `provider_id`, or None."""
+    if not engine_id or engine_id in EXTERNAL_ENGINES or engine_id in M5RT_OPTION_KEYS:
+        return None
+    plugins = discover_external_engine_plugins()
+    direct = plugins.get(engine_id)
+    if direct is not None:
+        return direct
+    for plugin in plugins.values():
+        if plugin.provider_id == engine_id:
+            return plugin
+    return None
 
 
 def get_external_engine_supported_settings(engine_id: str | None) -> tuple[str, ...]:
     """Return standard oMLX `ModelSettings` keys honored by `engine_id`.
 
     Built-in `splash` returns `()` (preserving exact upstream UI lock behavior);
-    `m5rt` (`ninfer-metal` / `miv`) returns its directly-mapped standard keys.
+    `m5rt` (`ninfer-metal` / `io.ninfer.metal` / `miv`) returns its directly-mapped
+    standard keys (merged with any installed `provider.json` keys).
     """
-    if not engine_id or engine_id == "stock":
+    if not engine_id:
         return ()
-    if engine_id == M5RT_ENGINE_ID:
-        return M5RT_SUPPORTED_STANDARD_SETTINGS
-    if engine_id == "splash":
+    cleaned = str(engine_id).strip()
+    if not cleaned or cleaned in ("stock", "splash"):
         return ()
-    plugin = get_external_engine_plugin(engine_id)
+    if cleaned in M5RT_OPTION_KEYS:
+        merged = list(M5RT_SUPPORTED_STANDARD_SETTINGS)
+        manifest = _builtin_m5rt_manifest()
+        for item in manifest.get("supported_standard_settings") or ():
+            if isinstance(item, str) and item.strip() and item.strip() not in merged:
+                merged.append(item.strip())
+        return tuple(merged)
+    plugin = get_external_engine_plugin(cleaned)
     if plugin is not None:
         return tuple(plugin.supported_standard_settings)
+    manifest = _spi_provider_manifest_for_engine(cleaned)
+    if isinstance(manifest, dict):
+        return tuple(
+            str(s).strip()
+            for s in (manifest.get("supported_standard_settings") or ())
+            if isinstance(s, str) and s.strip()
+        )
+    return ()
+
+
+def get_external_engine_options_schema(
+    engine_id: str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Return `options_schema` entries exposed by `engine_id`."""
+    if not engine_id:
+        return ()
+    cleaned = str(engine_id).strip()
+    if not cleaned or cleaned in ("stock", "splash"):
+        return ()
+    if cleaned in M5RT_OPTION_KEYS:
+        manifest = _builtin_m5rt_manifest()
+        raw_schema = manifest.get("options_schema")
+        if isinstance(raw_schema, list) and raw_schema:
+            by_key: dict[str, dict[str, Any]] = {}
+            ordered: list[dict[str, Any]] = []
+            for entry in raw_schema:
+                if isinstance(entry, dict) and entry.get("key"):
+                    copied = dict(entry)
+                    by_key[str(copied["key"])] = copied
+                    ordered.append(copied)
+            for fallback_entry in M5RT_DEFAULT_OPTIONS_SCHEMA:
+                fkey = str(fallback_entry["key"])
+                if fkey not in by_key:
+                    ordered.append(dict(fallback_entry))
+            return tuple(ordered)
+        return tuple(dict(x) for x in M5RT_DEFAULT_OPTIONS_SCHEMA)
+    plugin = get_external_engine_plugin(cleaned)
+    if plugin is not None:
+        return tuple(dict(x) for x in plugin.options_schema)
+    manifest = _spi_provider_manifest_for_engine(cleaned)
+    if isinstance(manifest, dict):
+        return tuple(
+            dict(s) for s in (manifest.get("options_schema") or ()) if isinstance(s, dict)
+        )
     return ()
 
 
@@ -446,6 +630,8 @@ class M5Options:
     fake_options: dict[str, Any] = field(default_factory=dict)
     memory_budget_bytes: int = 0
     trust_remote_code: bool = False
+    lora_adapter: str = ""
+    lora_mode: str = "merge"
 
 
 def _executable(path: Path) -> bool:
@@ -937,7 +1123,22 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
         if not mdir.is_dir():
             raise ValueError(f"m5rt_options.metallib_dir is not a directory: {mdir}")
 
-    return dict(options)
+    cleaned = dict(options)
+    if "lora_mode" in options and options.get("lora_mode") is not None:
+        raw_mode = options.get("lora_mode")
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in VALID_LORA_MODES:
+            raise ValueError(
+                f"m5rt_options.lora_mode must be one of {sorted(VALID_LORA_MODES)}"
+            )
+        cleaned["lora_mode"] = raw_mode.strip().lower()
+
+    if "lora_adapter" in options and options.get("lora_adapter") is not None:
+        raw_lora = options.get("lora_adapter")
+        if not isinstance(raw_lora, str):
+            raise ValueError("m5rt_options.lora_adapter must be a string")
+        cleaned["lora_adapter"] = raw_lora.strip()
+
+    return cleaned
 
 
 def sync_m5rt_ui_kv_setting(
@@ -1026,8 +1227,35 @@ def apply_m5rt_model_settings_update(
                 if eng_key in M5RT_OPTION_KEYS:
                     validated_ext[eng_key] = validate_m5rt_options(eng_val) or {}
                 else:
-                    validated_ext[str(eng_key)] = dict(eng_val)
+                    schema = get_external_engine_options_schema(str(eng_key))
+                    cleaned_provider_opts = dict(eng_val)
+                    for item in schema:
+                        opt_key = item.get("key")
+                        if not opt_key or opt_key not in cleaned_provider_opts:
+                            continue
+                        val = cleaned_provider_opts[opt_key]
+                        if val is None:
+                            continue
+                        if item.get("type") == "enum" and isinstance(item.get("options"), list):
+                            allowed_vals = [str(x) for x in item["options"]]
+                            if not isinstance(val, str) or val.strip() not in allowed_vals:
+                                raise ValueError(
+                                    f"external_engine_options.{eng_key}.{opt_key} must be one of "
+                                    f"{sorted(allowed_vals)}"
+                                )
+                            cleaned_provider_opts[opt_key] = val.strip()
+                    validated_ext[str(eng_key)] = cleaned_provider_opts
             current_settings.external_engine_options = validated_ext
+            if "m5rt_options" not in sent and isinstance(
+                getattr(current_settings, "m5rt_options", None), dict
+            ):
+                synced_m5 = dict(current_settings.m5rt_options)
+                for eng_key in M5RT_OPTION_KEYS:
+                    if eng_key in validated_ext:
+                        for opt_k, opt_v in validated_ext[eng_key].items():
+                            if opt_k in synced_m5:
+                                synced_m5[opt_k] = opt_v
+                current_settings.m5rt_options = synced_m5
 
     eff_ext = external_engine
     if eff_ext is None:
@@ -1035,6 +1263,7 @@ def apply_m5rt_model_settings_update(
             eff_ext = None if is_diffusion_model else getattr(request, "external_engine", None) or None
         else:
             eff_ext = getattr(current_settings, "external_engine", None)
+    eff_ext = canonical_external_engine_id(eff_ext)
     if not is_diffusion_model and eff_ext == M5RT_ENGINE_ID:
         sync_m5rt_ui_kv_setting(current_settings, request, sent)
 
@@ -1071,6 +1300,8 @@ def _extract_toml_layered_options(
             "draft_dir",
             "mtp_artifact",
             "mtp_artifact_path",
+            "lora_adapter",
+            "lora_mode",
         ):
             if model_sec.get(key) is not None:
                 shared[key] = model_sec[key]
@@ -1088,6 +1319,8 @@ def _extract_toml_layered_options(
             "prefix_cache_gb",
             "batch_mode",
             "batch_projection_prototype",
+            "lora_adapter",
+            "lora_mode",
             "metallib_dir",
             "m5rt_path",
             "path_overrides",
@@ -1106,6 +1339,18 @@ def _extract_toml_layered_options(
                 shared[key] = spec_sec[key]
 
     per_model: dict[str, Any] = {}
+    models_arr = doc.get("models")
+    if model_id and isinstance(models_arr, list):
+        for item in models_arr:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            item_dir = str(item.get("model_dir") or "").strip()
+            if item_id == model_id or (item_dir and Path(item_dir).name == model_id):
+                for key, val in item.items():
+                    if key not in ("id", "model_dir") and val is not None:
+                        per_model[key] = val
+
     sidecar_sec = doc.get("sidecar")
     if isinstance(sidecar_sec, dict):
         for key, val in sidecar_sec.items():
@@ -1246,10 +1491,13 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
         "legacy_provider_ids": [M5RT_LEGACY_PROVIDER_ID],
         "engine_id": M5RT_ENGINE_ID,
         "display_name": M5RT_ENGINE_LABEL,
+        "capabilities": list(M5RT_DEFAULT_CAPABILITIES),
         "supported_topologies": list(M5RT_SUPPORTED_TOPOLOGIES),
         "supported_model_types": list(M5RT_SUPPORTED_MODEL_TYPES),
         "supported_draft_architectures": list(M5RT_SUPPORTED_DFLASH2_ARCHITECTURES),
         "supported_dflash2_models": list(M5RT_SUPPORTED_DFLASH2_REPOS),
+        "supported_standard_settings": list(M5RT_SUPPORTED_STANDARD_SETTINGS),
+        "options_schema": [dict(s) for s in M5RT_DEFAULT_OPTIONS_SCHEMA],
         "artifact_extensions": list(M5RT_ARTIFACT_EXTENSIONS),
         "converter": dict(M5RT_DEFAULT_CONVERTER),
     }
@@ -1263,6 +1511,25 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
             vals = installed.get(key)
             if isinstance(vals, list) and vals:
                 manifest[key] = vals
+        for union_key, default_vals in (
+            ("capabilities", M5RT_DEFAULT_CAPABILITIES),
+            ("supported_standard_settings", M5RT_SUPPORTED_STANDARD_SETTINGS),
+        ):
+            inst_vals = installed.get(union_key)
+            if isinstance(inst_vals, list) and inst_vals:
+                merged_vals = list(default_vals)
+                for item in inst_vals:
+                    if isinstance(item, str) and item.strip() and item.strip() not in merged_vals:
+                        merged_vals.append(item.strip())
+                manifest[union_key] = merged_vals
+        inst_schema = installed.get("options_schema")
+        if isinstance(inst_schema, list) and inst_schema:
+            parsed_schema = [dict(s) for s in inst_schema if isinstance(s, dict)]
+            seen_keys = {str(s.get("key")) for s in parsed_schema if s.get("key")}
+            for default_item in M5RT_DEFAULT_OPTIONS_SCHEMA:
+                if default_item["key"] not in seen_keys:
+                    parsed_schema.append(dict(default_item))
+            manifest["options_schema"] = parsed_schema
         inst_exts = installed.get("artifact_extensions")
         if isinstance(inst_exts, list) and inst_exts:
             merged_exts = list(M5RT_ARTIFACT_EXTENSIONS)
@@ -2581,7 +2848,13 @@ def _resolve_effective_speculative(
             toml_dt = _positive_int(model_toml, "draft_tokens") or _positive_int(
                 shared_toml, "draft_tokens"
             )
-            draft_tokens = toml_dt if toml_dt is not None else 4
+            if toml_dt is not None:
+                draft_tokens = toml_dt
+            else:
+                draft_bs = _dflash2_draft_block_size(
+                    target.draft_dir if target is not None else None
+                )
+                draft_tokens = (draft_bs - 1) if draft_bs is not None else 4
     else:
         draft_tokens = 0
 
@@ -2590,6 +2863,21 @@ def _resolve_effective_speculative(
     else:
         draft_tokens = 0
     return spec_backend, draft_tokens
+
+
+def _dflash2_draft_block_size(draft_dir: Path | None) -> int | None:
+    if draft_dir is None:
+        return None
+    cfg = _read_json(draft_dir / "config.json")
+    if not isinstance(cfg, dict):
+        return None
+    df_cfg = cfg.get("dflash_config")
+    raw_bs = df_cfg.get("block_size") if isinstance(df_cfg, dict) else None
+    if raw_bs is None:
+        raw_bs = cfg.get("block_size")
+    if isinstance(raw_bs, int) and not isinstance(raw_bs, bool) and raw_bs >= 2:
+        return raw_bs
+    return None
 
 
 def _resolve_effective_concurrency(
@@ -2652,6 +2940,81 @@ def _manifest_allowed_kv_dtypes(manifest: dict[str, Any] | None) -> frozenset[st
     return vals or None
 
 
+def resolve_sidecar_lora_settings(
+    model_dir: str | Path | None,
+    model_settings: object | None,
+    *,
+    shared_toml: dict[str, Any] | None = None,
+    model_toml: dict[str, Any] | None = None,
+    explicit_opts: dict[str, Any] | None = None,
+    lora_adapters: dict[str, str] | None = None,
+    model_dirs: Iterable[str | Path] = (),
+    engine_id: str = M5RT_ENGINE_ID,
+    provider_id: str = M5RT_PROVIDER_ID,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Resolve `(lora_adapter_abs_path, lora_mode)` for SPI v2 sidecar `load` RPC."""
+    mdir = Path(model_dir).expanduser() if model_dir is not None else None
+    if shared_toml is None and model_toml is None and explicit_opts is None:
+        shared_toml, model_toml, explicit_opts = _layered_provider_options(
+            mdir,
+            model_settings,
+            engine_id=engine_id,
+            provider_id=provider_id,
+            manifest=manifest,
+        )
+
+    is_builtin = (engine_id == M5RT_ENGINE_ID) or (provider_id in M5RT_BUILTIN_PROVIDER_IDS)
+    supports_std_lora = is_builtin or (
+        "lora_adapter" in get_external_engine_supported_settings(engine_id)
+    )
+    if not supports_std_lora and isinstance(manifest, dict):
+        raw_std = manifest.get("supported_standard_settings") or ()
+        supports_std_lora = any(str(s).strip() == "lora_adapter" for s in raw_std)
+
+    raw_lora = ""
+    ms_lora = getattr(model_settings, "lora_adapter", None) if supports_std_lora else None
+    if isinstance(ms_lora, str) and ms_lora.strip():
+        raw_lora = ms_lora.strip()
+    else:
+        for layer in (explicit_opts, model_toml, shared_toml):
+            if layer is not None and "lora_adapter" in layer and layer["lora_adapter"] is not None:
+                raw_lora = str(layer["lora_adapter"]).strip()
+                break
+
+    resolved_lora = ""
+    if raw_lora:
+        resolved_lora = str(
+            resolve_adapter_path(
+                raw_lora,
+                adapters=lora_adapters,
+                model_dir=mdir,
+                model_dirs=model_dirs,
+            )
+        )
+
+    raw_mode: str | None = None
+    for layer in (explicit_opts, model_toml, shared_toml):
+        if layer is not None and layer.get("lora_mode") is not None:
+            cand_mode = str(layer["lora_mode"]).strip().lower()
+            if cand_mode:
+                raw_mode = cand_mode
+                break
+    if raw_mode is None:
+        lora_mode = "merge"
+    elif raw_mode in VALID_LORA_MODES:
+        lora_mode = raw_mode
+    else:
+        logger.warning(
+            "Sidecar Runtime: unsupported lora_mode=%r (expected %s); falling back to 'merge'",
+            raw_mode,
+            sorted(VALID_LORA_MODES),
+        )
+        lora_mode = "merge"
+
+    return resolved_lora, lora_mode
+
+
 def m5rt_memory_estimate(
     model_path: str | Path,
     target: M5Target,
@@ -2662,10 +3025,11 @@ def m5rt_memory_estimate(
     engine_id: str | None = None,
     provider_id: str | None = None,
     manifest: dict[str, Any] | None = None,
+    lora_adapters: dict[str, str] | None = None,
+    model_dirs: Iterable[str | Path] = (),
+    model_id: str | None = None,
 ) -> int:
     """Estimate unified memory footprint for `M5SidecarEngine`."""
-    if target.fake:
-        return 64 * 1024**2
     mdir = Path(model_path)
     eff_manifest = manifest if manifest is not None else target.binary.provider_manifest
     eff_provider_id = provider_id or target.binary.provider_id
@@ -2676,7 +3040,25 @@ def m5rt_memory_estimate(
         engine_id=eff_engine_id,
         provider_id=eff_provider_id,
         manifest=eff_manifest,
+        model_id=model_id,
     )
+    lora_path, lora_mode = resolve_sidecar_lora_settings(
+        mdir,
+        model_settings,
+        shared_toml=shared_toml,
+        model_toml=model_toml,
+        explicit_opts=explicit_opts,
+        lora_adapters=lora_adapters,
+        model_dirs=model_dirs,
+        engine_id=eff_engine_id,
+        provider_id=eff_provider_id,
+        manifest=eff_manifest,
+    )
+    lora_bytes = (
+        estimate_sidecar_lora_bytes(lora_path, lora_mode=lora_mode) if lora_path else 0
+    )
+    if target.fake:
+        return 64 * 1024**2 + lora_bytes
     opts = {**shared_toml, **model_toml, **explicit_opts}
     allowed_kv = (
         None
@@ -2741,7 +3123,28 @@ def m5rt_memory_estimate(
         model_toml=model_toml,
         explicit_opts=explicit_opts,
     )
-    return weights + draft + kv + workspace + prefix_cache
+    return weights + draft + kv + workspace + prefix_cache + lora_bytes
+
+
+def _safe_lora_fingerprint(
+    lora_ref: str | None,
+    *,
+    lora_adapters: dict[str, str] | None = None,
+    model_path: str | Path | None = None,
+    model_dirs: Iterable[str | Path] = (),
+) -> str | None:
+    if not lora_ref or not str(lora_ref).strip():
+        return None
+    with contextlib.suppress(Exception):
+        resolved = resolve_adapter_path(
+            lora_ref,
+            adapters=lora_adapters,
+            model_dir=model_path,
+            model_dirs=model_dirs,
+        )
+        if resolved.is_dir():
+            return lora_fingerprint(resolved)
+    return None
 
 
 def m5rt_runtime_signature(
@@ -2749,6 +3152,9 @@ def m5rt_runtime_signature(
     global_m5rt_path: str | None,
     *,
     global_settings: Any | None = None,
+    lora_adapters: dict[str, str] | None = None,
+    model_path: str | Path | None = None,
+    model_dirs: Iterable[str | Path] = (),
 ) -> tuple[Any, ...]:
     """Canonical tuple of load-time M5 settings that require engine reload."""
     global_conc = (
@@ -2776,6 +3182,13 @@ def m5rt_runtime_signature(
         if isinstance(ext_opts, dict) and ext_opts
         else None
     )
+    lora_ref = getattr(model_settings, "lora_adapter", None) or None
+    lora_fp = _safe_lora_fingerprint(
+        lora_ref,
+        lora_adapters=lora_adapters,
+        model_path=model_path,
+        model_dirs=model_dirs,
+    )
     synced_standard = (
         getattr(model_settings, "max_context_window", None),
         bool(getattr(model_settings, "mtp_enabled", False)),
@@ -2787,6 +3200,8 @@ def m5rt_runtime_signature(
         bool(getattr(model_settings, "turboquant_kv_enabled", False)),
         getattr(model_settings, "turboquant_kv_scheme", None),
         getattr(model_settings, "turboquant_kv_bits", None),
+        lora_ref,
+        lora_fp,
     )
     return (
         global_m5rt_path or None,
@@ -2803,11 +3218,11 @@ def m5rt_status(global_settings: Any, engine_pool: Any | None = None) -> dict[st
     """Admin global-settings status payload for miv Core Backend (`ninfer-metal`)."""
     configured = getattr(getattr(global_settings, "integrations", None), "m5rt_path", None)
     binary, reason = find_m5rt_binary(configured)
-    manifest = (
-        binary.provider_manifest
-        if binary and isinstance(binary.provider_manifest, dict)
-        else {}
-    )
+    manifest = _builtin_m5rt_manifest()
+    if binary and isinstance(binary.provider_manifest, dict):
+        for k in ("supported_topologies", "supported_model_types", "display_version"):
+            if binary.provider_manifest.get(k):
+                manifest[k] = binary.provider_manifest[k]
     models = []
     entries = getattr(engine_pool, "_entries", None) or {}
     for model_id, entry in list(entries.items()):
@@ -2823,6 +3238,9 @@ def m5rt_status(global_settings: Any, engine_pool: Any | None = None) -> dict[st
                 "id": model_id,
                 "memory_bytes": stats["process_memory_bytes"],
                 "memory_budget_bytes": stats["memory_budget_bytes"],
+                "lora_adapter": stats.get("lora_adapter", ""),
+                "lora_mode": stats.get("lora_mode", "merge"),
+                "lora_buffer_bytes": stats.get("lora_buffer_bytes", 0),
                 "log_path": stats["log_path"],
             }
         )
@@ -2856,11 +3274,15 @@ def m5rt_status(global_settings: Any, engine_pool: Any | None = None) -> dict[st
         "auto_detected": binary.auto_detected if binary else None,
         "version": version,
         "label": binary.label if binary else M5RT_ENGINE_LABEL,
+        "capabilities": list(manifest.get("capabilities") or M5RT_DEFAULT_CAPABILITIES),
         "supported_topologies": supported_topologies,
         "supported_model_types": supported_model_types,
         "artifact_extensions": artifact_extensions,
         "kv_formats": sorted(VALID_KV_DTYPES),
-        "supported_standard_settings": list(M5RT_SUPPORTED_STANDARD_SETTINGS),
+        "supported_standard_settings": list(
+            manifest.get("supported_standard_settings") or M5RT_SUPPORTED_STANDARD_SETTINGS
+        ),
+        "options_schema": list(manifest.get("options_schema") or M5RT_DEFAULT_OPTIONS_SCHEMA),
         "reason": reason,
         "install_hint": M5RT_INSTALL_HINT,
         "models": models,
@@ -2879,6 +3301,8 @@ def build_m5rt_options(
     engine_id: str | None = None,
     provider_id: str | None = None,
     manifest: dict[str, Any] | None = None,
+    lora_adapters: dict[str, str] | None = None,
+    model_dirs: Iterable[str | Path] = (),
 ) -> M5Options:
     """Build `M5Options` from `ModelSettings`, provider options, and model config."""
     mdir = Path(model_path)
@@ -2935,6 +3359,18 @@ def build_m5rt_options(
         explicit_opts=explicit_opts,
         model_dir=mdir,
     )
+    lora_adapter, lora_mode = resolve_sidecar_lora_settings(
+        mdir,
+        model_settings,
+        shared_toml=shared_toml,
+        model_toml=model_toml,
+        explicit_opts=explicit_opts,
+        lora_adapters=lora_adapters,
+        model_dirs=model_dirs,
+        engine_id=eff_engine_id,
+        provider_id=eff_provider_id,
+        manifest=eff_manifest,
+    )
 
     raw_overrides = opts.get("path_overrides")
     overrides = (
@@ -2969,6 +3405,8 @@ def build_m5rt_options(
         sampling_contract=str(opts.get("sampling_contract") or "legacy_rejection_v1"),
         speculative_backend=spec_backend,
         draft_tokens=draft_tokens,
+        lora_adapter=lora_adapter,
+        lora_mode=lora_mode,
         prefix_cache_bytes=_resolve_prefix_cache_bytes(
             opts,
             shared_toml=shared_toml,
@@ -2997,6 +3435,8 @@ def create_m5rt_pool_engine(
     engine_id: str | None = None,
     provider_id: str | None = None,
     manifest: dict[str, Any] | None = None,
+    lora_adapters: dict[str, str] | None = None,
+    model_dirs: Iterable[str | Path] = (),
 ) -> M5SidecarEngine | None:
     """Construct `M5SidecarEngine` for `EnginePool`, or None when memory budget <= 0."""
     eff_manifest = manifest if manifest is not None else m5_target.binary.provider_manifest
@@ -3011,6 +3451,9 @@ def create_m5rt_pool_engine(
         engine_id=eff_engine_id,
         provider_id=eff_provider_id,
         manifest=eff_manifest,
+        lora_adapters=lora_adapters,
+        model_dirs=model_dirs,
+        model_id=entry.model_id,
     )
     if admission_limit > 0:
         room = admission_limit - current_model_memory
@@ -3030,6 +3473,8 @@ def create_m5rt_pool_engine(
         engine_id=eff_engine_id,
         provider_id=eff_provider_id,
         manifest=eff_manifest,
+        lora_adapters=lora_adapters,
+        model_dirs=model_dirs,
     )
     logger.info(
         "Serving %s through %s %s (%s)",
@@ -3060,6 +3505,10 @@ def _spi_provider_runtime_signature(
     manifest: dict[str, Any],
     model_settings: object | None,
     global_settings: Any | None = None,
+    *,
+    lora_adapters: dict[str, str] | None = None,
+    model_path: str | Path | None = None,
+    model_dirs: Iterable[str | Path] = (),
 ) -> tuple[Any, ...]:
     """Canonical tuple of load-time settings for a Path B SPI provider plugin."""
     global_conc = (
@@ -3091,9 +3540,24 @@ def _spi_provider_runtime_signature(
         for s in (manifest.get("supported_standard_settings") or ())
         if isinstance(s, str) and s.strip()
     )
-    synced_std = tuple(
+    std_items: list[tuple[str, Any]] = [
         (key, getattr(model_settings, key, None)) for key in supported_std
-    )
+    ]
+    if "lora_adapter" in supported_std:
+        lora_ref = getattr(model_settings, "lora_adapter", None) or None
+        if lora_ref:
+            std_items.append(
+                (
+                    "lora_adapter_fingerprint",
+                    _safe_lora_fingerprint(
+                        lora_ref,
+                        lora_adapters=lora_adapters,
+                        model_path=model_path,
+                        model_dirs=model_dirs,
+                    ),
+                )
+            )
+    synced_std = tuple(std_items)
     return (
         engine_id,
         provider_id,
@@ -3139,6 +3603,9 @@ def _spi_provider_status(
                 "id": model_id,
                 "memory_bytes": stats["process_memory_bytes"],
                 "memory_budget_bytes": stats["memory_budget_bytes"],
+                "lora_adapter": stats.get("lora_adapter", ""),
+                "lora_mode": stats.get("lora_mode", "merge"),
+                "lora_buffer_bytes": stats.get("lora_buffer_bytes", 0),
                 "log_path": stats["log_path"],
             }
         )
@@ -3176,11 +3643,15 @@ def _spi_provider_status(
             or None
         ),
         "label": label,
+        "capabilities": list(manifest.get("capabilities") or ()),
         "supported_topologies": list(manifest.get("supported_topologies") or ()),
         "supported_model_types": list(manifest.get("supported_model_types") or ()),
         "artifact_extensions": list(_normalize_extensions(manifest.get("artifact_extensions"))),
         "kv_formats": kv_formats,
         "supported_standard_settings": supported_std,
+        "options_schema": [
+            dict(s) for s in (manifest.get("options_schema") or ()) if isinstance(s, dict)
+        ],
         "reason": reason,
         "models": models,
     }
@@ -3237,6 +3708,8 @@ def _build_spi_provider_plugin(
         global_settings: Any,
         *,
         sizing_context: int | None = None,
+        lora_adapters: dict[str, str] | None = None,
+        model_dirs: Iterable[str | Path] = (),
     ) -> int | None:
         target, _ = resolve_spi_provider_target(
             entry.model_path, binary_path, manifest_copy, model_settings
@@ -3252,11 +3725,29 @@ def _build_spi_provider_plugin(
             engine_id=engine_id,
             provider_id=provider_id,
             manifest=manifest_copy,
+            lora_adapters=lora_adapters,
+            model_dirs=model_dirs,
+            model_id=entry.model_id,
         )
 
-    def _runtime_sig(model_settings: object | None, global_settings: Any) -> tuple[Any, ...]:
+    def _runtime_sig(
+        model_settings: object | None,
+        global_settings: Any,
+        *,
+        lora_adapters: dict[str, str] | None = None,
+        model_path: str | Path | None = None,
+        model_dirs: Iterable[str | Path] = (),
+    ) -> tuple[Any, ...]:
         return _spi_provider_runtime_signature(
-            engine_id, provider_id, binary_path, manifest_copy, model_settings, global_settings
+            engine_id,
+            provider_id,
+            binary_path,
+            manifest_copy,
+            model_settings,
+            global_settings,
+            lora_adapters=lora_adapters,
+            model_path=model_path,
+            model_dirs=model_dirs,
         )
 
     def _factory(
@@ -3268,6 +3759,8 @@ def _build_spi_provider_plugin(
         sizing_context: int | None = None,
         admission_limit: int = 0,
         current_model_memory: int = 0,
+        lora_adapters: dict[str, str] | None = None,
+        model_dirs: Iterable[str | Path] = (),
     ) -> M5SidecarEngine | None:
         del scheduler_config
         target, reason = resolve_spi_provider_target(
@@ -3286,6 +3779,8 @@ def _build_spi_provider_plugin(
             engine_id=engine_id,
             provider_id=provider_id,
             manifest=manifest_copy,
+            lora_adapters=lora_adapters,
+            model_dirs=model_dirs,
         )
 
     def _can_auto_convert_fast(
@@ -3367,7 +3862,12 @@ def _spi_provider_manifest_for_engine(engine_id: str) -> dict[str, Any] | None:
                     continue
                 pid = str(parsed.get("provider_id") or entry.name).strip()
                 eid = str(parsed.get("engine_id") or pid).strip()
-                if eid == engine_id:
+                legacy_ids = [
+                    str(x).strip()
+                    for x in (parsed.get("legacy_provider_ids") or ())
+                    if isinstance(x, str) and x.strip()
+                ]
+                if engine_id in (eid, pid, *legacy_ids):
                     return parsed
                 break
     return None
@@ -4116,7 +4616,10 @@ class M5SidecarEngine(BaseEngine):
         self._last_stats: dict[str, Any] | None = None
         self._last_capacity: dict[str, Any] | None = None
         self._reported_footprint_bytes: int = 0
+        self._reported_lora_buffer_bytes: int | None = None
+        self._reported_lora_adapted_layers: int = 0
         self._weights_size: int | None = None
+        self._lora_estimated_size: int | None = None
         self._last_gpu_contended_hint: bool | None = None
         self._trim_cache_unsupported: bool = False
         self._scheduler_hint_unsupported: bool = False
@@ -4281,7 +4784,9 @@ class M5SidecarEngine(BaseEngine):
                 "max_context": opts.max_context,
                 "kv_dtype": opts.kv_dtype,
                 "prefill_engine": opts.prefill_engine,
-                "sampling_contract": opts.sampling_contract,
+                "sampling_contract": "legacy_rejection_v1",
+                "lora_adapter": opts.lora_adapter,
+                "lora_mode": opts.lora_mode,
                 "fake_options": fake_opts,
             }
             if opts.memory_budget_bytes > 0:
@@ -4367,6 +4872,8 @@ class M5SidecarEngine(BaseEngine):
             "kv_dtype": opts.kv_dtype,
             "prefill_engine": opts.prefill_engine,
             "sampling_contract": opts.sampling_contract,
+            "lora_adapter": opts.lora_adapter,
+            "lora_mode": opts.lora_mode,
             "speculative": {
                 "backend": spec_backend,
                 "draft_tokens": draft_tokens,
@@ -4386,6 +4893,12 @@ class M5SidecarEngine(BaseEngine):
         fp = payload.get("phys_footprint_bytes")
         if isinstance(fp, int) and fp >= 0:
             self._reported_footprint_bytes = fp
+        lora_buf = payload.get("lora_buffer_bytes")
+        if isinstance(lora_buf, int) and not isinstance(lora_buf, bool) and lora_buf >= 0:
+            self._reported_lora_buffer_bytes = lora_buf
+        lora_layers = payload.get("lora_adapted_layers")
+        if isinstance(lora_layers, int) and not isinstance(lora_layers, bool) and lora_layers >= 0:
+            self._reported_lora_adapted_layers = lora_layers
 
     def _mark_runtime_failed(self, detail: str) -> str:
         if self._stopping:
@@ -4835,7 +5348,66 @@ class M5SidecarEngine(BaseEngine):
                 sock_path.unlink(missing_ok=True)
         self._sidecar_pid = None
         self._reported_footprint_bytes = 0
+        self._reported_lora_buffer_bytes = None
+        self._reported_lora_adapted_layers = 0
         self._last_gpu_contended_hint = None
+
+    async def reload_lora(
+        self,
+        lora_adapter: str | Path | None,
+        lora_mode: str = "merge",
+        *,
+        lora_adapters: dict[str, str] | None = None,
+        model_dirs: Iterable[str | Path] = (),
+    ) -> dict[str, Any]:
+        """Swap or clear the active LoRA adapter via `reload_lora` RPC (fallback `load`)."""
+        norm_mode = str(lora_mode or "merge").strip().lower()
+        if norm_mode not in VALID_LORA_MODES:
+            raise ValueError(f"lora_mode must be one of {sorted(VALID_LORA_MODES)}")
+        raw_ref = str(lora_adapter or "").strip()
+        resolved_lora = (
+            str(
+                resolve_adapter_path(
+                    raw_ref,
+                    adapters=lora_adapters,
+                    model_dir=self._path,
+                    model_dirs=model_dirs,
+                )
+            )
+            if raw_ref
+            else ""
+        )
+        self._options = replace(
+            self._options,
+            lora_adapter=resolved_lora,
+            lora_mode=norm_mode,
+        )
+        self._lora_estimated_size = None
+        self._reported_lora_buffer_bytes = None
+        self._reported_lora_adapted_layers = 0
+        if self._ctrl_writer is None or self._stopping:
+            return {
+                "lora_adapter": resolved_lora,
+                "lora_mode": norm_mode,
+                "lora_buffer_bytes": self.lora_memory_bytes(),
+                "lora_adapted_layers": 0,
+            }
+        try:
+            res = await self._rpc(
+                "reload_lora",
+                {"lora_adapter": resolved_lora, "lora_mode": norm_mode},
+                timeout=STARTUP_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as exc:
+            if not self._is_unknown_rpc_error(exc):
+                raise
+            res = await self._rpc(
+                "load",
+                self._build_load_params(),
+                timeout=STARTUP_TIMEOUT_SECONDS,
+            )
+        self._last_stats = res
+        return res
 
     @staticmethod
     def _is_unknown_rpc_error(exc: BaseException) -> bool:
@@ -5554,6 +6126,23 @@ class M5SidecarEngine(BaseEngine):
             self._weights_size = total
         return self._weights_size
 
+    def lora_memory_bytes(self) -> int:
+        """Return resident GPU UMA buffer bytes for the active LoRA adapter."""
+        if (
+            self._reported_lora_buffer_bytes is not None
+            and self._reported_lora_buffer_bytes > 0
+        ):
+            return self._reported_lora_buffer_bytes
+        if not self._options.lora_adapter:
+            return 0
+        if self._lora_estimated_size is None:
+            self._lora_estimated_size = estimate_sidecar_lora_bytes(
+                self._options.lora_adapter, lora_mode=self._options.lora_mode
+            )
+        if self._reported_lora_buffer_bytes == 0 and self._lora_estimated_size == 0:
+            return 0
+        return self._lora_estimated_size
+
     def _group_pids(self) -> list[int]:
         proc = self._process
         if proc is None or proc.poll() is not None:
@@ -5568,11 +6157,31 @@ class M5SidecarEngine(BaseEngine):
         if not pids:
             return 0
         group_footprint = sum(get_phys_footprint(pid) for pid in pids)
-        floor = max(self._reported_footprint_bytes, self._weights_bytes())
+        floor = max(
+            self._reported_footprint_bytes,
+            self._weights_bytes() + self.lora_memory_bytes(),
+        )
         return max(group_footprint, floor)
 
     def get_stats(self) -> dict[str, Any]:
         running = self._process is not None and self._process.poll() is None
+        last = self._last_stats or {}
+        active_lora_adapter = (
+            str(last["lora_adapter"])
+            if isinstance(last.get("lora_adapter"), str)
+            else self._options.lora_adapter
+        )
+        active_lora_mode = (
+            str(last["lora_mode"])
+            if isinstance(last.get("lora_mode"), str) and last.get("lora_mode")
+            else self._options.lora_mode
+        )
+        active_lora_layers = (
+            int(last["lora_adapted_layers"])
+            if isinstance(last.get("lora_adapted_layers"), int)
+            and not isinstance(last.get("lora_adapted_layers"), bool)
+            else self._reported_lora_adapted_layers
+        )
         stats: dict[str, Any] = {
             "engine_type": self.external_engine_id,
             "provider_id": self._provider_id,
@@ -5585,6 +6194,10 @@ class M5SidecarEngine(BaseEngine):
             "push_subscribed": self._push_subscribed,
             "requests": self._requests,
             "active_requests": self._active,
+            "lora_adapter": active_lora_adapter,
+            "lora_mode": active_lora_mode,
+            "lora_buffer_bytes": self.lora_memory_bytes(),
+            "lora_adapted_layers": active_lora_layers,
             "memory_budget_bytes": self.reserved_bytes(),
             "process_memory_bytes": self.process_memory_bytes(),
         }

@@ -1159,9 +1159,24 @@ public:
                           cw.layout == "oq_nax_tiled_g128_v1");
     }
 
+    const void *head_buf_ptr =
+        head.planes.empty() ? nullptr : head.planes.front().buffer;
+    bool head_is_overridden = false;
+    if (tgt_weights != nullptr && head_buf_ptr != nullptr) {
+      try {
+        const auto orig_head = tgt_weights->parent_view(head.object_id);
+        head_is_overridden =
+            orig_head.planes.empty() ||
+            orig_head.planes.front().buffer != head_buf_ptr;
+      } catch (...) {
+        head_is_overridden = true;
+      }
+    }
     const void *head_owner_key =
-        tgt_weights ? static_cast<const void *>(tgt_weights)
-                    : static_cast<const void *>(&mtp_weights);
+        head_is_overridden
+            ? head_buf_ptr
+            : (tgt_weights ? static_cast<const void *>(tgt_weights)
+                           : static_cast<const void *>(&mtp_weights));
     const void *mtp_owner_key = reinterpret_cast<const void *>(
         reinterpret_cast<std::uintptr_t>(&mtp_weights) ^ 0x4D545035ULL);
 

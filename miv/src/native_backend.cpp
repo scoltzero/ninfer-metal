@@ -21,12 +21,14 @@
 #include <vector>
 
 #include "forward_plan.h"
+#include "lora_runtime.h"
 #include "omlx_m5/artifact.h"
 #include "omlx_m5/bounded_batch.h"
 #include "omlx_m5/dflash_forward.h"
 #include "omlx_m5/dispatch.h"
 #include "omlx_m5/execution_contract.h"
 #include "omlx_m5/layer_schedule.h"
+#include "omlx_m5/lora.h"
 #include "omlx_m5/materialization.h"
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/mtp_forward.h"
@@ -626,6 +628,11 @@ public:
         context(MetalContext::create()),
         config(load_qwen_model_config(model_dir / "config.json")) {
     sampling_contract = parse_sampling_contract(options.sampling_contract);
+    const std::string effective_lora_mode =
+        options.lora_mode.empty() ? std::string("merge") : options.lora_mode;
+    if (effective_lora_mode != "merge" && effective_lora_mode != "bypass") {
+      throw std::invalid_argument("lora_mode must be merge or bypass");
+    }
     rolling_prefix_cache = resolve_rolling_prefix_cache(options);
     if (options.max_concurrency < 1 || options.max_concurrency > 8)
       throw std::invalid_argument("max_concurrency must be in [1, 8]");
@@ -807,6 +814,37 @@ public:
           flash_nax_override->second != "false"));
     const auto primary_ws_rows = resolve_qwen_primary_workspace_rows(
         max_context, false, config.num_experts > 1);
+    this->primary_ws_rows = primary_ws_rows;
+    layers = build_qwen_layer_catalog(*artifact, config, max_context, 64);
+    {
+      std::uint32_t emb_obj = UINT32_MAX;
+      std::uint32_t head_obj = UINT32_MAX;
+      for (const auto &st : layers.global_stages()) {
+        if (st.role == "embedding")
+          emb_obj = st.object_id;
+        if (st.role == "lm_head")
+          head_obj = st.object_id;
+      }
+      lm_head_tied = (emb_obj != UINT32_MAX && emb_obj == head_obj);
+    }
+    std::optional<LoadedLoraAdapter> loaded_lora;
+    std::uint64_t est_lora_bytes = 0;
+    if (!options.lora_adapter.empty()) {
+      loaded_lora = load_lora_adapter_for_qwen(options.lora_adapter, config,
+                                               lm_head_tied);
+      if (shared_head_enabled) {
+        for (const auto &u : loaded_lora->updates) {
+          if (u.target.is_global && u.target.role == "lm_head") {
+            throw std::invalid_argument(
+                "batch_projection_prototype=on does not support lm_head LoRA "
+                "adaptation");
+          }
+        }
+      }
+      est_lora_bytes = detail::lora_rt::estimate_lora_gpu_bytes(
+          *loaded_lora, effective_lora_mode, primary_ws_rows,
+          std::uint32_t(options.max_concurrency));
+    }
     auto memory = plan_qwen_forward_memory(
         config, max_context,
         std::uint32_t(draft_config.target_layer_ids.size()), false,
@@ -916,8 +954,8 @@ public:
             ? std::min<std::uint64_t>(rec_ws_bytes, options.memory_budget_bytes)
             : rec_ws_bytes;
     const auto base_budget = qwen_load_budget(
-        planned_weights.resident_bytes + companion_weights, memory,
-        effective_ws_limit, context.current_allocated_bytes());
+        planned_weights.resident_bytes + companion_weights + est_lora_bytes,
+        memory, effective_ws_limit, context.current_allocated_bytes());
     const std::uint64_t base_required_bytes =
         base_budget.required_bytes +
         std::uint64_t(options.max_concurrency - 1) *
@@ -992,8 +1030,8 @@ public:
     if (memory.largest_buffer_bytes > context.capabilities().max_buffer_length)
       throw std::invalid_argument("Qwen planned buffer exceeds device limit");
     auto budget = qwen_load_budget(
-        planned_weights.resident_bytes + companion_weights, memory,
-        effective_ws_limit, context.current_allocated_bytes());
+        planned_weights.resident_bytes + companion_weights + est_lora_bytes,
+        memory, effective_ws_limit, context.current_allocated_bytes());
     budget.required_bytes +=
         std::uint64_t(options.max_concurrency - 1) *
         budget.runtime_reserve_bytes; // per-slot ICB/pipeline parameter room
@@ -1009,7 +1047,6 @@ public:
         plan_model_materialization(*artifact, context,
                                    {.components = main_components,
                                     .require_verified_payload = true});
-    layers = build_qwen_layer_catalog(*artifact, config, max_context, 64);
     const auto topology =
         describe_qwen_topology(*artifact, config, layers, max_context, 64);
     artifact_id = artifact->summary().source_repo + "@" +
@@ -1043,6 +1080,21 @@ public:
     const auto model_digest = execution_artifact_digest(*artifact);
     artifact.reset();
 
+    if (loaded_lora.has_value()) {
+      lora_adapter_path = options.lora_adapter;
+      lora_mode_active = effective_lora_mode;
+      if (effective_lora_mode == "merge") {
+        merged_lora = detail::lora_rt::build_merged_lora_overrides(
+            context, libraries, weights, layers, *loaded_lora);
+        lora_buffer_bytes = merged_lora->buffer_bytes;
+        lora_adapted_layers = merged_lora->adapted_layers;
+      } else {
+        bypass_lora = detail::lora_rt::build_bypass_lora_runtime(
+            context, weights, layers, *loaded_lora);
+        lora_adapted_layers = bypass_lora->adapted_layers;
+      }
+    }
+
     const auto lin_policy = coupled ? LinearNumericPolicy::RowExactPortableV1
                                     : LinearNumericPolicy::Legacy;
     const auto attn_policy =
@@ -1054,7 +1106,7 @@ public:
         enable_m4_short_routes, diagnostic_route, enable_attention_split,
         slot_batch_enabled, moe_route, lin_policy, sampling_contract,
         attn_policy, false, slot_kv_dtype, nullptr, enable_flash_nax_prefill,
-        shared_kv_pages);
+        shared_kv_pages, merged_lora, bypass_lora);
 
     std::string draft_digest = "none";
     std::string ext_mtp_digest;
@@ -1151,7 +1203,7 @@ public:
           slot_short_routes, slot_route_override, slot_attention_split,
           slot_batch_enabled, slot_moe_override, lin_policy, sampling_contract,
           attn_policy, false, slot_kv_dtype, program.get(),
-          enable_flash_nax_prefill);
+          enable_flash_nax_prefill, 0U, merged_lora, bypass_lora);
       if (slot_speculative) {
         if (slot_gpu_verify)
           slot.verifier = std::make_unique<TargetGpuVerifier>(
@@ -1182,6 +1234,15 @@ public:
             slot_short_routes, lin_policy, sampling_contract, slot_kv_dtype,
             &layers, &weights, &program->trunk_hidden_buffer());
       }
+    }
+
+    if (bypass_lora != nullptr) {
+      std::uint64_t scratch_sum = program->lora_scratch_bytes();
+      for (const auto &es : extra_slots) {
+        if (es.program)
+          scratch_sum += es.program->lora_scratch_bytes();
+      }
+      lora_buffer_bytes = bypass_lora->weight_buffer_bytes + scratch_sum;
     }
 
     // Preserve exact canonical execution_fields when default bf16 + standard
@@ -1228,6 +1289,10 @@ public:
           "mtp", ext_mtp_digest.empty() ? "embedded" : ext_mtp_digest);
       execution_fields.emplace("mtp_draft_tokens",
                                std::to_string(mtp_draft_tokens));
+    }
+    if (loaded_lora.has_value()) {
+      execution_fields.emplace("lora", loaded_lora->fingerprint);
+      execution_fields.emplace("lora_mode", effective_lora_mode);
     }
     execution_identity = execution_identity_digest(execution_fields);
     for (std::size_t index = 0; index < occupied.size(); ++index)
@@ -1415,6 +1480,14 @@ public:
   std::unique_ptr<PositionKeyedSampler> coupled_anchor_sampler;
   std::unique_ptr<LegacyAnchorSampler> legacy_anchor_sampler;
   bool shared_head_enabled = false;
+  bool lm_head_tied = false;
+  std::uint32_t primary_ws_rows = 1024;
+  std::string lora_adapter_path;
+  std::string lora_mode_active;
+  std::uint64_t lora_buffer_bytes = 0;
+  std::uint32_t lora_adapted_layers = 0;
+  std::shared_ptr<QwenMergedLoraOverrides> merged_lora;
+  std::shared_ptr<QwenBypassLoraRuntime> bypass_lora;
   AdaptiveSpecController spec_controller;
   ContendedPrefillScheduler scheduler;
 };
@@ -3155,11 +3228,20 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
           ? "grouped_plus_shared_head_rerun_v1"
           : ar_program_->slot_batch_enabled ? "packed_shared_weights_v2"
                                             : "independent_slots_v1";
+  if (options_.lora_mode.empty()) {
+    options_.lora_mode = "merge";
+  }
   backend_stats_.kernel_family = ar_program_->draft
                                      ? "qwen_dflash2_forward_a16_metal4"
                                      : ar_program_->mtp
                                            ? "qwen_mtp_forward_a16_metal4"
                                            : "qwen_forward_a16_metal4";
+  backend_stats_.lora_adapter = ar_program_->lora_adapter_path;
+  backend_stats_.lora_mode = ar_program_->lora_adapter_path.empty()
+                                 ? std::string{}
+                                 : ar_program_->lora_mode_active;
+  backend_stats_.lora_buffer_bytes = ar_program_->lora_buffer_bytes;
+  backend_stats_.lora_adapted_layers = ar_program_->lora_adapted_layers;
 }
 
 NativeBackend::~NativeBackend() = default;
@@ -4682,6 +4764,10 @@ void NativeBackend::populate_stats(StatsReport &stats) const {
   stats.contended_prefill_chunks = backend_stats_.contended_prefill_chunks;
   stats.packed_batch_calls = backend_stats_.packed_batch_calls;
   stats.packed_batch_tokens = backend_stats_.packed_batch_tokens;
+  stats.lora_adapter = backend_stats_.lora_adapter;
+  stats.lora_mode = backend_stats_.lora_mode;
+  stats.lora_buffer_bytes = backend_stats_.lora_buffer_bytes;
+  stats.lora_adapted_layers = backend_stats_.lora_adapted_layers;
 }
 
 TrimCacheReport NativeBackend::trim_cache(std::uint64_t target_free_bytes) {
@@ -4716,6 +4802,143 @@ void NativeBackend::set_scheduler_hint(const SchedulerHint &hint) {
   if (ar_program_) {
     ar_program_->external_gpu_contended.store(hint.gpu_contended,
                                               std::memory_order_release);
+  }
+}
+
+bool NativeBackend::reload_lora(const std::string &lora_adapter,
+                                const std::string &lora_mode,
+                                std::string *error) {
+  assert_owner();
+  const std::string effective_mode =
+      lora_mode.empty() ? std::string("merge") : lora_mode;
+  if (effective_mode != "merge" && effective_mode != "bypass") {
+    if (error != nullptr) {
+      *error = "lora_mode must be merge or bypass";
+    }
+    return false;
+  }
+  if (!ar_program_ || !ar_program_->program) {
+    if (error != nullptr) {
+      *error = "native backend is not loaded";
+    }
+    return false;
+  }
+  if ((!ar_program_->lora_adapter_path.empty() &&
+       ar_program_->lora_mode_active == "merge") ||
+      (!lora_adapter.empty() && effective_mode == "merge")) {
+    if (error != nullptr) {
+      *error = "merge mode requires full backend reload";
+    }
+    return false;
+  }
+  if (ar_program_->active_occupied_count() != 0U) {
+    if (error != nullptr) {
+      *error = "cannot hot-swap LoRA while inference slots are active";
+    }
+    return false;
+  }
+
+  try {
+    auto &owner = *ar_program_;
+    std::shared_ptr<QwenBypassLoraRuntime> new_bypass;
+    if (!lora_adapter.empty()) {
+      LoadedLoraAdapter loaded = load_lora_adapter_for_qwen(
+          lora_adapter, owner.config, owner.lm_head_tied);
+      if (owner.shared_head_enabled) {
+        for (const auto &u : loaded.updates) {
+          if (u.target.is_global && u.target.role == "lm_head") {
+            throw std::invalid_argument(
+                "batch_projection_prototype=on does not support lm_head LoRA "
+                "adaptation");
+          }
+        }
+      }
+      const std::uint64_t new_lora_est =
+          detail::lora_rt::estimate_lora_gpu_bytes(
+              loaded, "bypass", owner.primary_ws_rows,
+              std::uint32_t(owner.occupied.size()));
+      const std::uint64_t rec_ws =
+          owner.context.capabilities().recommended_working_set_bytes;
+      const std::uint64_t ws_limit =
+          options_.memory_budget_bytes > 0
+              ? std::min<std::uint64_t>(rec_ws, options_.memory_budget_bytes)
+              : rec_ws;
+      const std::uint64_t cur_alloc = owner.context.current_allocated_bytes();
+      const std::uint64_t base_alloc =
+          cur_alloc > owner.lora_buffer_bytes
+              ? (cur_alloc - owner.lora_buffer_bytes)
+              : 0ULL;
+      if (base_alloc + new_lora_est > ws_limit) {
+        throw std::runtime_error(
+            "LoRA bypass hot-swap exceeds Metal memory budget: required=" +
+            std::to_string(base_alloc + new_lora_est) +
+            " available=" + std::to_string(ws_limit));
+      }
+      new_bypass = detail::lora_rt::build_bypass_lora_runtime(
+          owner.context, owner.weights, owner.layers, loaded);
+    }
+
+    owner.prefix_cache.clear_all([&](std::size_t s) -> QwenForward & {
+      return owner.program_at(s);
+    });
+    owner.execution_fields.erase("lora");
+    owner.execution_fields.erase("lora_mode");
+    if (new_bypass != nullptr) {
+      owner.execution_fields.emplace("lora", new_bypass->fingerprint);
+      owner.execution_fields.emplace("lora_mode", "bypass");
+    }
+    owner.execution_identity =
+        execution_identity_digest(owner.execution_fields);
+
+    for (std::size_t s = 0; s < owner.occupied.size(); ++s) {
+      owner.program_at(s).set_bypass_lora(new_bypass, owner.execution_identity);
+      owner.spec_controller.reset_slot(s);
+      if (auto *dr = owner.draft_at(s)) {
+        dr->reset();
+        sync_draft_target_ring(*dr, owner.program_at(s).feature_ring_rows());
+      }
+      if (auto *mt = owner.mtp_at(s)) {
+        mt->reset();
+      }
+      if (auto *mc = owner.mtp_controller_at(s)) {
+        mc->on_new_request();
+      }
+    }
+
+    std::uint64_t scratch_sum = 0;
+    if (new_bypass != nullptr) {
+      for (std::size_t s = 0; s < owner.occupied.size(); ++s) {
+        scratch_sum += owner.program_at(s).lora_scratch_bytes();
+      }
+    }
+    owner.bypass_lora = new_bypass;
+    owner.lora_adapter_path = lora_adapter;
+    owner.lora_mode_active =
+        lora_adapter.empty() ? std::string{} : std::string("bypass");
+    owner.lora_buffer_bytes =
+        new_bypass != nullptr ? (new_bypass->weight_buffer_bytes + scratch_sum)
+                              : 0ULL;
+    owner.lora_adapted_layers =
+        new_bypass != nullptr ? new_bypass->adapted_layers : 0U;
+
+    options_.lora_adapter = lora_adapter;
+    options_.lora_mode =
+        lora_adapter.empty() ? std::string("merge") : std::string("bypass");
+    {
+      std::scoped_lock lock(stats_mutex_);
+      backend_stats_.execution_identity_id = owner.execution_identity;
+      backend_stats_.prefix_pinned_entries = 0;
+      backend_stats_.lora_adapter = owner.lora_adapter_path;
+      backend_stats_.lora_mode = owner.lora_mode_active;
+      backend_stats_.lora_buffer_bytes = owner.lora_buffer_bytes;
+      backend_stats_.lora_adapted_layers = owner.lora_adapted_layers;
+    }
+    return true;
+  } catch (const std::exception &ex) {
+    if (error != nullptr) {
+      *error = ex.what();
+    }
+    return false;
   }
 }
 

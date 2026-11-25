@@ -2,7 +2,7 @@
 
 # `oMLX-extend` ビジュアルガイド
 
-`oMLX-extend` は、Apple M5+ Mac（`macOS 27+`）上の `oMLX` macOS アプリに **`miv Core Backend (ninfer-metal)`** とコミュニティ製ルート B Metal 4 マイクロカーネルを追加する。変換済みの `.omlxm5` モデルは自動でネイティブ Metal 4 NAX 実行に切り替わり、通常の MLX モデルはそのまま Stock MLX で動作する。
+`oMLX-extend` は、Apple M5+ Mac（`macOS 27+`）上の `oMLX` macOS アプリに **`miv Core Backend (ninfer-metal)`** とコミュニティ製ルート B Metal 4 マイクロカーネルを追加する。変換済みの `.miv` モデルは自動でネイティブ Metal 4 NAX 実行に切り替わり、通常の MLX モデルはそのまま Stock MLX で動作する。
 
 以下の 5 つの画面に沿って、インストール状態の確認、エンジンルーティングの把握、高速デコード機能の有効化、および設定ファイルを手書きしない単体サーバー起動を確認する。
 
@@ -34,7 +34,7 @@
 ![アクティブエンジンバッジとモデルライブラリラベルを表示する Models 画面](../../assets/omlx-mac/models-overview.png)
 
 - **Active Models**：ロード済みの各モデルには **`Loaded`** のすぐ隣にエンジンバッジ（`miv Core`、ルート B マイクロカーネル名、または `MLX`）が表示される。
-- **Model Library**：`.omlxm5` ウェイトを持つモデルにはハイライトバッジ（`miv Core · Auto`、ルート B マイクロカーネル、または外部ルーティングをオフにした場合は `Stock MLX`）が表示される。
+- **Model Library**：`.miv` ウェイトを持つモデルにはハイライトバッジ（`miv Core · Auto`、ルート B マイクロカーネル、または外部ルーティングをオフにした場合は `Stock MLX`）が表示される。
 - **未変換モデルへの影響はゼロ**：通常の MLX チェックポイントには外部エンジンバッジが付かず、サイドカープロセスを一切起動せずに Stock MLX で動作する。`miv Core Backend`、ルート B、および Stock MLX の各モデルは、単一の統合メモリ上限のもとで並列ロードできる。
 
 ---
@@ -45,8 +45,8 @@
 
 ![miv Core Backend への自動ルーティングを表示する Model Settings Advanced 画面](../../assets/omlx-mac/engine-routing-auto.png)
 
-- 変換済み `.omlxm5` モデルでは **`Use External Engine`** が初期状態で **ON** になっており、ドロップダウンに **`miv Core Backend (Auto)`** が選択されている（上位の Model Settings ヘッダにもアクティブエンジンバッジが表示される）。
-- **いつでも Stock MLX へ戻せる**：**`Use External Engine`** を **OFF** に切り替えると、`oMLX` は `.omlxm5` ウェイトを削除せずに `external_engine: "stock"` を記録し、*"Using Stock MLX (auto-route overridden)"* と表示する。再び **ON** に戻せば自動ルーティングへ復帰する。
+- 変換済み `.miv` モデルでは **`Use External Engine`** が初期状態で **ON** になっており、ドロップダウンに **`miv Core Backend (Auto)`** が選択されている（上位の Model Settings ヘッダにもアクティブエンジンバッジが表示される）。
+- **いつでも Stock MLX へ戻せる**：**`Use External Engine`** を **OFF** に切り替えると、`oMLX` は `.miv` ウェイトを削除せずに `external_engine: "stock"` を記録し、*"Using Stock MLX (auto-route overridden)"* と表示する。再び **ON** に戻せば自動ルーティングへ復帰する。
 - **別エンジンの選択**：同じモデルに対応するルート B マイクロカーネルや Splash が導入されている場合は、同じドロップダウンから直接切り替えられる。
 
 ---
@@ -96,7 +96,7 @@
 # 変換済みモデルディレクトリを直接指定して起動
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# パスを省略すると ./models または oMLX のモデルフォルダ内の最初の .omlxm5 モデルを自動選択
+# パスを省略すると ./models または oMLX のモデルフォルダ内の最初の .miv モデルを自動選択
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@
 
 ## 次のステップ
 
-- **[クイックスタートと設定](getting-started.md)** — ソースからのビルド、`.omlxm5` へのチェックポイント変換、`ninfer-metal-serve` の全 CLI フラグ解説。
+- **[クイックスタートと設定](getting-started.md)** — ソースからのビルド、`.miv` へのチェックポイント変換、`ninfer-metal-serve` の全 CLI フラグ解説。
 - **[アーキテクチャと共存設計](architecture.md)** — O(1) 自動ルーティング、Provider SPI v2、共有 UMA メモリ予算の内部設計。
 - **[Microkernel Foundry](microkernel-foundry.md)** — Apple M5+ 向けに新しいルート A / ルート B モデルファミリーを追加する手順。

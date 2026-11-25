@@ -58,7 +58,7 @@
 - 支援零拷貝 GPU 前綴續接（`64K` 還原耗時 `0.73–1.62 ms`）、原地滾動 UMA 前綴重用，以及面向並發連線的批次 `affine4_g128` NAX 注意力。
 
 ### `oMLX-extend` `omlx-extend-v0.8.3`（macOS 應用程式與 Sidecar）
-- 以 `AF_UNIX` Sidecar（`mseries_backendd`）接入 **`miv 核心後端`**：已適配的 `.omlxm5` 模型以 O(1) 自動路由，一般 MLX 模型維持在原版 MLX 上運作，不啟動額外程序。
+- 以 `AF_UNIX` Sidecar（`mseries_backendd`）接入 **`miv 核心後端`**：已適配的 `.miv` 模型以 O(1) 自動路由，一般 MLX 模型維持在原版 MLX 上運作，不啟動額外程序。
 - 原生 macOS 介面於 `Integrations → External Engines` 新增 `miv 核心後端` 與路徑 B 微核心卡片，並在模型清單與設定頁提供執行引擎徽章、自動路由／原版 MLX 切換，以及依後端能力解鎖的 `64K+` 上下文、`MTP`、`DFlash2` 與 `affine4_g128` KV 控制項。
 - 在 Sidecar 與 MLX 模型之間協調 UMA 預算、閒置快取回收與並發分塊 Prefill，並支援以 `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/` 原子符號連結直接升級與回滾。
 
@@ -75,7 +75,7 @@
 | 硬體 | Apple Silicon `MTLGPUFamilyApple10+`（Apple M5 / M5 Pro / M5 Max / M5 Ultra，含 64-GPU 與 80-GPU） |
 | 系統與編譯 | macOS 27+（執行免 Xcode；從原始碼編譯需 Xcode 27+ / macOS 27 SDK） |
 | 模型架構 | **Qwen3.5 / Qwen3.6 / Qwen3.8 混合架構**（3:1 GDN + GQA；Dense 0.8B–27B 與 256×8 MoE，如 35B-A3B） |
-| 權重格式 | 離線 NAX 預先重排 `.omlxm5`：`MXFP4`（`E2M1 × UE8M0`）與 `oQ` Affine（`q3–q8`，`g64 / g128`） |
+| 權重格式 | 離線 NAX 預先重排 `.miv`：`MXFP4`（`E2M1 × UE8M0`）與 `oQ` Affine（`q3–q8`，`g64 / g128`） |
 | KV 快取 | `bf16` 與 `affine4_g128`（`0.5625 B/val`，`2K–64K` 通過 `0-ULP` 驗證） |
 | 推測解碼 | 純 AR（`none`）、內嵌 `Native MTP` 與 `DFlash2`（支援單流與 `B=2..4` 批次） |
 | 服務介面 | `ninfer-metal-serve` 提供 OpenAI HTTP/SSE 端點；`oMLX-extend` 提供 OpenAI + Anthropic 端點與原生 macOS 介面 |

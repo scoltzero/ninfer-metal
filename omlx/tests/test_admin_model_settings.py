@@ -1137,3 +1137,98 @@ async def test_paroquant_dflash_allows_only_qwen_targets(
             await _update_settings(pool, settings, request)
         assert exc.value.status_code == 400
         assert exc.value.detail == admin_routes._PAROQUANT_REASON
+
+
+@pytest.mark.asyncio
+async def test_admin_lora_adapter_and_lora_mode_capability_aware_external_engines(tmp_path):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen3_5"
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "num_hidden_layers": 2, "hidden_size": 2})
+    )
+    adapter = _write_lora_adapter(tmp_path / "qwen-lora")
+    pool._lora_adapters = {"qwen-lora": str(adapter)}
+
+    # 1) Capable external engines (m5rt / ninfer-metal / io.ninfer.metal) allow lora_adapter + lora_mode.
+    for ext_alias, opt_key, mode in (
+        ("ninfer-metal", "ninfer-metal", "merge"),
+        ("io.ninfer.metal", "io.ninfer.metal", "bypass"),
+        ("m5rt", "m5rt", "merge"),
+    ):
+        settings = ModelSettings(external_engine="m5rt")
+        with patch.object(
+            pool,
+            "external_engine_compatibility",
+            return_value=(True, "", None),
+        ):
+            res = await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(
+                    external_engine=ext_alias,
+                    lora_adapter="qwen-lora",
+                    external_engine_options={opt_key: {"lora_mode": mode}},
+                ),
+            )
+        assert settings.external_engine == "m5rt"
+        assert settings.lora_adapter == "qwen-lora"
+        assert settings.external_engine_options == {opt_key: {"lora_mode": mode}}
+        assert res["settings"]["lora_adapter"] == "qwen-lora"
+
+    # 2) Invalid lora_mode is rejected with 400.
+    settings_bad_mode = ModelSettings(external_engine="m5rt")
+    with pytest.raises(HTTPException) as bad_mode:
+        await _update_settings(
+            pool,
+            settings_bad_mode,
+            admin_routes.ModelSettingsRequest(
+                external_engine_options={"ninfer-metal": {"lora_mode": "bogus"}}
+            ),
+        )
+    assert bad_mode.value.status_code == 400
+    assert "lora_mode" in bad_mode.value.detail
+
+    # 3) Splash (explicit or auto-routed GGUF) preserves conflict error.
+    splash_settings = ModelSettings(external_engine="splash")
+    with pytest.raises(HTTPException, match="cannot be combined with an external engine") as splash_err:
+        await _update_settings(
+            pool,
+            splash_settings,
+            admin_routes.ModelSettingsRequest(lora_adapter=str(adapter)),
+        )
+    assert splash_err.value.status_code == 400
+
+    entry.model_format = "gguf"
+    gguf_settings = ModelSettings()
+    with pytest.raises(HTTPException, match="cannot be combined with an external engine") as gguf_err:
+        await _update_settings(
+            pool,
+            gguf_settings,
+            admin_routes.ModelSettingsRequest(lora_adapter=str(adapter)),
+        )
+    assert gguf_err.value.status_code == 400
+    entry.model_format = None
+
+    # 4) Changing lora_mode or lora_adapter on a loaded engine triggers reload.
+    fake_loaded_engine = MagicMock()
+    fake_loaded_engine.external_engine_id = "m5rt"
+    entry.engine = fake_loaded_engine
+    entry.is_pinned = False
+    pool.request_unload = AsyncMock(return_value=True)
+    loaded_settings = ModelSettings(
+        external_engine="m5rt",
+        lora_adapter="qwen-lora",
+        external_engine_options={"m5rt": {"lora_mode": "merge"}},
+    )
+    reload_res = await _update_settings(
+        pool,
+        loaded_settings,
+        admin_routes.ModelSettingsRequest(
+            external_engine_options={"m5rt": {"lora_mode": "bypass"}}
+        ),
+    )
+    assert reload_res["requires_reload"] is True
+    assert reload_res["auto_unloaded"] is True
+    pool.request_unload.assert_awaited_once()
+

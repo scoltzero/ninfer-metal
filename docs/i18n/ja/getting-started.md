@@ -2,7 +2,7 @@
 
 # クイックスタートと設定
 
-ゼロ MLX の `ninfer-metal` コア（`miv/`）のビルド、`.omlxm5` へのウェイト変換、単体 C++20 OpenAI サーバー（`ninfer-metal-serve`）のワンクリック起動、**`miv Core Backend`** の `oMLX-extend` 連携、`ninfer-metal.toml` のカスタマイズ、および低レベル CLI・デーモンの呼び出し手順をまとめる。`oMLX` macOS アプリを利用する場合は、まず 5 ステップの画面ガイドである **[`oMLX-extend` ビジュアルガイド](omlx-extend-guide.md)** から参照されたい。
+ゼロ MLX の `ninfer-metal` コア（`miv/`）のビルド、`.miv` へのウェイト変換、単体 C++20 OpenAI サーバー（`ninfer-metal-serve`）のワンクリック起動、**`miv Core Backend`** の `oMLX-extend` 連携、`ninfer-metal.toml` のカスタマイズ、および低レベル CLI・デーモンの呼び出し手順をまとめる。`oMLX` macOS アプリを利用する場合は、まず 5 ステップの画面ガイドである **[`oMLX-extend` ビジュアルガイド](omlx-extend-guide.md)** から参照されたい。
 
 ---
 
@@ -75,14 +75,14 @@ macOS 27+ を搭載した Apple M5+ Mac でアーカイブを展開し、`instal
         └── tools/
 ```
 
-### モデルの `.omlxm5` 変換
+### モデルの `.miv` 変換
 
 オフライン NAX プリタイリングにより、`MXFP4`（`E2M1 × UE8M0`）または `oQ` Affine（`q3–q8`、`g64/g128`）ウェイトを一度だけパックする。Prefill・`T=1` AR デコード・投機検証が単一の常駐メモリコピーを共有する。
 
 ```bash
 python3 miv/tools/m5_artifact.py convert \
   --source <model_dir> \
-  --output <model_dir>/model.omlxm5 \
+  --output <model_dir>/model.miv \
   --source-repo <repo_id> \
   --nax-pretile
 ```
@@ -101,7 +101,7 @@ python3 miv/tools/m5_artifact.py convert \
 # 特定のモデルディレクトリを指定してワンクリック起動（デフォルトポート 8080、oMLX のポート 8000 と分離）
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# モデルディレクトリを省略すると ./models または oMLX のモデルフォルダ内の最初の .omlxm5 モデルを自動選択
+# モデルディレクトリを省略すると ./models または oMLX のモデルフォルダ内の最初の .miv モデルを自動選択
 ./omlx-extend/scripts/start_ninfer_serve.sh
 
 # 任意の CLI フラグを追加して共有デフォルト設定を上書き
@@ -204,12 +204,12 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 |---|---|---|
 | `--config PATH` | 自動検出 | 明示的な `ninfer-metal.toml`（`[server]`、`[model]`、`[[models]]`、`[engine]`、`[speculative]`）を読み込む。CLI フラグが TOML 値を上書きする |
 | `--no-default-config` | オフ | `ninfer-metal.toml` の自動検出をスキップし、素のコンパイル時デフォルトから起動する |
-| `--model-dir PATH` | 必須（または TOML 指定） | `config.json`、`tokenizer.json`、`tokenizer_config.json`、`chat_template.jinja`、`model.omlxm5` を含むモデルディレクトリ。複数回指定で単一ポート並列ホスト |
+| `--model-dir PATH` | 必須（または TOML 指定） | `config.json`、`tokenizer.json`、`tokenizer_config.json`、`chat_template.jinja`、`model.miv` を含むモデルディレクトリ。複数回指定で単一ポート並列ホスト |
 | `--providers-dir PATH` | 自動（`$OMLX_PROVIDERS_DIR`、`~/Library/Application Support/oMLX/Providers`） | ルート B SPI v2 マイクロカーネルサイドカーの検索ルート（複数回指定可）。`<dir>/*/current/provider.json`（フォールバック `<dir>/*/provider.json`）を走査する |
 | `--provider MODE` | `auto`（`auto` \| `inproc` \| `<provider_id>`） | バックエンド選択：O(1) 自動ルーティング（`auto`）、インプロセス `miv`（`inproc`）、または明示 SPI v2 `<provider_id>` |
 | `--metallib-dir PATH`（エイリアス：`--kernel-dir`） | 自動検出 | Metal 4 / NAX コンパイル済み `.metallib` シェーダディレクトリ（`$OMLX_M5_METALLIB_DIR` -> `<exe>/../metallib` -> `<exe>/metallib`）。Metal シェーダ用であり、SPI v2 マイクロカーネルプロバイダではない |
-| `--artifact PATH` | 自動検出 | 対象 `.omlxm5`（またはプロバイダ成果物）の明示パス |
-| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | `dflash2` / `mtp` 用ドラフトモデルディレクトリまたは `.omlxm5` アーティファクト |
+| `--artifact PATH` | 自動検出 | 対象 `.miv`（またはプロバイダ成果物）の明示パス |
+| `--draft-dir PATH`、`--draft-artifact PATH`、`--mtp-artifact PATH` | — | `dflash2` / `mtp` 用ドラフトモデルディレクトリまたは `.miv` アーティファクト |
 | `--chat-template PATH`、`--model-id NAME` | 自動 | Jinja チャットテンプレートファイルまたは公開モデル ID の上書き |
 | `--host ADDR`、`--port PORT` | `127.0.0.1`、`8080` | HTTP バインドアドレスおよびポート |
 | `--api-key KEY`、`--cors` / `--no-cors` | `""`、有効 | `Authorization: Bearer <KEY>` の要求、CORS ヘッダ制御 |
@@ -238,7 +238,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
 ```
 
-`io.ninfer.metal/current/` がインストール済みであれば、`oMLX-extend` は **`miv Core Backend`**（`mseries_backendd`、フォールバック先：`com.omlx.mseries/current/`、`PATH`、`build/*/miv/`）を自動検出し、導入済みのルート A およびルート B マイクロカーネルを **`Integrations → External Engines`** に表示する。`model.omlxm5`、`model_pack.json`、または `omlxm5-manifest.json` を含むモデルディレクトリは初回リクエスト時に遅延で **`miv Core Backend`** へルーティングされ、未変換モデルは Stock MLX のまま動作する。変換済みモデルに対して Stock MLX を強制する場合は、**`Model Settings → Advanced Settings`** で **`Use External Engine`** をオフにする（`external_engine: "stock"` を書き込む）。
+`io.ninfer.metal/current/` がインストール済みであれば、`oMLX-extend` は **`miv Core Backend`**（`mseries_backendd`、フォールバック先：`com.omlx.mseries/current/`、`PATH`、`build/*/miv/`）を自動検出し、導入済みのルート A およびルート B マイクロカーネルを **`Integrations → External Engines`** に表示する。`model.miv` / `model.omlxm5`、`model_pack.json`、または `omlxm5-manifest.json` を含むモデルディレクトリは初回リクエスト時に遅延で **`miv Core Backend`** へルーティングされ、未変換モデルは Stock MLX のまま動作する。変換済みモデルに対して Stock MLX を強制する場合は、**`Model Settings → Advanced Settings`** で **`Use External Engine`** をオフにする（`external_engine: "stock"` を書き込む）。
 
 `oMLX` macOS アプリの画面付きガイドは **[`oMLX-extend` ビジュアルガイド](omlx-extend-guide.md)** を参照。ホスト内部構造および UI 設定マッピングの詳細は [`omlx-extend/README.md`](../../../omlx-extend/README.md) を参照。
 
@@ -270,7 +270,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 |---|---|---|---|
 | `host` / `port` / `api_key` | `[server]` | `"127.0.0.1"`、`8080`、`""` | 単体 `ninfer-metal-serve` 専用設定（`oMLX-extend` AF_UNIX サイドカーでは無視） |
 | `providers_dir` / `memory_budget_gb` | `[server]` | パス（文字列または配列）、GiB 浮動小数 | ルート B SPI v2 プロバイダ検索ディレクトリおよびサーバー全体の UMA 予算上限（デフォルト：物理 RAM の `81%`） |
-| `model_dir` / `artifact`（または `artifact_path`） | `[model]` / `[[models]]` | パス | 単体起動時のモデルディレクトリおよび任意の明示 `.omlxm5` パス（`artifact` / `artifact_path`、`draft_artifact` / `draft_artifact_path`、`metallib_dir` の双方を受理）。`[[models]]` 配列で複数モデルを並列定義 |
+| `model_dir` / `artifact`（または `artifact_path`） | `[model]` / `[[models]]` | パス | 単体起動時のモデルディレクトリおよび任意の明示 `.miv` パス（`artifact` / `artifact_path`、`draft_artifact` / `draft_artifact_path`、`metallib_dir` の双方を受理）。`[[models]]` 配列で複数モデルを並列定義 |
 | `max_concurrency` | `[engine]` | `1..8`（素の CLI 既定 `1`、TOML テンプレート `4`） | マルチユーザー同時バッチスロット数（`miv` 文書では **`B`**、アップストリーム `ninfer` では **`C`**）。サイドカーモードで省略時は oMLX の `max_concurrent_requests` を継承 |
 | `max_context` | `[engine]` | `32768`–`262144+`（素の CLI 既定 `32768`） | コンテキストウィンドウ長（**`L`**）。サイドカーモードでは oMLX の `max_context_window` からマッピング |
 | `kv_dtype` | `[engine]` | `"bf16"` \| `"affine4_g128"` | `affine4_g128` は `0.5625 B/val` で格納し `64K+` で `0-ULP` 一致を検証済み。`miv-v0.01` に `int8_g64` は未搭載 |
@@ -291,7 +291,7 @@ cp omlx-extend/config/ninfer-metal.toml ~/.config/ninfer-metal/ninfer-metal.toml
 1. **`m5rt_runner`（トークン ID CLI）** — 整数トークン ID 入力からシングルストリーム、バッチ（`--batch-mode on --max-concurrency 4`）、または DFlash2 投機推論を実行し、NDJSON 形式でメトリクスとトークンを出力する：
    ```bash
    ./build/miv-v001/miv/m5rt_runner \
-     --artifact /path/to/model.omlxm5 \
+     --artifact /path/to/model.miv \
      --config /path/to/config.json \
      --prompt 151644,8948,198,2610,525,264 \
      --max-context 8192 \

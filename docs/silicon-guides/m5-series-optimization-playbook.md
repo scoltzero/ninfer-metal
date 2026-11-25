@@ -60,7 +60,7 @@
   - 正确范式：在单线程组 `omlx_m5_moe_nax_bucket_schedule` 内完成 GPU 端计数与 `BM=8` 分桶，按最坏上界 **`max_tiles = T + 256`**（`top_k=8` 且 `BM=8` 时，总有效分配行 `8T` 除以 `8` 为 `T` 个满桶，外加最多 256 个专家各 1 个尾桶）固定发射静态网格，越界桶在核首行 `if (tile_idx >= *total_tiles) return;` 零成本早退。在 `T >= 32` 启用后，64 核 `T=1024` Prefill TTFT 从 `905.20 ms` 骤降至 **`381.71 ms`（`2.37×` 提速）**。
 
 ### 定律 4：离线 NAX 预重排消除双份驻留（物理内存立减 **`-48.1%`** 公式）
-- **内存翻倍根源**：若 `.omlxm5` 保存行主序 `rowsplit` 权重而运行时 `Mxfp4NaxCache` / `AffineNaxCache` 在 GPU 上重排生成 `Private` tiled buffer，则在 `QwenProgram` 生命周期内会同时常驻原始 `Shared/Immutable` 权重池（供元数据/回退使用）与重排后 `Private` 权重池，总权重内存膨胀为：
+- **内存翻倍根源**：若 `.miv` 保存行主序 `rowsplit` 权重而运行时 `Mxfp4NaxCache` / `AffineNaxCache` 在 GPU 上重排生成 `Private` tiled buffer，则在 `QwenProgram` 生命周期内会同时常驻原始 `Shared/Immutable` 权重池（供元数据/回退使用）与重排后 `Private` 权重池，总权重内存膨胀为：
   $$M_{\text{untiled\_nax}} \approx M_{\text{artifact}} + M_{\text{2D\_dense\_projections}} \approx 1.92 \times M_{\text{artifact}}$$
   实测 27B-MXFP4（`14.17 GiB`）在 `m5rt.2` 中 `phys_footprint` 高达 **`27.0 GiB`**！
 - **零拷贝离线预重排定律**：使用 `tools/m5_artifact.py convert --nax-pretile`（或 `pretile` 子命令）在磁盘离线写好 `mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1` 布局（自动按 `N >= 65536 ? BN=32 : BN=16` 对齐），运行时直接将 `ModelPlaneBinding` 指向 mmap/上传后的唯一不可变分段池：
@@ -119,7 +119,7 @@
 2. **96GB 容量红线守则**：开启预重排（省 `13 GiB`）后，`27B + DFlash2` 在 `32K` 可安全开到 `B=4`（实测 `124–143 tok/s`），在 `64K` 限 `B=2`，在 `128K` 限 `B=1..2`；切勿在 96GB 上强开 `27B+DFlash2 128K × B=4/8`。
 
 #### D. M5 Ultra 80 核 256GB（`apple-m5-ultra-80gpu`）：Stage B 到货一键校准协议
-80 核 256GB 到货后，直接复用 64 核已排雷的全部内核与离线预重排 `.omlxm5` 制品，按以下 4 步生成 `apple-m5-ultra-80gpu.json`：
+80 核 256GB 到货后，直接复用 64 核已排雷的全部内核与离线预重排 `.miv` 制品，按以下 4 步生成 `apple-m5-ultra-80gpu.json`：
 1. 运行 `eval "$(./omlx/.venv/bin/python tools/m5_silicon_profile.py --shell-env)"` 锁定 `m5-ultra-80gpu-256g`。
 2. 执行 `./tools/run_m5_ultra_capability.sh --iterations 50` 采集 80 核 H0 硬件计数器，验证 64→80 核在 `nax-q4-m8` / Prefill 上的真实加速比（理论预期 `1.20×–1.25×`）与 `recommended_working_set_bytes`（预期 `~192–207 GiB`）。
 3. 执行 `./tools/run_m5_ultra_tuning.sh --iterations 30` 检查 `+25%` NAX 核心是否使 `Split-KV` 分片数从 `12` 升至 `16`、以及 `moe_nax_min_tokens` 是否从 `32` 下移至 `16`。
@@ -164,7 +164,7 @@ eval "$(./omlx/.venv/bin/python tools/m5_silicon_profile.py --shell-env)"
 
 ## 7. 常见性能反模式排查清单（Troubleshooting Pitfalls）
 
-1. **`phys_footprint` 接近模型体积的 2 倍（如 27B 占 27 GB）**：检查 `.omlxm5` 制品是否未经过 `m5_artifact.py pretile` / `convert --nax-pretile` 转换，触发了加载期在线 GPU 重排双份驻留。
+1. **`phys_footprint` 接近模型体积的 2 倍（如 27B 占 27 GB）**：检查 `.miv` 制品是否未经过 `m5_artifact.py pretile` / `convert --nax-pretile` 转换，触发了加载期在线 GPU 重排双份驻留。
 2. **长上下文（`>= 4K`）下 GQA 模型解码 TPOT 随长度线性暴涨**：检查 `--attention-split-kv` 是否误设为 `off`，或未加载校准覆盖文件导致 `split_kv_min_context` 停留在过高阈值。
 3. **高并发（`B=4/8`）吞吐不随槽位数扩展**：确认 `--batch-mode on` 已开启，使引擎走单命令缓冲 `replay_icb_batch` 而非串行单槽轮询。
 4. **新增自定义大缓冲在 `execute_batch` 正常但 `ICB` 重放数值损坏**：立即核查缓冲内子对象 `offset` 是否可能达到或超过 `4 GiB`（`4,294,963,200 B`），按 `<= 2 GiB` 分段切分。

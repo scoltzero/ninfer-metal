@@ -4,6 +4,7 @@
 #include "bf16_nax.h"
 #include "forward_plan.h"
 #include "gdn_prefill.h"
+#include "lora_runtime.h"
 #include "moe_nax.h"
 #include "mxfp4_nax_cache.h"
 #include "silicon_tuning.h"
@@ -379,6 +380,9 @@ public:
   const U64 owner_id = new_owner_id();
   std::string execution_identity;
   std::string shared_contract_identity;
+  std::string base_execution_identity_;
+  std::string base_shared_contract_identity_;
+  std::string bound_context_identity_;
   bool execution_identity_bound = false, execution_started = false;
 
   Impl(const MetalContext &context, const MaterializedModel &weights,
@@ -392,7 +396,9 @@ public:
        omlx::m5::AttentionNumericPolicy attention_policy,
        bool inspect_tensors_workspace, std::string_view kv_dtype,
        QwenForward *shared_primary, bool enable_flash_nax_prefill,
-       U32 kv_pool_pages = 0U)
+       U32 kv_pool_pages = 0U,
+       std::shared_ptr<const QwenMergedLoraOverrides> merged_lora = nullptr,
+       std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr)
       : context(context), weights(weights), config(std::move(config)),
         max_context(max_context), libraries(libraries),
         silicon_tuning(detail::resolve_silicon_tuning(context)),
@@ -422,6 +428,8 @@ public:
         batch_enabled(enable_batch),
         diagnostic_override(std::move(diagnostic_override)),
         moe_override(std::move(moe_override)) {
+    merged_lora_ = std::move(merged_lora);
+    bypass_lora_ = std::move(bypass_lora);
     (void)sampling_contract_name(sampling_contract);
     if (attention_policy != omlx::m5::AttentionNumericPolicy::Legacy &&
         attention_policy != omlx::m5::AttentionNumericPolicy::RowExactV1)
@@ -544,6 +552,9 @@ public:
       gdn_chunk_ws = allocate("qwen.workspace.gdn_chunk");
     zero = allocate("zero");
     const_cast<MetalBuffer *>(zero.buffer)->zero();
+    argmax_scratch = allocate_private("argmax_partials");
+    rms_sq_buf = allocate_private("rms_sq_buf");
+    moe_tg_done_buf = allocate_private("moe_tg_done_buf");
     if (c.full_attention_layers() > 0) {
       if (attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1 ||
           affine4_kv || flash_nax_prefill_) {
@@ -664,6 +675,24 @@ public:
     }
     if (embedding.name.empty() || final_norm.name.empty() || head.name.empty())
       throw std::invalid_argument("Qwen global parameters missing");
+    if (merged_lora_ != nullptr &&
+        !merged_lora_->views_by_object_id.empty()) {
+      if (const auto it =
+              merged_lora_->views_by_object_id.find(head.object_id);
+          it != merged_lora_->views_by_object_id.end()) {
+        head = it->second;
+      }
+      for (auto &block : blocks) {
+        for (auto &[role, w] : block.operands) {
+          (void)role;
+          if (const auto it =
+                  merged_lora_->views_by_object_id.find(w.object_id);
+              it != merged_lora_->views_by_object_id.end()) {
+            w = it->second;
+          }
+        }
+      }
+    }
     if (!source_norm_offset.has_value()) {
       const auto is_delta_norm_family = [](std::string_view type) {
         return type.starts_with("qwen3_5") || type.starts_with("qwen3_6") ||
@@ -709,19 +738,21 @@ public:
     if (allocation_names.size() != allocation_plan.buffers.size())
       throw std::logic_error("Qwen allocation plan not fully consumed");
 
-    // Private packed verify logits scratch on primary slot (for B>=2 verify M>8).
+    // Private packed verify logits workspace on primary slot (for B>=2 verify M>8).
     if (!shared_primary_ && batch_enabled && speculative &&
         logits.bytes < mul(64U, mul(v, 2U))) {
       const U64 pv_bytes = mul(64U, mul(v, 2U));
       auto pv_buf =
           std::make_unique<MetalBuffer>(context.make_private_buffer(pv_bytes));
       packed_verify_logits = Ref{pv_buf.get(), 0, pv_bytes};
+      track_extra_workspace("packed_verify_logits", *pv_buf);
       buffers.push_back(std::move(pv_buf));
     }
 
+    bf16_nax_bypass_ok_ = bf16_nax_runtime_eligible(context, libraries);
     bf16_nax_enabled =
         linear_policy == LinearNumericPolicy::RowExactPortableV1 &&
-        bf16_nax_runtime_eligible(context, libraries);
+        bf16_nax_bypass_ok_;
     if (config.num_experts &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          linear_policy == LinearNumericPolicy::Legacy) &&
@@ -729,9 +760,14 @@ public:
         moe_nax_weight_eligible(blocks.front().get("moe_expert_gate"),
                                 blocks.front().get("moe_expert_up"),
                                 blocks.front().get("moe_expert_down"), h, f)) {
+      const std::size_t moe_buf_start = buffers.size();
       moe_nax_ws.allocate(context, workspace_rows_, h, f, buffers,
                           U32(config.num_experts),
                           U32(config.num_experts_per_token));
+      for (std::size_t bi = moe_buf_start; bi < buffers.size(); ++bi) {
+        track_extra_workspace("moe_nax_ws_" + std::to_string(bi - moe_buf_start),
+                              *buffers[bi]);
+      }
     }
 
     std::vector<MaterializedWeightView> candidates;
@@ -751,13 +787,16 @@ public:
 
     has_row_exact_metallib_ =
         std::filesystem::is_regular_file(libraries / "omlx_m5_row_exact.metallib");
+    const void *cache_owner_key =
+        merged_lora_ ? static_cast<const void *>(merged_lora_.get())
+                     : static_cast<const void *>(&weights);
 
     if (mxfp4_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          mxfp4_w4a4_prefill_enabled() || has_pretiled_mxfp4 ||
          (t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled()))) {
       mxfp4_nax_cache = Mxfp4NaxCache::acquire(
-          &weights, context, libraries, candidates,
+          cache_owner_key, context, libraries, candidates,
           silicon_tuning.linear_split_k_target_slices);
       if (mxfp4_nax_cache && !sibling_concat_disabled()) {
         std::lock_guard<std::recursive_mutex> cache_lk(
@@ -810,6 +849,10 @@ public:
         f16_scratch = Ref{f16_buf.get(), 0, f16_bytes};
         f16_row_scale = Ref{rs_buf.get(), 0, rs_bytes};
         f16_ones_scale = Ref{ones_buf.get(), 0, rs_bytes};
+        track_extra_workspace("mxfp4_nax_f16_norm", *f16_norm_buf);
+        track_extra_workspace("mxfp4_nax_f16_ws", *f16_buf);
+        track_extra_workspace("mxfp4_nax_f16_row_scale", *rs_buf);
+        track_extra_workspace("mxfp4_nax_f16_ones_scale", *ones_buf);
         buffers.push_back(std::move(f16_norm_buf));
         buffers.push_back(std::move(f16_buf));
         buffers.push_back(std::move(rs_buf));
@@ -824,6 +867,8 @@ public:
               context.make_private_buffer(a4_scale_bytes));
           a4_codes = Ref{a4_c_buf.get(), 0, a4_code_bytes};
           a4_scales = Ref{a4_s_buf.get(), 0, a4_scale_bytes};
+          track_extra_workspace("mxfp4_nax_a4_codes", *a4_c_buf);
+          track_extra_workspace("mxfp4_nax_a4_scales", *a4_s_buf);
           buffers.push_back(std::move(a4_c_buf));
           buffers.push_back(std::move(a4_s_buf));
         }
@@ -835,7 +880,7 @@ public:
          has_pretiled_affine ||
          (t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled()))) {
       affine_nax_cache = AffineNaxCache::acquire(
-          &weights, context, libraries, zero, candidates,
+          cache_owner_key, context, libraries, zero, candidates,
           silicon_tuning.linear_split_k_target_slices);
       if (affine_nax_cache && !sibling_concat_disabled()) {
         std::lock_guard<std::recursive_mutex> cache_lk(
@@ -875,6 +920,7 @@ public:
         auto xs_buf =
             std::make_unique<MetalBuffer>(context.make_private_buffer(xs_bytes));
         affine_nax_xs = Ref{xs_buf.get(), 0, xs_bytes};
+        track_extra_workspace("affine_nax_xs", *xs_buf);
         buffers.push_back(std::move(xs_buf));
       }
     }
@@ -883,7 +929,7 @@ public:
         has_row_exact_metallib_ && t_domain_dispatch_enabled() &&
         pretiled_qmv_t1_enabled()) {
       q5_high1_cache = acquire_q5_high1_cache(
-          &weights, context, libraries, candidates, affine_nax_cache.get());
+          cache_owner_key, context, libraries, candidates, affine_nax_cache.get());
     }
 
     if ((mxfp4_nax_active() || affine_nax_active()) &&
@@ -894,43 +940,30 @@ public:
       auto c_buf = std::make_unique<MetalBuffer>(
           context.make_private_buffer(concat_bytes));
       concat_out = Ref{c_buf.get(), 0, concat_bytes};
+      track_extra_workspace("sibling_concat_out", *c_buf);
       buffers.push_back(std::move(c_buf));
     }
 
-    {
-      auto am_buf =
-          std::make_unique<MetalBuffer>(context.make_private_buffer(1024U));
-      argmax_scratch = Ref{am_buf.get(), 0, 1024U};
-      buffers.push_back(std::move(am_buf));
-      const U64 sq_bytes = std::max<U64>(
-          4096ULL, mul(U64(blocks.size() * 2U + 16U) * 8ULL, 4ULL));
-      const U64 moe_done_bytes =
-          std::max<U64>(512ULL, mul(U64(blocks.size() + 16U) * 8ULL, 4ULL));
-      auto sq_buf =
-          std::make_unique<MetalBuffer>(context.make_private_buffer(sq_bytes));
-      auto moe_done_buf = std::make_unique<MetalBuffer>(
-          context.make_private_buffer(moe_done_bytes));
-      rms_sq_buf = Ref{sq_buf.get(), 0, sq_bytes};
-      moe_tg_done_buf = Ref{moe_done_buf.get(), 0, moe_done_bytes};
-      buffers.push_back(std::move(sq_buf));
-      buffers.push_back(std::move(moe_done_buf));
-      if (!shared_primary_) {
-        auto ps_parts =
-            std::make_unique<MetalBuffer>(context.make_private_buffer(8192U));
-        auto ps_meta = std::make_unique<MetalBuffer>(context.make_buffer(64U));
-        auto ps_ids = std::make_unique<MetalBuffer>(context.make_buffer(2048U));
-        auto ps_scores =
-            std::make_unique<MetalBuffer>(context.make_buffer(2048U));
-        packed_samp_parts = Ref{ps_parts.get(), 0, 8192U};
-        packed_samp_meta = Ref{ps_meta.get(), 0, 64U};
-        packed_samp_ids = Ref{ps_ids.get(), 0, 2048U};
-        packed_samp_scores = Ref{ps_scores.get(), 0, 2048U};
-        buffers.push_back(std::move(ps_parts));
-        buffers.push_back(std::move(ps_meta));
-        buffers.push_back(std::move(ps_ids));
-        buffers.push_back(std::move(ps_scores));
-        last_packed_logits_buf_ = logits.buffer;
-      }
+    if (!shared_primary_) {
+      auto ps_parts =
+          std::make_unique<MetalBuffer>(context.make_private_buffer(8192U));
+      auto ps_meta = std::make_unique<MetalBuffer>(context.make_buffer(64U));
+      auto ps_ids = std::make_unique<MetalBuffer>(context.make_buffer(2048U));
+      auto ps_scores =
+          std::make_unique<MetalBuffer>(context.make_buffer(2048U));
+      packed_samp_parts = Ref{ps_parts.get(), 0, 8192U};
+      packed_samp_meta = Ref{ps_meta.get(), 0, 64U};
+      packed_samp_ids = Ref{ps_ids.get(), 0, 2048U};
+      packed_samp_scores = Ref{ps_scores.get(), 0, 2048U};
+      track_extra_workspace("packed_samp_parts", *ps_parts);
+      track_extra_workspace("packed_samp_meta", *ps_meta);
+      track_extra_workspace("packed_samp_ids", *ps_ids);
+      track_extra_workspace("packed_samp_scores", *ps_scores);
+      buffers.push_back(std::move(ps_parts));
+      buffers.push_back(std::move(ps_meta));
+      buffers.push_back(std::move(ps_ids));
+      buffers.push_back(std::move(ps_scores));
+      last_packed_logits_buf_ = logits.buffer;
     }
 
     gdn_chunk_nax_enabled_ =
@@ -941,6 +974,139 @@ public:
             U32(c.linear_value_head_dim));
 
     reset();
+
+    if (!speculative_enabled && !inspect_routes_enabled &&
+        !inspect_tensors_workspace && feature_layers.empty() &&
+        context.capabilities().profile.compute_icb_eligible) {
+      for (U32 slot_i = 0; slot_i < 2U; ++slot_i) {
+        auto &ap = ar_pipe_[slot_i];
+        auto samp_buf = std::make_unique<MetalBuffer>(context.make_buffer(8U));
+        ap.sampled = Ref{samp_buf.get(), 0, 8U};
+        track_extra_workspace("ar_pipe_sampled_" + std::to_string(slot_i),
+                              *samp_buf);
+        buffers.push_back(std::move(samp_buf));
+        if (attention_positions.buffer) {
+          auto pos_buf = std::make_unique<MetalBuffer>(context.make_buffer(4U));
+          ap.attn_pos = Ref{pos_buf.get(), 0, 4U};
+          track_extra_workspace("ar_pipe_attn_pos_" + std::to_string(slot_i),
+                                *pos_buf);
+          buffers.push_back(std::move(pos_buf));
+        }
+      }
+    }
+    if (!shared_primary_ && !inspect_routes_enabled &&
+        !inspect_tensors_workspace && workspace_rows_ >= 64U) {
+      for (U32 slot_i = 0; slot_i < 2U; ++slot_i) {
+        auto &pp = prefill_pipe_[slot_i];
+        const U64 tok_bytes = mul(workspace_rows_, 4U);
+        auto tok_buf =
+            std::make_unique<MetalBuffer>(context.make_buffer(tok_bytes));
+        pp.token_ids = Ref{tok_buf.get(), 0, tok_bytes};
+        track_extra_workspace("prefill_pipe_tokens_" + std::to_string(slot_i),
+                              *tok_buf);
+        buffers.push_back(std::move(tok_buf));
+        if (attention_positions.buffer) {
+          auto pos_buf =
+              std::make_unique<MetalBuffer>(context.make_buffer(tok_bytes));
+          pp.attn_pos = Ref{pos_buf.get(), 0, tok_bytes};
+          track_extra_workspace(
+              "prefill_pipe_attn_pos_" + std::to_string(slot_i), *pos_buf);
+          buffers.push_back(std::move(pos_buf));
+        }
+      }
+    }
+
+    ensure_bypass_scratch();
+    rebuild_profiles();
+
+    ExecutionIdentityFields base_fields{
+        {"source", std::string(execution_source_id())},
+        {"kernels", execution_kernel_bundle_digest(libraries)},
+        {"linear",
+         linear_policy == LinearNumericPolicy::RowExactPortableV1
+             ? (mxfp4_nax_active()
+                    ? "linear_row_exact_mxfp4_nax_v1"
+                    : affine_nax_active() ? "linear_row_exact_affine_nax_v1"
+                                          : "linear_row_exact_portable_v1")
+             : "legacy_route_v1"},
+        {"attention",
+         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1
+             ? (strict_two_pass_attn_ ? "attention.row_exact.2pass.v1"
+                                      : "attention.row_exact.v1")
+             : "legacy_attention_v1"},
+        {"gdn", "gdn.sequential.simd32.f32_state.conv_bf16.v1"},
+        {"sampling", std::string(sampling_contract_name(sampling_contract))},
+        {"chunk", std::string(prefill_chunk_policy_id(sampling_contract))},
+        {"scope", "process-local immutable Program owner"}};
+    if (kv_format_ != KvStorageFormat::BFloat16) {
+      base_fields.emplace("kv_dtype",
+                          std::string(kv_storage_format_name(kv_format_)));
+    }
+    if (merged_lora_ && !merged_lora_->fingerprint.empty()) {
+      base_fields.emplace("merged_lora", merged_lora_->fingerprint);
+    }
+    base_shared_contract_identity_ = execution_identity_digest(base_fields);
+    base_fields.emplace("owner", std::to_string(owner_id));
+    base_execution_identity_ = execution_identity_digest(base_fields);
+    refresh_lora_execution_identity();
+
+    if (this->diagnostic_override && !diagnostic_override_matched)
+      throw std::invalid_argument(
+          "linear A/B override key matches no weight/profile");
+    if (this->moe_override && !moe_override_matched)
+      throw std::invalid_argument(
+          "MoE A/B override key matches no weight/profile");
+  }
+
+  void ensure_bypass_scratch() {
+    if (bypass_lora_ && !bypass_lora_->entries_by_object_id.empty()) {
+      const U32 mp = ((workspace_rows_ + 7U) / 8U) * 8U;
+      const U32 max_r = std::max<U32>(16U, bypass_lora_->max_r_slot);
+      const U64 need_bytes =
+          detail::lora_rt::align_256(mul(mul(mp, max_r), 2U));
+      if (!lora_bypass_tmp_buf_ || lora_bypass_tmp_buf_->size() < need_bytes) {
+        lora_bypass_tmp_buf_ =
+            std::make_unique<MetalBuffer>(context.make_private_buffer(need_bytes));
+      }
+      lora_bypass_tmp_ = Ref{lora_bypass_tmp_buf_.get(), 0, need_bytes};
+    } else {
+      lora_bypass_tmp_ = {};
+      lora_bypass_tmp_buf_.reset();
+    }
+  }
+
+  void refresh_lora_execution_identity() {
+    std::string sh = base_shared_contract_identity_;
+    std::string ex = base_execution_identity_;
+    if (bypass_lora_ && !bypass_lora_->fingerprint.empty()) {
+      sh = execution_identity_digest(
+          {{"program", sh}, {"bypass_lora", bypass_lora_->fingerprint}});
+      ex = execution_identity_digest(
+          {{"program", ex}, {"bypass_lora", bypass_lora_->fingerprint}});
+    }
+    if (execution_identity_bound && !bound_context_identity_.empty()) {
+      sh = execution_identity_digest(
+          {{"program", sh}, {"context", bound_context_identity_}});
+      ex = execution_identity_digest(
+          {{"program", ex}, {"context", bound_context_identity_}});
+    }
+    shared_contract_identity = std::move(sh);
+    execution_identity = std::move(ex);
+  }
+
+  void rebuild_profiles() {
+    profiles.clear();
+    batch_profiles.clear();
+    verify_profiles.clear();
+    split_profiles.clear();
+    split_batch_profiles.clear();
+    split_verify_profiles.clear();
+    packed_cache_.clear();
+    verify_async_profile_ = nullptr;
+    for (auto &ap : ar_pipe_)
+      ap.profiles.clear();
+    for (auto &pp : prefill_pipe_)
+      pp.profiles.clear();
 
     for (U32 capacity : {1U, 2U, 4U, 8U, 12U, 16U, 24U, 32U, 64U, 128U, 256U,
                          512U, 1024U, 2048U, 4096U}) {
@@ -961,22 +1127,20 @@ public:
           ensure_profile_icb(context, batch_profiles.back());
         }
       }
-      const U32 batch_tail =
-          std::min({max_context, workspace_rows_, 8U});
+      const U32 batch_tail = std::min({max_context, workspace_rows_, 8U});
       if (batch_profiles.empty() || batch_profiles.back().capacity < batch_tail) {
         batch_profiles.push_back(compile(batch_tail, false, false, 0, true));
         ensure_profile_icb(context, batch_profiles.back());
       }
     }
-    if (speculative) {
+    if (speculative_enabled) {
       for (U32 capacity : {1U, 2U, 3U, 4U, 8U}) {
         if (capacity > workspace_rows_ || capacity > max_context)
           break;
         verify_profiles.push_back(compile(capacity, true));
         ensure_profile_icb(context, verify_profiles.back());
       }
-      const U32 verify_tail =
-          std::min({max_context, workspace_rows_, 8U});
+      const U32 verify_tail = std::min({max_context, workspace_rows_, 8U});
       if (verify_profiles.empty() ||
           verify_profiles.back().capacity < verify_tail) {
         verify_profiles.push_back(compile(verify_tail, true));
@@ -995,7 +1159,7 @@ public:
       ensure_profile_icb(context, inspect_norm_profile);
       ensure_profile_icb(context, inspect_head_chunk_profile);
     }
-    if (enable_attention_split) {
+    if (split_attention_enabled) {
       std::vector<U32> envelopes{std::min(2048U, max_context),
                                  std::min(8192U, max_context),
                                  std::min(32768U, max_context),
@@ -1018,7 +1182,7 @@ public:
               ensure_profile_icb(context, split_batch_profiles.back());
             }
           }
-          if (speculative) {
+          if (speculative_enabled) {
             split_verify_profiles.push_back(
                 compile(capacity, true, true, envelope));
             ensure_profile_icb(context, split_verify_profiles.back());
@@ -1032,7 +1196,8 @@ public:
     }
     if (!speculative_enabled && !inspect_routes_enabled &&
         !inspect_tensors_workspace && feature_layers.empty() &&
-        context.capabilities().profile.compute_icb_eligible) {
+        context.capabilities().profile.compute_icb_eligible &&
+        ar_pipe_[0].sampled.buffer != nullptr) {
       const Ref feed_tok{token_ids.buffer, 0, 4U};
       const U32 split_min_ctx =
           std::max<U32>(512U, silicon_tuning.split_kv_min_context);
@@ -1063,14 +1228,6 @@ public:
               : silicon_tuning.split_kv_partitions};
       for (U32 slot_i = 0; slot_i < 2U; ++slot_i) {
         auto &ap = ar_pipe_[slot_i];
-        auto samp_buf = std::make_unique<MetalBuffer>(context.make_buffer(8U));
-        ap.sampled = Ref{samp_buf.get(), 0, 8U};
-        buffers.push_back(std::move(samp_buf));
-        if (attention_positions.buffer) {
-          auto pos_buf = std::make_unique<MetalBuffer>(context.make_buffer(4U));
-          ap.attn_pos = Ref{pos_buf.get(), 0, 4U};
-          buffers.push_back(std::move(pos_buf));
-        }
         const std::string tag = ".ar_pipe" + std::to_string(slot_i) +
                                 (batch_enabled ? ".td1" : "");
         if (split_attention_enabled) {
@@ -1103,20 +1260,10 @@ public:
       }
     }
     if (!shared_primary_ && !inspect_routes_enabled &&
-        !inspect_tensors_workspace && workspace_rows_ >= 64U) {
+        !inspect_tensors_workspace && workspace_rows_ >= 64U &&
+        prefill_pipe_[0].token_ids.buffer != nullptr) {
       for (U32 slot_i = 0; slot_i < 2U; ++slot_i) {
         auto &pp = prefill_pipe_[slot_i];
-        const U64 tok_bytes = mul(workspace_rows_, 4U);
-        auto tok_buf =
-            std::make_unique<MetalBuffer>(context.make_buffer(tok_bytes));
-        pp.token_ids = Ref{tok_buf.get(), 0, tok_bytes};
-        buffers.push_back(std::move(tok_buf));
-        if (attention_positions.buffer) {
-          auto pos_buf =
-              std::make_unique<MetalBuffer>(context.make_buffer(tok_bytes));
-          pp.attn_pos = Ref{pos_buf.get(), 0, tok_bytes};
-          buffers.push_back(std::move(pos_buf));
-        }
         const std::string tag = ".pf_pipe" + std::to_string(slot_i);
         for (U32 capacity : {64U, 128U, 256U, 512U, 1024U, 2048U, 4096U}) {
           if (capacity > workspace_rows_ || capacity > max_context)
@@ -1135,40 +1282,6 @@ public:
         }
       }
     }
-
-    ExecutionIdentityFields base_fields{
-        {"source", std::string(execution_source_id())},
-        {"kernels", execution_kernel_bundle_digest(libraries)},
-        {"linear",
-         linear_policy == LinearNumericPolicy::RowExactPortableV1
-             ? (mxfp4_nax_active()
-                    ? "linear_row_exact_mxfp4_nax_v1"
-                    : affine_nax_active() ? "linear_row_exact_affine_nax_v1"
-                                          : "linear_row_exact_portable_v1")
-             : "legacy_route_v1"},
-        {"attention",
-         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1
-             ? (strict_two_pass_attn_ ? "attention.row_exact.2pass.v1"
-                                      : "attention.row_exact.v1")
-             : "legacy_attention_v1"},
-        {"gdn", "gdn.sequential.simd32.f32_state.conv_bf16.v1"},
-        {"sampling", std::string(sampling_contract_name(sampling_contract))},
-        {"chunk", std::string(prefill_chunk_policy_id(sampling_contract))},
-        {"scope", "process-local immutable Program owner"}};
-    if (kv_format_ != KvStorageFormat::BFloat16) {
-      base_fields.emplace("kv_dtype",
-                          std::string(kv_storage_format_name(kv_format_)));
-    }
-    shared_contract_identity = execution_identity_digest(base_fields);
-    base_fields.emplace("owner", std::to_string(owner_id));
-    execution_identity = execution_identity_digest(base_fields);
-
-    if (this->diagnostic_override && !diagnostic_override_matched)
-      throw std::invalid_argument(
-          "linear A/B override key matches no weight/profile");
-    if (this->moe_override && !moe_override_matched)
-      throw std::invalid_argument(
-          "MoE A/B override key matches no weight/profile");
   }
 
   Ref allocate(std::string_view name) {
@@ -1186,6 +1299,32 @@ public:
       states.push_back(buffer.get());
     buffers.push_back(std::move(buffer));
     return ref;
+  }
+
+  Ref allocate_private(std::string_view name) {
+    const auto found = std::find_if(
+        allocation_plan.buffers.begin(), allocation_plan.buffers.end(),
+        [&](const auto &item) { return item.name == name; });
+    if (found == allocation_plan.buffers.end() ||
+        !allocation_names.insert(std::string(name)).second)
+      throw std::logic_error("Qwen allocation is absent or duplicated: " +
+                             std::string(name));
+    auto buffer = std::make_unique<MetalBuffer>(
+        context.make_private_buffer(found->bytes));
+    Ref ref{buffer.get(), 0, found->bytes};
+    if (found->clear_on_reset)
+      states.push_back(buffer.get());
+    buffers.push_back(std::move(buffer));
+    return ref;
+  }
+
+  void track_extra_workspace(std::string name, const MetalBuffer &buf) {
+    const U64 bytes = buf.size();
+    allocation_plan.workspace_bytes += bytes;
+    allocation_plan.largest_buffer_bytes =
+        std::max(allocation_plan.largest_buffer_bytes, bytes);
+    allocation_plan.buffers.push_back(
+        {std::move(name), bytes, /*state=*/false, /*clear_on_reset=*/false});
   }
 
   Ref allocate_sized(std::string_view name, U64 explicit_bytes) {
@@ -1214,6 +1353,47 @@ public:
   bool is_overridden(const MaterializedWeightView &w) const {
     return diagnostic_override.has_value() &&
            diagnostic_override->object == w.name;
+  }
+
+  bool has_bypass_lora(const MaterializedWeightView &w) const noexcept {
+    return bypass_lora_ != nullptr && bypass_lora_->has(w.object_id);
+  }
+
+  const QwenBypassLoraEntry *
+  find_bypass_lora(const MaterializedWeightView &w) const noexcept {
+    return bypass_lora_ != nullptr ? bypass_lora_->find(w.object_id) : nullptr;
+  }
+
+  const QwenBypassSiblingGroup *
+  find_bypass_group(U32 layer_index, QwenBypassGroupKind kind) const noexcept {
+    return bypass_lora_ != nullptr ? bypass_lora_->find_group(layer_index, kind)
+                                   : nullptr;
+  }
+
+  template <typename BlockT>
+  bool block_has_any_bypass(
+      const BlockT &block,
+      std::initializer_list<const char *> roles) const noexcept {
+    if (bypass_lora_ == nullptr)
+      return false;
+    for (const char *role : roles) {
+      const auto it = block.operands.find(role);
+      if (it != block.operands.end() &&
+          bypass_lora_->has(it->second.object_id)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void emit_bypass_for_weight(Encoder &e, const MaterializedWeightView &w,
+                              Ref x, Ref y, U32 n,
+                              std::optional<U32> explicit_t = {}) {
+    if (const auto *entry = find_bypass_lora(w); entry != nullptr) {
+      detail::lora_rt::emit_bypass_single_entry(
+          e, *entry, x, y, lora_bypass_tmp_, n, 0U, bf16_nax_bypass_ok_,
+          silicon_tuning.gpu_cores, explicit_t);
+    }
   }
 
   static bool pretiled_qmv_t1_enabled() {
@@ -1475,8 +1655,8 @@ public:
         true, explicit_t);
   }
 
-  void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y, U32 n,
-              U32 k, std::optional<U32> explicit_t = {}) {
+  void linear_base(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
+                   U32 n, U32 k, std::optional<U32> explicit_t = {}) {
     const U32 t = explicit_t.value_or(e.profile.capacity);
     const U32 sel_t = nax_effective_select_t(e, explicit_t);
     if (use_mxfp4_w4a4_for(sel_t) && !is_overridden(w)) {
@@ -1585,6 +1765,12 @@ public:
                     decision.fallback_reason, decision.route.numeric_contract_id,
                     decision.route.row_exact_group, decision.route.row_exact,
                     explicit_t);
+  }
+
+  void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y, U32 n,
+              U32 k, std::optional<U32> explicit_t = {}) {
+    linear_base(e, w, x, y, n, k, explicit_t);
+    emit_bypass_for_weight(e, w, x, y, n, explicit_t);
   }
 
   // 9e163eee N-concatenated sibling projection helper (2-way or 3-way).
@@ -1770,8 +1956,8 @@ public:
     return resolve_affine_planes_any_t(w, out_codes, out_high, out_sb);
   }
 
-  bool try_linear_m2(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
-                     U32 n, U32 k) {
+  bool try_linear_m2_base(Encoder &e, const MaterializedWeightView &w, Ref x,
+                          Ref y, U32 n, U32 k) {
     if (w.row_count != n || w.in_features != k)
       return false;
     Ref mx_c{}, mx_s{};
@@ -1815,10 +2001,18 @@ public:
     return false;
   }
 
+  bool try_linear_m2(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
+                     U32 n, U32 k) {
+    if (!try_linear_m2_base(e, w, x, y, n, k))
+      return false;
+    emit_bypass_for_weight(e, w, x, y, n, 2U);
+    return true;
+  }
+
   bool try_linear_add_sq_m2(Encoder &e, const MaterializedWeightView &w, Ref x,
                             Ref hidden_io, U32 n, U32 k, U32 sq_slot) {
-    if (n >= 65536U || !rms_sq_buf.buffer || w.row_count != n ||
-        w.in_features != k) {
+    if (has_bypass_lora(w) || n >= 65536U || !rms_sq_buf.buffer ||
+        w.row_count != n || w.in_features != k) {
       return false;
     }
     Ref mx_c{}, mx_s{};
@@ -1865,7 +2059,8 @@ public:
   bool try_linear_norm_m2(Encoder &e, const MaterializedWeightView &w,
                           const MaterializedWeightView &norm_w, Ref hidden_in,
                           Ref y, U32 n, U32 k, U32 sq_slot) {
-    if (!rms_sq_buf.buffer || w.row_count != n || w.in_features != k) {
+    if (has_bypass_lora(w) || !rms_sq_buf.buffer || w.row_count != n ||
+        w.in_features != k) {
       return false;
     }
     Ref mx_c{}, mx_s{};
@@ -1920,6 +2115,7 @@ public:
                             const MaterializedWeightView *norm_w = nullptr,
                             std::optional<U32> sq_slot = std::nullopt) {
     if (n >= 65536U || is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) ||
         gate_w.padded_k != up_w.padded_k || gate_w.row_count != n ||
         gate_w.in_features != k || up_w.row_count != n ||
         up_w.in_features != k) {
@@ -2025,6 +2221,10 @@ public:
     }
     const bool fused = (norm_w != nullptr && sq_slot.has_value() &&
                         rms_sq_buf.buffer != nullptr);
+    if (fused && (has_bypass_lora(parts[0]) || has_bypass_lora(parts[1]) ||
+                  has_bypass_lora(parts[2]))) {
+      return false;
+    }
     Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{};
     if (resolve_pretiled_mxfp4_m2(parts[0], &d0, &s0) &&
         resolve_pretiled_mxfp4_m2(parts[1], &d1, &s1) &&
@@ -2134,6 +2334,10 @@ public:
     }
     const bool fused = (norm_w != nullptr && sq_slot.has_value() &&
                         rms_sq_buf.buffer != nullptr);
+    if (fused && (has_bypass_lora(parts[0]) || has_bypass_lora(parts[1]) ||
+                  has_bypass_lora(parts[2]) || has_bypass_lora(parts[3]))) {
+      return false;
+    }
     Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{}, d3{}, s3{};
     if (resolve_pretiled_mxfp4_m2(parts[0], &d0, &s0) &&
         resolve_pretiled_mxfp4_m2(parts[1], &d1, &s1) &&
@@ -2229,8 +2433,8 @@ public:
 
   bool try_linear_add_sq_t1(Encoder &e, const MaterializedWeightView &w, Ref x,
                             Ref hidden_io, U32 n, U32 k, U32 sq_slot) {
-    if (e.profile.capacity != 1U || n >= 65536U || !rms_sq_buf.buffer ||
-        w.row_count != n || w.in_features != k) {
+    if (has_bypass_lora(w) || e.profile.capacity != 1U || n >= 65536U ||
+        !rms_sq_buf.buffer || w.row_count != n || w.in_features != k) {
       return false;
     }
     Ref mx_c{}, mx_s{};
@@ -2280,8 +2484,8 @@ public:
   bool try_linear_norm_t1(Encoder &e, const MaterializedWeightView &w,
                           const MaterializedWeightView &norm_w, Ref hidden_in,
                           Ref y, U32 n, U32 k, U32 sq_slot) {
-    if (e.profile.capacity != 1U || !rms_sq_buf.buffer || w.row_count != n ||
-        w.in_features != k) {
+    if (has_bypass_lora(w) || e.profile.capacity != 1U || !rms_sq_buf.buffer ||
+        w.row_count != n || w.in_features != k) {
       return false;
     }
     Ref mx_c{}, mx_s{};
@@ -2348,6 +2552,7 @@ public:
                                  U32 sq_slot) {
     if (e.profile.capacity != 1U || n >= 65536U || !rms_sq_buf.buffer ||
         is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) ||
         gate_w.padded_k != up_w.padded_k || gate_w.row_count != n ||
         gate_w.in_features != k || up_w.row_count != n ||
         up_w.in_features != k) {
@@ -2414,6 +2619,7 @@ public:
                          const MaterializedWeightView &up_w, Ref x, Ref y,
                          U32 n, U32 k, std::optional<U32> explicit_t = {}) {
     if (is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) ||
         gate_w.padded_k != up_w.padded_k) {
       return false;
     }
@@ -2604,6 +2810,15 @@ public:
 
   bool block_input_nax(const Block &block, U32 t,
                        std::optional<U32> explicit_t = {}) const {
+    if (block.type == LayerType::full_attention) {
+      if (block_has_any_bypass(block,
+                               {"attention_q", "attention_k", "attention_v"})) {
+        return false;
+      }
+    } else if (block_has_any_bypass(block,
+                                    {"gdn_qkv", "gdn_z", "gdn_a", "gdn_b"})) {
+      return false;
+    }
     auto has = [&](const char *role, U32 n, U32 k) {
       const auto &w = block.get(role);
       if (!use_mxfp4_nax_for_weight(w, t))
@@ -2624,7 +2839,8 @@ public:
 
   bool block_mlp_input_nax(const Block &block, U32 t,
                            std::optional<U32> explicit_t = {}) const {
-    if (config.num_experts)
+    if (config.num_experts ||
+        block_has_any_bypass(block, {"mlp_gate", "mlp_up", "mlp_down"}))
       return false;
     const auto &gw_v = block.get("mlp_gate");
     const auto &uw_v = block.get("mlp_up");
@@ -3065,16 +3281,19 @@ public:
         block.get("attention_q"), block.get("attention_k"),
         block.get("attention_v")};
     const std::array<U32, 3> part_ns{2 * q, kv, kv};
+    const auto *qkv_bypass =
+        find_bypass_group(block.layer_index, QwenBypassGroupKind::attn_qkv);
     Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{};
     Ref h0{}, h1{}, h2{};
     bool fused_qkv_norm = false;
     if (io_sq_slot != nullptr && io_sq_slot->has_value()) {
       const U32 sq_in = **io_sq_slot;
       *io_sq_slot = std::nullopt;
-      if (t == 1U && !input_is_f16 && 2 * q < 65536U && kv < 65536U &&
-          parts[0].row_count == 2 * q && parts[1].row_count == kv &&
-          parts[2].row_count == kv && parts[0].in_features == h &&
-          parts[1].in_features == h && parts[2].in_features == h) {
+      if (qkv_bypass == nullptr && t == 1U && !input_is_f16 && 2 * q < 65536U &&
+          kv < 65536U && parts[0].row_count == 2 * q &&
+          parts[1].row_count == kv && parts[2].row_count == kv &&
+          parts[0].in_features == h && parts[1].in_features == h &&
+          parts[2].in_features == h) {
         if (resolve_pretiled_mxfp4_t1(parts[0], 1U, &d0, &s0) &&
             resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
             resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
@@ -3221,9 +3440,19 @@ public:
       linear_from_f16(e, block.get("attention_v"), f16_norm, f16_ones_scale,
                       value, kv, h);
     } else if (!fused_qkv_norm) {
-      linear(e, block.get("attention_q"), norm, query, 2 * q, h);
-      linear(e, block.get("attention_k"), norm, key, kv, h);
-      linear(e, block.get("attention_v"), norm, value, kv, h);
+      linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+      linear_base(e, block.get("attention_k"), norm, key, kv, h);
+      linear_base(e, block.get("attention_v"), norm, value, kv, h);
+    }
+    if (qkv_bypass != nullptr) {
+      const std::array<detail::lora_rt::BypassPartDest, 3> dests{{
+          {q_ref, 2 * q, 0U},
+          {k_ref, kv, 0U},
+          {v_ref, kv, 0U},
+      }};
+      detail::lora_rt::emit_bypass_sibling_group(
+          e, *qkv_bypass, norm, dests, lora_bypass_tmp_, bf16_nax_bypass_ok_,
+          silicon_tuning.gpu_cores);
     }
 
     emit_attention_state_step(
@@ -3296,7 +3525,8 @@ public:
 
     const auto &out_w = block.get("gdn_out");
     const auto *gdn_out_nax =
-        (allow_f16_out && use_mxfp4_nax_for_weight(out_w, t))
+        (allow_f16_out && !has_bypass_lora(out_w) &&
+         use_mxfp4_nax_for_weight(out_w, t))
             ? mxfp4_nax_cache->find(out_w.object_id)
             : nullptr;
     const bool out_f16 =
@@ -3487,14 +3717,16 @@ public:
     const std::array<MaterializedWeightView, 2> ab_parts{
         block.get("gdn_a"), block.get("gdn_b")};
     const std::array<U32, 2> ab_ns{hv, hv};
+    const auto *gdn_bypass =
+        find_bypass_group(block.layer_index, QwenBypassGroupKind::gdn_inputs);
     Ref qz_c0{}, qz_s0{}, qz_c1{}, qz_s1{}, qz_h0{}, qz_h1{};
     Ref ab_c0{}, ab_s0{}, ab_c1{}, ab_s1{}, ab_h0{}, ab_h1{};
     bool fused_qkvzab = false;
     if (io_sq_slot != nullptr && io_sq_slot->has_value()) {
       const U32 sq_in = **io_sq_slot;
       *io_sq_slot = std::nullopt;
-      if (t == 1U && !input_is_f16 && conv < 65536U && gv < 65536U &&
-          hv < 65536U && qkvz_parts[0].row_count == conv &&
+      if (gdn_bypass == nullptr && t == 1U && !input_is_f16 && conv < 65536U &&
+          gv < 65536U && hv < 65536U && qkvz_parts[0].row_count == conv &&
           qkvz_parts[1].row_count == gv && ab_parts[0].row_count == hv &&
           ab_parts[1].row_count == hv && qkvz_parts[0].in_features == h &&
           qkvz_parts[1].in_features == h && ab_parts[0].in_features == h &&
@@ -3723,8 +3955,8 @@ public:
         linear_from_f16(e, block.get("gdn_z"), f16_norm, f16_ones_scale, z, gv,
                         h);
       } else {
-        linear(e, block.get("gdn_qkv"), norm, qkv, conv, h);
-        linear(e, block.get("gdn_z"), norm, z, gv, h);
+        linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+        linear_base(e, block.get("gdn_z"), norm, z, gv, h);
       }
 
       const Ref ab_concat =
@@ -3783,9 +4015,20 @@ public:
         linear_from_f16(e, block.get("gdn_b"), f16_norm, f16_ones_scale, b, hv,
                         h);
       } else {
-        linear(e, block.get("gdn_a"), norm, a, hv, h);
-        linear(e, block.get("gdn_b"), norm, b, hv, h);
+        linear_base(e, block.get("gdn_a"), norm, a, hv, h);
+        linear_base(e, block.get("gdn_b"), norm, b, hv, h);
       }
+    }
+    if (gdn_bypass != nullptr) {
+      const std::array<detail::lora_rt::BypassPartDest, 4> dests{{
+          {qkv_ref, conv, 0U},
+          {z_ref, gv, 0U},
+          {a_ref, hv, 0U},
+          {b_ref, hv, 0U},
+      }};
+      detail::lora_rt::emit_bypass_sibling_group(
+          e, *gdn_bypass, norm, dests, lora_bypass_tmp_, bf16_nax_bypass_ok_,
+          silicon_tuning.gpu_cores);
     }
 
     bool gdn_fused_sq = false;
@@ -4109,8 +4352,19 @@ public:
       if (!swiglu_done &&
           !try_linear_swiglu(e, block.get("mlp_gate"), block.get("mlp_up"),
                              norm, product, f, h, explicit_t)) {
-        linear(e, block.get("mlp_gate"), norm, gate, f, h, explicit_t);
-        linear(e, block.get("mlp_up"), norm, up, f, h, explicit_t);
+        linear_base(e, block.get("mlp_gate"), norm, gate, f, h, explicit_t);
+        linear_base(e, block.get("mlp_up"), norm, up, f, h, explicit_t);
+        if (const auto *mlp_gu_bypass =
+                find_bypass_group(layer_index, QwenBypassGroupKind::mlp_gate_up);
+            mlp_gu_bypass != nullptr) {
+          const std::array<detail::lora_rt::BypassPartDest, 2> dests{{
+              {gate, f, 0U},
+              {up, f, 0U},
+          }};
+          detail::lora_rt::emit_bypass_sibling_group(
+              e, *mlp_gu_bypass, norm, dests, lora_bypass_tmp_,
+              bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, explicit_t);
+        }
         swiglu(e, t, f, explicit_t);
       }
       if (io_sq_slot != nullptr && out_sq_slot.has_value() &&
@@ -4129,8 +4383,13 @@ public:
         explicit_t.has_value() ? std::optional<U32>{} : std::optional<U32>{0U};
     const bool trace_routes = route_trace.buffer && !explicit_t.has_value();
 
-    if (e.profile.capacity == 1U && t == 1U && !speculative_enabled &&
-        allow_tdom_t1() && t_domain_dispatch_enabled() && !moe_override) {
+    const bool moe_has_bypass = block_has_any_bypass(
+        block, {"moe_shared_mlp_gate", "moe_shared_mlp_up",
+                "moe_shared_mlp_down", "moe_shared_gate", "moe_router"});
+
+    if (!moe_has_bypass && e.profile.capacity == 1U && t == 1U &&
+        !speculative_enabled && allow_tdom_t1() && t_domain_dispatch_enabled() &&
+        !moe_override) {
       const U32 shared_f_t1 = U32(config.shared_expert_intermediate_size);
       const auto &gw = block.get("moe_expert_gate");
       const auto &uw = block.get("moe_expert_up");
@@ -4224,8 +4483,9 @@ public:
       }
     }
 
-    if (allow_moe9_bt && explicit_t.has_value() && t >= 2U && t <= 8U &&
-        !speculative_enabled && t_domain_dispatch_enabled() && !moe_override) {
+    if (!moe_has_bypass && allow_moe9_bt && explicit_t.has_value() && t >= 2U &&
+        t <= 8U && !speculative_enabled && t_domain_dispatch_enabled() &&
+        !moe_override) {
       const U32 shared_f_bt = U32(config.shared_expert_intermediate_size);
       const auto &gw = block.get("moe_expert_gate");
       const auto &uw = block.get("moe_expert_up");
@@ -4347,10 +4607,21 @@ public:
     if (!try_linear_swiglu(e, block.get("moe_shared_mlp_gate"),
                            block.get("moe_shared_mlp_up"), norm, product,
                            shared_f, h, explicit_t)) {
-      linear(e, block.get("moe_shared_mlp_gate"), norm, gate, shared_f, h,
-             explicit_t);
-      linear(e, block.get("moe_shared_mlp_up"), norm, up, shared_f, h,
-             explicit_t);
+      linear_base(e, block.get("moe_shared_mlp_gate"), norm, gate, shared_f, h,
+                  explicit_t);
+      linear_base(e, block.get("moe_shared_mlp_up"), norm, up, shared_f, h,
+                  explicit_t);
+      if (const auto *sgu_bypass = find_bypass_group(
+              layer_index, QwenBypassGroupKind::moe_shared_gate_up);
+          sgu_bypass != nullptr) {
+        const std::array<detail::lora_rt::BypassPartDest, 2> dests{{
+            {gate, shared_f, 0U},
+            {up, shared_f, 0U},
+        }};
+        detail::lora_rt::emit_bypass_sibling_group(
+            e, *sgu_bypass, norm, dests, lora_bypass_tmp_, bf16_nax_bypass_ok_,
+            silicon_tuning.gpu_cores, explicit_t);
+      }
       swiglu(e, t, shared_f, explicit_t);
     }
     linear(e, block.get("moe_shared_mlp_down"), product, shared, h, shared_f,
@@ -4380,6 +4651,14 @@ public:
         embedding.planes.front().buffer == head.planes.front().buffer &&
         embedding.planes.front().offset == head.planes.front().offset;
     wsig.u64(tied_head ? 1ULL : 0ULL);
+    if (merged_lora_ && !merged_lora_->fingerprint.empty()) {
+      wsig.str("merged_lora");
+      wsig.str(merged_lora_->fingerprint);
+    }
+    if (bypass_lora_ && !bypass_lora_->fingerprint.empty()) {
+      wsig.str("bypass_lora");
+      wsig.str(bypass_lora_->fingerprint);
+    }
     std::string layer_sig;
     layer_sig.reserve(blocks.size());
     for (const auto &block : blocks) {
@@ -4520,6 +4799,7 @@ public:
     const bool extract_last_row_head =
         !verify && !defer_sample && !inspect_tensors_workspace && t > 8U;
     const bool nax_head =
+        !has_bypass_lora(head) &&
         use_mxfp4_nax_for_weight(head, extract_last_row_head ? 1U : t) &&
         [&] {
           const auto *tw = mxfp4_nax_cache->find(head.object_id);
@@ -5095,6 +5375,7 @@ public:
 
     const bool verify_head_f16 =
         (skey.verify && !use_m2 && !single_t1_tdom &&
+         !has_bypass_lora(head) &&
          use_mxfp4_nax_for_weight(head, total_m) &&
          [&] {
            const auto *tw = mxfp4_nax_cache->find(head.object_id);
@@ -5232,16 +5513,18 @@ public:
           }
         }
 
+        const auto *qkv_bypass =
+            find_bypass_group(layer_index, QwenBypassGroupKind::attn_qkv);
         bool qkv_done = false;
         bool used_strided_qkv = false;
         if (layer_fuse_t1 && pending_sq_slot.has_value()) {
           const U32 sq_in = *pending_sq_slot;
           pending_sq_slot.reset();
           Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{}, h0{}, h1{}, h2{};
-          if (2 * q < 65536U && kv < 65536U && parts[0].row_count == 2 * q &&
-              parts[1].row_count == kv && parts[2].row_count == kv &&
-              parts[0].in_features == h && parts[1].in_features == h &&
-              parts[2].in_features == h) {
+          if (qkv_bypass == nullptr && 2 * q < 65536U && kv < 65536U &&
+              parts[0].row_count == 2 * q && parts[1].row_count == kv &&
+              parts[2].row_count == kv && parts[0].in_features == h &&
+              parts[1].in_features == h && parts[2].in_features == h) {
             if (resolve_pretiled_mxfp4_t1(parts[0], 1U, &d0, &s0) &&
                 resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
                 resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
@@ -5413,19 +5696,43 @@ public:
             linear_from_f16(e, block.get("attention_v"), f16_norm,
                             f16_ones_scale, value, kv, h, total_m);
           } else if (use_m2) {
-            if (!try_linear_m2(e, block.get("attention_q"), norm, query, 2 * q,
-                               h))
-              linear(e, block.get("attention_q"), norm, query, 2 * q, h,
-                     total_m);
-            if (!try_linear_m2(e, block.get("attention_k"), norm, key, kv, h))
-              linear(e, block.get("attention_k"), norm, key, kv, h, total_m);
-            if (!try_linear_m2(e, block.get("attention_v"), norm, value, kv, h))
-              linear(e, block.get("attention_v"), norm, value, kv, h, total_m);
+            if (!try_linear_m2_base(e, block.get("attention_q"), norm, query,
+                                    2 * q, h))
+              linear_base(e, block.get("attention_q"), norm, query, 2 * q, h,
+                          total_m);
+            if (!try_linear_m2_base(e, block.get("attention_k"), norm, key, kv,
+                                    h))
+              linear_base(e, block.get("attention_k"), norm, key, kv, h,
+                          total_m);
+            if (!try_linear_m2_base(e, block.get("attention_v"), norm, value,
+                                    kv, h))
+              linear_base(e, block.get("attention_v"), norm, value, kv, h,
+                          total_m);
           } else {
-            linear(e, block.get("attention_q"), norm, query, 2 * q, h, total_m);
-            linear(e, block.get("attention_k"), norm, key, kv, h, total_m);
-            linear(e, block.get("attention_v"), norm, value, kv, h, total_m);
+            linear_base(e, block.get("attention_q"), norm, query, 2 * q, h,
+                        total_m);
+            linear_base(e, block.get("attention_k"), norm, key, kv, h, total_m);
+            linear_base(e, block.get("attention_v"), norm, value, kv, h,
+                        total_m);
           }
+        }
+        if (qkv_bypass != nullptr) {
+          const U32 qkv_tot = 2 * q + 2 * kv;
+          const std::array<detail::lora_rt::BypassPartDest, 3> dests =
+              used_strided_qkv
+                  ? std::array<detail::lora_rt::BypassPartDest, 3>{{
+                        {concat_out, qkv_tot, 0U},
+                        {concat_out, qkv_tot, 2 * q},
+                        {concat_out, qkv_tot, 2 * q + kv},
+                    }}
+                  : std::array<detail::lora_rt::BypassPartDest, 3>{{
+                        {query, 2 * q, 0U},
+                        {key, kv, 0U},
+                        {value, kv, 0U},
+                    }};
+          detail::lora_rt::emit_bypass_sibling_group(
+              e, *qkv_bypass, norm, dests, lora_bypass_tmp_,
+              bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, total_m);
         }
 
         if (can_batched_attn) {
@@ -5657,8 +5964,11 @@ public:
         const std::array<MaterializedWeightView, 4> qkvzab_parts{
             qkvz_parts[0], qkvz_parts[1], ab_parts[0], ab_parts[1]};
         const std::array<U32, 4> qkvzab_ns{conv, gv, hv, hv};
+        const auto *gdn_bypass =
+            find_bypass_group(layer_index, QwenBypassGroupKind::gdn_inputs);
 
         Ref qkv_in = qkv, z_in = z, a_in = a, b_in = b;
+        Ref ab_strided_base{};
         U32 qkv_stride = conv, z_stride = gv, a_stride = hv, b_stride = hv;
         bool qkvzab_done = false;
 
@@ -5667,8 +5977,8 @@ public:
           pending_sq_slot.reset();
           Ref qz_c0{}, qz_s0{}, qz_c1{}, qz_s1{}, qz_h0{}, qz_h1{};
           Ref ab_c0{}, ab_s0{}, ab_c1{}, ab_s1{}, ab_h0{}, ab_h1{};
-          if (conv < 65536U && gv < 65536U && hv < 65536U &&
-              qkvz_parts[0].row_count == conv &&
+          if (gdn_bypass == nullptr && conv < 65536U && gv < 65536U &&
+              hv < 65536U && qkvz_parts[0].row_count == conv &&
               qkvz_parts[1].row_count == gv && ab_parts[0].row_count == hv &&
               ab_parts[1].row_count == hv && qkvz_parts[0].in_features == h &&
               qkvz_parts[1].in_features == h && ab_parts[0].in_features == h &&
@@ -5861,13 +6171,13 @@ public:
             linear_from_f16(e, block.get("gdn_z"), f16_norm, f16_ones_scale, z,
                             gv, h, total_m);
           } else if (use_m2) {
-            if (!try_linear_m2(e, block.get("gdn_qkv"), norm, qkv, conv, h))
-              linear(e, block.get("gdn_qkv"), norm, qkv, conv, h, total_m);
-            if (!try_linear_m2(e, block.get("gdn_z"), norm, z, gv, h))
-              linear(e, block.get("gdn_z"), norm, z, gv, h, total_m);
+            if (!try_linear_m2_base(e, block.get("gdn_qkv"), norm, qkv, conv, h))
+              linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h, total_m);
+            if (!try_linear_m2_base(e, block.get("gdn_z"), norm, z, gv, h))
+              linear_base(e, block.get("gdn_z"), norm, z, gv, h, total_m);
           } else {
-            linear(e, block.get("gdn_qkv"), norm, qkv, conv, h, total_m);
-            linear(e, block.get("gdn_z"), norm, z, gv, h, total_m);
+            linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h, total_m);
+            linear_base(e, block.get("gdn_z"), norm, z, gv, h, total_m);
           }
 
           const U64 ab_bytes = mul(mul(total_m, 2U * hv), 2U);
@@ -5889,6 +6199,7 @@ public:
               try_concat_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
                              in_f16, norm, ab_dst, total_m)) {
             if (ab_direct_strided) {
+              ab_strided_base = ab_dst;
               a_in = ab_dst;
               b_in = Ref{ab_dst.buffer, ab_dst.offset + mul(hv, 2U),
                          ab_dst.bytes - mul(hv, 2U)};
@@ -5903,19 +6214,42 @@ public:
             linear_from_f16(e, block.get("gdn_b"), f16_norm, f16_ones_scale, b,
                             hv, h, total_m);
           } else if (use_m2) {
-            if (!try_linear_m2(e, block.get("gdn_a"), norm, a, hv, h))
-              linear(e, block.get("gdn_a"), norm, a, hv, h, total_m);
-            if (!try_linear_m2(e, block.get("gdn_b"), norm, b, hv, h))
-              linear(e, block.get("gdn_b"), norm, b, hv, h, total_m);
+            if (!try_linear_m2_base(e, block.get("gdn_a"), norm, a, hv, h))
+              linear_base(e, block.get("gdn_a"), norm, a, hv, h, total_m);
+            if (!try_linear_m2_base(e, block.get("gdn_b"), norm, b, hv, h))
+              linear_base(e, block.get("gdn_b"), norm, b, hv, h, total_m);
           } else {
-            linear(e, block.get("gdn_a"), norm, a, hv, h, total_m);
-            linear(e, block.get("gdn_b"), norm, b, hv, h, total_m);
+            linear_base(e, block.get("gdn_a"), norm, a, hv, h, total_m);
+            linear_base(e, block.get("gdn_b"), norm, b, hv, h, total_m);
           }
+        }
+        if (gdn_bypass != nullptr) {
+          const bool qz_strided = (qkv_in.buffer == concat_out.buffer);
+          const bool ab_strided = (ab_strided_base.buffer != nullptr);
+          const std::array<detail::lora_rt::BypassPartDest, 4> dests{{
+              qz_strided
+                  ? detail::lora_rt::BypassPartDest{concat_out, conv + gv, 0U}
+                  : detail::lora_rt::BypassPartDest{qkv, conv, 0U},
+              qz_strided
+                  ? detail::lora_rt::BypassPartDest{concat_out, conv + gv, conv}
+                  : detail::lora_rt::BypassPartDest{z, gv, 0U},
+              ab_strided
+                  ? detail::lora_rt::BypassPartDest{ab_strided_base, 2U * hv,
+                                                    0U}
+                  : detail::lora_rt::BypassPartDest{a, hv, 0U},
+              ab_strided
+                  ? detail::lora_rt::BypassPartDest{ab_strided_base, 2U * hv,
+                                                    hv}
+                  : detail::lora_rt::BypassPartDest{b, hv, 0U},
+          }};
+          detail::lora_rt::emit_bypass_sibling_group(
+              e, *gdn_bypass, norm, dests, lora_bypass_tmp_,
+              bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, total_m);
         }
 
         const auto &out_w = block.get("gdn_out");
         const auto *gdn_out_nax =
-            (!use_m2 && !single_t1_tdom &&
+            (!use_m2 && !single_t1_tdom && !has_bypass_lora(out_w) &&
              use_mxfp4_nax_for_weight(out_w, total_m))
                 ? mxfp4_nax_cache->find(out_w.object_id)
                 : nullptr;
@@ -6132,8 +6466,21 @@ public:
                                   norm, product, f, h)) {
           if (!try_linear_swiglu(e, block.get("mlp_gate"), block.get("mlp_up"),
                                  norm, product, f, h, 2U)) {
-            linear(e, block.get("mlp_gate"), norm, gate, f, h, 2U);
-            linear(e, block.get("mlp_up"), norm, up, f, h, 2U);
+            if (!try_linear_m2_base(e, block.get("mlp_gate"), norm, gate, f, h))
+              linear_base(e, block.get("mlp_gate"), norm, gate, f, h, 2U);
+            if (!try_linear_m2_base(e, block.get("mlp_up"), norm, up, f, h))
+              linear_base(e, block.get("mlp_up"), norm, up, f, h, 2U);
+            if (const auto *mlp_gu_bypass = find_bypass_group(
+                    layer_index, QwenBypassGroupKind::mlp_gate_up);
+                mlp_gu_bypass != nullptr) {
+              const std::array<detail::lora_rt::BypassPartDest, 2> dests{{
+                  {gate, f, 0U},
+                  {up, f, 0U},
+              }};
+              detail::lora_rt::emit_bypass_sibling_group(
+                  e, *mlp_gu_bypass, norm, dests, lora_bypass_tmp_,
+                  bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, 2U);
+            }
             swiglu(e, 2U, f, 2U);
           }
         }
@@ -6300,7 +6647,7 @@ public:
              t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
              !inspect_tensors_workspace && has_row_exact_metallib_);
         const bool ar_head_f16 =
-            (!ar_head_m2 && !single_t1_tdom &&
+            (!ar_head_m2 && !single_t1_tdom && !has_bypass_lora(head) &&
              use_mxfp4_nax_for_weight(head, b_count) &&
              [&] {
                const auto *tw = mxfp4_nax_cache->find(head.object_id);
@@ -7069,6 +7416,7 @@ public:
     return affine_nax_cache && affine_nax_cache->active();
   }
   bool bf16_nax_enabled = false;
+  bool bf16_nax_bypass_ok_ = false;
   bool has_row_exact_metallib_ = false;
   const Profile *verify_async_profile_ = nullptr;
   MoeNaxWorkspace moe_nax_ws;
@@ -7086,6 +7434,10 @@ public:
   U32 split_kv_partition_cap_override_ = 0U;
   Ref gdn_chunk_ws;
   bool gdn_chunk_nax_enabled_ = false;
+  std::shared_ptr<const QwenMergedLoraOverrides> merged_lora_;
+  std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora_;
+  std::unique_ptr<MetalBuffer> lora_bypass_tmp_buf_;
+  Ref lora_bypass_tmp_{};
 
   struct UmaCheckpointPool {
     static constexpr std::size_t kDefaultMaxPooledSlabs = 16U;
@@ -7300,14 +7652,17 @@ QwenForward::QwenForward(
     omlx::m5::AttentionNumericPolicy attention_policy,
     bool inspect_tensors_workspace, std::string_view kv_dtype,
     QwenForward *shared_primary, bool enable_flash_nax_prefill,
-    U32 kv_pool_pages)
+    U32 kv_pool_pages,
+    std::shared_ptr<const QwenMergedLoraOverrides> merged_lora,
+    std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora)
     : impl_(std::make_unique<Impl>(
           context, weights, layers, std::move(config), max_context, libraries,
           feature_layers, inspect_routes, speculative, enable_m4_short_routes,
           std::move(diagnostic_override), enable_attention_split, enable_batch,
           std::move(moe_override), linear_policy, sampling_contract,
           attention_policy, inspect_tensors_workspace, kv_dtype,
-          shared_primary, enable_flash_nax_prefill, kv_pool_pages)) {}
+          shared_primary, enable_flash_nax_prefill, kv_pool_pages,
+          std::move(merged_lora), std::move(bypass_lora))) {}
 QwenForward::~QwenForward() = default;
 QwenForward::QwenForward(QwenForward &&) noexcept = default;
 QwenForward &QwenForward::operator=(QwenForward &&) noexcept = default;
@@ -8615,11 +8970,35 @@ void QwenForward::bind_execution_identity(std::string identity) {
   if (identity.empty() || p.execution_started || p.execution_identity_bound ||
       p.next_position || p.pending_verify)
     throw std::invalid_argument("Qwen execution identity must bind once before use");
-  p.shared_contract_identity = execution_identity_digest(
-      {{"program", p.shared_contract_identity}, {"context", identity}});
-  p.execution_identity = execution_identity_digest(
-      {{"program", p.execution_identity}, {"context", std::move(identity)}});
+  p.bound_context_identity_ = std::move(identity);
   p.execution_identity_bound = true;
+  p.refresh_lora_execution_identity();
+}
+
+void QwenForward::set_bypass_lora(
+    std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora,
+    std::string context_execution_identity) {
+  auto &p = *impl_;
+  if (p.merged_lora_ != nullptr && !p.merged_lora_->views_by_object_id.empty()) {
+    throw std::logic_error(
+        "QwenForward cannot hot-swap bypass LoRA while merge LoRA is active");
+  }
+  p.drain_and_invalidate_async_steps();
+  p.reset();
+  p.bypass_lora_ = std::move(bypass_lora);
+  p.ensure_bypass_scratch();
+  p.rebuild_profiles();
+  if (!context_execution_identity.empty()) {
+    p.bound_context_identity_ = std::move(context_execution_identity);
+    p.execution_identity_bound = true;
+  }
+  p.refresh_lora_execution_identity();
+  p.execution_started = false;
+}
+
+std::uint64_t QwenForward::lora_scratch_bytes() const noexcept {
+  const auto &p = *impl_;
+  return p.lora_bypass_tmp_buf_ ? p.lora_bypass_tmp_buf_->size() : 0ULL;
 }
 
 std::string_view QwenForward::execution_identity() const {

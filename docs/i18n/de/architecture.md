@@ -41,8 +41,8 @@ flowchart LR
     Local --> Runtime
     MMH -- "Path B (AF_UNIX NDJSON v2)" --> Sidecar
     Sidecar -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> ExtProviders
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     UI -- "Context L / Concurrency B,C / MTP / DFlash2 / affine4" --> Daemon
     Daemon --> Runtime
@@ -66,7 +66,7 @@ flowchart LR
 
 ## 2. O(1)-Auto-Routing für Modelle (`oMLX-extend`)
 
-`oMLX-extend` prüft jedes Modellverzeichnis mit `detect_adapted(model_dir)` in `< 1 ms` über reine Dateisystemabfragen (`model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`), ohne einen Subprozess zu starten:
+`oMLX-extend` prüft jedes Modellverzeichnis mit `detect_adapted(model_dir)` in `< 1 ms` über reine Dateisystemabfragen (`model.miv` / `model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`), ohne einen Subprozess zu starten:
 
 - **Angepasste Modelle**: Werden bei der ersten Anfrage (oder wenn angepinnt) verzögert an **`miv Core Backend`** (`mseries_backendd`) geroutet und zeigen **`miv Core Backend (Auto)`** in `Model Settings → Advanced Settings`. Durch Ausschalten von **`Use External Engine`** wird `external_engine: "stock"` geschrieben und das Modell auf Stock MLX zurückgestellt.
 - **Unangepasste Modelle**: Laufen unverändert über Stock MLX (`BatchedEngine` / `VLMBatchedEngine`) — ohne Sidecar-Prozesse, ohne zusätzlichen Speicherbedarf und ohne Leistungsänderung.
@@ -90,7 +90,7 @@ Wenn `ninfer-metal`-Modelle, Pfad-B-Sidecar-Microkernel und Stock-MLX-Modelle au
 
 ## 4. Design der Metal-4-Engine (`miv/`)
 
-- **Einfache vor-gekachelte Gewichtskopie**: Offline-`.omlxm5`-Konvertierung (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) versorgt breites `64×64`-Prefill-NAX, `T=1`-QMV-Decode und `BM=8/16/32`-Spekulationsverifikation aus einer einzigen residenten Allokation (`1.0×` Artefakt-Footprint gegenüber `~1.92×` bei Online-Re-Tiling).
+- **Einfache vor-gekachelte Gewichtskopie**: Offline-`.miv`-Konvertierung (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) versorgt breites `64×64`-Prefill-NAX, `T=1`-QMV-Decode und `BM=8/16/32`-Spekulationsverifikation aus einer einzigen residenten Allokation (`1.0×` Artefakt-Footprint gegenüber `~1.92×` bei Online-Re-Tiling).
 - **Sichere Compute-ICB-Aufzeichnung**: Alle indirekten Puffersegmente bleiben strikt unter `2 GiB` (`< 1 GiB` für kompakte Hilfs-Caches), um 32-Bit-Hardware-Offset-Überläufe auszuschließen. Doppelt gepufferte `ar_pipe_[2]`-Command-Allocators überlappen Host-Encoding und GPU-Ausführung.
 - **Paged CoW KV & UMA-Fortsetzung**: `KvPagePool` verwaltet referenzgezählte `64`-Token-Seiten (`bf16` und `0-ULP` `affine4_g128` bei `0.5625 B/val`). `QwenUmaContinuation` sichert und lädt den 48-Layer-GDN-Zustand (`146.81 MiB`) in einem einzelnen GPU-Command-Buffer (`0.22–1.62 ms`, kein CPU-`memcpy`), und `rolling_prefix_cache` ersetzt ungepinnte Vorgänger direkt am Platz (`1×`-Slab-Wiederverwendung).
 - **Strikte Isolation der SKU-Kalibrierungen**: `silicon_tuning.h` lädt SKU-Profile (`apple-m5-ultra-64gpu.json`, `apple-m5-ultra-80gpu.json`) anhand der exakten `profile_id` und fällt bei ungemessenen Chips auf parametrisierte Priors zurück — gemessene Konstanten eines SKUs werden nie auf ein anderes übertragen.
@@ -113,6 +113,6 @@ Kern-Tarballs werden nebeneinander unter `~/Library/Application Support/oMLX/Pro
 ## Vertiefende Referenzen
 
 - [Porting-Architektur v2](../../backend/ninfer-m5-porting-architecture-v2.md)
-- [`.omlxm5`-Artefaktformat v1](../../backend/artifact-format-v1.md) & [Dispatch-Vertrag v1](../../backend/dispatch-contract-v1.md)
+- [`.miv`-Artefaktformat v1](../../backend/artifact-format-v1.md) & [Dispatch-Vertrag v1](../../backend/dispatch-contract-v1.md)
 - [Hardware- & Software-Grenzen v1](../../foundations/hardware-software-boundaries-v1.md)
 - [Core-Zertifizierungsstandard](../../standards/core-certification-standard.md)

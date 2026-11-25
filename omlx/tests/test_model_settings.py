@@ -1127,3 +1127,42 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+def test_lora_adapter_capability_aware_external_engine_conflicts():
+    """LoRA coexists with external engines declaring lora_adapter, and conflicts otherwise."""
+    for capable_engine in ("m5rt", "ninfer-metal", "io.ninfer.metal", "stock"):
+        ms = ModelSettings(
+            lora_adapter="/tmp/my-lora",
+            external_engine=capable_engine,
+            external_engine_options={"ninfer-metal": {"lora_mode": "bypass"}},
+        )
+        assert ms.lora_adapter == "/tmp/my-lora"
+        assert ms.external_engine == capable_engine
+
+    # m5rt declares both lora_adapter and dflash_enabled in supported_standard_settings.
+    ms_dflash = ModelSettings(
+        lora_adapter="/tmp/my-lora",
+        external_engine="m5rt",
+        dflash_enabled=True,
+    )
+    assert ms_dflash.dflash_enabled is True
+
+    # Non-LoRA external engines (Splash or unknown) preserve the conflict error.
+    for non_lora_engine in ("splash", "unknown-external-engine"):
+        with pytest.raises(ValueError, match="external engine"):
+            ModelSettings(lora_adapter="/tmp/my-lora", external_engine=non_lora_engine)
+
+    # resolve_lora_conflicts keeps capable external engines and drops non-LoRA ones.
+    kept, kept_names = resolve_lora_conflicts(
+        {"lora_adapter": "/tmp/my-lora", "external_engine": "ninfer-metal"}
+    )
+    assert kept_names == []
+    assert kept["external_engine"] == "ninfer-metal"
+
+    dropped, dropped_names = resolve_lora_conflicts(
+        {"lora_adapter": "/tmp/my-lora", "external_engine": "splash"}
+    )
+    assert dropped_names == ["external_engine"]
+    assert dropped["external_engine"] is None
+

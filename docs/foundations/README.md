@@ -19,5 +19,5 @@
 - **`docs/foundations/`（本目录 — 为什么这么设计 & 硬件物理边界）**：跨版本恒定的底层设计哲学、硅片基因映射、C01–C13 边界账本与跨框架技术吸收方法论。
 - **[`docs/dim-guides/`](../dim-guides/qwen-mxfp4-oq4e-silicon-squeeze-skill.md) & [`docs/standards/`](../standards/core-certification-standard.md)（怎么写新核 & 怎么过认证）**：Apple M5+ 无损硅片压榨 Core-Authoring Skill 与四门禁核认证准入标准。
 - **[`docs/silicon-guides/`](../silicon-guides/m5-series-optimization-playbook.md)（怎么跨 SKU 调优）**：Apple M5 Base/Pro/Max/Ultra 分档调优定律与统一内存准入方程。
-- **[`docs/backend/`](../backend/README.md)（具体二进制与接口合同）**：`.omlxm5` 字节级容器规范、静态派发表 JSON 与按 SKU 严格隔离的硬件校准锁文件。
+- **[`docs/backend/`](../backend/README.md)（具体二进制与接口合同）**：`.miv` 字节级容器规范、静态派发表 JSON 与按 SKU 严格隔离的硬件校准锁文件。
 - **[`docs/releases/`](../releases/miv-v0.01-changelog.md) & [`docs/roadmap/`](../roadmap/v0.02-kvmem-actkv-plan.md)（版本交付与演进路线）**：当前 `miv-v0.01` 正式发布说明与 `v0.02+` `KVMem-UMA + ActKV` 技术路线图。

@@ -46,6 +46,16 @@ public:
   [[nodiscard]] virtual TrimCacheReport
   trim_cache(std::uint64_t target_free_bytes = 0) = 0;
   virtual void set_scheduler_hint(const SchedulerHint &hint) = 0;
+  [[nodiscard]] virtual bool reload_lora(const std::string &lora_adapter,
+                                         const std::string &lora_mode = "bypass",
+                                         std::string *error = nullptr) {
+    (void)lora_adapter;
+    (void)lora_mode;
+    if (error != nullptr) {
+      *error = "backend does not support reload_lora";
+    }
+    return false;
+  }
   [[nodiscard]] virtual std::uint64_t resident_memory_bytes() const = 0;
   virtual void shutdown() = 0;
 
@@ -98,6 +108,12 @@ public:
 
   void set_scheduler_hint(const SchedulerHint &hint) override {
     engine_->set_scheduler_hint(hint);
+  }
+
+  [[nodiscard]] bool reload_lora(const std::string &lora_adapter,
+                                 const std::string &lora_mode = "bypass",
+                                 std::string *error = nullptr) override {
+    return engine_->reload_lora(lora_adapter, lora_mode, error);
   }
 
   [[nodiscard]] std::uint64_t resident_memory_bytes() const override {

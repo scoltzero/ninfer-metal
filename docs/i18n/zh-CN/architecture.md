@@ -44,8 +44,8 @@ flowchart LR
     MultiHost -- "memory_budget_bytes / trim_cache / gpu_contended" --> UdsClient
     InProc --> Runtime
     UdsClient -- "AF_UNIX NDJSON RPC v2" --> SidecarB
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Router -- "Path B manifest match" --> SidecarB
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     Enforcer -- "UMA budget & contention hints" --> SidecarB
@@ -70,7 +70,7 @@ flowchart LR
 
 ## 2. O(1) 自动模型路由（`oMLX-extend`）
 
-`oMLX-extend` 通过 `detect_adapted(model_dir)` 在 `< 1 ms` 内完成文件系统探测（检查 `model.omlxm5`、`model_pack.json`、`omlxm5-manifest.json`），不拉起任何子进程：
+`oMLX-extend` 通过 `detect_adapted(model_dir)` 在 `< 1 ms` 内完成文件系统探测（检查 `model.miv` / `model.omlxm5`、`model_pack.json`、`omlxm5-manifest.json`），不拉起任何子进程：
 
 - **已适配模型**：首次请求到达时（或配置常驻时）懒加载路由至 **`miv 核心后端`**（`mseries_backendd`），并在 `Model Settings → Advanced Settings` 显示 **`miv Core Backend (Auto)`**。关闭 **`Use External Engine`** 开关即写入 `external_engine: "stock"`，随时切回原生 MLX。
 - **未适配模型**：原样交由 Stock MLX（`BatchedEngine` / `VLMBatchedEngine`）运行，不启动 Sidecar 进程，零额外内存开销，性能零变化。
@@ -94,7 +94,7 @@ flowchart LR
 
 ## 4. Metal 4 引擎设计（`miv/`）
 
-- **单副本预重排权重**：离线 `.omlxm5` 转换（`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`）让 `64×64` 宽块预填 NAX、`T=1` QMV 解码与 `BM=8/16/32` 投机校验共享同一份驻留内存分配（体积 `1.0×`，在线重排则需要 `~1.92×`）。
+- **单副本预重排权重**：离线 `.miv` 转换（`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`）让 `64×64` 宽块预填 NAX、`T=1` QMV 解码与 `BM=8/16/32` 投机校验共享同一份驻留内存分配（体积 `1.0×`，在线重排则需要 `~1.92×`）。
 - **安全的 Compute ICB 录制**：所有间接缓冲区段严格控制在 `2 GiB` 以下（辅助紧凑缓存 `< 1 GiB`），避免 32 位硬件偏移回绕。双缓冲 `ar_pipe_[2]` 命令分配器将主机端编码与 GPU 执行流水重叠。
 - **分页写时复制（CoW）KV 与 UMA 续算**：`KvPagePool` 管理 `64`-token 引用计数页（支持 `bf16` 与 `0.5625 B/val` 的 `0-ULP` `affine4_g128`）。`QwenUmaContinuation` 在单条 GPU 命令缓冲区内完成 48 层 GDN 状态（`146.81 MiB`）的快照保存与恢复（`0.22–1.62 ms`，零 CPU `memcpy`），`rolling_prefix_cache` 对未固定祖先槽位做原地 `1×` 覆写复用。
 - **严格的 SKU 校准隔离**：`silicon_tuning.h` 按精确 `profile_id` 加载单机校准档案（`apple-m5-ultra-64gpu.json`、`apple-m5-ultra-80gpu.json`），遇到未实测芯片时回退到参数化先验，绝不把某一款 SKU 的实测常数套用到另一款芯片上。
@@ -117,6 +117,6 @@ flowchart LR
 ## 深入参考文档
 
 - [移植架构规范 v2](../../backend/ninfer-m5-porting-architecture-v2.md)
-- [`.omlxm5` 权重容器规范 v1](../../backend/artifact-format-v1.md) 与 [派发契约 v1](../../backend/dispatch-contract-v1.md)
+- [`.miv` 权重容器规范 v1](../../backend/artifact-format-v1.md) 与 [派发契约 v1](../../backend/dispatch-contract-v1.md)
 - [软硬件边界规范 v1](../../foundations/hardware-software-boundaries-v1.md)
 - [核心认证标准](../../standards/core-certification-standard.md)

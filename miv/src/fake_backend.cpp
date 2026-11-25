@@ -22,7 +22,12 @@ std::int32_t next_fake_token(std::int32_t base, std::int32_t offset,
 
 } // namespace
 
-FakeBackend::FakeBackend(FakeBackendOptions options) : options_(options) {
+FakeBackend::FakeBackend(FakeBackendOptions options, LoadOptions load_options)
+    : options_(options),
+      lora_adapter_(std::move(load_options.lora_adapter)),
+      lora_mode_(load_options.lora_mode.empty()
+                     ? std::string("merge")
+                     : std::move(load_options.lora_mode)) {
   if (options_.event_batch_size <= 0) {
     throw std::invalid_argument("event_batch_size must be positive");
   }
@@ -34,6 +39,13 @@ FakeBackend::FakeBackend(FakeBackendOptions options) : options_(options) {
   }
   if (options_.vocab_size <= 1) {
     throw std::invalid_argument("vocab_size must be greater than one");
+  }
+  if (lora_mode_ != "merge" && lora_mode_ != "bypass") {
+    throw std::invalid_argument("lora_mode must be merge or bypass");
+  }
+  if (!lora_adapter_.empty()) {
+    lora_buffer_bytes_ = 65536ULL;
+    lora_adapted_layers_ = 1U;
   }
 }
 
@@ -175,6 +187,38 @@ void FakeBackend::populate_stats(StatsReport &stats) const {
   stats.backend_kind = "fake";
   stats.model_execution_kind = "fake";
   stats.kernel_family = "deterministic_fake";
+  std::lock_guard lock(lora_mutex_);
+  stats.lora_adapter = lora_adapter_;
+  stats.lora_mode = lora_adapter_.empty() ? std::string{} : lora_mode_;
+  stats.lora_buffer_bytes = lora_buffer_bytes_;
+  stats.lora_adapted_layers = lora_adapted_layers_;
+}
+
+bool FakeBackend::reload_lora(const std::string &lora_adapter,
+                              const std::string &lora_mode,
+                              std::string *error) {
+  assert_owner();
+  const std::string effective_mode =
+      lora_mode.empty() ? std::string("merge") : lora_mode;
+  if (effective_mode != "merge" && effective_mode != "bypass") {
+    if (error != nullptr) {
+      *error = "lora_mode must be merge or bypass";
+    }
+    return false;
+  }
+  std::lock_guard lock(lora_mutex_);
+  if ((!lora_adapter_.empty() && lora_mode_ == "merge") ||
+      (!lora_adapter.empty() && effective_mode == "merge")) {
+    if (error != nullptr) {
+      *error = "merge mode requires full backend reload";
+    }
+    return false;
+  }
+  lora_adapter_ = lora_adapter;
+  lora_mode_ = effective_mode;
+  lora_buffer_bytes_ = lora_adapter_.empty() ? 0ULL : 65536ULL;
+  lora_adapted_layers_ = lora_adapter_.empty() ? 0U : 1U;
+  return true;
 }
 
 } // namespace omlx::m5::detail

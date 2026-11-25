@@ -74,6 +74,13 @@ public:
       throw std::invalid_argument(
           "prefill_engine must be auto, nax, nax_ane, or flash_nax");
     }
+    if (load_options_.lora_mode.empty()) {
+      load_options_.lora_mode = "merge";
+    }
+    if (load_options_.lora_mode != "merge" &&
+        load_options_.lora_mode != "bypass") {
+      throw std::invalid_argument("lora_mode must be merge or bypass");
+    }
     static_cast<void>(detail::resolve_spec_search_mode(load_options_));
     worker_ = std::thread([this] { worker_loop(); });
   }
@@ -208,6 +215,39 @@ public:
     backend_->set_scheduler_hint(hint);
   }
 
+  bool reload_lora(const std::string &lora_adapter,
+                   const std::string &lora_mode, std::string *error) {
+    if (worker_done_.load(std::memory_order_acquire)) {
+      if (error != nullptr) {
+        *error = "engine is shut down";
+      }
+      return false;
+    }
+    std::future<std::pair<bool, std::string>> future;
+    {
+      std::lock_guard lock(request_mutex_);
+      if (!accepting_ || stop_requested_ ||
+          worker_done_.load(std::memory_order_acquire)) {
+        if (error != nullptr) {
+          *error = "engine is shut down";
+        }
+        return false;
+      }
+      PendingLoraReload pending{
+          .lora_adapter = lora_adapter,
+          .lora_mode = lora_mode,
+      };
+      future = pending.promise.get_future();
+      lora_reload_queue_.push_back(std::move(pending));
+    }
+    request_cv_.notify_one();
+    auto [ok, err_msg] = future.get();
+    if (!ok && error != nullptr) {
+      *error = std::move(err_msg);
+    }
+    return ok;
+  }
+
   void shutdown() {
     std::lock_guard shutdown_lock(shutdown_mutex_);
     {
@@ -230,14 +270,22 @@ private:
     std::promise<TrimCacheReport> promise;
   };
 
+  struct PendingLoraReload {
+    std::string lora_adapter;
+    std::string lora_mode;
+    std::promise<std::pair<bool, std::string>> promise;
+  };
+
   void process_pending_trims() {
     std::deque<PendingTrim> local;
+    std::deque<PendingLoraReload> local_reloads;
     {
       std::lock_guard lock(request_mutex_);
-      if (trim_queue_.empty()) {
+      if (trim_queue_.empty() && lora_reload_queue_.empty()) {
         return;
       }
       local.swap(trim_queue_);
+      local_reloads.swap(lora_reload_queue_);
     }
     for (auto &item : local) {
       try {
@@ -246,16 +294,33 @@ private:
         item.promise.set_value(TrimCacheReport{});
       }
     }
+    for (auto &item : local_reloads) {
+      try {
+        std::string err_msg;
+        const bool ok =
+            backend_->reload_lora(item.lora_adapter, item.lora_mode, &err_msg);
+        item.promise.set_value({ok, std::move(err_msg)});
+      } catch (const std::exception &ex) {
+        item.promise.set_value({false, ex.what()});
+      } catch (...) {
+        item.promise.set_value({false, "unknown LoRA reload failure"});
+      }
+    }
   }
 
   void fail_pending_trims() {
     std::deque<PendingTrim> local;
+    std::deque<PendingLoraReload> local_reloads;
     {
       std::lock_guard lock(request_mutex_);
       local.swap(trim_queue_);
+      local_reloads.swap(lora_reload_queue_);
     }
     for (auto &item : local) {
       item.promise.set_value(TrimCacheReport{});
+    }
+    for (auto &item : local_reloads) {
+      item.promise.set_value({false, "engine is shut down"});
     }
   }
 
@@ -311,9 +376,9 @@ private:
         std::unique_lock lock(request_mutex_);
         request_cv_.wait(lock, [this] {
           return stop_requested_ || !request_queue_.empty() ||
-                 !trim_queue_.empty();
+                 !trim_queue_.empty() || !lora_reload_queue_.empty();
         });
-        if (!trim_queue_.empty()) {
+        if (!trim_queue_.empty() || !lora_reload_queue_.empty()) {
           continue;
         }
         if (request_queue_.empty()) {
@@ -384,7 +449,7 @@ private:
           if (ready.empty())
             request_cv_.wait(lock, [this] {
               return stop_requested_ || !request_queue_.empty() ||
-                     !trim_queue_.empty();
+                     !trim_queue_.empty() || !lora_reload_queue_.empty();
             });
           if (request_queue_.empty()) break;
           item = std::move(request_queue_.front());
@@ -493,6 +558,7 @@ private:
   std::condition_variable request_cv_;
   std::deque<RequestItem> request_queue_;
   std::deque<PendingTrim> trim_queue_;
+  std::deque<PendingLoraReload> lora_reload_queue_;
   std::unordered_map<std::uint64_t, std::shared_ptr<std::atomic<bool>>>
       cancellations_;
   std::uint64_t next_request_id_ = 1;
@@ -517,9 +583,16 @@ private:
 };
 
 std::unique_ptr<Engine> Engine::create(const LoadOptions &load_options) {
-  auto backend = std::make_unique<detail::NativeBackend>(load_options);
+  LoadOptions normalized = load_options;
+  if (normalized.lora_mode.empty()) {
+    normalized.lora_mode = "merge";
+  }
+  if (normalized.lora_mode != "merge" && normalized.lora_mode != "bypass") {
+    throw std::invalid_argument("lora_mode must be merge or bypass");
+  }
+  auto backend = std::make_unique<detail::NativeBackend>(normalized);
   return std::unique_ptr<Engine>(
-      new Engine(std::make_unique<Impl>(load_options, std::move(backend))));
+      new Engine(std::make_unique<Impl>(normalized, std::move(backend))));
 }
 
 std::unique_ptr<Engine>
@@ -527,9 +600,16 @@ Engine::create_fake(const LoadOptions &load_options,
                     const FakeBackendOptions &fake_options) {
   if(parse_sampling_contract(load_options.sampling_contract)!=SamplingContract::LegacyRejectionV1)
     throw std::invalid_argument("position-coupled sampling requires native backend");
-  auto backend = std::make_unique<detail::FakeBackend>(fake_options);
+  LoadOptions normalized = load_options;
+  if (normalized.lora_mode.empty()) {
+    normalized.lora_mode = "merge";
+  }
+  if (normalized.lora_mode != "merge" && normalized.lora_mode != "bypass") {
+    throw std::invalid_argument("lora_mode must be merge or bypass");
+  }
+  auto backend = std::make_unique<detail::FakeBackend>(fake_options, normalized);
   return std::unique_ptr<Engine>(
-      new Engine(std::make_unique<Impl>(load_options, std::move(backend))));
+      new Engine(std::make_unique<Impl>(normalized, std::move(backend))));
 }
 
 Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -559,6 +639,11 @@ TrimCacheReport Engine::trim_cache(std::uint64_t target_free_bytes) {
 
 void Engine::set_scheduler_hint(const SchedulerHint &hint) {
   impl_->set_scheduler_hint(hint);
+}
+
+bool Engine::reload_lora(const std::string &lora_adapter,
+                         const std::string &lora_mode, std::string *error) {
+  return impl_->reload_lora(lora_adapter, lora_mode, error);
 }
 
 void Engine::shutdown() { impl_->shutdown(); }

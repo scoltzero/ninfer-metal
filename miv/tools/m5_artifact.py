@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and inspect deterministic omlx-m5 backend artifacts."""
+"""Build and inspect deterministic .miv (ninfer-metal / miv) backend artifacts."""
 
 from __future__ import annotations
 
@@ -624,6 +624,68 @@ def _build_affine_recipe(
     )
 
 
+def _build_mlx_mxfp4_module_recipe(
+    source: SafeTensorSource, module: str
+) -> tuple[ObjectRecipe, list[str]] | None:
+    weight_name = module + ".weight"
+    scales_name = module + ".scales"
+    weight = source.tensors[weight_name]
+    scales = source.tensors[scales_name]
+    if weight.dtype != "U32" or scales.dtype not in ("U8", "F8_E8M0"):
+        return None
+    if len(weight.shape) < 2 or len(scales.shape) < 2:
+        raise ValueError(f"{module}: MXFP4 tensors must have rank >= 2")
+    leading_shape = scales.shape[:-1]
+    rows = product(leading_shape)
+    scale_groups = scales.shape[-1]
+    logical_k = scale_groups * 32
+    padded_k = align_up(logical_k, 128)
+    if weight.shape != (*leading_shape, logical_k // 8):
+        raise ValueError(f"{module}: MXFP4 weight shape mismatch")
+    source_names = [weight_name, scales_name]
+    format_id = "mxfp4_e2m1_g32_e8m0_v1"
+    recipe = ObjectRecipe(
+        name=module,
+        format_id=format_id,
+        layout_id=(
+            "mx_rowsplit_k128_v1"
+            if len(leading_shape) == 1
+            else "mx_expert_rowsplit_k128_v1"
+        ),
+        shape=(*leading_shape, logical_k),
+        padded_k=padded_k,
+        planes=[
+            _plane_from_tensor(
+                source,
+                weight_name,
+                "data",
+                rows,
+                logical_k // 2,
+                padded_k // 2,
+            ),
+            _plane_from_tensor(
+                source,
+                scales_name,
+                "scale",
+                rows,
+                scale_groups,
+                padded_k // 32,
+            ),
+        ],
+        source_tensors=source_names,
+        binding={
+            "name": module,
+            "format": format_id,
+            "use": infer_weight_use(module),
+            "activation_policy": "AllowA4",
+            "leading_shape": list(leading_shape[:-1]),
+            "out_features": leading_shape[-1],
+            "in_features": logical_k,
+        },
+    )
+    return recipe, source_names
+
+
 def build_oq_recipes(source: SafeTensorSource) -> tuple[list[ObjectRecipe], set[str]]:
     recipes: list[ObjectRecipe] = []
     consumed: set[str] = set()
@@ -632,11 +694,21 @@ def build_oq_recipes(source: SafeTensorSource) -> tuple[list[ObjectRecipe], set[
     ):
         module = weight_name[: -len(".weight")]
         source_names = [module + suffix for suffix in (".weight", ".scales", ".biases")]
-        if not all(name in source.tensors for name in source_names):
+        if all(name in source.tensors for name in source_names):
+            recipe = _build_affine_recipe(source, module, require_affine_mode=True)
+            recipes.append(recipe)
+            consumed.update(source_names)
             continue
-        recipe = _build_affine_recipe(source, module, require_affine_mode=True)
-        recipes.append(recipe)
-        consumed.update(source_names)
+        if (
+            (module + ".scales") in source.tensors
+            and (module + ".biases") not in source.tensors
+            and quant_spec(source.config, module).get("mode") == "mxfp4"
+        ):
+            mx_res = _build_mlx_mxfp4_module_recipe(source, module)
+            if mx_res is not None:
+                recipe, mx_names = mx_res
+                recipes.append(recipe)
+                consumed.update(mx_names)
     if not recipes:
         raise ValueError("oQ source contains no affine modules")
     return recipes, consumed
@@ -660,63 +732,11 @@ def build_mlx_mxfp4_recipes(
             recipes.append(recipe)
             consumed.update([weight_name, scales_name, biases_name])
             continue
-        weight = source.tensors[weight_name]
-        scales = source.tensors[scales_name]
-        if weight.dtype != "U32" or scales.dtype not in ("U8", "F8_E8M0"):
-            continue
-        if len(weight.shape) < 2 or len(scales.shape) < 2:
-            raise ValueError(f"{module}: MXFP4 tensors must have rank >= 2")
-        leading_shape = scales.shape[:-1]
-        rows = product(leading_shape)
-        scale_groups = scales.shape[-1]
-        logical_k = scale_groups * 32
-        padded_k = align_up(logical_k, 128)
-        if weight.shape != (*leading_shape, logical_k // 8):
-            raise ValueError(f"{module}: MXFP4 weight shape mismatch")
-        source_names = [weight_name, scales_name]
-        consumed.update(source_names)
-        format_id = "mxfp4_e2m1_g32_e8m0_v1"
-        recipes.append(
-            ObjectRecipe(
-                name=module,
-                format_id=format_id,
-                layout_id=(
-                    "mx_rowsplit_k128_v1"
-                    if len(leading_shape) == 1
-                    else "mx_expert_rowsplit_k128_v1"
-                ),
-                shape=(*leading_shape, logical_k),
-                padded_k=padded_k,
-                planes=[
-                    _plane_from_tensor(
-                        source,
-                        weight_name,
-                        "data",
-                        rows,
-                        logical_k // 2,
-                        padded_k // 2,
-                    ),
-                    _plane_from_tensor(
-                        source,
-                        scales_name,
-                        "scale",
-                        rows,
-                        scale_groups,
-                        padded_k // 32,
-                    ),
-                ],
-                source_tensors=source_names,
-                binding={
-                    "name": module,
-                    "format": format_id,
-                    "use": infer_weight_use(module),
-                    "activation_policy": "AllowA4",
-                    "leading_shape": list(leading_shape[:-1]),
-                    "out_features": leading_shape[-1],
-                    "in_features": logical_k,
-                },
-            )
-        )
+        mx_res = _build_mlx_mxfp4_module_recipe(source, module)
+        if mx_res is not None:
+            recipe, source_names = mx_res
+            recipes.append(recipe)
+            consumed.update(source_names)
     if not recipes:
         raise ValueError("MLX source contains no MXFP4 modules")
     return recipes, consumed
@@ -1209,7 +1229,7 @@ def _expected_plane_bytes(record: dict) -> dict[str, int] | None:
         if record.get("layout") == "oq_nax_tiled_g64_v1":
             if (
                 len(record["shape"]) != 2
-                or bits not in (3, 4, 5, 6)
+                or bits not in (3, 4, 5, 6, 8)
                 or group_size not in (64, 128)
                 or logical_k < 512
                 or (logical_k % group_size) != 0
@@ -1222,6 +1242,8 @@ def _expected_plane_bytes(record: dict) -> dict[str, int] | None:
                     "nax_codes": padded_n * logical_k // 4,
                     "nax_high1": padded_n * logical_k // 8,
                 }
+            elif bits == 8:
+                planes = {"nax_codes": padded_n * logical_k}
             else:
                 planes = {"nax_codes": padded_n * logical_k // 2}
                 if bits in (5, 6):
@@ -1575,7 +1597,7 @@ def decode_artifact_row(
             if record.get("layout") == "oq_nax_tiled_g64_v1":
                 if (
                     len(record["shape"]) != 2
-                    or bits not in (3, 4, 5, 6)
+                    or bits not in (3, 4, 5, 6, 8)
                     or group_size not in (64, 128)
                     or logical_k < 512
                     or (logical_k % group_size) != 0
@@ -1604,6 +1626,12 @@ def decode_artifact_row(
                         code = ((c_byte >> ((col_in_g & 3) * 2)) & 0x3) | (
                             ((h_byte >> (col_in_g & 7)) & 0x1) << 2
                         )
+                    elif bits == 8:
+                        code = read_plane(
+                            "nax_codes",
+                            tile_idx * (bn * 64) + rn * 64 + col_in_g,
+                            1,
+                        )[0]
                     else:
                         c_byte = read_plane(
                             "nax_codes",
@@ -1822,6 +1850,8 @@ def pretile_artifact(input_path: Path, output_path: Path) -> dict:
                         (5, 128),
                         (6, 64),
                         (6, 128),
+                        (8, 64),
+                        (8, 128),
                     )
                     and layout == "oq_rowsplit_k128_v1"
                     and len(shape) == 2
@@ -1864,6 +1894,20 @@ def pretile_artifact(input_path: Path, output_path: Path) -> dict:
                             )
                         )
                         new_planes.append(emit_raw_plane("nax_high1", tiled_h1.tobytes()))
+                    elif bits == 8:
+                        raw_c = np.frombuffer(
+                            read_src_plane(planes_by_kind["code"]), dtype=np.uint8
+                        ).reshape(n, padded_k)[:, :k]
+                        if padded_n > n:
+                            pad_c = np.zeros((padded_n, k), dtype=np.uint8)
+                            pad_c[:n] = raw_c
+                            raw_c = pad_c
+                        tiled_c = np.ascontiguousarray(
+                            raw_c.reshape(padded_n // bn, bn, groups, 64).transpose(
+                                0, 2, 1, 3
+                            )
+                        )
+                        new_planes.append(emit_raw_plane("nax_codes", tiled_c.tobytes()))
                     else:
                         raw_c = np.frombuffer(
                             read_src_plane(planes_by_kind["base_code"]), dtype=np.uint8
@@ -2421,7 +2465,7 @@ def quantize_source_with_recipe_to_artifact(
     nax_pretile: bool = False,
     hessian_json: Path | None = None,
 ) -> dict:
-    """Apply #5292 oQe WLS+flip quantization using a QDA recipe and emit .omlxm5."""
+    """Apply #5292 oQe WLS+flip quantization using a QDA recipe and emit .miv."""
     hessian_map: dict[str, np.ndarray] = {}
     if hessian_json is not None and hessian_json.exists():
         raw_h = json.loads(hessian_json.read_text(encoding="utf-8"))
@@ -2522,7 +2566,7 @@ def quantize_source_with_recipe_to_artifact(
             )
             out_profile = "mlx_mxfp4" if has_passthrough_mxfp4 else "oq_affine"
 
-            # Write single model.safetensors in tmp_dir and convert to .omlxm5.
+            # Write single model.safetensors in tmp_dir and convert to .miv.
             st_header: dict[str, Any] = {}
             cursor = 0
             for tname, (dt, shp, raw_b) in tensors_out.items():
@@ -2792,7 +2836,7 @@ def extract_mtp_artifact(
     profile: str = "auto",
     nax_pretile: bool = False,
 ) -> dict:
-    """Extract only ModelComponent::mtp weights from a checkpoint dir or .omlxm5 into a standalone .omlxm5."""
+    """Extract only ModelComponent::mtp weights from a checkpoint dir or .miv into a standalone .miv."""
     source_path = source_path.resolve()
     output_path = output_path.resolve()
     if nax_pretile:
@@ -3052,7 +3096,7 @@ def bundle_mtp_artifact(
     *,
     nax_pretile: bool = False,
 ) -> dict:
-    """Bundle MTP objects from a checkpoint dir or .omlxm5 into an existing base .omlxm5 without mutating backbone planes."""
+    """Bundle MTP objects from a checkpoint dir or .miv into an existing base .miv without mutating backbone planes."""
     base_artifact_path = base_artifact_path.resolve()
     mtp_source_path = mtp_source_path.resolve()
     output_path = output_path.resolve()
@@ -3073,7 +3117,7 @@ def bundle_mtp_artifact(
         if mtp_source_path.is_dir():
             fd, tmp_name = tempfile.mkstemp(
                 prefix=output_path.name + ".mtp_src.",
-                suffix=".omlxm5",
+                suffix=".miv",
                 dir=output_path.parent,
             )
             os.close(fd)
@@ -3096,7 +3140,7 @@ def bundle_mtp_artifact(
             if not already_tiled:
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=output_path.name + ".mtp_tiled.",
-                    suffix=".omlxm5",
+                    suffix=".miv",
                     dir=output_path.parent,
                 )
                 os.close(fd)
@@ -3277,19 +3321,19 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument(
         "--nax-pretile",
         action="store_true",
-        help="offline pre-tile rank-2 MXFP4 and Q3/Q4/Q5/Q6 G64/G128 weights for zero-repack M5 NAX",
+        help="offline pre-tile rank-2 MXFP4 and Q3/Q4/Q5/Q6/Q8 G64/G128 weights for zero-repack M5 NAX",
     )
     convert.set_defaults(func=command_convert)
     pretile = subparsers.add_parser(
         "pretile",
-        help="offline pre-tile an existing .omlxm5 artifact for zero-repack M5 NAX",
+        help="offline pre-tile an existing .miv artifact for zero-repack M5 NAX",
     )
     pretile.add_argument("--input", type=Path, required=True)
     pretile.add_argument("--output", type=Path, required=True)
     pretile.set_defaults(func=command_pretile)
     extract_mtp = subparsers.add_parser(
         "extract-mtp",
-        help="extract ModelComponent::mtp weights from a checkpoint directory or .omlxm5 into a standalone .omlxm5",
+        help="extract ModelComponent::mtp weights from a checkpoint directory or .miv into a standalone .miv",
     )
     extract_mtp.add_argument("--source", type=Path, required=True)
     extract_mtp.add_argument("--output", type=Path, required=True)
@@ -3310,7 +3354,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_mtp.set_defaults(func=command_extract_mtp)
     bundle_mtp = subparsers.add_parser(
         "bundle-mtp",
-        help="bundle ModelComponent::mtp weights from a checkpoint directory or .omlxm5 into an existing base .omlxm5",
+        help="bundle ModelComponent::mtp weights from a checkpoint directory or .miv into an existing base .miv",
     )
     bundle_mtp.add_argument("--base", type=Path, required=True)
     bundle_mtp.add_argument("--mtp", type=Path, required=True)
@@ -3319,7 +3363,7 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_mtp.set_defaults(func=command_bundle_mtp)
     qda = subparsers.add_parser(
         "qda-search",
-        help="#4776 + #5292 oQe + QDA top-k KL knapsack bit-allocation search & optional .omlxm5 export",
+        help="#4776 + #5292 oQe + QDA top-k KL knapsack bit-allocation search & optional .miv export",
     )
     qda.add_argument("--source", type=Path, required=True)
     qda.add_argument("--target-bpw", type=float, default=None)

@@ -43,6 +43,7 @@ from .engine.m5_sidecar import (
     M5RT_PROVIDER_ID,
     M5Target,
     can_auto_convert_m5rt_fast,
+    canonical_external_engine_id,
     create_m5rt_pool_engine,
     detect_adapted,
     discover_external_engine_plugins,
@@ -88,7 +89,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_metal_out_of_memory,
 )
-from .lora_adapters import adapter_info
+from .lora_adapters import adapter_info, resolve_adapter_path
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -667,6 +668,9 @@ class EnginePool:
                     self._splash_sizing_context(entry, runtime_settings),
                     runtime_settings,
                     global_settings=_safe_global_settings(),
+                    lora_adapters=self._lora_adapters,
+                    model_dirs=self._model_dirs,
+                    model_id=entry.model_id,
                 )
                 limit = self._splash_admission_target()
                 return min(wanted, limit) if limit > 0 else wanted
@@ -677,16 +681,20 @@ class EnginePool:
                 try:
                     sig = inspect.signature(plugin.estimate_memory_bytes)
                     params = sig.parameters
-                    if (
-                        any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in params.values()
-                        )
-                        or "sizing_context" in params
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    )
+                    for key, value in (
+                        (
+                            "sizing_context",
+                            self._splash_sizing_context(entry, runtime_settings),
+                        ),
+                        ("lora_adapters", self._lora_adapters),
+                        ("model_dirs", self._model_dirs),
                     ):
-                        est_kwargs["sizing_context"] = self._splash_sizing_context(
-                            entry, runtime_settings
-                        )
+                        if has_var_kw or key in params:
+                            est_kwargs[key] = value
                 except (TypeError, ValueError):
                     pass
                 est = plugin.estimate_memory_bytes(
@@ -812,8 +820,15 @@ class EnginePool:
                 # BF16 draft weights plus the folded [vocab, rank] Markov head.
                 extra += draft.stat().st_size + 201024 * 256 * 2
         lora_path = getattr(runtime_settings, "lora_adapter", None)
-        if lora_path and (info := adapter_info(lora_path)) is not None:
-            extra += info.resident_bytes
+        if lora_path:
+            resolved_lora = resolve_adapter_path(
+                lora_path,
+                adapters=self._lora_adapters,
+                model_dir=entry.model_path,
+                model_dirs=self._model_dirs,
+            )
+            if (info := adapter_info(resolved_lora)) is not None:
+                extra += info.resident_bytes
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -1379,24 +1394,64 @@ class EnginePool:
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
         ext_engine = data.get("external_engine") or None
-        add("external_engine", ext_engine)
+        norm_ext_engine = (
+            "stock"
+            if ext_engine == "stock"
+            else canonical_external_engine_id(str(ext_engine))
+            if ext_engine
+            else None
+        )
+        add("external_engine", norm_ext_engine)
         resolved_ext_engine = self.external_engine_id(model_id, settings)
-        if resolved_ext_engine is None and ext_engine and ext_engine != "stock":
-            resolved_ext_engine = str(ext_engine)
+        if resolved_ext_engine is None and norm_ext_engine and norm_ext_engine != "stock":
+            resolved_ext_engine = str(norm_ext_engine)
+        if (
+            resolved_ext_engine is None
+            and norm_ext_engine != "stock"
+            and entry is not None
+            and entry.engine is not None
+        ):
+            live_ext_id = getattr(entry.engine, "external_engine_id", None)
+            if isinstance(live_ext_id, str) and live_ext_id:
+                resolved_ext_engine = live_ext_id
         if resolved_ext_engine == M5RT_ENGINE_ID:
             gs = _safe_global_settings()
             add(
                 "m5rt_signature",
                 m5rt_runtime_signature(
-                    settings, gs.integrations.m5rt_path, global_settings=gs
+                    settings,
+                    gs.integrations.m5rt_path,
+                    global_settings=gs,
+                    lora_adapters=self._lora_adapters,
+                    model_path=entry.model_path if entry else None,
+                    model_dirs=self._model_dirs,
                 ),
             )
         elif resolved_ext_engine and resolved_ext_engine != "splash":
             plugin = get_external_engine_plugin(str(resolved_ext_engine))
             if plugin is not None and callable(plugin.runtime_signature):
+                sig_kwargs: dict[str, object] = {}
+                try:
+                    sig_obj = inspect.signature(plugin.runtime_signature)
+                    sig_params = sig_obj.parameters
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig_params.values()
+                    )
+                    for key, value in (
+                        ("lora_adapters", self._lora_adapters),
+                        ("model_path", entry.model_path if entry else None),
+                        ("model_dirs", self._model_dirs),
+                    ):
+                        if has_var_kw or key in sig_params:
+                            sig_kwargs[key] = value
+                except (TypeError, ValueError):
+                    pass
                 add(
                     "external_plugin_signature",
-                    plugin.runtime_signature(settings, _safe_global_settings()),
+                    plugin.runtime_signature(
+                        settings, _safe_global_settings(), **sig_kwargs
+                    ),
                 )
         add("index_cache_freq", normalized_index_cache_freq())
         # Embedding audio tower residency is decided at load. The audio length
@@ -2499,7 +2554,7 @@ class EnginePool:
         if engine_id == "stock":
             return None
         if engine_id:
-            return engine_id
+            return canonical_external_engine_id(str(engine_id))
         entry = self._entries.get(model_id)
         if entry is None:
             return None
@@ -2673,6 +2728,8 @@ class EnginePool:
                 sizing_context=self._splash_sizing_context(entry, model_settings),
                 admission_limit=self._splash_admission_target(),
                 current_model_memory=self._current_model_memory,
+                lora_adapters=self._lora_adapters,
+                model_dirs=self._model_dirs,
             )
             if m5_engine is None:
                 raise ModelLoadingError(
@@ -2687,6 +2744,8 @@ class EnginePool:
                 "sizing_context": self._splash_sizing_context(entry, model_settings),
                 "admission_limit": self._splash_admission_target(),
                 "current_model_memory": self._current_model_memory,
+                "lora_adapters": self._lora_adapters,
+                "model_dirs": self._model_dirs,
             }
             call_kwargs: dict[str, object] = {}
             try:

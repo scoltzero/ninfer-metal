@@ -2,7 +2,7 @@
 
 # Guide visuel d'`oMLX-extend`
 
-`oMLX-extend` ajoute **`miv Core Backend (ninfer-metal)`** et les microkernels communautaires Metal 4 Voie B à l'application macOS `oMLX` sur Mac Apple M5+ (`macOS 27+`). Les modèles `.omlxm5` adaptés basculent automatiquement sur l'exécution native Metal 4 NAX, tandis que tes modèles MLX habituels continuent de tourner sur Stock MLX.
+`oMLX-extend` ajoute **`miv Core Backend (ninfer-metal)`** et les microkernels communautaires Metal 4 Voie B à l'application macOS `oMLX` sur Mac Apple M5+ (`macOS 27+`). Les modèles `.miv` adaptés basculent automatiquement sur l'exécution native Metal 4 NAX, tandis que tes modèles MLX habituels continuent de tourner sur Stock MLX.
 
 Parcours les cinq écrans ci-dessous pour vérifier l'installation, contrôler le routage des moteurs, activer les fonctions de décodage rapide et lancer le serveur autonome sans écrire de fichier de configuration à la main.
 
@@ -34,7 +34,7 @@ Passe à l'écran **`Models`** pour visualiser le routage de chaque modèle sur 
 ![Écran Models affichant les badges de moteur actif et les pastilles de la bibliothèque](../../assets/omlx-mac/models-overview.png)
 
 - **Active Models** : Chaque modèle chargé affiche un badge de moteur (`miv Core`, le nom de ton microkernel Voie B ou `MLX`) juste à côté de **`Loaded`**.
-- **Model Library** : Les modèles équipés de poids `.omlxm5` affichent une pastille mise en évidence (`miv Core · Auto`, un microkernel Voie B ou `Stock MLX` si tu as désactivé le routage externe).
+- **Model Library** : Les modèles équipés de poids `.miv` affichent une pastille mise en évidence (`miv Core · Auto`, un microkernel Voie B ou `Stock MLX` si tu as désactivé le routage externe).
 - **Modèles non adaptés inchangés** : Les checkpoints MLX standard n'affichent aucune pastille de moteur externe et s'exécutent via Stock MLX sans aucun processus sidecar. Tu peux charger côte à côte des modèles `miv Core Backend`, Voie B et Stock MLX sous un plafond de mémoire unifiée commun.
 
 ---
@@ -45,8 +45,8 @@ Clique sur n'importe quel modèle adapté dans **Model Library**, puis ouvre **`
 
 ![Model Settings Advanced affichant le routage automatique vers miv Core Backend](../../assets/omlx-mac/engine-routing-auto.png)
 
-- **`Use External Engine`** est activé (**ON**) par défaut pour les modèles `.omlxm5` adaptés, avec le menu déroulant réglé sur **`miv Core Backend (Auto)`** (l'en-tête principal de Model Settings affiche également la pastille du moteur actif).
-- **Revenir à Stock MLX à tout moment** : Bascule **`Use External Engine`** sur **OFF**. `oMLX` enregistre `external_engine: "stock"` et affiche *"Using Stock MLX (auto-route overridden)"* sans supprimer tes poids `.omlxm5`. Repasse le bouton sur **ON** pour rétablir le routage automatique.
+- **`Use External Engine`** est activé (**ON**) par défaut pour les modèles `.miv` adaptés, avec le menu déroulant réglé sur **`miv Core Backend (Auto)`** (l'en-tête principal de Model Settings affiche également la pastille du moteur actif).
+- **Revenir à Stock MLX à tout moment** : Bascule **`Use External Engine`** sur **OFF**. `oMLX` enregistre `external_engine: "stock"` et affiche *"Using Stock MLX (auto-route overridden)"* sans supprimer tes poids `.miv`. Repasse le bouton sur **ON** pour rétablir le routage automatique.
 - **Choisir un autre moteur** : Si un microkernel Voie B compatible ou Splash est installé pour le même modèle, sélectionne-le directement dans le menu déroulant.
 
 ---
@@ -96,7 +96,7 @@ Pour démarrer le serveur autonome compatible OpenAI sur le port `8080` (distinc
 # Pointer directement vers un répertoire de modèle adapté
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# Ou omettre le chemin pour sélectionner automatiquement le premier modèle .omlxm5 dans ./models ou le dossier des modèles d'oMLX
+# Ou omettre le chemin pour sélectionner automatiquement le premier modèle .miv dans ./models ou le dossier des modèles d'oMLX
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@ Pour démarrer le serveur autonome compatible OpenAI sur le port `8080` (distinc
 
 ## Prochaines étapes
 
-- **[Démarrage et configuration](getting-started.md)** — Compiler depuis les sources, convertir des checkpoints en `.omlxm5` et passer en revue toutes les options CLI de `ninfer-metal-serve`.
+- **[Démarrage et configuration](getting-started.md)** — Compiler depuis les sources, convertir des checkpoints en `.miv` et passer en revue toutes les options CLI de `ninfer-metal-serve`.
 - **[Architecture et coexistence](architecture.md)** — Fonctionnement interne du routage O(1), de Provider SPI v2 et des budgets mémoire UMA partagés.
 - **[Microkernel Foundry](microkernel-foundry.md)** — Ajouter de nouvelles familles de modèles Voie A ou Voie B pour Apple M5+.

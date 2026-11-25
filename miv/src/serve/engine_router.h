@@ -99,6 +99,9 @@ public:
   [[nodiscard]] TrimCacheReport
   trim_cache(std::uint64_t target_free_bytes = 0);
   void set_scheduler_hint(const SchedulerHint &hint);
+  [[nodiscard]] bool reload_lora(const std::string &lora_adapter,
+                                 const std::string &lora_mode = "bypass",
+                                 std::string *error = nullptr);
   [[nodiscard]] std::uint64_t resident_memory_bytes() const;
   [[nodiscard]] std::string provider_id() const;
   [[nodiscard]] std::string backend_mode() const;

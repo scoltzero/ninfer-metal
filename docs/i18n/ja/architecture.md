@@ -41,8 +41,8 @@ flowchart LR
     Local --> Runtime
     MMH -- "Path B (AF_UNIX NDJSON v2)" --> Sidecar
     Sidecar -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> ExtProviders
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     UI -- "Context L / Concurrency B,C / MTP / DFlash2 / affine4" --> Daemon
     Daemon --> Runtime
@@ -66,7 +66,7 @@ flowchart LR
 
 ## 2. O(1) 自動モデルルーティング（`oMLX-extend`）
 
-`oMLX-extend` はサブプロセスを起動せず、ファイルシステム検査のみで `detect_adapted(model_dir)` を `< 1 ms` で完了し、`model.omlxm5`、`model_pack.json`、`omlxm5-manifest.json` の存在を判定する：
+`oMLX-extend` はサブプロセスを起動せず、ファイルシステム検査のみで `detect_adapted(model_dir)` を `< 1 ms` で完了し、`model.miv` / `model.omlxm5`、`model_pack.json`、`omlxm5-manifest.json` の存在を判定する：
 
 - **変換済みモデル**: 初回リクエスト時（またはピン留め時）に遅延で **`miv Core Backend`**（`mseries_backendd`）へルーティングし、`Model Settings → Advanced Settings` に **`miv Core Backend (Auto)`** と表示する。**`Use External Engine`** をオフにすると `external_engine: "stock"` を書き込み、モデルを Stock MLX へ戻す。
 - **未変換モデル**: Stock MLX（`BatchedEngine` / `VLMBatchedEngine`）をそのまま通過し、サイドカープロセス・追加メモリ・性能オーバーヘッドはいずれもゼロである。
@@ -90,7 +90,7 @@ flowchart LR
 
 ## 4. Metal 4 エンジン設計（`miv/`）
 
-- **単一プリタイル・ウェイトコピー**: オフライン `.omlxm5` 変換（`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`）により、ワイド `64×64` Prefill NAX、`T=1` QMV デコード、`BM=8/16/32` 投機検証を単一の常駐確保領域から供給する（オンライン再タイリング時の `~1.92×` に対し成果物フットプリント `1.0×`）。
+- **単一プリタイル・ウェイトコピー**: オフライン `.miv` 変換（`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`）により、ワイド `64×64` Prefill NAX、`T=1` QMV デコード、`BM=8/16/32` 投機検証を単一の常駐確保領域から供給する（オンライン再タイリング時の `~1.92×` に対し成果物フットプリント `1.0×`）。
 - **安全な Compute ICB 記録**: 32 ビットハードウェアオフセットのラップアラウンドを防ぐため、すべての間接バッファセグメントを `2 GiB` 未満（補助コンパクトキャッシュは `< 1 GiB`）に厳密制限する。ダブルバッファ化された `ar_pipe_[2]` コマンドアロケータがホストエンコードと GPU 実行をオーバーラップさせる。
 - **ページ化 CoW KV & UMA コンティニュエーション**: `KvPagePool` が参照カウント付き `64` トークンページ（`bf16` および `0.5625 B/val` の `0-ULP` `affine4_g128`）を管理する。`QwenUmaContinuation` は 48 層 GDN 状態（`146.81 MiB`）を単一 GPU コマンドバッファで保存・復元し（`0.22–1.62 ms`、CPU `memcpy` ゼロ）、`rolling_prefix_cache` が未ピン留め祖先をインプレース置換（`1×` スラブ再利用）する。
 - **厳格な SKU キャリブレーション分離**: `silicon_tuning.h` は正確な `profile_id` をキーとして SKU 別プロファイル（`apple-m5-ultra-64gpu.json`、`apple-m5-ultra-80gpu.json`）を読み込み、未計測チップではパラメータ化事前分布へフォールバックする。ある SKU の実測定数を別 SKU に流用することはない。
@@ -113,6 +113,6 @@ flowchart LR
 ## 詳細技術リファレンス
 
 - [Porting Architecture v2](../../backend/ninfer-m5-porting-architecture-v2.md)
-- [`.omlxm5` Artifact Format v1](../../backend/artifact-format-v1.md) & [Dispatch Contract v1](../../backend/dispatch-contract-v1.md)
+- [`.miv` Artifact Format v1](../../backend/artifact-format-v1.md) & [Dispatch Contract v1](../../backend/dispatch-contract-v1.md)
 - [Hardware & Software Boundaries v1](../../foundations/hardware-software-boundaries-v1.md)
 - [Core Certification Standard](../../standards/core-certification-standard.md)

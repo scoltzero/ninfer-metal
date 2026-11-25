@@ -28,8 +28,8 @@
 
 - **Zero Python, zero MLX**: Ships 16 Mach-O binaries (including native `ninfer-metal-serve` and `mseries_backendd`) and 38 precompiled `.metallib` shaders linked solely against macOS system frameworks — runs on clean Macs without Xcode, Python, or Homebrew dylibs.
 - **Standalone OpenAI server (`ninfer-metal-serve`)**: Single C++20 binary hosting in-process `miv` and parallel Path B SPI v2 microkernels on one HTTP/SSE port (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`), with C++ BPE tokenizer, Jinja chat templates, `<think>` `reasoning_content` split, and Qwen XML/JSON `<tool_call>` parsing — ready for Open WebUI, Cursor, Cline, NewAPI, and OpenAI SDKs.
-- **Single-copy NAX weights & `0-ULP` parity**: Offline NAX pre-tiling (`.omlxm5`) feeds Prefill, `T=1` AR decode, and speculative verify from one resident weight copy (`1.0×` artifact size). Baseline **`miv-v0.01`** runs Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid models (Dense 27B & 35B-A3B MoE) across `MXFP4` and `oQ` Affine (`q3–q8`) with `affine4_g128` KV cache, Native MTP / DFlash2, multi-user batching (`B/C = 1..8`), and rolling UMA prefix reuse.
-- **Drop-in `oMLX-extend` coexistence**: Bundles `oMLX-extend` (`omlx-extend-v0.8.3` over `jundot/omlx`) exposing **`miv Core Backend`** via an AF_UNIX Provider SPI v2 sidecar — adapted `.omlxm5` models route automatically in O(1), unadapted models stay on Stock MLX untouched, and sidecar + MLX models share UMA under one memory cap.
+- **Single-copy NAX weights & `0-ULP` parity**: Offline NAX pre-tiling (`.miv`) feeds Prefill, `T=1` AR decode, and speculative verify from one resident weight copy (`1.0×` artifact size). Baseline **`miv-v0.01`** runs Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid models (Dense 27B & 35B-A3B MoE) across `MXFP4` and `oQ` Affine (`q3–q8`) with `affine4_g128` KV cache, Native MTP / DFlash2, multi-user batching (`B/C = 1..8`), and rolling UMA prefix reuse.
+- **Drop-in `oMLX-extend` coexistence**: Bundles `oMLX-extend` (`omlx-extend-v0.8.3` over `jundot/omlx`) exposing **`miv Core Backend`** via an AF_UNIX Provider SPI v2 sidecar — `.miv` models (and auto-repacked Qwen `.safetensors`) route automatically in O(1), unadapted models stay on Stock MLX untouched, and sidecar + MLX models share UMA under one memory cap.
 
 ---
 
@@ -75,7 +75,7 @@ Launch the standalone C++ OpenAI server in one command (auto-loads shared defaul
 ./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
 ```
 
-Full build flags, `.omlxm5` weight conversion, multi-microkernel `ninfer-metal-serve --providers-dir` / `[[models]]` configs, and `oMLX-extend` hot-update instructions are in **[Getting Started & Config](docs/getting-started.md)**; for a screenshot walkthrough of the macOS app, see **[`oMLX-extend` Visual Guide](docs/omlx-extend-guide.md)**.
+Full build flags, `.miv` weight conversion, multi-microkernel `ninfer-metal-serve --providers-dir` / `[[models]]` configs, and `oMLX-extend` hot-update instructions are in **[Getting Started & Config](docs/getting-started.md)**; for a screenshot walkthrough of the macOS app, see **[`oMLX-extend` Visual Guide](docs/omlx-extend-guide.md)**.
 
 ---
 

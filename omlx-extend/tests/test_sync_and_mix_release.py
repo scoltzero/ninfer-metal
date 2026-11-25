@@ -353,3 +353,106 @@ class TestThreeWaySyncCarriesMixForward:
         # Live directory was NOT corrupted or partially overwritten
         assert server_py.read_text(encoding="utf-8") == original_mix_text
         assert '__version__ = "0.8.3"' in (live_omlx / "omlx" / "_version.py").read_text(encoding="utf-8")
+
+    def test_exported_spi_patch_matches_live_omlx_and_applies_cleanly(self, tmp_path: Path):
+        patch_file = REPO_ROOT / "omlx-extend" / "patches" / "omlx-v0.8.3-provider-spi.patch"
+        apply_script = SCRIPTS_DIR / "apply_spi_patch.sh"
+        assert patch_file.is_file() and patch_file.stat().st_size > 0
+        patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
+        assert "resolve_sidecar_lora_settings" in patch_text
+        assert "estimate_sidecar_lora_bytes" in patch_text
+        assert "lora_mode" in patch_text
+
+        # Copy tracked omlx/ files into a clean git repo, reverse-apply the SPI patch to
+        # reconstruct upstream v0.8.3, and verify apply_spi_patch.sh applies cleanly forward!
+        stage = tmp_path / "omlx_stage"
+        subprocess.run(
+            [
+                "rsync",
+                "-ac",
+                "--exclude=/.git/",
+                "--exclude=/.venv/",
+                "--exclude=/venv/",
+                "--exclude=/build/",
+                "--exclude=/dist/",
+                "--exclude=/.pytest_cache/",
+                "--exclude=/.mypy_cache/",
+                "--exclude=/.ruff_cache/",
+                "--exclude=/.mlx_cache/",
+                "--exclude=/*.egg-info/",
+                "--exclude=/packaging/_build/",
+                "--exclude=/packaging/_export/",
+                "--exclude=/packaging/_wheels/",
+                "--exclude=/apps/omlx-mac/.build/",
+                "--exclude=/apps/omlx-mac/.swiftpm/",
+                "--exclude=/apps/omlx-mac/DerivedData/",
+                "--exclude=/apps/omlx-mac/oMLX.xcodeproj/project.xcworkspace/xcshareddata/",
+                "--exclude=/node_modules/",
+                "--exclude=__pycache__/",
+                "--exclude=*.pyc",
+                "--exclude=*.pyo",
+                "--exclude=.DS_Store",
+                "--exclude=*.dylib",
+                "--exclude=*.so",
+                "--exclude=*.metallib",
+                "--exclude=*.dmg",
+                "--exclude=*.pkg",
+                "--exclude=*.db",
+                "--exclude=*.sqlite",
+                "--exclude=*.sqlite3",
+                "--exclude=*.log",
+                f"{REPO_ROOT / 'omlx'}/",
+                f"{stage}/",
+            ],
+            check=True,
+        )
+        _git(stage, "init", "-q")
+        _git(stage, "config", "user.name", "Test")
+        _git(stage, "config", "user.email", "test@example.com")
+        _git(stage, "add", "-A")
+        _git(stage, "commit", "-q", "-m", "live omlx-extend state")
+
+        # Reverse-apply the exported patch to reach exact upstream v0.8.3 base
+        subprocess.run(
+            ["git", "-C", str(stage), "apply", "--index", "--reverse", "--binary", str(patch_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _git(stage, "commit", "-q", "-m", "upstream v0.8.3 base")
+
+        # Forward check & apply via apply_spi_patch.sh
+        chk = subprocess.run(
+            [
+                "bash",
+                str(apply_script),
+                "--omlx-dir",
+                str(stage),
+                "--patch",
+                str(patch_file),
+                "--check-only",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "Patch applies cleanly" in chk.stdout
+
+        app = subprocess.run(
+            [
+                "bash",
+                str(apply_script),
+                "--omlx-dir",
+                str(stage),
+                "--patch",
+                str(patch_file),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "Patch applied successfully" in app.stdout
+        assert (stage / "omlx" / "engine" / "m5_sidecar.py").read_bytes() == (
+            REPO_ROOT / "omlx" / "omlx" / "engine" / "m5_sidecar.py"
+        ).read_bytes()
+

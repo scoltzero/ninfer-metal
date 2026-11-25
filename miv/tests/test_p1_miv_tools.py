@@ -856,3 +856,709 @@ def test_tool_test4_d1_quantization_parity_catches_truncation_and_nan() -> None:
     bad_err[10] += 2e-4
     with pytest.raises(AssertionError, match="decoder mismatch"):
         d1_quantization_parity.verify_sample_parity("m", 4, bad_err, ref)
+
+
+# ---------------------------------------------------------------------------
+# TASK-1: affine8 (q8_g64 & q8_g128) NAX pre-tile, mixed MXFP4+affine8 & matmul
+# ---------------------------------------------------------------------------
+
+
+def _read_plane_raw(path: Path, manifest: dict, obj_name: str, kind: str) -> bytes:
+    rec = next(item for item in manifest["objects"] if item["name"] == obj_name)
+    plane = next(p for p in rec["planes"] if p["kind"] == kind)
+    with path.open("rb") as handle:
+        payload_offset = m5_artifact.HEADER_STRUCT.unpack(
+            handle.read(m5_artifact.HEADER_BYTES)
+        )[5]
+        handle.seek(payload_offset + int(plane["offset"]))
+        return handle.read(int(plane["bytes"]))
+
+
+def _bf16_round_f32(values: np.ndarray) -> np.ndarray:
+    raw = _bf16_bytes(values)
+    u16 = np.frombuffer(raw, dtype="<u2")
+    return (u16.astype(np.uint32) << 16).view(np.float32).reshape(values.shape)
+
+
+def _dequant_affine_ref(
+    codes: np.ndarray, scales_f32: np.ndarray, biases_f32: np.ndarray, group_size: int
+) -> np.ndarray:
+    n, k = codes.shape
+    sc = np.repeat(_bf16_round_f32(scales_f32), group_size, axis=1)
+    bi = np.repeat(_bf16_round_f32(biases_f32), group_size, axis=1)
+    assert sc.shape == (n, k) and bi.shape == (n, k)
+    return sc * codes.astype(np.float32) + bi
+
+
+def _dequant_mxfp4_ref(codes: np.ndarray, scales_e8m0: np.ndarray) -> np.ndarray:
+    lut = np.array(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=np.float32,
+    )
+    vals = lut[codes & 0xF]
+    exps = np.where(scales_e8m0 == 0, -127, scales_e8m0.astype(np.int32) - 127)
+    sc = np.ldexp(np.ones_like(exps, dtype=np.float32), exps)
+    return vals * np.repeat(sc, 32, axis=1)
+
+
+def _decode_full_matrix(path: Path, manifest: dict, obj_name: str) -> np.ndarray:
+    rec = next(item for item in manifest["objects"] if item["name"] == obj_name)
+    n, k = int(rec["shape"][0]), int(rec["shape"][1])
+    rows = [
+        m5_artifact.decode_artifact_row(path, manifest, obj_name, r, 0, k)
+        for r in range(n)
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _simulate_affine8_nax_tiled_matmul(
+    x_f32: np.ndarray,
+    nax_codes_bytes: bytes,
+    nax_sb_bytes: bytes,
+    n: int,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Simulate Metal 4 NAX group-64 tiled matmul directly from raw nax_codes & nax_sb planes.
+
+    Returns (y_valid [T, n], y_padded_tail [T, padded_n - n]).
+    """
+    bn = 32 if n >= 65536 else 16
+    padded_n = m5_artifact.align_up(n, bn)
+    groups = k // 64
+    x_bf16 = _bf16_round_f32(x_f32)
+    t_rows = x_bf16.shape[0]
+
+    codes_tiled = np.frombuffer(nax_codes_bytes, dtype=np.uint8).reshape(
+        padded_n // bn, groups, bn, 64
+    )
+    sb_u32 = np.frombuffer(nax_sb_bytes, dtype="<u4").reshape(groups, padded_n)
+    sc_f32 = ((sb_u32 & 0xFFFF) << 16).view(np.float32)
+    bi_f32 = (sb_u32 & 0xFFFF0000).view(np.float32)
+
+    acc = np.zeros((t_rows, padded_n), dtype=np.float32)
+    for g in range(groups):
+        xg = x_bf16[:, g * 64 : (g + 1) * 64]  # [T, 64]
+        xsum = np.sum(xg, axis=1, keepdims=True)  # [T, 1]
+        cg = codes_tiled[:, g, :, :].reshape(padded_n, 64).astype(np.float32)
+        dot = xg @ cg.T  # [T, padded_n]
+        acc += dot * sc_f32[g][None, :] + xsum * bi_f32[g][None, :]
+    return acc[:, :n], acc[:, n:]
+
+
+def test_affine8_pure_q8_g64_and_g128_nax_pretile_roundtrip_and_matmul(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rng = np.random.default_rng(101)
+    # Use unaligned row counts (19 -> padded_n=32, 24 -> padded_n=32) and
+    # non-128-multiple K=576 (padded_k=640) for q8_g64 alongside K=512 for q8_g128.
+    n_q, k_q = 19, 576
+    n_d, k_d = 24, 512
+    q_codes = rng.integers(0, 256, size=(n_q, k_q), dtype=np.uint8)
+    q_scales = rng.uniform(0.01, 0.2, size=(n_q, k_q // 64)).astype(np.float32)
+    q_biases = rng.uniform(-3.0, 1.0, size=(n_q, k_q // 64)).astype(np.float32)
+
+    d_codes = rng.integers(0, 256, size=(n_d, k_d), dtype=np.uint8)
+    d_scales = rng.uniform(0.01, 0.2, size=(n_d, k_d // 128)).astype(np.float32)
+    d_biases = rng.uniform(-2.0, 2.0, size=(n_d, k_d // 128)).astype(np.float32)
+
+    emb_codes = rng.integers(0, 256, size=(16, 512), dtype=np.uint8)
+    emb_scales = np.full((16, 512 // 64), 0.0625, dtype=np.float32)
+    emb_biases = np.full((16, 512 // 64), -1.0, dtype=np.float32)
+
+    exp_codes = rng.integers(0, 256, size=(2 * 4, 512), dtype=np.uint8)
+    exp_scales = np.full((2 * 4, 512 // 64), 0.125, dtype=np.float32)
+    exp_biases = np.full((2 * 4, 512 // 64), -0.5, dtype=np.float32)
+
+    tensors: dict[str, tuple[str, list[int], bytes]] = {
+        "model.embed_tokens.weight": (
+            "U32",
+            [16, 512 * 8 // 32],
+            _pack_codes(emb_codes, 8),
+        ),
+        "model.embed_tokens.scales": ("BF16", [16, 512 // 64], _bf16_bytes(emb_scales)),
+        "model.embed_tokens.biases": ("BF16", [16, 512 // 64], _bf16_bytes(emb_biases)),
+        "model.layers.0.self_attn.q_proj.weight": (
+            "U32",
+            [n_q, k_q * 8 // 32],
+            _pack_codes(q_codes, 8),
+        ),
+        "model.layers.0.self_attn.q_proj.scales": (
+            "BF16",
+            [n_q, k_q // 64],
+            _bf16_bytes(q_scales),
+        ),
+        "model.layers.0.self_attn.q_proj.biases": (
+            "BF16",
+            [n_q, k_q // 64],
+            _bf16_bytes(q_biases),
+        ),
+        "model.layers.0.mlp.down_proj.weight": (
+            "U32",
+            [n_d, k_d * 8 // 32],
+            _pack_codes(d_codes, 8),
+        ),
+        "model.layers.0.mlp.down_proj.scales": (
+            "BF16",
+            [n_d, k_d // 128],
+            _bf16_bytes(d_scales),
+        ),
+        "model.layers.0.mlp.down_proj.biases": (
+            "BF16",
+            [n_d, k_d // 128],
+            _bf16_bytes(d_biases),
+        ),
+        "model.layers.0.mlp.switch_mlp.gate_proj.weight": (
+            "U32",
+            [2, 4, 512 * 8 // 32],
+            _pack_codes(exp_codes, 8),
+        ),
+        "model.layers.0.mlp.switch_mlp.gate_proj.scales": (
+            "BF16",
+            [2, 4, 512 // 64],
+            _bf16_bytes(exp_scales),
+        ),
+        "model.layers.0.mlp.switch_mlp.gate_proj.biases": (
+            "BF16",
+            [2, 4, 512 // 64],
+            _bf16_bytes(exp_biases),
+        ),
+        "model.norm.weight": (
+            "BF16",
+            [512],
+            _bf16_bytes(np.ones(512, dtype=np.float32)),
+        ),
+    }
+    src = _write_checkpoint(
+        tmp_path / "src_pure_q8",
+        revision="rev-pure-q8-001",
+        config={
+            "model_type": "qwen3_8",
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+                "model.layers.0.mlp.down_proj": {
+                    "bits": 8,
+                    "group_size": 128,
+                    "mode": "affine",
+                },
+            },
+        },
+        tensors=tensors,
+    )
+
+    untiled_art = tmp_path / "out_untiled" / "model.omlxm5"
+    pretiled_art = tmp_path / "out_pretiled" / "model.omlxm5"
+    two_step_art = tmp_path / "out_twostep" / "model.omlxm5"
+
+    # 1) Untiled convert + two-step pretile vs single-step convert --nax-pretile
+    m5_artifact.command_convert(
+        m5_artifact.build_parser().parse_args(
+            [
+                "convert",
+                "--source",
+                str(src),
+                "--output",
+                str(untiled_art),
+                "--source-repo",
+                "test/pure-q8",
+                "--expected-revision",
+                "rev-pure-q8-001",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+
+    m5_artifact.command_convert(
+        m5_artifact.build_parser().parse_args(
+            [
+                "convert",
+                "--source",
+                str(src),
+                "--output",
+                str(pretiled_art),
+                "--source-repo",
+                "test/pure-q8",
+                "--expected-revision",
+                "rev-pure-q8-001",
+                "--nax-pretile",
+            ]
+        )
+    )
+    pt_stdout = json.loads(capsys.readouterr().out)
+    assert pt_stdout["pretiled_objects"] == 2
+
+    two_step_art.parent.mkdir(parents=True, exist_ok=True)
+    pt_summary = m5_artifact.pretile_artifact(untiled_art, two_step_art)
+    assert pt_summary["pretiled_objects"] == 2
+    assert pretiled_art.read_bytes() == two_step_art.read_bytes()
+
+    _, untiled_manifest = m5_artifact.read_artifact(untiled_art, verify_payload=True)
+    _, pretiled_manifest = m5_artifact.read_artifact(pretiled_art, verify_payload=True)
+
+    objs = {obj["name"]: obj for obj in pretiled_manifest["objects"]}
+    # Embedding and 3D expert tensors must remain untiled; rank-2 linear Q8 layers pre-tile.
+    assert objs["model.embed_tokens"]["layout"] == "oq_rowsplit_k128_v1"
+    assert [p["kind"] for p in objs["model.embed_tokens"]["planes"]] == [
+        "code",
+        "scale",
+        "bias",
+    ]
+    assert (
+        objs["model.layers.0.mlp.switch_mlp.gate_proj"]["layout"]
+        == "oq_expert_rowsplit_k128_v1"
+    )
+
+    q_obj = objs["model.layers.0.self_attn.q_proj"]
+    assert q_obj["format"] == "oq_affine_q8_g64_bf16_v1"
+    assert q_obj["layout"] == "oq_nax_tiled_g64_v1"
+    assert q_obj["padded_k"] == 640
+    assert [(p["kind"], p["bytes"]) for p in q_obj["planes"]] == [
+        ("nax_codes", 32 * 576),
+        ("nax_sb", 32 * (576 // 64) * 4),
+    ]
+
+    d_obj = objs["model.layers.0.mlp.down_proj"]
+    assert d_obj["format"] == "oq_affine_q8_g128_bf16_v1"
+    assert d_obj["layout"] == "oq_nax_tiled_g64_v1"
+    assert d_obj["padded_k"] == 512
+    assert [(p["kind"], p["bytes"]) for p in d_obj["planes"]] == [
+        ("nax_codes", 32 * 512),
+        ("nax_sb", 32 * (512 // 64) * 4),
+    ]
+
+    # Verify g128 nax_sb repeats each 128-group (scale, bias) across 2 consecutive g64 slots.
+    d_sb_raw = _read_plane_raw(
+        pretiled_art, pretiled_manifest, "model.layers.0.mlp.down_proj", "nax_sb"
+    )
+    d_sb_u32 = np.frombuffer(d_sb_raw, dtype="<u4").reshape(k_d // 64, 32)
+    for g128 in range(k_d // 128):
+        np.testing.assert_array_equal(
+            d_sb_u32[2 * g128, :n_d], d_sb_u32[2 * g128 + 1, :n_d]
+        )
+    # Padding rows [n_d:32] must be strictly zero in both nax_sb and nax_codes.
+    assert np.all(d_sb_u32[:, n_d:] == 0)
+    d_codes_raw = _read_plane_raw(
+        pretiled_art, pretiled_manifest, "model.layers.0.mlp.down_proj", "nax_codes"
+    )
+    d_codes_tiled = np.frombuffer(d_codes_raw, dtype=np.uint8).reshape(2, 8, 16, 64)
+    assert np.all(d_codes_tiled[1, :, 8:, :] == 0)
+
+    # 2) Full-matrix dequantization bit-exactness (untiled == pretiled == BF16 reference)
+    w_q_ref = _dequant_affine_ref(q_codes, q_scales, q_biases, 64)
+    w_q_untiled = _decode_full_matrix(
+        untiled_art, untiled_manifest, "model.layers.0.self_attn.q_proj"
+    )
+    w_q_pretiled = _decode_full_matrix(
+        pretiled_art, pretiled_manifest, "model.layers.0.self_attn.q_proj"
+    )
+    np.testing.assert_array_equal(w_q_untiled, w_q_ref)
+    np.testing.assert_array_equal(w_q_pretiled, w_q_ref)
+
+    w_d_ref = _dequant_affine_ref(d_codes, d_scales, d_biases, 128)
+    w_d_untiled = _decode_full_matrix(
+        untiled_art, untiled_manifest, "model.layers.0.mlp.down_proj"
+    )
+    w_d_pretiled = _decode_full_matrix(
+        pretiled_art, pretiled_manifest, "model.layers.0.mlp.down_proj"
+    )
+    np.testing.assert_array_equal(w_d_untiled, w_d_ref)
+    np.testing.assert_array_equal(w_d_pretiled, w_d_ref)
+
+    # 3) Numerical matmul consistency across T=1 decode and T=16 prefill
+    q_codes_raw = _read_plane_raw(
+        pretiled_art, pretiled_manifest, "model.layers.0.self_attn.q_proj", "nax_codes"
+    )
+    q_sb_raw = _read_plane_raw(
+        pretiled_art, pretiled_manifest, "model.layers.0.self_attn.q_proj", "nax_sb"
+    )
+    for t_batch in (1, 16):
+        x_q = _bf16_round_f32(rng.normal(0.0, 0.5, size=(t_batch, k_q)).astype(np.float32))
+        y_q_ref = x_q @ w_q_ref.T
+        y_q_untiled = x_q @ w_q_untiled.T
+        y_q_pretiled = x_q @ w_q_pretiled.T
+        y_q_nax, y_q_pad = _simulate_affine8_nax_tiled_matmul(
+            x_q, q_codes_raw, q_sb_raw, n_q, k_q
+        )
+        np.testing.assert_array_equal(y_q_pretiled, y_q_untiled)
+        np.testing.assert_allclose(y_q_nax, y_q_ref, rtol=5e-5, atol=5e-4)
+        assert np.all(y_q_pad == 0.0)
+
+        x_d = _bf16_round_f32(rng.normal(0.0, 0.5, size=(t_batch, k_d)).astype(np.float32))
+        y_d_ref = x_d @ w_d_ref.T
+        y_d_untiled = x_d @ w_d_untiled.T
+        y_d_pretiled = x_d @ w_d_pretiled.T
+        y_d_nax, y_d_pad = _simulate_affine8_nax_tiled_matmul(
+            x_d, d_codes_raw, d_sb_raw, n_d, k_d
+        )
+        np.testing.assert_array_equal(y_d_pretiled, y_d_untiled)
+        np.testing.assert_allclose(y_d_nax, y_d_ref, rtol=5e-5, atol=5e-4)
+        assert np.all(y_d_pad == 0.0)
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_affine8_large_n_bn32_pretile_and_boundary_decode(
+    tmp_path: Path, group_size: int
+) -> None:
+    rng = np.random.default_rng(202 + group_size)
+    n, k = 65540, 512  # n >= 65536 triggers bn = 32 -> padded_n = 65568
+    codes = rng.integers(0, 256, size=(n, k), dtype=np.uint8)
+    scales = rng.uniform(0.02, 0.1, size=(n, k // group_size)).astype(np.float32)
+    biases = rng.uniform(-1.5, 1.5, size=(n, k // group_size)).astype(np.float32)
+
+    src = _write_checkpoint(
+        tmp_path / f"src_bn32_g{group_size}",
+        revision="rev-bn32-q8",
+        config={
+            "model_type": "qwen3_8",
+            "quantization": {"bits": 8, "group_size": group_size, "mode": "affine"},
+        },
+        tensors={
+            "lm_head.weight": ("U32", [n, k * 8 // 32], _pack_codes(codes, 8)),
+            "lm_head.scales": ("BF16", [n, k // group_size], _bf16_bytes(scales)),
+            "lm_head.biases": ("BF16", [n, k // group_size], _bf16_bytes(biases)),
+        },
+    )
+    out_art = tmp_path / f"out_bn32_g{group_size}.omlxm5"
+    args = m5_artifact.build_parser().parse_args(
+        [
+            "convert",
+            "--source",
+            str(src),
+            "--output",
+            str(out_art),
+            "--source-repo",
+            "test/bn32-q8",
+            "--nax-pretile",
+        ]
+    )
+    m5_artifact.command_convert(args)
+
+    _, manifest = m5_artifact.read_artifact(out_art, verify_payload=True)
+    obj = manifest["objects"][0]
+    assert obj["format"] == f"oq_affine_q8_g{group_size}_bf16_v1"
+    assert obj["layout"] == "oq_nax_tiled_g64_v1"
+    padded_n = 65568  # align_up(65540, 32)
+    assert [(p["kind"], p["bytes"]) for p in obj["planes"]] == [
+        ("nax_codes", padded_n * k),
+        ("nax_sb", padded_n * (k // 64) * 4),
+    ]
+
+    # Spot-check rows straddling bn=16 and bn=32 tile boundaries and the final row.
+    sc_bf16 = _bf16_round_f32(scales)
+    bi_bf16 = _bf16_round_f32(biases)
+    for row in (0, 15, 16, 31, 32, 65535, 65536, 65539):
+        decoded = m5_artifact.decode_artifact_row(out_art, manifest, "lm_head", row, 0, k)
+        expected = (
+            np.repeat(sc_bf16[row], group_size) * codes[row].astype(np.float32)
+            + np.repeat(bi_bf16[row], group_size)
+        )
+        np.testing.assert_array_equal(np.asarray(decoded, dtype=np.float32), expected)
+
+    # Verify tail padding rows 65540..65567 in nax_codes and nax_sb are zero.
+    raw_codes = _read_plane_raw(out_art, manifest, "lm_head", "nax_codes")
+    last_tile = np.frombuffer(raw_codes, dtype=np.uint8).reshape(
+        padded_n // 32, k // 64, 32, 64
+    )[-1]
+    assert np.all(last_tile[:, 4:, :] == 0)  # 65540 % 32 == 4
+
+
+@pytest.mark.parametrize("default_mode", ["mxfp4", "affine"])
+def test_mixed_mxfp4_and_affine8_per_layer_pretile_and_matmul_consistency(
+    tmp_path: Path, default_mode: str
+) -> None:
+    rng = np.random.default_rng(303)
+    k = 512
+    n_mx = 16
+    n_q8_g64 = 20
+    n_q8_g128 = 18
+
+    mx_codes = rng.integers(0, 16, size=(n_mx, k), dtype=np.uint8)
+    mx_packed = (mx_codes[:, 0::2] & 0xF) | ((mx_codes[:, 1::2] & 0xF) << 4)
+    mx_scales = rng.integers(124, 130, size=(n_mx, k // 32), dtype=np.uint8)
+
+    o_codes = rng.integers(0, 256, size=(n_q8_g64, k), dtype=np.uint8)
+    o_scales = rng.uniform(0.01, 0.15, size=(n_q8_g64, k // 64)).astype(np.float32)
+    o_biases = rng.uniform(-2.0, 2.0, size=(n_q8_g64, k // 64)).astype(np.float32)
+
+    down_codes = rng.integers(0, 256, size=(n_q8_g128, k), dtype=np.uint8)
+    down_scales = rng.uniform(0.01, 0.15, size=(n_q8_g128, k // 128)).astype(np.float32)
+    down_biases = rng.uniform(-2.0, 2.0, size=(n_q8_g128, k // 128)).astype(np.float32)
+
+    router_codes = rng.integers(0, 256, size=(4, 128), dtype=np.uint8)
+    router_scales = np.full((4, 2), 0.0625, dtype=np.float32)
+    router_biases = np.full((4, 2), -1.0, dtype=np.float32)
+
+    tensors: dict[str, tuple[str, list[int], bytes]] = {
+        "model.layers.0.self_attn.q_proj.weight": (
+            "U32",
+            [n_mx, k // 8],
+            np.ascontiguousarray(mx_packed).tobytes(),
+        ),
+        "model.layers.0.self_attn.q_proj.scales": (
+            "U8",
+            [n_mx, k // 32],
+            mx_scales.tobytes(),
+        ),
+        "model.layers.0.self_attn.o_proj.weight": (
+            "U32",
+            [n_q8_g64, k * 8 // 32],
+            _pack_codes(o_codes, 8),
+        ),
+        "model.layers.0.self_attn.o_proj.scales": (
+            "BF16",
+            [n_q8_g64, k // 64],
+            _bf16_bytes(o_scales),
+        ),
+        "model.layers.0.self_attn.o_proj.biases": (
+            "BF16",
+            [n_q8_g64, k // 64],
+            _bf16_bytes(o_biases),
+        ),
+        "model.layers.0.mlp.down_proj.weight": (
+            "U32",
+            [n_q8_g128, k * 8 // 32],
+            _pack_codes(down_codes, 8),
+        ),
+        "model.layers.0.mlp.down_proj.scales": (
+            "BF16",
+            [n_q8_g128, k // 128],
+            _bf16_bytes(down_scales),
+        ),
+        "model.layers.0.mlp.down_proj.biases": (
+            "BF16",
+            [n_q8_g128, k // 128],
+            _bf16_bytes(down_biases),
+        ),
+        "model.layers.0.mlp.gate.weight": (
+            "U32",
+            [4, 128 * 8 // 32],
+            _pack_codes(router_codes, 8),
+        ),
+        "model.layers.0.mlp.gate.scales": (
+            "BF16",
+            [4, 2],
+            _bf16_bytes(router_scales),
+        ),
+        "model.layers.0.mlp.gate.biases": (
+            "BF16",
+            [4, 2],
+            _bf16_bytes(router_biases),
+        ),
+    }
+
+    if default_mode == "mxfp4":
+        quant_cfg: dict = {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+            "model.layers.0.self_attn.o_proj": {"bits": 8, "group_size": 64},
+            "model.layers.0.mlp.down_proj": {
+                "bits": 8,
+                "group_size": 128,
+                "mode": "affine",
+            },
+            "model.layers.0.mlp.gate": {"bits": 8, "group_size": 64},
+        }
+    else:
+        quant_cfg = {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+            "model.layers.0.self_attn.q_proj": {
+                "bits": 4,
+                "group_size": 32,
+                "mode": "mxfp4",
+            },
+            "model.layers.0.mlp.down_proj": {
+                "bits": 8,
+                "group_size": 128,
+                "mode": "affine",
+            },
+        }
+
+    src = _write_checkpoint(
+        tmp_path / f"src_mixed_{default_mode}",
+        revision=f"rev-mixed-{default_mode}",
+        config={"model_type": "qwen3_6_moe", "quantization": quant_cfg},
+        tensors=tensors,
+    )
+    untiled_art = tmp_path / f"mixed_{default_mode}_untiled.omlxm5"
+    pretiled_art = tmp_path / f"mixed_{default_mode}_pretiled.omlxm5"
+
+    for out_p, flag in ((untiled_art, []), (pretiled_art, ["--nax-pretile"])):
+        args = m5_artifact.build_parser().parse_args(
+            [
+                "convert",
+                "--source",
+                str(src),
+                "--output",
+                str(out_p),
+                "--source-repo",
+                f"test/mixed-{default_mode}",
+                *flag,
+            ]
+        )
+        m5_artifact.command_convert(args)
+
+    _, u_manifest = m5_artifact.read_artifact(untiled_art, verify_payload=True)
+    pt_summary, p_manifest = m5_artifact.read_artifact(pretiled_art, verify_payload=True)
+    assert pt_summary["formats"] == {
+        "mxfp4_e2m1_g32_e8m0_v1": 1,
+        "oq_affine_q8_g128_bf16_v1": 1,
+        "oq_affine_q8_g64_bf16_v1": 2,
+    }
+
+    objs = {obj["name"]: obj for obj in p_manifest["objects"]}
+    assert objs["model.layers.0.self_attn.q_proj"]["layout"] == "mx_nax_tiled_bk128_v1"
+    assert [
+        p["kind"] for p in objs["model.layers.0.self_attn.q_proj"]["planes"]
+    ] == ["nax_data", "nax_scale"]
+
+    assert objs["model.layers.0.self_attn.o_proj"]["layout"] == "oq_nax_tiled_g64_v1"
+    assert [(p["kind"], p["bytes"]) for p in objs["model.layers.0.self_attn.o_proj"]["planes"]] == [
+        ("nax_codes", 32 * k),
+        ("nax_sb", 32 * (k // 64) * 4),
+    ]
+
+    assert objs["model.layers.0.mlp.down_proj"]["layout"] == "oq_nax_tiled_g64_v1"
+    assert [(p["kind"], p["bytes"]) for p in objs["model.layers.0.mlp.down_proj"]["planes"]] == [
+        ("nax_codes", 32 * k),
+        ("nax_sb", 32 * (k // 64) * 4),
+    ]
+
+    # Router with K=128 (< 512) remains untiled oq_rowsplit_k128_v1.
+    assert objs["model.layers.0.mlp.gate"]["layout"] == "oq_rowsplit_k128_v1"
+    assert [p["kind"] for p in objs["model.layers.0.mlp.gate"]["planes"]] == [
+        "code",
+        "scale",
+        "bias",
+    ]
+
+    bindings = {b["name"]: b for b in p_manifest["bindings"]}
+    assert bindings["model.layers.0.self_attn.q_proj"]["activation_policy"] == "AllowA4"
+    assert bindings["model.layers.0.self_attn.o_proj"]["activation_policy"] == "A16Only"
+    assert bindings["model.layers.0.mlp.down_proj"]["activation_policy"] == "A16Only"
+
+    # Verify dequantization & matmul consistency across all mixed layers.
+    w_mx_ref = _dequant_mxfp4_ref(mx_codes, mx_scales)
+    w_o_ref = _dequant_affine_ref(o_codes, o_scales, o_biases, 64)
+    w_down_ref = _dequant_affine_ref(down_codes, down_scales, down_biases, 128)
+
+    for obj_name, w_ref in (
+        ("model.layers.0.self_attn.q_proj", w_mx_ref),
+        ("model.layers.0.self_attn.o_proj", w_o_ref),
+        ("model.layers.0.mlp.down_proj", w_down_ref),
+    ):
+        w_u = _decode_full_matrix(untiled_art, u_manifest, obj_name)
+        w_p = _decode_full_matrix(pretiled_art, p_manifest, obj_name)
+        np.testing.assert_array_equal(w_u, w_ref)
+        np.testing.assert_array_equal(w_p, w_ref)
+
+    for t_batch in (1, 12):
+        x = _bf16_round_f32(rng.normal(0.0, 0.5, size=(t_batch, k)).astype(np.float32))
+        y_mx_p = x @ _decode_full_matrix(
+            pretiled_art, p_manifest, "model.layers.0.self_attn.q_proj"
+        ).T
+        np.testing.assert_allclose(y_mx_p, x @ w_mx_ref.T, rtol=1e-6, atol=1e-6)
+
+        for obj_name, n_rows, w_ref in (
+            ("model.layers.0.self_attn.o_proj", n_q8_g64, w_o_ref),
+            ("model.layers.0.mlp.down_proj", n_q8_g128, w_down_ref),
+        ):
+            y_nax, y_pad = _simulate_affine8_nax_tiled_matmul(
+                x,
+                _read_plane_raw(pretiled_art, p_manifest, obj_name, "nax_codes"),
+                _read_plane_raw(pretiled_art, p_manifest, obj_name, "nax_sb"),
+                n_rows,
+                k,
+            )
+            np.testing.assert_allclose(y_nax, x @ w_ref.T, rtol=5e-5, atol=5e-4)
+            assert np.all(y_pad == 0.0)
+
+
+def test_affine8_nax_tiled_rejects_high_planes_and_invalid_geometry(
+    tmp_path: Path,
+) -> None:
+    dummy_art = tmp_path / "dummy_q8.omlxm5"
+    dummy_art.write_bytes(b"\x00" * (m5_artifact.HEADER_BYTES + 4096))
+
+    # 1) Invalid geometries rejected by both _expected_plane_bytes and decode_artifact_row
+    for fmt, shape, padded_k in (
+        ("oq_affine_q8_g64_bf16_v1", [16, 256], 256),     # k < 512
+        ("oq_affine_q8_g128_bf16_v1", [16, 576], 640),    # k % 128 != 0
+        ("oq_affine_q8_g64_bf16_v1", [2, 16, 512], 512),  # rank != 2
+    ):
+        bad_rec = {
+            "id": 0,
+            "name": "bad_q8",
+            "format": fmt,
+            "layout": "oq_nax_tiled_g64_v1",
+            "shape": shape,
+            "padded_k": padded_k,
+            "planes": [],
+        }
+        with pytest.raises(ValueError, match="affine NAX tiled geometry mismatch"):
+            m5_artifact._expected_plane_bytes(bad_rec)
+        with pytest.raises(ValueError, match="affine NAX tiled geometry mismatch"):
+            m5_artifact.decode_artifact_row(
+                dummy_art, {"objects": [bad_rec]}, "bad_q8", 0, 0, 16
+            )
+
+    # 2) Spurious nax_high2 / nax_high1 plane or 4-bit nax_codes size rejected when bits == 8
+    base_valid = {
+        "id": 0,
+        "name": "q8_obj",
+        "format": "oq_affine_q8_g64_bf16_v1",
+        "layout": "oq_nax_tiled_g64_v1",
+        "shape": [16, 512],
+        "padded_k": 512,
+        "object_offset": 0,
+        "object_bytes": 16 * 512 + 16 * 8 * 4,
+        "object_sha256": "0" * 64,
+        "source_tensors": ["q8_obj.weight", "q8_obj.scales", "q8_obj.biases"],
+        "planes": [
+            {"kind": "nax_codes", "offset": 0, "bytes": 16 * 512},
+            {"kind": "nax_sb", "offset": 16 * 512, "bytes": 16 * 8 * 4},
+        ],
+    }
+    m5_artifact._validate_object_contract(base_valid, 0)
+
+    for high_kind in ("nax_high1", "nax_high2"):
+        with_high = {
+            **base_valid,
+            "planes": [
+                {"kind": "nax_codes", "offset": 0, "bytes": 16 * 512},
+                {"kind": high_kind, "offset": 16 * 512, "bytes": 16 * 128},
+                {"kind": "nax_sb", "offset": 16 * 512 + 16 * 128, "bytes": 16 * 8 * 4},
+            ],
+        }
+        with pytest.raises(ValueError, match="quantized layout contract mismatch"):
+            m5_artifact._validate_object_contract(with_high, 0)
+
+    wrong_code_size = {
+        **base_valid,
+        "planes": [
+            {"kind": "nax_codes", "offset": 0, "bytes": 16 * 512 // 2},
+            {"kind": "nax_sb", "offset": 16 * 512 // 2, "bytes": 16 * 8 * 4},
+        ],
+    }
+    with pytest.raises(ValueError, match="quantized plane size mismatch"):
+        m5_artifact._validate_object_contract(wrong_code_size, 0)

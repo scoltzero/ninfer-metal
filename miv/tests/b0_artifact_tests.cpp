@@ -1,5 +1,7 @@
 #include <array>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +17,8 @@
 #include <vector>
 
 #include "omlx_m5/artifact.h"
+#include "omlx_m5/materialization.h"
+#include "omlx_m5/metal.h"
 
 namespace {
 
@@ -302,12 +306,289 @@ void test_16kib_and_legacy_4kib_artifacts() {
   expect(caught_corrupt, "single-pass verify_payload missed plane corruption");
 }
 
+std::uint16_t float_to_bf16_bits(float v) {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(v);
+  const std::uint32_t lsb = (bits >> 16U) & 1U;
+  return static_cast<std::uint16_t>((bits + 0x7FFFU + lsb) >> 16U);
+}
+
+float bf16_bits_to_float(std::uint16_t b) {
+  return std::bit_cast<float>(static_cast<std::uint32_t>(b) << 16U);
+}
+
+std::vector<std::byte> build_affine8_pretiled_artifact(
+    std::uint32_t n, std::uint32_t k, std::uint32_t group_size,
+    bool inject_spurious_high2 = false, bool half_size_codes = false,
+    std::vector<float> *out_ref = nullptr) {
+  const std::uint32_t bn = (n >= 65536U) ? 32U : 16U;
+  const std::uint32_t padded_n = ((n + bn - 1U) / bn) * bn;
+  const std::uint32_t padded_k = ((k + 127U) / 128U) * 128U;
+  const std::uint32_t k_groups64 = k / 64U;
+  const std::uint32_t sb_groups = k / group_size;
+
+  std::vector<std::byte> nax_codes(
+      half_size_codes ? (std::size_t(padded_n) * k / 2U)
+                      : (std::size_t(padded_n) * k),
+      std::byte{0});
+  std::vector<std::byte> nax_sb(std::size_t(k_groups64) * padded_n * 4U,
+                                std::byte{0});
+  if (out_ref != nullptr) {
+    out_ref->assign(std::size_t(n) * k, 0.0F);
+  }
+
+  for (std::uint32_t row = 0; row < n; ++row) {
+    const std::uint32_t tile_n = row / bn;
+    const std::uint32_t rn = row % bn;
+    for (std::uint32_t sg = 0; sg < sb_groups; ++sg) {
+      const float sc_raw = 0.0125F * float((sg % 7U) + 1U) + 0.001F * float(row % 5U);
+      const float bi_raw = -1.25F + 0.05F * float((row + sg) % 11U);
+      const std::uint16_t sc_bf = float_to_bf16_bits(sc_raw);
+      const std::uint16_t bi_bf = float_to_bf16_bits(bi_raw);
+      const std::uint32_t packed_sb =
+          static_cast<std::uint32_t>(sc_bf) |
+          (static_cast<std::uint32_t>(bi_bf) << 16U);
+      if (group_size == 128U) {
+        std::memcpy(nax_sb.data() + (std::size_t(2U * sg) * padded_n + row) * 4U,
+                    &packed_sb, 4U);
+        std::memcpy(
+            nax_sb.data() + (std::size_t(2U * sg + 1U) * padded_n + row) * 4U,
+            &packed_sb, 4U);
+      } else {
+        std::memcpy(nax_sb.data() + (std::size_t(sg) * padded_n + row) * 4U,
+                    &packed_sb, 4U);
+      }
+    }
+    if (!half_size_codes) {
+      for (std::uint32_t col = 0; col < k; ++col) {
+        const std::uint8_t q =
+            static_cast<std::uint8_t>((row * 37U + col * 13U + 5U) & 0xFFU);
+        const std::uint32_t g64 = col / 64U;
+        const std::uint32_t off = col % 64U;
+        const std::size_t c_idx =
+            (std::size_t(tile_n) * k_groups64 + g64) * (std::size_t(bn) * 64U) +
+            std::size_t(rn) * 64U + off;
+        nax_codes[c_idx] = static_cast<std::byte>(q);
+
+        if (out_ref != nullptr) {
+          std::uint32_t packed_sb = 0;
+          std::memcpy(&packed_sb,
+                      nax_sb.data() + (std::size_t(g64) * padded_n + row) * 4U,
+                      4U);
+          const float sc =
+              bf16_bits_to_float(static_cast<std::uint16_t>(packed_sb & 0xFFFFU));
+          const float bi =
+              bf16_bits_to_float(static_cast<std::uint16_t>(packed_sb >> 16U));
+          (*out_ref)[std::size_t(row) * k + col] = std::fma(sc, float(q), bi);
+        }
+      }
+    }
+  }
+
+  std::vector<std::byte> payload;
+  const auto align_payload = [&](std::size_t alignment) {
+    while (payload.size() % alignment != 0U) {
+      payload.push_back(std::byte{0});
+    }
+  };
+
+  const std::uint64_t p0_offset = payload.size();
+  payload.insert(payload.end(), nax_codes.begin(), nax_codes.end());
+  align_payload(256U);
+  std::uint64_t p_high_offset = 0;
+  std::vector<std::byte> spurious_high(std::size_t(padded_n) * (k / 4U),
+                                       std::byte{0});
+  if (inject_spurious_high2) {
+    p_high_offset = payload.size();
+    payload.insert(payload.end(), spurious_high.begin(), spurious_high.end());
+    align_payload(256U);
+  }
+  const std::uint64_t p1_offset = payload.size();
+  payload.insert(payload.end(), nax_sb.begin(), nax_sb.end());
+  const std::uint64_t obj0_bytes = payload.size();
+  const auto obj0_sha = omlx::m5::artifact_sha256_hex(payload);
+
+  const std::string fmt =
+      (group_size == 128U) ? "oq_affine_q8_g128_bf16_v1"
+                           : "oq_affine_q8_g64_bf16_v1";
+  std::ostringstream json;
+  json << "{\"bindings\":[{\"activation_policy\":\"A16Only\","
+       << "\"format\":\"" << fmt << "\",\"in_features\":" << k
+       << ",\"leading_shape\":[],\"name\":\"linear\",\"object_id\":0,"
+       << "\"out_features\":" << n << ",\"use\":\"linear\"}],"
+       << "\"container_version\":1,"
+       << "\"model\":{\"source_profile\":\"oq_affine\","
+       << "\"source_repo\":\"test/affine8\",\"source_revision\":\"rev8\"},"
+       << "\"objects\":[{\"format\":\"" << fmt << "\",\"id\":0,"
+       << "\"layout\":\"oq_nax_tiled_g64_v1\",\"name\":\"linear\","
+       << "\"object_bytes\":" << obj0_bytes << ",\"object_offset\":0,"
+       << "\"object_sha256\":\"" << obj0_sha << "\",\"padded_k\":" << padded_k
+       << ",\"planes\":["
+       << "{\"alignment\":256,\"bytes\":" << nax_codes.size() << ",\"crc32\":\""
+       << hex_crc32(omlx::m5::artifact_crc32(nax_codes))
+       << "\",\"kind\":\"nax_codes\",\"offset\":" << p0_offset
+       << ",\"sha256\":\"" << omlx::m5::artifact_sha256_hex(nax_codes) << "\"},";
+  if (inject_spurious_high2) {
+    json << "{\"alignment\":256,\"bytes\":" << spurious_high.size()
+         << ",\"crc32\":\""
+         << hex_crc32(omlx::m5::artifact_crc32(spurious_high))
+         << "\",\"kind\":\"nax_high2\",\"offset\":" << p_high_offset
+         << ",\"sha256\":\"" << omlx::m5::artifact_sha256_hex(spurious_high)
+         << "\"},";
+  }
+  json << "{\"alignment\":256,\"bytes\":" << nax_sb.size() << ",\"crc32\":\""
+       << hex_crc32(omlx::m5::artifact_crc32(nax_sb))
+       << "\",\"kind\":\"nax_sb\",\"offset\":" << p1_offset
+       << ",\"sha256\":\"" << omlx::m5::artifact_sha256_hex(nax_sb) << "\"}"
+       << "],\"shape\":[" << n << "," << k
+       << "],\"source_tensors\":[\"linear.weight\"]}],"
+       << "\"payload_bytes\":" << payload.size()
+       << ",\"schema\":\"omlx-m5-artifact-v1\",\"views\":[]}";
+
+  const auto manifest_str = json.str();
+  const auto manifest_bytes =
+      std::as_bytes(std::span(manifest_str.data(), manifest_str.size()));
+  const std::uint64_t raw_end = 64ULL + manifest_bytes.size();
+  const std::uint64_t payload_offset = (raw_end + 16383ULL) & ~16383ULL;
+  const std::uint32_t manifest_crc = omlx::m5::artifact_crc32(manifest_bytes);
+
+  std::vector<std::byte> file;
+  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
+  for (char c : magic) {
+    file.push_back(static_cast<std::byte>(c));
+  }
+  append_u32(file, 1U);
+  append_u32(file, 64U);
+  append_u64(file, 64ULL);
+  append_u64(file, manifest_bytes.size());
+  append_u64(file, payload_offset);
+  append_u64(file, payload.size());
+  append_u32(file, 1U);
+  append_u32(file, manifest_crc);
+  const std::uint32_t header_crc =
+      omlx::m5::artifact_crc32(std::span<const std::byte>(file.data(), 56U));
+  append_u32(file, header_crc);
+  append_u32(file, 0U);
+  file.insert(file.end(), manifest_bytes.begin(), manifest_bytes.end());
+  file.resize(static_cast<std::size_t>(payload_offset), std::byte{0});
+  file.insert(file.end(), payload.begin(), payload.end());
+  return file;
+}
+
+void test_affine8_nax_pretile_contract_and_decode() {
+  const auto tmp_dir = std::filesystem::temp_directory_path() /
+                       ("omlx-m5-b0-aff8-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(tmp_dir);
+  struct Cleanup {
+    std::filesystem::path dir;
+    ~Cleanup() { std::filesystem::remove_all(dir); }
+  } cleanup{tmp_dir};
+
+  const auto write_bytes = [](const std::filesystem::path &p,
+                              const std::vector<std::byte> &data) {
+    std::ofstream out(p, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(data.data()),
+              static_cast<std::streamsize>(data.size()));
+  };
+
+  // 1. q8_g64 pre-tiled (N=37 -> padded_n=48, K=512) + zero-copy materialization
+  std::vector<float> ref_g64;
+  const auto p_g64 = tmp_dir / "q8_g64.omlxm5";
+  write_bytes(p_g64,
+              build_affine8_pretiled_artifact(37U, 512U, 64U, false, false,
+                                              &ref_g64));
+  const auto art_g64 = omlx::m5::ArtifactModel::open(p_g64, true);
+  expect(art_g64.objects().size() == 1U &&
+             art_g64.objects()[0].planes.size() == 2U,
+         "q8_g64 pre-tiled must have exactly 2 planes (nax_codes, nax_sb)");
+  for (std::uint32_t row : {0U, 15U, 16U, 36U}) {
+    const auto decoded =
+        art_g64.decode_weight_row(art_g64.objects()[0], row, 0U, 512U);
+    expect(decoded.size() == 512U, "q8_g64 decoded row length mismatch");
+    for (std::size_t col = 0; col < 512U; ++col) {
+      expect(decoded[col] == ref_g64[std::size_t(row) * 512U + col],
+             "q8_g64 decode_weight_row 0-ULP mismatch");
+    }
+  }
+  auto ctx = omlx::m5::MetalContext::create();
+  auto plan = omlx::m5::plan_model_materialization(
+      art_g64, ctx, {.require_verified_payload = true});
+  auto mat = omlx::m5::materialize_model(art_g64, std::move(plan), ctx);
+  const auto view = mat.parent_view(0U);
+  expect(view.format == "oq_affine_q8_g64_bf16_v1" &&
+             view.layout == "oq_nax_tiled_g64_v1" && view.planes.size() == 2U &&
+             view.planes[0].kind == "nax_codes" &&
+             view.planes[0].bytes == 48ULL * 512ULL &&
+             view.planes[1].kind == "nax_sb" &&
+             view.planes[1].bytes == 48ULL * 8ULL * 4ULL,
+         "q8_g64 materialized view plane contract mismatch");
+
+  // 2. q8_g128 pre-tiled (N=20 -> padded_n=32, K=512)
+  std::vector<float> ref_g128;
+  const auto p_g128 = tmp_dir / "q8_g128.omlxm5";
+  write_bytes(p_g128,
+              build_affine8_pretiled_artifact(20U, 512U, 128U, false, false,
+                                              &ref_g128));
+  const auto art_g128 = omlx::m5::ArtifactModel::open(p_g128, true);
+  for (std::uint32_t row : {0U, 15U, 16U, 19U}) {
+    const auto decoded =
+        art_g128.decode_weight_row(art_g128.objects()[0], row, 0U, 512U);
+    for (std::size_t col = 0; col < 512U; ++col) {
+      expect(decoded[col] == ref_g128[std::size_t(row) * 512U + col],
+             "q8_g128 decode_weight_row 0-ULP mismatch");
+    }
+  }
+
+  // 3. Non-128-multiple K=576 (padded_k=640) q8_g64 pre-tiled
+  std::vector<float> ref_k576;
+  const auto p_k576 = tmp_dir / "q8_g64_k576.omlxm5";
+  write_bytes(p_k576,
+              build_affine8_pretiled_artifact(18U, 576U, 64U, false, false,
+                                              &ref_k576));
+  const auto art_k576 = omlx::m5::ArtifactModel::open(p_k576, true);
+  for (std::uint32_t row : {0U, 15U, 16U, 17U}) {
+    const auto decoded =
+        art_k576.decode_weight_row(art_k576.objects()[0], row, 0U, 576U);
+    expect(decoded.size() == 576U, "q8_g64 K=576 decoded length mismatch");
+    for (std::size_t col = 0; col < 576U; ++col) {
+      expect(decoded[col] == ref_k576[std::size_t(row) * 576U + col],
+             "q8_g64 K=576 decode_weight_row 0-ULP mismatch");
+    }
+  }
+
+  // 4. Negative: spurious nax_high2 plane on bits == 8 must be rejected
+  const auto p_spurious = tmp_dir / "bad_high2.omlxm5";
+  write_bytes(p_spurious,
+              build_affine8_pretiled_artifact(16U, 512U, 64U, true, false));
+  bool rejected_spurious = false;
+  try {
+    static_cast<void>(omlx::m5::ArtifactModel::open(p_spurious, false));
+  } catch (const std::exception &) {
+    rejected_spurious = true;
+  }
+  expect(rejected_spurious,
+         "spurious nax_high2 plane on q8 oq_nax_tiled_g64_v1 was accepted");
+
+  // 5. Negative: 4-bit half-size nax_codes on bits == 8 must be rejected
+  const auto p_half = tmp_dir / "bad_half_codes.omlxm5";
+  write_bytes(p_half,
+              build_affine8_pretiled_artifact(16U, 512U, 64U, false, true));
+  bool rejected_half = false;
+  try {
+    static_cast<void>(omlx::m5::ArtifactModel::open(p_half, false));
+  } catch (const std::exception &) {
+    rejected_half = true;
+  }
+  expect(rejected_half,
+         "half-size nax_codes on q8 oq_nax_tiled_g64_v1 was accepted");
+}
+
 } // namespace
 
 int main() {
   try {
     test_crc32_contract_and_speed();
     test_16kib_and_legacy_4kib_artifacts();
+    test_affine8_nax_pretile_contract_and_decode();
     std::cout << "b0 artifact native tests passed\n";
     return 0;
   } catch (const std::exception &error) {

@@ -58,7 +58,7 @@
 - 제로카피 GPU 프리픽스 이어쓰기(`64K` 복원 `0.73–1.62 ms`), 인플레이스 롤링 UMA 프리픽스 재사용, 동시 세션을 위한 배치 `affine4_g128` NAX 어텐션을 제공합니다.
 
 ### `oMLX-extend` `omlx-extend-v0.8.3` (macOS 앱 및 사이드카)
-- `AF_UNIX` 사이드카(`mseries_backendd`)를 통해 **`miv Core Backend`**를 등록해 변환된 `.omlxm5` 모델은 O(1)로 자동 라우팅하고, 일반 MLX 모델은 추가 프로세스 없이 Stock MLX에서 그대로 실행합니다.
+- `AF_UNIX` 사이드카(`mseries_backendd`)를 통해 **`miv Core Backend`**를 등록해 변환된 `.miv` 모델은 O(1)로 자동 라우팅하고, 일반 MLX 모델은 추가 프로세스 없이 Stock MLX에서 그대로 실행합니다.
 - 네이티브 macOS UI의 `Integrations → External Engines`에 `miv Core Backend` 및 경로 B 마이크로커널 카드, 모델별 엔진 배지, Auto / Stock MLX 선택기, 백엔드 기능에 따라 활성화되는 `64K+` 컨텍스트, `MTP`, `DFlash2`, `affine4_g128` KV 캐시 제어를 추가했습니다.
 - 사이드카와 MLX 모델 간 UMA 예산, 유휴 캐시 회수, 경합 인식 청크 프리필을 조율하며 `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/`의 원자적 심볼릭 링크 업데이트를 지원합니다.
 
@@ -75,7 +75,7 @@
 | 하드웨어 | Apple Silicon `MTLGPUFamilyApple10+` (Apple M5 / M5 Pro / M5 Max / M5 Ultra, 64-GPU & 80-GPU) |
 | OS 및 툴체인 | macOS 27+ (실행 시 Xcode 불필요, 소스 빌드 시 Xcode 27+ / macOS 27 SDK) |
 | 모델 | **Qwen3.5 / Qwen3.6 / Qwen3.8 하이브리드** (3:1 GDN + GQA; Dense 0.8B–27B 및 35B-A3B 등 256×8 MoE) |
-| 가중치 형식 | 오프라인 NAX 사전 타일링 `.omlxm5`: `MXFP4` (`E2M1 × UE8M0`) 및 `oQ` Affine (`q3–q8`, `g64 / g128`) |
+| 가중치 형식 | 오프라인 NAX 사전 타일링 `.miv`: `MXFP4` (`E2M1 × UE8M0`) 및 `oQ` Affine (`q3–q8`, `g64 / g128`) |
 | KV 캐시 | `bf16` 및 `affine4_g128` (`0.5625 B/val`, `2K–64K` 전 구간 `0-ULP` 검증) |
 | 투기적 디코딩 | 순수 AR (`none`), 내장 `Native MTP`, `DFlash2` (단일 스트림 및 `B=2..4` 배치) |
 | 서빙 인터페이스 | `ninfer-metal-serve`의 OpenAI HTTP/SSE 엔드포인트, `oMLX-extend`의 OpenAI + Anthropic 엔드포인트 및 macOS GUI |

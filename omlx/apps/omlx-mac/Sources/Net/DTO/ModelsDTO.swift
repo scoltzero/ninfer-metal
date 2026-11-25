@@ -322,10 +322,14 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let reason: String?
     /// Hugging Face repo of the draft the engine lacks, when one provides it.
     var draftRepo: String? = nil
-    /// True when `.safetensors` weights can be converted in-place to `.omlxm5` for this engine.
+    /// True when `.safetensors` weights can be converted in-place to `.miv` for this engine.
     var canConvert: Bool? = nil
     /// Standard `ModelSettings` keys honored when this engine serves the model.
     var supportedStandardSettings: [String]? = nil
+    /// Canonical SPI provider ID when backed by an out-of-process provider.
+    var providerId: String? = nil
+    /// Provider-specific per-model options schema.
+    var optionsSchema: [[String: AnyCodable]]? = nil
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
@@ -424,6 +428,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let vlmMtpDraftBlockSize: Int?
     // LoRA adapter folder applied on top of the weights at load.
     let loraAdapter: String?
+    /// Per-provider external engine options (e.g. `lora_mode`, `max_concurrency`, `sampling_contract`).
+    var externalEngineOptions: [String: [String: AnyCodable]]? = nil
+    /// Legacy `m5rt_options` dict from older `model_settings.json` files.
+    var m5rtOptions: [String: AnyCodable]? = nil
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
@@ -515,6 +523,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
     var loraAdapter: String? = nil // "" clears the adapter.
+    var externalEngineOptions: [String: [String: AnyCodable]]? = nil
 }
 
 /// GET /admin/api/models/{id}/generation_config: the sampling values a new

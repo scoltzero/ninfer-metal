@@ -67,10 +67,10 @@ inline U32 bf16_nax_split_k(U32 n, U32 k, U32 bk, U32 bn) {
 
 inline U32 bf16_nax_mp(U32 t) { return ((t + 7u) / 8u) * 8u; }
 
-inline void linear_bf16_nax(Encoder &e, const MaterializedWeightView &w, Ref x,
-                            Ref y, U32 n, U32 k,
-                            std::optional<U32> explicit_t = {},
-                            U32 gpu_cores = 64u) {
+inline std::string emit_bf16_nax_raw(Encoder &e, Ref w_data, Ref x, Ref y,
+                                     U32 n, U32 k,
+                                     std::optional<U32> explicit_t = {},
+                                     U32 gpu_cores = 64u) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = bf16_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
@@ -98,14 +98,9 @@ inline void linear_bf16_nax(Encoder &e, const MaterializedWeightView &w, Ref x,
     const MetalDispatchSize grid{.width = U64(x_tiles) * tptg,
                                  .height = y_tiles};
     const MetalDispatchSize threads{.width = tptg};
-    e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
-    auto &d = e.emit("bf16_nax", fn, grid, threads, {x, plane(w, "data"), y});
+    auto &d = e.emit("bf16_nax", fn, grid, threads, {x, w_data, y});
     e.dynamic(d, 3, words({n, k, mp, t}), tokens_patch);
-    e.record_weight(w, n, k, "bf16_nax_m5_v1", "bf16_nax_m5_v1", {},
-                    "linear_row_exact_portable_v1",
-                    "bf16.nax.bk" + std::to_string(bk) + "." + tag + ".sk1.v1",
-                    true, explicit_t);
-    return;
+    return "bf16.nax.bk" + std::to_string(bk) + "." + tag + ".sk1.v1";
   }
 
   const U32 bn = bf16_nax_bn(n, bk);
@@ -139,14 +134,41 @@ inline void linear_bf16_nax(Encoder &e, const MaterializedWeightView &w, Ref x,
   const MetalDispatchSize grid{.width = U64(x_tiles) * 32u * sk * nsg,
                                .height = y_tiles};
   const MetalDispatchSize threads{.width = 32u * sk * nsg};
-  e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
-  auto &d = e.emit("bf16_nax", fn, grid, threads, {x, plane(w, "data"), y});
+  auto &d = e.emit("bf16_nax", fn, grid, threads, {x, w_data, y});
   e.dynamic(d, 3, words({n, k, mp, t}), tokens_patch);
+  return "bf16.nax.bk" + std::to_string(bk) + ".n" + std::to_string(bn) +
+         ".sk" + std::to_string(sk) + ".v1";
+}
+
+inline void linear_bf16_nax(Encoder &e, const MaterializedWeightView &w, Ref x,
+                            Ref y, U32 n, U32 k,
+                            std::optional<U32> explicit_t = {},
+                            U32 gpu_cores = 64u) {
+  e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+  const std::string grp =
+      emit_bf16_nax_raw(e, plane(w, "data"), x, y, n, k, explicit_t, gpu_cores);
   e.record_weight(w, n, k, "bf16_nax_m5_v1", "bf16_nax_m5_v1", {},
-                  "linear_row_exact_portable_v1",
-                  "bf16.nax.bk" + std::to_string(bk) + ".n" +
-                      std::to_string(bn) + ".sk" + std::to_string(sk) + ".v1",
-                  true, explicit_t);
+                  "linear_row_exact_portable_v1", grp, true, explicit_t);
+}
+
+inline void emit_lora_up_accum_bf16_nax(Encoder &e, Ref tmp, Ref b_data, Ref y,
+                                        U32 n, U32 r_valid, U32 r_stride_b,
+                                        U32 tmp_stride, U32 tmp_col_offset,
+                                        U32 y_stride, U32 y_col_offset,
+                                        float scale,
+                                        std::optional<U32> explicit_t = {}) {
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  const U32 x_tgs = (n + 63u) / 64u;
+  const U32 y_tgs = (t + 15u) / 16u;
+  auto &d = e.emit("bf16_nax", "omlx_m5_lora_up_accum_bf16_nax",
+                   {.width = U64(x_tgs) * 128u, .height = y_tgs},
+                   {.width = 128u}, {tmp, b_data, y});
+  e.dynamic(d, 3,
+            words({n, r_valid, r_stride_b, t, tmp_stride, tmp_col_offset,
+                   y_stride, y_col_offset, word(scale)}),
+            tokens_patch);
 }
 
 inline void linear_bf16_nax_swiglu(Encoder &e,

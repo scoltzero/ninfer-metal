@@ -390,6 +390,21 @@ struct ServeHttpServer::Impl {
   }
 
   Json model_object(const ModelInstance &m) const {
+    std::string lora_adapter = m.lora_adapter;
+    std::string lora_mode =
+        m.lora_adapter.empty() ? std::string{} : m.lora_mode;
+    std::uint64_t lora_buffer_bytes = 0;
+    std::uint32_t lora_adapted_layers = 0;
+    if (m.router != nullptr && m.router->is_running()) {
+      try {
+        const auto st = m.router->stats();
+        lora_adapter = st.lora_adapter;
+        lora_mode = st.lora_mode;
+        lora_buffer_bytes = st.lora_buffer_bytes;
+        lora_adapted_layers = st.lora_adapted_layers;
+      } catch (...) {
+      }
+    }
     return {
         {"id", m.id},
         {"object", "model"},
@@ -398,6 +413,10 @@ struct ServeHttpServer::Impl {
         {"max_model_len", m.max_context},
         {"provider_id", m.provider_id},
         {"backend_mode", m.backend_mode},
+        {"lora_adapter", std::move(lora_adapter)},
+        {"lora_mode", std::move(lora_mode)},
+        {"lora_buffer_bytes", lora_buffer_bytes},
+        {"lora_adapted_layers", lora_adapted_layers},
     };
   }
 
@@ -571,6 +590,11 @@ struct ServeHttpServer::Impl {
     std::int32_t total_max_concurrency = 0;
     std::int32_t total_active = 0;
     std::string primary_backend;
+    std::string primary_lora_adapter;
+    std::string primary_lora_mode;
+    std::uint64_t total_lora_buffer_bytes = 0;
+    std::uint32_t total_lora_adapted_layers = 0;
+    bool captured_primary_lora = false;
     std::size_t healthy_count = 0;
     std::size_t unhealthy_count = 0;
     for (const auto &m : all_models) {
@@ -581,6 +605,13 @@ struct ServeHttpServer::Impl {
         if (primary_backend.empty()) {
           primary_backend = st.backend_kind;
         }
+        if (!captured_primary_lora) {
+          primary_lora_adapter = st.lora_adapter;
+          primary_lora_mode = st.lora_mode;
+          captured_primary_lora = true;
+        }
+        total_lora_buffer_bytes += st.lora_buffer_bytes;
+        total_lora_adapted_layers += st.lora_adapted_layers;
         total_max_concurrency += cap.max_concurrency;
         total_active += cap.active_requests;
         ++healthy_count;
@@ -593,6 +624,10 @@ struct ServeHttpServer::Impl {
             {"max_concurrency", cap.max_concurrency},
             {"active_requests", cap.active_requests},
             {"resident_memory_bytes", resident},
+            {"lora_adapter", st.lora_adapter},
+            {"lora_mode", st.lora_mode},
+            {"lora_buffer_bytes", st.lora_buffer_bytes},
+            {"lora_adapted_layers", st.lora_adapted_layers},
         });
       } catch (const std::exception &err) {
         ++unhealthy_count;
@@ -611,6 +646,11 @@ struct ServeHttpServer::Impl {
             {"active_requests",
              static_cast<std::int32_t>(m->router->active_requests())},
             {"resident_memory_bytes", resident},
+            {"lora_adapter", m->lora_adapter},
+            {"lora_mode",
+             m->lora_adapter.empty() ? std::string{} : m->lora_mode},
+            {"lora_buffer_bytes", 0ULL},
+            {"lora_adapted_layers", 0U},
         });
       } catch (...) {
         ++unhealthy_count;
@@ -624,6 +664,11 @@ struct ServeHttpServer::Impl {
             {"active_requests",
              static_cast<std::int32_t>(m->router->active_requests())},
             {"resident_memory_bytes", 0},
+            {"lora_adapter", m->lora_adapter},
+            {"lora_mode",
+             m->lora_adapter.empty() ? std::string{} : m->lora_mode},
+            {"lora_buffer_bytes", 0ULL},
+            {"lora_adapted_layers", 0U},
         });
       }
     }
@@ -641,6 +686,10 @@ struct ServeHttpServer::Impl {
          {"active_requests", total_active},
          {"gpu_contended", host_->is_gpu_contended()},
          {"memory_budget_bytes", host_->total_memory_budget_bytes()},
+         {"lora_adapter", primary_lora_adapter},
+         {"lora_mode", primary_lora_mode},
+         {"lora_buffer_bytes", total_lora_buffer_bytes},
+         {"lora_adapted_layers", total_lora_adapted_layers},
          {"models", std::move(models_json)}});
   }
 
@@ -1680,6 +1729,8 @@ ServeHttpServer::ServeHttpServer(ServeConfig config,
   inst.chat_template = std::move(chat_template);
   inst.max_context = config.max_context;
   inst.max_concurrency = config.max_concurrency;
+  inst.lora_adapter = config.lora_adapter;
+  inst.lora_mode = config.lora_mode;
   host->add_model(std::move(inst));
   impl_ = std::make_unique<Impl>(std::move(config), std::move(host));
 }

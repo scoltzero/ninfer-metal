@@ -28,8 +28,8 @@
 
 - **Kein Python, kein MLX**: Liefert 16 Mach-O-Binaries (darunter der native Server `ninfer-metal-serve` und der Daemon `mseries_backendd`) sowie 38 vorkompilierte `.metallib`-Shader, die ausschließlich gegen macOS-System-Frameworks gelinkt sind — läuft auf sauberen Macs ohne Xcode, Python oder Homebrew-Dylibs.
 - **Eigenständiger OpenAI-Server (`ninfer-metal-serve`)**: Ein einzelnes C++20-Binary, das In-Process-`miv` und parallele Pfad-B-SPI-v2-Microkernel auf einem HTTP/SSE-Port (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`) hostet — inklusive C++-BPE-Tokenizer, Jinja-Chat-Templates, `<think>`-Trennung in `reasoning_content` sowie Qwen-XML/JSON-`<tool_call>`-Parsing, direkt nutzbar mit Open WebUI, Cursor, Cline, NewAPI und den OpenAI-SDKs.
-- **Einfache NAX-Gewichtskopie & `0-ULP`-Parität**: Offline-NAX-Pre-Tiling (`.omlxm5`) bedient Prefill, `T=1`-AR-Decode und spekulative Verifikation aus einer einzigen residenten Gewichtskopie (`1.0×` Artefaktgröße). Die Basisversion **`miv-v0.01`** führt hybride Qwen3.5- / Qwen3.6- / Qwen3.8-Modelle (Dense 27B & 35B-A3B MoE) in `MXFP4` und `oQ` Affine (`q3–q8`) mit `affine4_g128`-KV-Cache, Native MTP / DFlash2, Multi-User-Batching (`B/C = 1..8`) und rollierender UMA-Präfix-Wiederverwendung aus.
-- **Direkte Koexistenz über `oMLX-extend`**: Bündelt `oMLX-extend` (`omlx-extend-v0.8.3` auf Basis von `jundot/omlx`), das **`miv Core Backend`** über einen AF_UNIX-Provider-SPI-v2-Sidecar bereitstellt — angepasste `.omlxm5`-Modelle werden automatisch in O(1) geroutet, unangepasste Modelle bleiben unverändert auf Stock MLX, und Sidecar sowie MLX teilen sich UMA unter einem gemeinsamen Speicherlimit.
+- **Einfache NAX-Gewichtskopie & `0-ULP`-Parität**: Offline-NAX-Pre-Tiling (`.miv`) bedient Prefill, `T=1`-AR-Decode und spekulative Verifikation aus einer einzigen residenten Gewichtskopie (`1.0×` Artefaktgröße). Die Basisversion **`miv-v0.01`** führt hybride Qwen3.5- / Qwen3.6- / Qwen3.8-Modelle (Dense 27B & 35B-A3B MoE) in `MXFP4` und `oQ` Affine (`q3–q8`) mit `affine4_g128`-KV-Cache, Native MTP / DFlash2, Multi-User-Batching (`B/C = 1..8`) und rollierender UMA-Präfix-Wiederverwendung aus.
+- **Direkte Koexistenz über `oMLX-extend`**: Bündelt `oMLX-extend` (`omlx-extend-v0.8.3` auf Basis von `jundot/omlx`), das **`miv Core Backend`** über einen AF_UNIX-Provider-SPI-v2-Sidecar bereitstellt — angepasste `.miv`-Modelle werden automatisch in O(1) geroutet, unangepasste Modelle bleiben unverändert auf Stock MLX, und Sidecar sowie MLX teilen sich UMA unter einem gemeinsamen Speicherlimit.
 
 ---
 
@@ -75,7 +75,7 @@ Starte den eigenständigen C++-OpenAI-Server mit einem Befehl (lädt automatisch
 ./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
 ```
 
-Alle Build-Flags, die `.omlxm5`-Gewichtskonvertierung, Multi-Microkernel-Konfigurationen für `ninfer-metal-serve --providers-dir` / `[[models]]` und Anleitungen für Hot-Updates in `oMLX-extend` findest du unter **[Einstieg & Konfiguration](getting-started.md)**; für eine bebilderte Einführung in die macOS-App siehe den **[Visuellen Leitfaden zu `oMLX-extend`](omlx-extend-guide.md)**.
+Alle Build-Flags, die `.miv`-Gewichtskonvertierung, Multi-Microkernel-Konfigurationen für `ninfer-metal-serve --providers-dir` / `[[models]]` und Anleitungen für Hot-Updates in `oMLX-extend` findest du unter **[Einstieg & Konfiguration](getting-started.md)**; für eine bebilderte Einführung in die macOS-App siehe den **[Visuellen Leitfaden zu `oMLX-extend`](omlx-extend-guide.md)**.
 
 ---
 

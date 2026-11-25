@@ -2,7 +2,7 @@
 
 # Guía visual de `oMLX-extend`
 
-`oMLX-extend` incorpora **`miv Core Backend (ninfer-metal)`** y microkernels comunitarios Metal 4 de la Vía B a la aplicación macOS `oMLX` en equipos Apple M5+ (`macOS 27+`). Los modelos `.omlxm5` adaptados pasan automáticamente a ejecución nativa en Metal 4 NAX, mientras que tus modelos MLX habituales siguen ejecutándose en Stock MLX.
+`oMLX-extend` incorpora **`miv Core Backend (ninfer-metal)`** y microkernels comunitarios Metal 4 de la Vía B a la aplicación macOS `oMLX` en equipos Apple M5+ (`macOS 27+`). Los modelos `.miv` adaptados pasan automáticamente a ejecución nativa en Metal 4 NAX, mientras que tus modelos MLX habituales siguen ejecutándose en Stock MLX.
 
 Recorre las cinco pantallas siguientes para comprobar la instalación, revisar el enrutamiento de motores, activar funciones de descodificación rápida y arrancar el servidor autónomo sin escribir archivos de configuración a mano.
 
@@ -34,7 +34,7 @@ Cambia a la pantalla **`Models`** para ver cómo `oMLX` enruta cada modelo en tu
 ![Pantalla Models con insignias de motor activo y etiquetas en la biblioteca](../../assets/omlx-mac/models-overview.png)
 
 - **Active Models**: Cada modelo cargado muestra una insignia de motor (`miv Core`, el nombre de tu microkernel de la Vía B o `MLX`) justo al lado de **`Loaded`**.
-- **Model Library**: Los modelos con pesos `.omlxm5` muestran una etiqueta destacada (`miv Core · Auto`, un microkernel de la Vía B o `Stock MLX` si desactivaste el enrutamiento externo).
+- **Model Library**: Los modelos con pesos `.miv` muestran una etiqueta destacada (`miv Core · Auto`, un microkernel de la Vía B o `Stock MLX` si desactivaste el enrutamiento externo).
 - **Modelos sin adaptar intactos**: Los checkpoints MLX estándar no llevan insignia de motor externo y corren sobre Stock MLX con cero procesos sidecar. Puedes mantener cargados simultáneamente modelos de `miv Core Backend`, de la Vía B y de Stock MLX bajo un único límite de memoria unificada.
 
 ---
@@ -45,8 +45,8 @@ Haz clic en cualquier modelo adaptado en **Model Library** y abre **`Advanced Se
 
 ![Model Settings Advanced mostrando el enrutamiento automático a miv Core Backend](../../assets/omlx-mac/engine-routing-auto.png)
 
-- **`Use External Engine`** arranca en **ON** para los modelos `.omlxm5` adaptados, con el selector fijado en **`miv Core Backend (Auto)`** (la cabecera superior de Model Settings también muestra la insignia del motor activo).
-- **Volver a Stock MLX en cualquier momento**: Cambia **`Use External Engine`** a **OFF**. `oMLX` guarda `external_engine: "stock"` y muestra *"Using Stock MLX (auto-route overridden)"* sin borrar tus pesos `.omlxm5`. Vuelve a ponerlo en **ON** para recuperar el enrutamiento automático.
+- **`Use External Engine`** arranca en **ON** para los modelos `.miv` adaptados, con el selector fijado en **`miv Core Backend (Auto)`** (la cabecera superior de Model Settings también muestra la insignia del motor activo).
+- **Volver a Stock MLX en cualquier momento**: Cambia **`Use External Engine`** a **OFF**. `oMLX` guarda `external_engine: "stock"` y muestra *"Using Stock MLX (auto-route overridden)"* sin borrar tus pesos `.miv`. Vuelve a ponerlo en **ON** para recuperar el enrutamiento automático.
 - **Elegir otro motor**: Si tienes instalado un microkernel compatible de la Vía B o Splash para el mismo modelo, selecciónalo directamente en el desplegable.
 
 ---
@@ -96,7 +96,7 @@ Para iniciar el servidor autónomo compatible con OpenAI en el puerto `8080` (se
 # Apuntar directamente a un directorio de modelo adaptado
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# U omitir la ruta para elegir automáticamente el primer modelo .omlxm5 en ./models o en la carpeta de modelos de oMLX
+# U omitir la ruta para elegir automáticamente el primer modelo .miv en ./models o en la carpeta de modelos de oMLX
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@ Para iniciar el servidor autónomo compatible con OpenAI en el puerto `8080` (se
 
 ## Siguientes pasos
 
-- **[Inicio y configuración](getting-started.md)** — Compilar desde el código fuente, convertir checkpoints a `.omlxm5` y revisar todas las opciones CLI de `ninfer-metal-serve`.
+- **[Inicio y configuración](getting-started.md)** — Compilar desde el código fuente, convertir checkpoints a `.miv` y revisar todas las opciones CLI de `ninfer-metal-serve`.
 - **[Arquitectura y coexistencia](architecture.md)** — Cómo funcionan internamente el enrutamiento O(1), Provider SPI v2 y el presupuesto compartido de memoria UMA.
 - **[Microkernel Foundry](microkernel-foundry.md)** — Añadir nuevas familias de modelos de la Vía A o la Vía B para Apple M5+.

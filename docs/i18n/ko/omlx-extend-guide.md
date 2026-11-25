@@ -2,7 +2,7 @@
 
 # `oMLX-extend` 비주얼 가이드
 
-`oMLX-extend`는 Apple M5+ Mac(`macOS 27+`)의 `oMLX` macOS 앱에 **`miv Core Backend (ninfer-metal)`**와 커뮤니티 경로 B Metal 4 마이크로커널을 추가합니다. 변환된 `.omlxm5` 모델은 네이티브 Metal 4 NAX 실행을 자동으로 선택하고, 일반 MLX 모델은 기존 Stock MLX에서 그대로 실행됩니다.
+`oMLX-extend`는 Apple M5+ Mac(`macOS 27+`)의 `oMLX` macOS 앱에 **`miv Core Backend (ninfer-metal)`**와 커뮤니티 경로 B Metal 4 마이크로커널을 추가합니다. 변환된 `.miv` 모델은 네이티브 Metal 4 NAX 실행을 자동으로 선택하고, 일반 MLX 모델은 기존 Stock MLX에서 그대로 실행됩니다.
 
 아래 다섯 화면을 따라 설치 상태를 확인하고, 모델별 엔진 라우팅을 파악하며, 고속 디코딩 기능을 켜고, 설정 파일을 손으로 쓰지 않고 독립 실행형 서버를 시작해 보세요.
 
@@ -34,7 +34,7 @@
 ![활성 엔진 배지와 모델 라이브러리 태그가 표시된 Models 화면](../../assets/omlx-mac/models-overview.png)
 
 - **Active Models**: 로드된 각 모델의 **`Loaded`** 바로 옆에 엔진 배지(`miv Core`, 경로 B 마이크로커널 이름, 또는 `MLX`)가 표시됩니다.
-- **Model Library**: `.omlxm5` 가중치가 있는 모델에는 강조 배지(`miv Core · Auto`, 경로 B 마이크로커널, 또는 외부 라우팅을 끈 경우 `Stock MLX`)가 표시됩니다.
+- **Model Library**: `.miv` 가중치가 있는 모델에는 강조 배지(`miv Core · Auto`, 경로 B 마이크로커널, 또는 외부 라우팅을 끈 경우 `Stock MLX`)가 표시됩니다.
 - **미변환 모델은 영향 없음**: 일반 MLX 체크포인트에는 외부 엔진 배지가 붙지 않으며 사이드카 프로세스 없이 Stock MLX로 실행됩니다. `miv Core Backend`, 경로 B, Stock MLX 모델은 하나의 통합 메모리 상한 아래 나란히 로드할 수 있습니다.
 
 ---
@@ -45,8 +45,8 @@
 
 ![miv Core Backend 자동 라우팅을 보여주는 Model Settings Advanced 화면](../../assets/omlx-mac/engine-routing-auto.png)
 
-- 변환된 `.omlxm5` 모델에서는 **`Use External Engine`**이 기본적으로 **ON** 상태이며 드롭다운이 **`miv Core Backend (Auto)`**로 설정됩니다(상위 Model Settings 헤더에도 활성 엔진 배지가 표시됩니다).
-- **언제든 Stock MLX로 복귀**: **`Use External Engine`**을 **OFF**로 전환하면 `oMLX`가 `.omlxm5` 가중치를 삭제하지 않고 `external_engine: "stock"`을 기록하며 *"Using Stock MLX (auto-route overridden)"*을 표시합니다. 다시 **ON**으로 켜면 자동 라우팅으로 돌아갑니다.
+- 변환된 `.miv` 모델에서는 **`Use External Engine`**이 기본적으로 **ON** 상태이며 드롭다운이 **`miv Core Backend (Auto)`**로 설정됩니다(상위 Model Settings 헤더에도 활성 엔진 배지가 표시됩니다).
+- **언제든 Stock MLX로 복귀**: **`Use External Engine`**을 **OFF**로 전환하면 `oMLX`가 `.miv` 가중치를 삭제하지 않고 `external_engine: "stock"`을 기록하며 *"Using Stock MLX (auto-route overridden)"*을 표시합니다. 다시 **ON**으로 켜면 자동 라우팅으로 돌아갑니다.
 - **다른 엔진 선택**: 같은 모델과 호환되는 경로 B 마이크로커널이나 Splash가 설치되어 있다면 드롭다운에서 바로 선택할 수 있습니다.
 
 ---
@@ -96,7 +96,7 @@
 # 변환된 모델 디렉터리를 직접 지정해 실행
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# 경로를 생략하면 ./models 또는 oMLX 모델 폴더의 첫 번째 .omlxm5 모델을 자동 선택
+# 경로를 생략하면 ./models 또는 oMLX 모델 폴더의 첫 번째 .miv 모델을 자동 선택
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@
 
 ## 다음 단계
 
-- **[시작 가이드 및 설정](getting-started.md)** — 소스 빌드, `.omlxm5` 체크포인트 변환, `ninfer-metal-serve` 전체 CLI 플래그 확인.
+- **[시작 가이드 및 설정](getting-started.md)** — 소스 빌드, `.miv` 체크포인트 변환, `ninfer-metal-serve` 전체 CLI 플래그 확인.
 - **[아키텍처 및 공존 설계](architecture.md)** — O(1) 라우팅, Provider SPI v2, 공유 UMA 메모리 예산의 내부 동작 구조.
 - **[Microkernel Foundry](microkernel-foundry.md)** — Apple M5+용 신규 경로 A 또는 경로 B 모델 패밀리 추가 방법.

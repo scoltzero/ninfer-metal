@@ -1125,3 +1125,136 @@ class TestExt7OfflineBundleDiscovery:
         found_cfg = m5_mod.discover_ninfer_metal_toml_path()
         assert found_cfg is not None
         assert found_cfg.resolve() == expected_cfg.resolve()
+
+
+# ---------------------------------------------------------------------------
+# EXT-8: SPI v2 LoRA provider manifest, Path B capability gating & patch check
+# ---------------------------------------------------------------------------
+
+
+class TestExt8SpiV2LoRAAndManifestContract:
+    def test_provider_manifest_template_declares_lora_and_lora_mode_schema(self):
+        tmpl_path = REPO_ROOT / "omlx-extend" / "provider" / "provider.json.template"
+        raw = tmpl_path.read_text(encoding="utf-8")
+        rendered = (
+            raw.replace("@DISPLAY_VERSION@", "miv-v0.02")
+            .replace("@SEMVER@", "0.2.0")
+            .replace("@GIT_SHA@", "deadbeef")
+            .replace("@BUILT_AT@", "2026-11-25T00:00:00Z")
+        )
+        manifest = json.loads(rendered)
+
+        assert "lora" in manifest["capabilities"]
+        assert "lora_adapter" in manifest["supported_standard_settings"]
+
+        by_key = {item["key"]: item for item in manifest["options_schema"]}
+        assert "lora_mode" in by_key
+        lora_mode_schema = by_key["lora_mode"]
+        assert lora_mode_schema["type"] == "enum"
+        assert lora_mode_schema["options"] == ["merge", "bypass"]
+        assert lora_mode_schema["default"] == "merge"
+        assert lora_mode_schema["reload_required"] is True
+        assert lora_mode_schema.get("label")
+
+    def test_path_b_lora_capability_gating_and_enum_validation(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from omlx.model_settings import lora_adapter_conflict
+
+        providers_dir = tmp_path / "Providers"
+
+        # Path B provider 1: declares lora_adapter + lora_mode enum
+        lora_prov = providers_dir / "io.vendor.lora_mk" / "current"
+        (lora_prov / "bin").mkdir(parents=True)
+        _make_fake_daemon(lora_prov / "bin" / "vendor_daemon", version="0.1.0", protocol=2)
+        (lora_prov / "provider.json").write_text(
+            json.dumps(
+                {
+                    "provider_id": "io.vendor.lora_mk",
+                    "engine_id": "vendor-lora-mk",
+                    "display_name": "Vendor LoRA MK",
+                    "protocol_version": 2,
+                    "entrypoint": "bin/vendor_daemon",
+                    "capabilities": ["ar", "lora"],
+                    "supported_standard_settings": ["max_context_window", "lora_adapter"],
+                    "options_schema": [
+                        {
+                            "key": "lora_mode",
+                            "label": "LoRA Mode",
+                            "type": "enum",
+                            "options": ["merge", "bypass"],
+                            "default": "merge",
+                            "reload_required": True,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Path B provider 2: does NOT declare lora_adapter
+        plain_prov = providers_dir / "io.vendor.plain_mk" / "current"
+        (plain_prov / "bin").mkdir(parents=True)
+        _make_fake_daemon(plain_prov / "bin" / "plain_daemon", version="0.1.0", protocol=2)
+        (plain_prov / "provider.json").write_text(
+            json.dumps(
+                {
+                    "provider_id": "io.vendor.plain_mk",
+                    "engine_id": "vendor-plain-mk",
+                    "display_name": "Vendor Plain MK",
+                    "protocol_version": 2,
+                    "entrypoint": "bin/plain_daemon",
+                    "capabilities": ["ar"],
+                    "supported_standard_settings": ["max_context_window"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(providers_dir))
+
+        assert (
+            lora_adapter_conflict(
+                {"lora_adapter": "/tmp/a", "external_engine": "vendor-lora-mk"}
+            )
+            is None
+        )
+        assert (
+            lora_adapter_conflict(
+                {"lora_adapter": "/tmp/a", "external_engine": "io.vendor.lora_mk"}
+            )
+            is None
+        )
+        assert (
+            lora_adapter_conflict(
+                {"lora_adapter": "/tmp/a", "external_engine": "vendor-plain-mk"}
+            )
+            == "an external engine"
+        )
+
+        # Schema-driven enum validation rejects invalid lora_mode on Path B too
+        ms = ModelSettings()
+        req_ok = admin_routes.ModelSettingsRequest(
+            external_engine_options={"vendor-lora-mk": {"lora_mode": "bypass"}}
+        )
+        m5_mod.apply_m5rt_model_settings_update(
+            ms,
+            req_ok,
+            {"external_engine_options"},
+            is_diffusion_model=False,
+            external_engine="vendor-lora-mk",
+        )
+        assert ms.external_engine_options == {"vendor-lora-mk": {"lora_mode": "bypass"}}
+
+        req_bad = admin_routes.ModelSettingsRequest(
+            external_engine_options={"vendor-lora-mk": {"lora_mode": "invalid"}}
+        )
+        with pytest.raises(ValueError, match="lora_mode"):
+            m5_mod.apply_m5rt_model_settings_update(
+                ms,
+                req_bad,
+                {"external_engine_options"},
+                is_diffusion_model=False,
+                external_engine="vendor-lora-mk",
+            )
+

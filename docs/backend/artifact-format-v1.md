@@ -1,12 +1,12 @@
-# `.omlxm5` artifact format v1
+# `.miv`（兼容历史 `.omlxm5`）artifact format v1
 
-> 状态：B0冻结；little-endian；schema `omlx-m5-artifact-v1`  
-> 生产实现：`tools/m5_artifact.py`、`m5rt/src/artifact.cpp`  
+> 状态：B0冻结；little-endian；schema `omlx-m5-artifact-v1`（magic `OMLXM5A1`）  
+> 生产实现：`miv/tools/m5_artifact.py`、`miv/src/artifact.cpp`  
 > R1范围：Qwen3.6/3.8 Dense与Qwen3.6 MoE的oQ affine Q4/Q5/Q6/Q8、MXFP4；MXFP8不在v1中
 
 ## 1. 设计目标
 
-`.omlxm5` 是backend自有的只读权重容器。safetensors和compressed-tensors只在
+`.miv`（向后兼容历史后缀 `.omlxm5`）是backend自有的只读权重容器。safetensors和compressed-tensors只在
 离线导入时使用；运行时mmap容器后直接得到各plane的非拥有视图，不解包、不转置、
 不按请求重排。格式把数值语义、物理布局、来源版本和activation policy一起冻结，
 防止converter和kernel各自猜测布局。

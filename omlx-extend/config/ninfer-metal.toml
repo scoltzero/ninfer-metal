@@ -25,16 +25,18 @@ cors = true
 providers_dir = ["~/Library/Application Support/oMLX/Providers"]
 
 [engine]
-max_concurrency = 4
+max_concurrency = 1
 max_context = 65536
-kv_dtype = "affine4_g128"
+kv_dtype = "bf16"
 rolling_prefix_cache = true
 prefix_cache_gb = 4.0
-sampling_contract = "legacy_rejection_v1"
+sampling_contract = "position_coupled_v1"
+lora_adapter = ""
+lora_mode = "merge"
 
 [speculative]
 # "auto" enables dflash2 if a companion dflash2/ artifact exists,
-# else mtp if mtp.omlxm5 or embedded MTP weights exist, else none.
+# else mtp if mtp.miv (or legacy mtp.omlxm5) or embedded MTP weights exist, else none.
 backend = "auto"
 # 0 = automatic depth tuned for the detected backend & silicon profile.
 draft_tokens = 0
@@ -42,6 +44,8 @@ draft_tokens = 0
 [sidecar]
 # Prefer in-process miv mainline in standalone mode and io.ninfer.metal in oMLX-extend.
 prefer_inproc_miv = true
+# lora_adapter = ""
+# lora_mode = "merge"
 
 # Optional per-model sidecar overrides (keyed by oMLX model_id):
 # [sidecar.models."Qwen3.8-27B-oQ4e-mtp"]
@@ -49,3 +53,5 @@ prefer_inproc_miv = true
 # max_context = 131072
 # kv_dtype = "affine4_g128"
 # prefix_cache_gb = 8.0
+# lora_adapter = "/path/to/lora-adapter"
+# lora_mode = "merge"

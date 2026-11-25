@@ -1285,6 +1285,9 @@ private struct AdvancedPage: View {
         ListGroup {
             if showsLLMRows, let engines = vm.model?.externalEngines, !engines.isEmpty {
                 ExternalEngineRow(vm: vm, client: client, engines: engines)
+                if !vm.effectiveExternalEngine.isEmpty && !vm.externalEngineGeneralOptions.isEmpty {
+                    ExternalEngineOptionsRows(vm: vm, client: client)
+                }
             }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
@@ -1430,17 +1433,45 @@ private struct AdvancedPage: View {
                                  defaultValue: "Apply a LoRA adapter from the model folders on top of these weights.",
                                  comment: "Subtitle for the LoRA adapter section")
             )
+            if !vm.externalEngineSupports("lora_adapter") {
+                HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
+                                      defaultValue: "Not used while an external engine serves this model.",
+                                      comment: "Note above MLX-only settings sections when an external engine is active"))
+            }
             ListGroup {
                 Row(label: String(localized: "settings.advanced.lora_adapter.label",
                                   defaultValue: "Adapter",
                                   comment: "Row label for the LoRA adapter picker"),
                     sublabel: vm.loraAdapterDetail,
-                    isLast: true) {
+                    isLast: !vm.showsExternalEngineLoraMode) {
                     Popup(
                         selection: vm.bindProfile($vm.loraAdapter),
                         width: .controlWide,
                         options: vm.loraAdapterOptions()
                     )
+                    .disabled(!vm.externalEngineSupports("lora_adapter"))
+                }
+                .opacity(vm.externalEngineSupports("lora_adapter") ? 1 : 0.4)
+                if vm.showsExternalEngineLoraMode {
+                    Row(label: String(localized: "settings.advanced.lora_mode.label",
+                                      defaultValue: "LoRA Mode",
+                                      comment: "Row label for external engine LoRA mode picker"),
+                        sublabel: String(localized: "settings.advanced.lora_mode.sub",
+                                         defaultValue: "Merge fuses LoRA into 8-bit NAX tiles at load time; Bypass injects BF16 low-rank projections at runtime.",
+                                         comment: "Sublabel for external engine LoRA mode picker"),
+                        isLast: true) {
+                        Popup(
+                            selection: Binding(
+                                get: { vm.externalEngineLoraMode },
+                                set: { newMode in
+                                    vm.externalEngineLoraMode = newMode
+                                    Task { await vm.save(.externalEngineLoraMode, client: client) }
+                                }
+                            ),
+                            width: .controlWide,
+                            options: vm.externalEngineLoraModeOptions
+                        )
+                    }
                 }
             }
         }
@@ -2119,6 +2150,98 @@ private struct ExternalEngineRow: View {
             draftError = nil
         } catch {
             draftError = error.omlxDescription
+        }
+    }
+}
+
+/// Renders dynamic `options_schema` controls for the active external engine
+/// (e.g. miv Concurrency (B/C), Sampling Contract, Rolling Prefix Cache).
+private struct ExternalEngineOptionsRows: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @State private var draftTexts: [String: String] = [:]
+
+    var body: some View {
+        ForEach(vm.externalEngineGeneralOptions) { opt in
+            Row(label: vm.externalEngineOptionDisplayLabel(opt),
+                sublabel: opt.description ?? "") {
+                control(for: opt)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func control(for opt: ModelSettingsScreenVM.ExternalEngineSchemaOption) -> some View {
+        switch opt.type {
+        case "bool":
+            RowSwitch(isOn: Binding(
+                get: { vm.externalEngineBoolOption(opt) },
+                set: { newValue in
+                    vm.setExternalEngineBoolOption(opt, newValue)
+                    Task { await vm.save(.externalEngineOptions, client: client) }
+                }
+            ))
+        case "enum":
+            Popup(
+                selection: Binding(
+                    get: { vm.externalEngineEnumOption(opt) },
+                    set: { newValue in
+                        vm.setExternalEngineEnumOption(opt, newValue)
+                        Task { await vm.save(.externalEngineOptions, client: client) }
+                    }
+                ),
+                width: .controlWide,
+                options: opt.options.map { ($0, opt.optionLabels[$0] ?? $0) }
+            )
+        case "int" where (opt.minValue != nil && opt.maxValue != nil && (opt.maxValue! - opt.minValue!) <= 16):
+            let lo = Int(opt.minValue!.rounded())
+            let hi = Int(opt.maxValue!.rounded())
+            Popup(
+                selection: Binding(
+                    get: { String(vm.externalEngineIntOption(opt)) },
+                    set: { newValue in
+                        if let iv = Int(newValue) {
+                            vm.setExternalEngineIntOption(opt, iv)
+                            Task { await vm.save(.externalEngineOptions, client: client) }
+                        }
+                    }
+                ),
+                width: .controlCompact,
+                options: (lo...hi).map { (String($0), String($0)) }
+            )
+        case "int", "bytes_gb", "float", "number":
+            TextInput(
+                text: Binding(
+                    get: { draftTexts[opt.key] ?? vm.externalEngineNumberText(opt) },
+                    set: { draftTexts[opt.key] = $0 }
+                ),
+                placeholder: vm.externalEngineNumberText(opt),
+                mono: true,
+                suffix: opt.type == "bytes_gb" ? "GiB" : nil,
+                width: .controlCompact
+            )
+            .onSubmit {
+                let text = draftTexts[opt.key] ?? vm.externalEngineNumberText(opt)
+                if vm.setExternalEngineNumberText(opt, text) {
+                    draftTexts[opt.key] = vm.externalEngineNumberText(opt)
+                    Task { await vm.save(.externalEngineOptions, client: client) }
+                }
+            }
+        default:
+            TextInput(
+                text: Binding(
+                    get: { draftTexts[opt.key] ?? vm.externalEngineStringOption(opt) },
+                    set: { draftTexts[opt.key] = $0 }
+                ),
+                placeholder: "(Auto)",
+                mono: true,
+                width: .controlWide
+            )
+            .onSubmit {
+                let text = draftTexts[opt.key] ?? vm.externalEngineStringOption(opt)
+                vm.setExternalEngineStringOption(opt, text)
+                Task { await vm.save(.externalEngineOptions, client: client) }
+            }
         }
     }
 }

@@ -89,8 +89,12 @@ int main(int argc, char **argv) {
                 << ", max_context=" << mcfg.max_context
                 << ", kv_dtype=" << mcfg.kv_dtype << ", spec="
                 << omlx::m5::serve::spec_backend_name(mcfg.spec_backend,
-                                                      mcfg.spec_backend_auto)
-                << ")...\n";
+                                                      mcfg.spec_backend_auto);
+      if (!mcfg.lora_adapter.empty()) {
+        std::cerr << ", lora=" << mcfg.lora_adapter << " (" << mcfg.lora_mode
+                  << ")";
+      }
+      std::cerr << ")...\n";
       auto inst = host->load_model(mcfg, registry);
       std::cerr << "[ninfer-metal-serve] Ready: '" << inst->id
                 << "' (provider=" << inst->provider_id

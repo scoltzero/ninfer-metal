@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -455,7 +456,7 @@ def rewrite_manifest(source: Path, target: Path, mutate) -> None:
 
 
 def expect_rejected(
-    path: Path, cpp_inspector: Path, verify_payload: bool = False
+    path: Path, cpp_inspector: Path | None, verify_payload: bool = False
 ) -> None:
     try:
         artifact.read_artifact(path, verify_payload=verify_payload)
@@ -463,11 +464,12 @@ def expect_rejected(
         pass
     else:
         raise AssertionError(f"Python reader accepted corruption: {path.name}")
-    command = [str(cpp_inspector), str(path)]
-    if verify_payload:
-        command.append("--verify-payload")
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
-    expect(result.returncode != 0, f"C++ reader accepted corruption: {path.name}")
+    if cpp_inspector is not None:
+        command = [str(cpp_inspector), str(path)]
+        if verify_payload:
+            command.append("--verify-payload")
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        expect(result.returncode != 0, f"C++ reader accepted corruption: {path.name}")
 
 
 def test_corruption(
@@ -554,6 +556,417 @@ def test_unsafe_source_index(root: Path) -> None:
         raise AssertionError("source adapter accepted a path-traversing shard")
 
 
+def test_affine8_nax_pretile_roundtrip(
+    root: Path, cpp_inspector: Path | None = None
+) -> None:
+    rng = np.random.default_rng(2026)
+    # 1) Pure 8-bit Affine checkpoint with q8_g64 (unaligned N=20, non-128-multiple K=576)
+    #    and q8_g128 (unaligned N=18, K=512).
+    n_g64, k_g64 = 20, 576
+    n_g128, k_g128 = 18, 512
+    codes_g64 = rng.integers(0, 256, size=(n_g64, k_g64), dtype=np.uint8)
+    scales_g64 = rng.uniform(0.01, 0.15, size=(n_g64, k_g64 // 64)).astype(np.float32)
+    biases_g64 = rng.uniform(-2.0, 2.0, size=(n_g64, k_g64 // 64)).astype(np.float32)
+
+    codes_g128 = rng.integers(0, 256, size=(n_g128, k_g128), dtype=np.uint8)
+    scales_g128 = rng.uniform(0.01, 0.15, size=(n_g128, k_g128 // 128)).astype(
+        np.float32
+    )
+    biases_g128 = rng.uniform(-2.0, 2.0, size=(n_g128, k_g128 // 128)).astype(
+        np.float32
+    )
+
+    pure_src = write_model(
+        root / "oq_affine8_pretile_src",
+        "oq-affine8-pretile-rev",
+        {
+            "model_type": "fixture",
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+                "down_proj": {"bits": 8, "group_size": 128, "mode": "affine"},
+            },
+        },
+        {
+            "q_proj.weight": (
+                "U32",
+                [n_g64, k_g64 * 8 // 32],
+                np.ascontiguousarray(codes_g64).tobytes(),
+            ),
+            "q_proj.scales": (
+                "BF16",
+                [n_g64, k_g64 // 64],
+                bf16(scales_g64.reshape(-1).tolist()),
+            ),
+            "q_proj.biases": (
+                "BF16",
+                [n_g64, k_g64 // 64],
+                bf16(biases_g64.reshape(-1).tolist()),
+            ),
+            "down_proj.weight": (
+                "U32",
+                [n_g128, k_g128 * 8 // 32],
+                np.ascontiguousarray(codes_g128).tobytes(),
+            ),
+            "down_proj.scales": (
+                "BF16",
+                [n_g128, k_g128 // 128],
+                bf16(scales_g128.reshape(-1).tolist()),
+            ),
+            "down_proj.biases": (
+                "BF16",
+                [n_g128, k_g128 // 128],
+                bf16(biases_g128.reshape(-1).tolist()),
+            ),
+            "norm.weight": ("BF16", [512], bf16([1.0] * 512)),
+        },
+    )
+
+    pure_untiled = root / "oq-affine8-untiled.omlxm5"
+    pure_pretiled = root / "oq-affine8-pretiled.omlxm5"
+    pure_twostep = root / "oq-affine8-twostep.omlxm5"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(MIV_ROOT / "tools" / "m5_artifact.py"),
+            "convert",
+            "--source",
+            str(pure_src),
+            "--output",
+            str(pure_untiled),
+            "--source-repo",
+            "fixture/pure-affine8",
+            "--expected-revision",
+            "oq-affine8-pretile-rev",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    conv_res = subprocess.run(
+        [
+            sys.executable,
+            str(MIV_ROOT / "tools" / "m5_artifact.py"),
+            "convert",
+            "--source",
+            str(pure_src),
+            "--output",
+            str(pure_pretiled),
+            "--source-repo",
+            "fixture/pure-affine8",
+            "--expected-revision",
+            "oq-affine8-pretile-rev",
+            "--nax-pretile",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    conv_report = json.loads(conv_res.stdout)
+    expect(conv_report["pretiled_objects"] == 2, "expected 2 pretiled affine8 objects")
+
+    pt_res = artifact.pretile_artifact(pure_untiled, pure_twostep)
+    expect(pt_res["pretiled_objects"] == 2, "two-step pretile count mismatch")
+    expect(
+        pure_pretiled.read_bytes() == pure_twostep.read_bytes(),
+        "convert --nax-pretile and pretile produced non-identical bytes",
+    )
+
+    _, u_manifest = artifact.read_artifact(pure_untiled, verify_payload=True)
+    _, p_manifest = artifact.read_artifact(pure_pretiled, verify_payload=True)
+    p_objs = {obj["name"]: obj for obj in p_manifest["objects"]}
+
+    expect(
+        p_objs["q_proj"]["layout"] == "oq_nax_tiled_g64_v1"
+        and [(p["kind"], p["bytes"]) for p in p_objs["q_proj"]["planes"]]
+        == [("nax_codes", 32 * k_g64), ("nax_sb", 32 * (k_g64 // 64) * 4)],
+        "q_proj q8_g64 NAX plane layout/bytes mismatch",
+    )
+    expect(
+        p_objs["down_proj"]["layout"] == "oq_nax_tiled_g64_v1"
+        and [(p["kind"], p["bytes"]) for p in p_objs["down_proj"]["planes"]]
+        == [("nax_codes", 32 * k_g128), ("nax_sb", 32 * (k_g128 // 64) * 4)],
+        "down_proj q8_g128 NAX plane layout/bytes mismatch",
+    )
+
+    # Stock MLX oracle dequantize & quantized_matmul verification for both q8_g64 and q8_g128.
+    for obj_name, codes_u8, sc_raw, bi_raw, gs in (
+        ("q_proj", codes_g64, scales_g64, biases_g64, 64),
+        ("down_proj", codes_g128, scales_g128, biases_g128, 128),
+    ):
+        n_rows, k_cols = codes_u8.shape
+        w_u32 = mx.array(np.ascontiguousarray(codes_u8).view(np.uint32))
+        s_bf16 = mx.array(
+            np.frombuffer(bf16(sc_raw.reshape(-1).tolist()), dtype=np.uint16).reshape(
+                sc_raw.shape
+            )
+        ).view(mx.bfloat16)
+        b_bf16 = mx.array(
+            np.frombuffer(bf16(bi_raw.reshape(-1).tolist()), dtype=np.uint16).reshape(
+                bi_raw.shape
+            )
+        ).view(mx.bfloat16)
+        oracle_w = np.asarray(
+            mx.dequantize(
+                w_u32,
+                s_bf16.astype(mx.float32),
+                b_bf16.astype(mx.float32),
+                group_size=gs,
+                bits=8,
+                mode="affine",
+                dtype=mx.float32,
+            )
+        )
+        u_w = np.asarray(
+            [
+                artifact.decode_artifact_row(pure_untiled, u_manifest, obj_name, r, 0, k_cols)
+                for r in range(n_rows)
+            ],
+            dtype=np.float32,
+        )
+        p_w = np.asarray(
+            [
+                artifact.decode_artifact_row(pure_pretiled, p_manifest, obj_name, r, 0, k_cols)
+                for r in range(n_rows)
+            ],
+            dtype=np.float32,
+        )
+        expect(np.array_equal(u_w, oracle_w), f"{obj_name} untiled disagrees with MLX")
+        expect(np.array_equal(p_w, oracle_w), f"{obj_name} pretiled disagrees with MLX")
+
+        # Matmul consistency across T=1 and T=8
+        for t_rows in (1, 8):
+            x_np = rng.normal(0.0, 0.5, size=(t_rows, k_cols)).astype(np.float32)
+            x_mx = mx.array(x_np).astype(mx.bfloat16)
+            x_bf16_f32 = np.asarray(x_mx.astype(mx.float32))
+            y_mlx_f32 = np.asarray(
+                mx.quantized_matmul(
+                    x_mx.astype(mx.float32),
+                    w_u32,
+                    s_bf16.astype(mx.float32),
+                    b_bf16.astype(mx.float32),
+                    transpose=True,
+                    group_size=gs,
+                    bits=8,
+                    mode="affine",
+                )
+            )
+            y_pretiled = x_bf16_f32 @ p_w.T
+            expect(
+                np.allclose(y_pretiled, y_mlx_f32, rtol=1e-4, atol=1e-3),
+                f"{obj_name} T={t_rows} matmul disagrees with MLX quantized_matmul",
+            )
+            expect(
+                np.array_equal(y_pretiled, x_bf16_f32 @ u_w.T),
+                f"{obj_name} T={t_rows} pretiled vs untiled matmul mismatch",
+            )
+
+        if cpp_inspector is not None:
+            for sample_row in (0, min(n_rows - 1, 17)):
+                native = json.loads(
+                    subprocess.check_output(
+                        [
+                            str(cpp_inspector),
+                            str(pure_pretiled),
+                            "--verify-payload",
+                            "--materialization-plan",
+                            "--sample-object",
+                            obj_name,
+                            "--sample-row",
+                            str(sample_row),
+                            "--sample-count",
+                            "64",
+                        ],
+                        text=True,
+                    )
+                )
+                expect(
+                    native["sample"]["values"] == p_w[sample_row, :64].tolist(),
+                    f"{obj_name} row {sample_row} C++ pretiled decode mismatch",
+                )
+
+    # 2) Mixed MXFP4 + affine8 (q8_g64 & q8_g128) checkpoint --nax-pretile roundtrip.
+    k_mix = 512
+    mx_codes = rng.integers(0, 16, size=(16, k_mix), dtype=np.uint8)
+    mx_packed = (mx_codes[:, 0::2] & 0xF) | ((mx_codes[:, 1::2] & 0xF) << 4)
+    mx_scales = rng.integers(125, 130, size=(16, k_mix // 32), dtype=np.uint8)
+
+    mix_src = write_model(
+        root / "mlx_mixed_mxfp4_affine8_src",
+        "mlx-mixed-affine8-rev",
+        {
+            "model_type": "fixture",
+            "quantization": {
+                "bits": 4,
+                "group_size": 32,
+                "mode": "mxfp4",
+                "o_proj": {"bits": 8, "group_size": 64},
+                "down_proj": {"bits": 8, "group_size": 128, "mode": "affine"},
+            },
+        },
+        {
+            "q_proj.weight": (
+                "U32",
+                [16, k_mix // 8],
+                np.ascontiguousarray(mx_packed).tobytes(),
+            ),
+            "q_proj.scales": ("U8", [16, k_mix // 32], mx_scales.tobytes()),
+            "o_proj.weight": (
+                "U32",
+                [16, k_mix * 8 // 32],
+                np.ascontiguousarray(codes_g128[:16]).tobytes(),
+            ),
+            "o_proj.scales": (
+                "BF16",
+                [16, k_mix // 64],
+                bf16(np.repeat(scales_g128[:16], 2, axis=1).reshape(-1).tolist()),
+            ),
+            "o_proj.biases": (
+                "BF16",
+                [16, k_mix // 64],
+                bf16(np.repeat(biases_g128[:16], 2, axis=1).reshape(-1).tolist()),
+            ),
+            "down_proj.weight": (
+                "U32",
+                [n_g128, k_mix * 8 // 32],
+                np.ascontiguousarray(codes_g128).tobytes(),
+            ),
+            "down_proj.scales": (
+                "BF16",
+                [n_g128, k_mix // 128],
+                bf16(scales_g128.reshape(-1).tolist()),
+            ),
+            "down_proj.biases": (
+                "BF16",
+                [n_g128, k_mix // 128],
+                bf16(biases_g128.reshape(-1).tolist()),
+            ),
+        },
+    )
+    mix_untiled = root / "mixed-untiled.omlxm5"
+    mix_pretiled = root / "mixed-pretiled.omlxm5"
+    convert(mix_src, mix_untiled, "mlx_mxfp4")
+    artifact.pretile_artifact(mix_untiled, mix_pretiled)
+    _, mix_u_man = artifact.read_artifact(mix_untiled, verify_payload=True)
+    _, mix_p_man = artifact.read_artifact(mix_pretiled, verify_payload=True)
+    mix_objs = {obj["name"]: obj for obj in mix_p_man["objects"]}
+    expect(
+        mix_objs["q_proj"]["layout"] == "mx_nax_tiled_bk128_v1"
+        and mix_objs["o_proj"]["layout"] == "oq_nax_tiled_g64_v1"
+        and mix_objs["down_proj"]["layout"] == "oq_nax_tiled_g64_v1",
+        "mixed MXFP4 + affine8 NAX layouts mismatch",
+    )
+    for obj_name in ("q_proj", "o_proj", "down_proj"):
+        row_count = mix_objs[obj_name]["shape"][0]
+        for r in range(row_count):
+            expect(
+                artifact.decode_artifact_row(mix_untiled, mix_u_man, obj_name, r, 0, k_mix)
+                == artifact.decode_artifact_row(mix_pretiled, mix_p_man, obj_name, r, 0, k_mix),
+                f"mixed {obj_name} row {r} untiled vs pretiled mismatch",
+            )
+        if cpp_inspector is not None:
+            native_mix = json.loads(
+                subprocess.check_output(
+                    [
+                        str(cpp_inspector),
+                        str(mix_pretiled),
+                        "--verify-payload",
+                        "--sample-object",
+                        obj_name,
+                        "--sample-row",
+                        "0",
+                        "--sample-count",
+                        "64",
+                    ],
+                    text=True,
+                )
+            )
+            expect(
+                native_mix["sample"]["values"]
+                == artifact.decode_artifact_row(
+                    mix_pretiled, mix_p_man, obj_name, 0, 0, 64
+                ),
+                f"mixed {obj_name} C++ pretiled decode mismatch",
+            )
+
+    # 3) Corruption checks for affine8 NAX tiled artifacts (rejected by Python & C++).
+    bad_q8_high = root / "bad-q8-spurious-high2.omlxm5"
+    rewrite_manifest(
+        pure_pretiled,
+        bad_q8_high,
+        lambda m: next(o for o in m["objects"] if o["name"] == "q_proj")[
+            "planes"
+        ].insert(
+            1,
+            {
+                "kind": "nax_high2",
+                "offset": 0,
+                "bytes": 256,
+                "alignment": 256,
+                "crc32": "00000000",
+                "sha256": "0" * 64,
+            },
+        ),
+    )
+    expect_rejected(bad_q8_high, cpp_inspector)
+
+    bad_q8_bytes = root / "bad-q8-half-codes.omlxm5"
+    rewrite_manifest(
+        pure_pretiled,
+        bad_q8_bytes,
+        lambda m: next(o for o in m["objects"] if o["name"] == "q_proj")["planes"][
+            0
+        ].__setitem__("bytes", 32 * k_g64 // 2),
+    )
+    expect_rejected(bad_q8_bytes, cpp_inspector)
+
+
+# Mark helper functions taking positional non-fixture args so pytest collection
+# runs the dedicated pytest entrypoints below while preserving CLI & import APIs.
+test_roundtrip.__test__ = False  # type: ignore[attr-defined]
+test_corruption.__test__ = False  # type: ignore[attr-defined]
+test_unsafe_source_index.__test__ = False  # type: ignore[attr-defined]
+test_affine8_nax_pretile_roundtrip.__test__ = False  # type: ignore[attr-defined]
+
+
+def _discover_cpp_inspector() -> Path | None:
+    env_path = os.environ.get("OMLX_M5_CPP_INSPECTOR")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.is_file():
+            return candidate.resolve()
+    for rel in (
+        "build/release/miv/omlx_m5_inspect_artifact",
+        "build/release/omlx_m5_inspect_artifact",
+    ):
+        candidate = ROOT / rel
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def test_pytest_b0_affine8_nax_pretile_roundtrip(tmp_path: Path) -> None:
+    test_affine8_nax_pretile_roundtrip(tmp_path, cpp_inspector=None)
+    test_unsafe_source_index(tmp_path)
+
+
+def test_pytest_b0_full_roundtrip_with_cpp_inspector(tmp_path: Path) -> None:
+    import pytest
+
+    inspector = _discover_cpp_inspector()
+    if inspector is None:
+        pytest.skip("omlx_m5_inspect_artifact not yet built in build/release")
+    golden_path = MIV_ROOT / "tests" / "data" / "b0_golden_vectors.json"
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    fixtures, codes = make_fixtures(tmp_path / "sources")
+    outputs = test_roundtrip(tmp_path, fixtures, codes, golden, inspector)
+    test_affine8_nax_pretile_roundtrip(tmp_path / "pretile", inspector)
+    oq_path, oq_manifest = outputs["oq"]
+    test_corruption(tmp_path, oq_path, copy.deepcopy(oq_manifest), inspector)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpp-inspector", type=Path, required=True)
@@ -565,14 +978,14 @@ def main() -> None:
     args = parse_args()
     golden = json.loads(args.golden.read_text())
     expect(golden["schema"] == "omlx-m5-b0-golden-v1", "golden schema mismatch")
+    inspector = args.cpp_inspector.resolve()
     with tempfile.TemporaryDirectory(prefix="omlx-m5-b0-") as temporary:
         root = Path(temporary)
         fixtures, codes = make_fixtures(root / "sources")
-        outputs = test_roundtrip(
-            root, fixtures, codes, golden, args.cpp_inspector.resolve()
-        )
+        outputs = test_roundtrip(root, fixtures, codes, golden, inspector)
+        test_affine8_nax_pretile_roundtrip(root / "pretile", inspector)
         oq_path, oq_manifest = outputs["oq"]
-        test_corruption(root, oq_path, copy.deepcopy(oq_manifest), args.cpp_inspector)
+        test_corruption(root, oq_path, copy.deepcopy(oq_manifest), inspector)
         test_unsafe_source_index(root)
     print("B0 artifact round-trip tests passed")
 

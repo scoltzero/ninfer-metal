@@ -41,8 +41,8 @@ flowchart LR
     Local --> Runtime
     MMH -- "Path B (AF_UNIX NDJSON v2)" --> Sidecar
     Sidecar -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> ExtProviders
-    Router -- "No .omlxm5 artifact" --> Stock
-    Router -- ".omlxm5 detected" --> Daemon
+    Router -- "No .miv artifact" --> Stock
+    Router -- ".miv detected" --> Daemon
     Enforcer -- "memory_budget_bytes / trim_cache / set_scheduler_hint" --> Daemon
     UI -- "Context L / Concurrency B,C / MTP / DFlash2 / affine4" --> Daemon
     Daemon --> Runtime
@@ -66,7 +66,7 @@ flowchart LR
 
 ## 2. Enrutamiento automático de modelos en O(1) (`oMLX-extend`)
 
-`oMLX-extend` inspecciona cada directorio de modelo con `detect_adapted(model_dir)` en `< 1 ms` mediante comprobaciones directas en el sistema de archivos (`model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`) sin lanzar subprocesos:
+`oMLX-extend` inspecciona cada directorio de modelo con `detect_adapted(model_dir)` en `< 1 ms` mediante comprobaciones directas en el sistema de archivos (`model.miv` / `model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json`) sin lanzar subprocesos:
 
 - **Modelos adaptados**: Se enrutan de forma diferida a **`miv Core Backend`** (`mseries_backendd`) en la primera solicitud (o cuando están fijados), mostrando **`miv Core Backend (Auto)`** en `Model Settings → Advanced Settings`. Desactivar **`Use External Engine`** escribe `external_engine: "stock"` y devuelve el modelo a Stock MLX.
 - **Modelos no adaptados**: Se ejecutan sin cambios en Stock MLX (`BatchedEngine` / `VLMBatchedEngine`), sin procesos sidecar, sin consumo extra de memoria y sin impacto en el rendimiento.
@@ -90,7 +90,7 @@ Cuando los modelos `ninfer-metal`, los microkernels sidecar de la Vía B y los m
 
 ## 4. Diseño del motor Metal 4 (`miv/`)
 
-- **Copia única de pesos premosaico**: La conversión offline a `.omlxm5` (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) abastece el Prefill NAX ancho `64×64`, la descodificación QMV `T=1` y la verificación especulativa `BM=8/16/32` desde una sola asignación residente (`1.0×` de huella del artefacto frente a `~1.92×` con remosaico en línea).
+- **Copia única de pesos premosaico**: La conversión offline a `.miv` (`mx_nax_tiled_bk128_v1` / `oq_nax_tiled_g64_v1`) abastece el Prefill NAX ancho `64×64`, la descodificación QMV `T=1` y la verificación especulativa `BM=8/16/32` desde una sola asignación residente (`1.0×` de huella del artefacto frente a `~1.92×` con remosaico en línea).
 - **Grabación segura de Compute ICB**: Todos los segmentos de búfer indirecto permanecen estrictamente por debajo de `2 GiB` (`< 1 GiB` para cachés auxiliares compactas) para evitar el desbordamiento de desplazamientos hardware de 32 bits. Los asignadores de comandos con doble búfer `ar_pipe_[2]` solapan la codificación en host con la ejecución en GPU.
 - **KV paginada CoW y continuación en UMA**: `KvPagePool` gestiona páginas de `64` tokens con conteo de referencias (`bf16` y `affine4_g128` `0-ULP` a `0.5625 B/val`). `QwenUmaContinuation` guarda y restaura el estado GDN de 48 capas (`146.81 MiB`) en un solo búfer de comandos GPU (`0.22–1.62 ms`, cero `memcpy` en CPU), y `rolling_prefix_cache` sustituye in-situ los ancestros no fijados (reutilización de bloques `1×`).
 - **Aislamiento estricto de calibración por SKU**: `silicon_tuning.h` carga perfiles por SKU (`apple-m5-ultra-64gpu.json`, `apple-m5-ultra-80gpu.json`) indexados por `profile_id` exacto y recurre a valores a priori parametrizados en chips sin medir — nunca aplica las constantes medidas de un SKU a otro.
@@ -113,6 +113,6 @@ Los archivos tar del núcleo se instalan en paralelo bajo `~/Library/Application
 ## Referencias en profundidad
 
 - [Arquitectura de portado v2](../../backend/ninfer-m5-porting-architecture-v2.md)
-- [Formato de artefacto `.omlxm5` v1](../../backend/artifact-format-v1.md) y [Contrato de despacho v1](../../backend/dispatch-contract-v1.md)
+- [Formato de artefacto `.miv` v1](../../backend/artifact-format-v1.md) y [Contrato de despacho v1](../../backend/dispatch-contract-v1.md)
 - [Fronteras de hardware y software v1](../../foundations/hardware-software-boundaries-v1.md)
 - [Estándar de certificación del núcleo](../../standards/core-certification-standard.md)

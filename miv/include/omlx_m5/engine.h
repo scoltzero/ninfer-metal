@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "omlx_m5/types.h"
@@ -30,6 +31,9 @@ public:
   [[nodiscard]] StatsReport stats() const;
   [[nodiscard]] TrimCacheReport trim_cache(std::uint64_t target_free_bytes = 0);
   void set_scheduler_hint(const SchedulerHint &hint);
+  [[nodiscard]] bool reload_lora(const std::string &lora_adapter,
+                                 const std::string &lora_mode = "bypass",
+                                 std::string *error = nullptr);
   void shutdown();
 
 private:

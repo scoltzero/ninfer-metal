@@ -27,6 +27,8 @@ struct ModelInstance {
   std::int32_t max_context = 32768;
   std::int32_t max_concurrency = 1;
   std::uint64_t allocated_budget_bytes = 0;
+  std::string lora_adapter;
+  std::string lora_mode = "merge";
 };
 
 // Queries total physical RAM via sysctl hw.memsize on Apple Silicon.

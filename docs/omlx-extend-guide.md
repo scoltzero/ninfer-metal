@@ -2,7 +2,7 @@
 
 # `oMLX-extend` Visual Guide
 
-`oMLX-extend` adds **`miv Core Backend (ninfer-metal)`** and community Path B Metal 4 microkernels to the `oMLX` macOS app on Apple M5+ Macs (`macOS 27+`). Adapted `.omlxm5` models pick up native Metal 4 NAX execution automatically, while your regular MLX models keep running on Stock MLX.
+`oMLX-extend` adds **`miv Core Backend (ninfer-metal)`** and community Path B Metal 4 microkernels to the `oMLX` macOS app on Apple M5+ Macs (`macOS 27+`). Adapted `.miv` models (and convertible Qwen `.safetensors`, which auto-repack to `.miv` on first Load) pick up native Metal 4 NAX execution automatically, while your regular MLX models keep running on Stock MLX.
 
 Walk through the five screens below to verify your install, check engine routing, turn on fast decode features, and launch the standalone server without writing config by hand.
 
@@ -34,7 +34,7 @@ Switch to the **`Models`** screen to see how `oMLX` routes every model on your M
 ![Models screen showing active engine badges and library pills](assets/omlx-mac/models-overview.png)
 
 - **Active Models**: Each loaded model displays an engine badge (`miv Core`, your Path B microkernel name, or `MLX`) right beside **`Loaded`**.
-- **Model Library**: Models with `.omlxm5` weights show a highlighted pill (`miv Core · Auto`, a Path B microkernel, or `Stock MLX` if you turned external routing off).
+- **Model Library**: Models with `.miv` weights (or pending `.safetensors → .miv` auto-repack) show a highlighted pill (`miv Core · Auto`, a Path B microkernel, or `Stock MLX` if you turned external routing off).
 - **Unadapted models stay untouched**: Standard MLX checkpoints have no external-engine pill and run through Stock MLX with zero sidecar processes. You can keep `miv Core Backend`, Path B, and Stock MLX models loaded side by side under one unified memory cap.
 
 ---
@@ -45,8 +45,8 @@ Click any adapted model in **Model Library**, then open **`Advanced Settings`**:
 
 ![Model Settings Advanced showing auto-routing to miv Core Backend](assets/omlx-mac/engine-routing-auto.png)
 
-- **`Use External Engine`** starts **ON** for adapted `.omlxm5` models, with the dropdown set to **`miv Core Backend (Auto)`** (the top-level Model Settings header also shows the active engine pill).
-- **Switch back to Stock MLX anytime**: Flip **`Use External Engine`** **OFF**. `oMLX` records `external_engine: "stock"` and shows *"Using Stock MLX (auto-route overridden)"* without deleting your `.omlxm5` weights. Flip it back **ON** to return to auto-routing.
+- **`Use External Engine`** starts **ON** for adapted `.miv` models, with the dropdown set to **`miv Core Backend (Auto)`** (the top-level Model Settings header also shows the active engine pill).
+- **Switch back to Stock MLX anytime**: Flip **`Use External Engine`** **OFF**. `oMLX` records `external_engine: "stock"` and shows *"Using Stock MLX (auto-route overridden)"* without deleting your `.miv` weights. Flip it back **ON** to return to auto-routing.
 - **Pick another engine**: If a compatible Path B microkernel or Splash is installed for the same model, pick it directly from the dropdown.
 
 ---
@@ -96,7 +96,7 @@ To start the standalone OpenAI-compatible server on port `8080` (separate from `
 # Point directly to an adapted model directory
 ./omlx-extend/scripts/start_ninfer_serve.sh /path/to/Qwen3.8-27B
 
-# Or omit the path to auto-pick the first .omlxm5 model in ./models or oMLX's models folder
+# Or omit the path to auto-pick the first .miv model in ./models or oMLX's models folder
 ./omlx-extend/scripts/start_ninfer_serve.sh
 ```
 
@@ -108,6 +108,6 @@ To start the standalone OpenAI-compatible server on port `8080` (separate from `
 
 ## Next Steps
 
-- **[Getting Started & Config](getting-started.md)** — Build from source, convert checkpoints to `.omlxm5`, and inspect all `ninfer-metal-serve` CLI flags.
+- **[Getting Started & Config](getting-started.md)** — Build from source, convert checkpoints to `.miv`, and inspect all `ninfer-metal-serve` CLI flags.
 - **[Architecture & Coexistence](architecture.md)** — How O(1) routing, Provider SPI v2, and shared UMA memory budgets work under the hood.
 - **[Microkernel Foundry](microkernel-foundry.md)** — Add new Path A or Path B model families for Apple M5+.
