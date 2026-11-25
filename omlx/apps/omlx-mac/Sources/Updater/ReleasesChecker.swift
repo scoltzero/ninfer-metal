@@ -69,7 +69,24 @@ enum ReleasesError: Error, CustomStringConvertible {
 }
 
 enum ReleasesChecker {
-    static let releasesURL = URL(string: "https://api.github.com/repos/jundot/omlx/releases?per_page=20")!
+    static let releasesURL = URL(string: "https://api.github.com/repos/scoltzero/ninfer-metal/releases?per_page=30")!
+
+    /// Extract normalized host version from an `omlx-extend-vX.Y.Z(-mixN)` or `vX.Y.Z` tag,
+    /// returning `nil` for non-host tags in the monorepo (such as `miv-v0.01` microkernel releases).
+    static func normalizedHostVersion(fromTag tagName: String) -> String? {
+        let trimmed = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let raw: Substring
+        if lower.hasPrefix("omlx-extend-") {
+            raw = trimmed.dropFirst("omlx-extend-".count).trimmingPrefix("v").trimmingPrefix("V")
+        } else if lower.hasPrefix("v") || trimmed.first?.isNumber == true {
+            raw = trimmed.trimmingPrefix("v").trimmingPrefix("V")
+        } else {
+            return nil
+        }
+        guard raw.first?.isNumber == true else { return nil }
+        return String(raw)
+    }
 
     /// Fetches recent releases and picks the newest one that beats `currentVersion`
     /// under the given channel. Returns `nil` if we're already up to date.
@@ -96,10 +113,10 @@ enum ReleasesChecker {
             throw ReleasesError.decode(String(describing: error))
         }
 
-        guard let best = selectLatest(releases, channel: channel) else { return nil }
+        guard let best = selectLatest(releases, channel: channel),
+              let latestStr = normalizedHostVersion(fromTag: best.tagName)
+        else { return nil }
 
-        let latest = best.tagName.trimmingPrefix("v").trimmingPrefix("V")
-        let latestStr = String(latest)
         guard isNewer(latestStr, than: currentVersion) else { return nil }
 
         let dmg = findMatchingDMG(assets: best.assets)
@@ -120,7 +137,7 @@ enum ReleasesChecker {
         channel: UpdateChannel
     ) -> GitHubRelease? {
         let allowed = releases.filter { r in
-            let version = String(r.tagName.trimmingPrefix("v").trimmingPrefix("V"))
+            guard let version = normalizedHostVersion(fromTag: r.tagName) else { return false }
             if r.draft { return false }
             switch channel {
             case .stable:
@@ -132,8 +149,8 @@ enum ReleasesChecker {
             }
         }
         return allowed.max { lhs, rhs in
-            let l = String(lhs.tagName.trimmingPrefix("v").trimmingPrefix("V"))
-            let r = String(rhs.tagName.trimmingPrefix("v").trimmingPrefix("V"))
+            let l = normalizedHostVersion(fromTag: lhs.tagName) ?? lhs.tagName
+            let r = normalizedHostVersion(fromTag: rhs.tagName) ?? rhs.tagName
             return compareVersions(l, r) == .orderedAscending
         }
     }
@@ -158,6 +175,8 @@ enum ReleasesChecker {
         if lhs.phaseRank > rhs.phaseRank { return .orderedDescending }
         if lhs.phaseNumber < rhs.phaseNumber { return .orderedAscending }
         if lhs.phaseNumber > rhs.phaseNumber { return .orderedDescending }
+        if lhs.mixNumber < rhs.mixNumber { return .orderedAscending }
+        if lhs.mixNumber > rhs.mixNumber { return .orderedDescending }
         return .orderedSame
     }
 
@@ -165,15 +184,19 @@ enum ReleasesChecker {
         let release: [Int]
         let phaseRank: Int
         let phaseNumber: Int
+        let mixNumber: Int
     }
 
     private static func parseVersion(_ version: String) -> ParsedVersion {
-        let normalized = String(version.trimmingPrefix("v").trimmingPrefix("V")).lowercased()
+        let stripped = normalizedHostVersion(fromTag: version) ?? String(version.trimmingPrefix("v").trimmingPrefix("V"))
+        let normalized = stripped.lowercased()
         let phase = parsePhase(normalized)
+        let mix = numberAfterFullMarker("mix", in: normalized) ?? 0
         return ParsedVersion(
             release: parseVersionComponents(normalized),
             phaseRank: phase.rank,
-            phaseNumber: phase.number
+            phaseNumber: phase.number,
+            mixNumber: mix
         )
     }
 

@@ -110,6 +110,33 @@ final class ReleasesCheckerTests: XCTestCase {
         )
     }
 
+    func testOMLXExtendTagsOrderMixUpdatesAndIgnoreMicrokernelReleases() {
+        XCTAssertEqual(
+            ReleasesChecker.compareVersions("omlx-extend-v0.8.3-mix1", "omlx-extend-v0.8.3"),
+            .orderedDescending
+        )
+        XCTAssertEqual(
+            ReleasesChecker.compareVersions("omlx-extend-v0.8.3-mix10", "omlx-extend-v0.8.3-mix9"),
+            .orderedDescending
+        )
+        XCTAssertEqual(
+            ReleasesChecker.compareVersions("omlx-extend-v0.8.4", "omlx-extend-v0.8.3-mix9"),
+            .orderedDescending
+        )
+
+        let selected = ReleasesChecker.selectLatest(
+            [
+                release("miv-v0.01"),
+                release("miv-v0.99"),
+                release("omlx-extend-v0.8.3"),
+                release("omlx-extend-v0.8.3-mix2"),
+                release("omlx-extend-v0.8.3-mix1"),
+            ],
+            channel: .stable
+        )
+        XCTAssertEqual(selected?.tagName, "omlx-extend-v0.8.3-mix2")
+    }
+
     private func release(
         _ tag: String,
         prerelease: Bool = false,

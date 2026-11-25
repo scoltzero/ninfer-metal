@@ -293,6 +293,12 @@ jobs:
             echo "No ninfer-metal core release found yet; skipping bundled offline tarball."
           fi
 
+          # 4) Build complete drag-to-install macOS oMLX-extend .dmg (oMLX.app + embedded Python/MLX + custom kernels)
+          ./omlx-extend/scripts/build_omlx_extend_dmg.sh \
+            --extend-tag "${EXTEND_TAG}" \
+            --upstream-tag "${{ steps.upstream.outputs.tag }}" \
+            --out-dir "${OUT_DIR}"
+
           echo "slim_tar=${SLIM_TAR}" >> "$GITHUB_OUTPUT"
           echo "bundled_tar=${BUNDLED_TAR}" >> "$GITHUB_OUTPUT"
           echo "core_tag=${CORE_TAG}" >> "$GITHUB_OUTPUT"
@@ -395,7 +401,7 @@ jobs:
             git push origin "refs/tags/${EXTEND_TAG}"
           fi
 
-          ASSETS=(dist/omlx-extend/*.whl dist/omlx-extend/*.tar.gz dist/omlx-extend/*.sha256)
+          ASSETS=(dist/omlx-extend/*.dmg dist/omlx-extend/*.whl dist/omlx-extend/*.tar.gz dist/omlx-extend/*.sha256)
           if [[ "${IS_MIX}" == "true" ]]; then
             NOTES="Incremental \`oMLX-extend\` mix update (\`${EXTEND_TAG}\`) built on upstream \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` with refreshed Provider SPI patch; all changes carry forward automatically into future upstream syncs."
           else

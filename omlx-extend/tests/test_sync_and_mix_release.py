@@ -92,6 +92,8 @@ class TestResolveExtendTag:
         # so sourcing it must happen inside a subshell to preserve owner/repo for gh api.
         assert 'CURRENT_TAG="$(' in wf_text
         assert "--latest=false" in wf_text
+        assert "./omlx-extend/scripts/build_omlx_extend_dmg.sh" in wf_text
+        assert "dist/omlx-extend/*.dmg" in wf_text
         rel_text = (REPO_ROOT / ".github" / "workflows" / "release-ninfer-metal.yml").read_text(
             encoding="utf-8"
         )

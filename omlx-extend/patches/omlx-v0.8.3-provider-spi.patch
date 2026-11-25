@@ -1451,6 +1451,19 @@ index a9c9fb7..bc11117 100644
      }
    },
    "version" : "1.0"
+diff --git a/apps/omlx-mac/Scripts/build.sh b/apps/omlx-mac/Scripts/build.sh
+index 2aa4a7c..588ad83 100755
+--- a/apps/omlx-mac/Scripts/build.sh
++++ b/apps/omlx-mac/Scripts/build.sh
+@@ -726,7 +726,7 @@ INFO_PLIST="$STAGED_APP/Contents/Info.plist"
+ 
+ if [ -d "$ICON_BUNDLE" ] && [ -d "$XCASSETS_DIR" ]; then
+     log "Compiling AppIcon.icon via actool…"
+-    ACTOOL=/Applications/Xcode.app/Contents/Developer/usr/bin/actool
++    ACTOOL="$(xcrun --find actool 2>/dev/null || echo /Applications/Xcode.app/Contents/Developer/usr/bin/actool)"
+     ICON_TMP=$(mktemp -d)
+     if "$ACTOOL" \
+             "$XCASSETS_DIR" \
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/IntegrationsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/IntegrationsScreen.swift
 index 2291b42..db09ba1 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/IntegrationsScreen.swift
@@ -3346,6 +3359,119 @@ index 5b1957c..183db0e 100644
  #Preview("StatusPill") {
      VStack(alignment: .leading, spacing: 10) {
          StatusPill(status: .running)
+diff --git a/apps/omlx-mac/Sources/Updater/AppUpdater.swift b/apps/omlx-mac/Sources/Updater/AppUpdater.swift
+index dc99af2..d9c10a7 100644
+--- a/apps/omlx-mac/Sources/Updater/AppUpdater.swift
++++ b/apps/omlx-mac/Sources/Updater/AppUpdater.swift
+@@ -479,10 +479,10 @@ final class AppUpdater {
+ 
+     // MARK: - Signature verification
+ 
+-    /// A plain `--verify` also accepts ad-hoc or foreign signatures, so the
+-    /// check pins the Developer ID team that signs releases.
++    /// Verify coherent bundle signature and expected bundle identifier (`app.omlx`).
++    /// Accepts both Developer-ID signed and ad-hoc signed `oMLX-extend` releases.
+     nonisolated static let releaseRequirement =
+-        #"=anchor apple generic and identifier "app.omlx" and certificate leaf[subject.OU] = "PSK5Q5T46L""#
++        #"=identifier "app.omlx""#
+ 
+     nonisolated static func verifyAppSignature(at appPath: String) throws {
+         let result = try runProcess(
+diff --git a/apps/omlx-mac/Sources/Updater/ReleasesChecker.swift b/apps/omlx-mac/Sources/Updater/ReleasesChecker.swift
+index ff553f3..2ea413b 100644
+--- a/apps/omlx-mac/Sources/Updater/ReleasesChecker.swift
++++ b/apps/omlx-mac/Sources/Updater/ReleasesChecker.swift
+@@ -69,7 +69,24 @@ enum ReleasesError: Error, CustomStringConvertible {
+ }
+ 
+ enum ReleasesChecker {
+-    static let releasesURL = URL(string: "https://api.github.com/repos/jundot/omlx/releases?per_page=20")!
++    static let releasesURL = URL(string: "https://api.github.com/repos/scoltzero/ninfer-metal/releases?per_page=30")!
++
++    /// Extract normalized host version from an `omlx-extend-vX.Y.Z(-mixN)` or `vX.Y.Z` tag,
++    /// returning `nil` for non-host tags in the monorepo (such as `miv-v0.01` microkernel releases).
++    static func normalizedHostVersion(fromTag tagName: String) -> String? {
++        let trimmed = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
++        let lower = trimmed.lowercased()
++        let raw: Substring
++        if lower.hasPrefix("omlx-extend-") {
++            raw = trimmed.dropFirst("omlx-extend-".count).trimmingPrefix("v").trimmingPrefix("V")
++        } else if lower.hasPrefix("v") || trimmed.first?.isNumber == true {
++            raw = trimmed.trimmingPrefix("v").trimmingPrefix("V")
++        } else {
++            return nil
++        }
++        guard raw.first?.isNumber == true else { return nil }
++        return String(raw)
++    }
+ 
+     /// Fetches recent releases and picks the newest one that beats `currentVersion`
+     /// under the given channel. Returns `nil` if we're already up to date.
+@@ -96,10 +113,10 @@ enum ReleasesChecker {
+             throw ReleasesError.decode(String(describing: error))
+         }
+ 
+-        guard let best = selectLatest(releases, channel: channel) else { return nil }
++        guard let best = selectLatest(releases, channel: channel),
++              let latestStr = normalizedHostVersion(fromTag: best.tagName)
++        else { return nil }
+ 
+-        let latest = best.tagName.trimmingPrefix("v").trimmingPrefix("V")
+-        let latestStr = String(latest)
+         guard isNewer(latestStr, than: currentVersion) else { return nil }
+ 
+         let dmg = findMatchingDMG(assets: best.assets)
+@@ -120,7 +137,7 @@ enum ReleasesChecker {
+         channel: UpdateChannel
+     ) -> GitHubRelease? {
+         let allowed = releases.filter { r in
+-            let version = String(r.tagName.trimmingPrefix("v").trimmingPrefix("V"))
++            guard let version = normalizedHostVersion(fromTag: r.tagName) else { return false }
+             if r.draft { return false }
+             switch channel {
+             case .stable:
+@@ -132,8 +149,8 @@ enum ReleasesChecker {
+             }
+         }
+         return allowed.max { lhs, rhs in
+-            let l = String(lhs.tagName.trimmingPrefix("v").trimmingPrefix("V"))
+-            let r = String(rhs.tagName.trimmingPrefix("v").trimmingPrefix("V"))
++            let l = normalizedHostVersion(fromTag: lhs.tagName) ?? lhs.tagName
++            let r = normalizedHostVersion(fromTag: rhs.tagName) ?? rhs.tagName
+             return compareVersions(l, r) == .orderedAscending
+         }
+     }
+@@ -158,6 +175,8 @@ enum ReleasesChecker {
+         if lhs.phaseRank > rhs.phaseRank { return .orderedDescending }
+         if lhs.phaseNumber < rhs.phaseNumber { return .orderedAscending }
+         if lhs.phaseNumber > rhs.phaseNumber { return .orderedDescending }
++        if lhs.mixNumber < rhs.mixNumber { return .orderedAscending }
++        if lhs.mixNumber > rhs.mixNumber { return .orderedDescending }
+         return .orderedSame
+     }
+ 
+@@ -165,15 +184,19 @@ enum ReleasesChecker {
+         let release: [Int]
+         let phaseRank: Int
+         let phaseNumber: Int
++        let mixNumber: Int
+     }
+ 
+     private static func parseVersion(_ version: String) -> ParsedVersion {
+-        let normalized = String(version.trimmingPrefix("v").trimmingPrefix("V")).lowercased()
++        let stripped = normalizedHostVersion(fromTag: version) ?? String(version.trimmingPrefix("v").trimmingPrefix("V"))
++        let normalized = stripped.lowercased()
+         let phase = parsePhase(normalized)
++        let mix = numberAfterFullMarker("mix", in: normalized) ?? 0
+         return ParsedVersion(
+             release: parseVersionComponents(normalized),
+             phaseRank: phase.rank,
+-            phaseNumber: phase.number
++            phaseNumber: phase.number,
++            mixNumber: mix
+         )
+     }
+ 
 diff --git a/apps/omlx-mac/Tests/oMLXTests/DTOFixtureTests.swift b/apps/omlx-mac/Tests/oMLXTests/DTOFixtureTests.swift
 index c4ddca3..b0c9d7d 100644
 --- a/apps/omlx-mac/Tests/oMLXTests/DTOFixtureTests.swift
@@ -3739,6 +3865,44 @@ index 2e40221..7e8ebcc 100644
  }
  
  /// Serves one model with Lightning MTP on and rejects its settings writes
+diff --git a/apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift b/apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift
+index 041a174..d70b889 100644
+--- a/apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift
++++ b/apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift
+@@ -110,6 +110,33 @@ final class ReleasesCheckerTests: XCTestCase {
+         )
+     }
+ 
++    func testOMLXExtendTagsOrderMixUpdatesAndIgnoreMicrokernelReleases() {
++        XCTAssertEqual(
++            ReleasesChecker.compareVersions("omlx-extend-v0.8.3-mix1", "omlx-extend-v0.8.3"),
++            .orderedDescending
++        )
++        XCTAssertEqual(
++            ReleasesChecker.compareVersions("omlx-extend-v0.8.3-mix10", "omlx-extend-v0.8.3-mix9"),
++            .orderedDescending
++        )
++        XCTAssertEqual(
++            ReleasesChecker.compareVersions("omlx-extend-v0.8.4", "omlx-extend-v0.8.3-mix9"),
++            .orderedDescending
++        )
++
++        let selected = ReleasesChecker.selectLatest(
++            [
++                release("miv-v0.01"),
++                release("miv-v0.99"),
++                release("omlx-extend-v0.8.3"),
++                release("omlx-extend-v0.8.3-mix2"),
++                release("omlx-extend-v0.8.3-mix1"),
++            ],
++            channel: .stable
++        )
++        XCTAssertEqual(selected?.tagName, "omlx-extend-v0.8.3-mix2")
++    }
++
+     private func release(
+         _ tag: String,
+         prerelease: Bool = false,
 diff --git a/apps/omlx-web/omlx_web/i18n/en.json b/apps/omlx-web/omlx_web/i18n/en.json
 index 8e2299c..227ee9c 100644
 --- a/apps/omlx-web/omlx_web/i18n/en.json

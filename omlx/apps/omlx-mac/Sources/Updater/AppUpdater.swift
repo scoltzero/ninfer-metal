@@ -479,10 +479,10 @@ final class AppUpdater {
 
     // MARK: - Signature verification
 
-    /// A plain `--verify` also accepts ad-hoc or foreign signatures, so the
-    /// check pins the Developer ID team that signs releases.
+    /// Verify coherent bundle signature and expected bundle identifier (`app.omlx`).
+    /// Accepts both Developer-ID signed and ad-hoc signed `oMLX-extend` releases.
     nonisolated static let releaseRequirement =
-        #"=anchor apple generic and identifier "app.omlx" and certificate leaf[subject.OU] = "PSK5Q5T46L""#
+        #"=identifier "app.omlx""#
 
     nonisolated static func verifyAppSignature(at appPath: String) throws {
         let result = try runProcess(
