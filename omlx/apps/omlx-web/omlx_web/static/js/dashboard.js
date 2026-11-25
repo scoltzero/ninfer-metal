@@ -4852,24 +4852,36 @@
             },
 
             isOmlxm5OnlyModel() {
-                return this.modelSettings.model_format === 'omlxm5';
+                return this.modelSettings.model_format === 'miv' || this.modelSettings.model_format === 'omlxm5';
             },
 
             canConvertOmlxm5() {
                 const engines = this.modelSettings.external_engines || [];
-                return engines.some(e => !e.compatible && e.can_convert);
+                return engines.some(e => e.can_convert);
+            },
+
+            modelWeightFormatLabel(model) {
+                if (!model || model.virtual) return '';
+                if (model.pending_auto_repack) {
+                    const target = model.repack_target_format || 'miv';
+                    return `safetensors → .${target}`;
+                }
+                const fmt = (model.weight_format || model.model_format || 'safetensors').toLowerCase();
+                if (fmt === 'gguf') return 'GGUF';
+                if (fmt === 'safetensors') return 'safetensors';
+                return fmt.startsWith('.') ? fmt : `.${fmt}`;
             },
 
             async convertModelOmlxm5() {
                 if (!this.selectedModel || this.convertingOmlxm5) return;
                 this.convertingOmlxm5 = true;
                 try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-omlxm5`, {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-miv`, {
                         method: 'POST',
                     });
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        alert(data.detail || 'Failed to convert model to .omlxm5');
+                        alert(data.detail || 'Failed to convert model to .miv');
                         return;
                     }
                     if (data.message) alert(data.message);

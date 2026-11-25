@@ -759,10 +759,18 @@ public:
         throw std::invalid_argument(
             "DFlash companion/target geometry mismatch");
       const auto found = options.path_overrides.find("draft_artifact");
-      draft_path =
-          found == options.path_overrides.end()
-              ? std::filesystem::path(options.draft_dir) / "model.omlxm5"
-              : std::filesystem::path(found->second);
+      if (found != options.path_overrides.end()) {
+        draft_path = std::filesystem::path(found->second);
+      } else {
+        const std::filesystem::path draft_base(options.draft_dir);
+        std::error_code draft_ec;
+        draft_path =
+            std::filesystem::is_regular_file(draft_base / "model.miv", draft_ec) ||
+                    !std::filesystem::is_regular_file(draft_base / "model.omlxm5",
+                                                      draft_ec)
+                ? draft_base / "model.miv"
+                : draft_base / "model.omlxm5";
+      }
       draft_artifact.emplace(ArtifactModel::open(draft_path, false));
       static_cast<void>(
           validate_dflash2_artifact(*draft_artifact, draft_config, false));
@@ -3109,8 +3117,14 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
   if (options.max_context < 1024)
     throw std::invalid_argument("native backend requires max_context >= 1024");
   const std::filesystem::path model_dir(options.model_dir);
+  std::error_code art_ec;
+  const auto default_artifact =
+      std::filesystem::is_regular_file(model_dir / "model.miv", art_ec) ||
+              !std::filesystem::is_regular_file(model_dir / "model.omlxm5", art_ec)
+          ? (model_dir / "model.miv")
+          : (model_dir / "model.omlxm5");
   const auto artifact =
-      override_or_default(options, "artifact", model_dir / "model.omlxm5");
+      override_or_default(options, "artifact", default_artifact);
   const auto metallib = override_or_default(
       options, "qwen_ar_metallib", model_dir / "omlx_m5_qwen_ar.metallib");
   const auto libraries =

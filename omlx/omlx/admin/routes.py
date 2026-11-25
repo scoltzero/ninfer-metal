@@ -51,12 +51,16 @@ from ..engine.m5_sidecar import (
     M5RT_ENGINE_LABEL,
     M5RT_PROVIDER_ID,
     apply_m5rt_model_settings_update,
+    can_convert_to_miv,
     can_convert_to_omlxm5,
+    convert_model_to_miv,
     convert_model_to_omlxm5,
+    detect_model_weight_format_info,
     discover_external_engine_plugins,
     external_engine_dflash_compatibility,
     external_engine_mtp_compatibility,
     find_m5rt_binary,
+    get_external_engine_plugin,
     get_external_engine_supported_settings,
     get_external_engines,
     inspect_m5rt_binary,
@@ -1184,18 +1188,30 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
             "reason": reason,
             "draft_repo": draft_repo,
         }
-        if engine_id == M5RT_ENGINE_ID and not compatible:
+        if engine_id == M5RT_ENGINE_ID:
             m5rt_cfg_path = (
                 global_settings.integrations.m5rt_path if global_settings else None
             )
-            can_conv, _ = can_convert_to_omlxm5(
+            can_conv, _ = can_convert_to_miv(
                 model_info.get("model_path") or "", m5rt_cfg_path, settings
             )
             if can_conv:
                 row["can_convert"] = True
-                row["reason"] = (
-                    "Convert weights to .omlxm5 to run this model on miv Core Backend."
-                )
+                if not compatible:
+                    row["reason"] = (
+                        "Convert weights to .miv (or click Load to auto-repack) for miv Core Backend."
+                    )
+        elif engine_id != "splash":
+            plugin_obj = plugins.get(engine_id)
+            if plugin_obj is not None and callable(getattr(plugin_obj, "can_convert", None)):
+                try:
+                    p_can_conv, _ = plugin_obj.can_convert(
+                        model_info.get("model_path") or "", settings
+                    )
+                    if p_can_conv:
+                        row["can_convert"] = True
+                except Exception:
+                    pass
         supported = list(get_external_engine_supported_settings(engine_id))
         if supported:
             row["supported_standard_settings"] = supported
@@ -2827,6 +2843,20 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     exc_info=True,
                 )
 
+        fmt_info = detect_model_weight_format_info(
+            model_info.get("model_path"),
+            model_format=model_info.get("model_format"),
+            active_external_engine=(
+                serving_engine_id
+                if serving_engine_id and serving_engine_id != "mlx"
+                else active_ext_engine
+            ),
+            model_settings=settings,
+            configured_m5rt_binary=(
+                global_settings.integrations.m5rt_path if global_settings else None
+            ),
+        )
+
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2874,6 +2904,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
             "model_format": model_info.get("model_format"),
+            "weight_format": fmt_info["weight_format"],
+            "has_miv_weights": fmt_info["has_miv_weights"],
+            "pending_auto_repack": fmt_info["pending_auto_repack"],
+            "repack_target_format": fmt_info["repack_target_format"],
             "source_path": model_info.get("source_path"),
             "distributed": model_info.get("distributed", False),
             "cluster": model_info.get("cluster"),
@@ -3216,12 +3250,13 @@ async def import_mtplx(
     return {"status": "ok", "model_id": model_id, **result}
 
 
+@router.post("/api/models/{model_id}/convert-miv")
 @router.post("/api/models/{model_id}/convert-omlxm5")
-async def convert_model_omlxm5(
+async def convert_model_miv(
     model_id: str,
     is_admin: bool = Depends(_require_admin_or_bearer),
 ):
-    """Convert a supported Qwen `.safetensors` checkpoint to `model.omlxm5` for `miv`."""
+    """Repack a supported `.safetensors` checkpoint to `.miv` (or Path B format) alongside original weights."""
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
@@ -3235,20 +3270,46 @@ async def convert_model_omlxm5(
     model_settings = (
         settings_mgr.get_settings(model_id) if settings_mgr is not None else None
     )
+    repo_label = getattr(entry, "source_repo_id", None) or model_id
 
     try:
-        result = await asyncio.to_thread(
-            convert_model_to_omlxm5,
-            entry.model_path,
-            source_repo=getattr(entry, "source_repo_id", None) or model_id,
-            configured_binary=m5rt_cfg_path,
-            model_settings=model_settings,
-            nax_pretile=True,
+        m5_ok, m5_reason = can_convert_to_miv(
+            entry.model_path, m5rt_cfg_path, model_settings
         )
+        if m5_ok:
+            result = await asyncio.to_thread(
+                convert_model_to_miv,
+                entry.model_path,
+                source_repo=repo_label,
+                configured_binary=m5rt_cfg_path,
+                model_settings=model_settings,
+                nax_pretile=True,
+            )
+            target_label = M5RT_ENGINE_LABEL
+        else:
+            plugin_converted = None
+            for _, plugin in sorted(discover_external_engine_plugins().items()):
+                if not callable(plugin.can_convert) or not callable(plugin.convert_model):
+                    continue
+                p_ok, _ = plugin.can_convert(entry.model_path, model_settings)
+                if p_ok:
+                    plugin_converted = (
+                        plugin.label,
+                        await asyncio.to_thread(
+                            plugin.convert_model,
+                            entry.model_path,
+                            source_repo=repo_label,
+                            model_settings=model_settings,
+                        ),
+                    )
+                    break
+            if plugin_converted is None:
+                raise ValueError(f"Cannot convert model to .miv: {m5_reason}")
+            target_label, result = plugin_converted
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Clear any prior Stock MLX override so auto-routing to miv Core Backend activates immediately.
+    # Clear any prior Stock MLX override so auto-routing activates immediately.
     if (
         settings_mgr is not None
         and model_settings is not None
@@ -3259,9 +3320,10 @@ async def convert_model_omlxm5(
         if callable(save_fn):
             save_fn(model_id, model_settings)
 
-    logger.info("Converted model '%s' to .omlxm5 (%s)", model_id, result.get("artifact_path"))
+    art_fmt = result.get("artifact_format") or "miv"
+    logger.info("Converted model '%s' to .%s (%s)", model_id, art_fmt, result.get("artifact_path"))
     if getattr(entry, "engine", None) is not None:
-        result["message"] = "Converted to .omlxm5. Reload the model to switch to miv Core Backend."
+        result["message"] = f"Converted to .{art_fmt}. Reload the model to switch to {target_label}."
     return {"status": "ok", "model_id": model_id, **result}
 
 
@@ -3710,10 +3772,10 @@ async def update_model_settings(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "external_engine" in sent:
         engine_id = None if is_diffusion_model else request.external_engine or None
-        if engine_id == "stock" and getattr(entry, "model_format", None) == "omlxm5":
+        if engine_id == "stock" and getattr(entry, "model_format", None) in ("miv", "omlxm5"):
             raise HTTPException(
                 status_code=400,
-                detail="Pure .omlxm5 models have no Stock MLX .safetensors weights on disk.",
+                detail="Pure .miv / .omlxm5 models have no Stock MLX .safetensors weights on disk.",
             )
         # Check only a change: a client may resend the stored value, and a
         # launcher or draft removed later must not block other fields.

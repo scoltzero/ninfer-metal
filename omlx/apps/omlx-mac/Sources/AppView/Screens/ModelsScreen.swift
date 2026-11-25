@@ -28,10 +28,12 @@ struct ModelsScreen: View {
                 models: vm.libraryModels,
                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
                 deletingID: vm.deletingID,
+                convertingID: vm.convertingID,
                 updates: vm,
                 onCheckUpdates: { Task { await vm.checkForUpdates(client: services.client) } },
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
+                onConvertMiv: { id in vm.convertToMiv(id: id, client: services.client) },
                 onOpenSettings: { id in services.modelDetailID = id },
                 onRequestRemove: { id in vm.pendingRemoveID = id },
                 onToggleFavorite: { id, fav in vm.setFavorite(id: id, favorite: fav, client: services.client) }
@@ -139,6 +141,12 @@ private struct ActiveModelsSection: View {
                             }
                             Spacer(minLength: 8)
                             if m.virtual != true {
+                                WeightFormatPill(
+                                    label: m.weightFormatBadgeLabel,
+                                    kind: m.weightFormatPillKind,
+                                    tooltip: m.weightFormatTooltip
+                                )
+                                .fixedSize(horizontal: true, vertical: false)
                                 EngineBadgePill(
                                     engineId: m.resolvedEngineId,
                                     label: m.compactEngineBadgeLabel,
@@ -197,10 +205,12 @@ private struct LibrarySection: View {
     let models: [ModelDTO]
     let isModelLoaded: (String) -> Bool
     let deletingID: String?
+    let convertingID: String?
     let updates: ModelsScreenVM
     let onCheckUpdates: () -> Void
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
+    let onConvertMiv: (String) -> Void
     let onOpenSettings: (String) -> Void
     let onRequestRemove: (String) -> Void
     let onToggleFavorite: (String, Bool) -> Void
@@ -267,9 +277,11 @@ private struct LibrarySection: View {
                         isLast: idx == models.count - 1,
                         isLoaded: isModelLoaded(m.id),
                         deletingID: deletingID,
+                        convertingID: convertingID,
                         updates: updates,
                         onLoad: onLoad,
                         onUnload: onUnload,
+                        onConvertMiv: onConvertMiv,
                         onOpenSettings: onOpenSettings,
                         onRequestRemove: onRequestRemove,
                         onToggleFavorite: onToggleFavorite
@@ -286,9 +298,11 @@ private struct LibraryRow: View {
     let isLast: Bool
     let isLoaded: Bool
     let deletingID: String?
+    let convertingID: String?
     let updates: ModelsScreenVM
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
+    let onConvertMiv: (String) -> Void
     let onOpenSettings: (String) -> Void
     let onRequestRemove: (String) -> Void
     let onToggleFavorite: (String, Bool) -> Void
@@ -312,6 +326,10 @@ private struct LibraryRow: View {
             if let alias = model.displayAlias {
                 Button(Self.copyAliasLabel) { copy(alias) }
             }
+            if model.canConvertMiv {
+                Button(Self.convertMivLabel) { onConvertMiv(model.id) }
+                    .disabled(convertingID != nil)
+            }
             Button(Self.settingsLabel) { onOpenSettings(model.id) }
             Divider()
             Button(Self.removeLabel, role: .destructive) { onRequestRemove(model.id) }
@@ -330,7 +348,9 @@ private struct LibraryRow: View {
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    weightFormatBadge
                     activeEngineBadge
+                    convertingBadge
                     updateBadge
                 }
                 details
@@ -452,6 +472,33 @@ private struct LibraryRow: View {
     }
 
     @ViewBuilder
+    private var weightFormatBadge: some View {
+        if model.virtual != true {
+            WeightFormatPill(
+                label: model.weightFormatBadgeLabel,
+                kind: model.weightFormatPillKind,
+                tooltip: model.weightFormatTooltip
+            )
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    @ViewBuilder
+    private var convertingBadge: some View {
+        if convertingID == model.id {
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text(String(localized: "settings.advanced.external_engine.converting_miv",
+                            defaultValue: "Repacking .miv…",
+                            comment: "Status badge while repacking .safetensors weights to .miv"))
+                    .font(.omlxText(DesignTokens.FontSize.caption, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    @ViewBuilder
     private var activeEngineBadge: some View {
         if model.virtual != true && (model.resolvedEngineId != "mlx" || model.isStockEngineOverride) {
             EngineBadgePill(
@@ -507,6 +554,12 @@ private struct LibraryRow: View {
         String(localized: "models.library.remove.help",
                defaultValue: "Remove from disk",
                comment: "Tooltip on the trash button that deletes a model from local storage")
+    }
+
+    private static var convertMivLabel: String {
+        String(localized: "settings.advanced.external_engine.convert_miv",
+               defaultValue: "Convert to .miv",
+               comment: "Action that repacks .safetensors weights to .miv alongside original weights")
     }
 }
 

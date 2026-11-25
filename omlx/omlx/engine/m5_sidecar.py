@@ -25,7 +25,7 @@ import uuid
 import zlib
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +66,15 @@ M5RT_SUPPORTED_MODEL_TYPES: tuple[str, ...] = (
     "qwen3_8",
     "qwen3_8_moe",
 )
-M5RT_ARTIFACT_EXTENSIONS: tuple[str, ...] = (".omlxm5",)
+M5RT_ARTIFACT_EXTENSIONS: tuple[str, ...] = (".miv", ".omlxm5")
+M5RT_DEFAULT_CONVERTER: dict[str, Any] = {
+    "entrypoint": "tools/m5_artifact.py",
+    "subcommand": "convert",
+    "output_filename": "model.miv",
+    "artifact_extension": ".miv",
+    "default_args": ["--nax-pretile"],
+    "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
+}
 M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
     "max_context_window",
     "mtp_enabled",
@@ -144,6 +152,9 @@ class ExternalEnginePlugin:
     runtime_signature: Callable[..., Any] | None = None
     supported_standard_settings: tuple[str, ...] = ()
     detect_adapted: Callable[..., ProbeResult | bool] | None = None
+    can_auto_convert_fast: Callable[..., bool] | None = None
+    can_convert: Callable[..., tuple[bool, str]] | None = None
+    convert_model: Callable[..., dict[str, Any]] | None = None
     options_schema: tuple[dict[str, Any], ...] = ()
     provider_id: str | None = None
 
@@ -351,6 +362,7 @@ class M5Target:
     draft_dir: Path | None = None
     draft_artifact_path: Path | None = None
     fake: bool = False
+    auto_convert_output: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1175,6 +1187,7 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
         "supported_topologies": list(M5RT_SUPPORTED_TOPOLOGIES),
         "supported_model_types": list(M5RT_SUPPORTED_MODEL_TYPES),
         "artifact_extensions": list(M5RT_ARTIFACT_EXTENSIONS),
+        "converter": dict(M5RT_DEFAULT_CONVERTER),
     }
     for root in _provider_root_dirs():
         if not root.is_dir():
@@ -1182,10 +1195,21 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
         installed = _read_provider_manifest(root)
         if installed is None:
             continue
-        for key in ("supported_topologies", "supported_model_types", "artifact_extensions"):
+        for key in ("supported_topologies", "supported_model_types"):
             vals = installed.get(key)
             if isinstance(vals, list) and vals:
                 manifest[key] = vals
+        inst_exts = installed.get("artifact_extensions")
+        if isinstance(inst_exts, list) and inst_exts:
+            merged_exts = list(M5RT_ARTIFACT_EXTENSIONS)
+            for ext in _normalize_extensions(inst_exts):
+                if ext not in merged_exts:
+                    merged_exts.append(ext)
+            manifest["artifact_extensions"] = merged_exts
+        if isinstance(installed.get("converter"), dict):
+            manifest["converter"] = dict(installed["converter"])
+        if installed.get("_provider_dir"):
+            manifest["_provider_dir"] = installed["_provider_dir"]
         break
     return manifest
 
@@ -1447,8 +1471,8 @@ def _probe_provider_adapted(
         if is_builtin or explicit_provider_match or topology_matched or model_type_matched:
             return True
         # Non-builtin Path B providers without an explicit provider/topology/model_type
-        # match may only auto-claim custom non-.omlxm5 artifact extensions.
-        return ext != ".omlxm5"
+        # match may only auto-claim custom non-.miv/.omlxm5 artifact extensions.
+        return ext not in (".miv", ".omlxm5")
 
     # (c) Artifact resolution matching manifest artifact_extensions
     if pack_meta is not None:
@@ -1517,8 +1541,12 @@ def _probe_provider_adapted(
                 reason=f"fixture parent model{ext}",
                 explicit_provider_match=explicit_provider_match,
             )
-        if ext != ".omlxm5" and mdir.is_dir():
-            custom_matches = [p for p in sorted(mdir.glob(f"*{ext}")) if p.is_file()]
+        if ext not in (".miv", ".omlxm5") and mdir.is_dir():
+            custom_matches = [
+                p
+                for p in sorted(mdir.glob(f"*{ext}"))
+                if p.is_file() and not p.name.startswith(".")
+            ]
             if len(custom_matches) == 1:
                 return ProbeResult(
                     adapted=True,
@@ -1547,7 +1575,7 @@ def detect_adapted(
 
 
 def _search_artifact_cache(model_dir: Path) -> Path | None:
-    """Match a model folder against `.cache/b0/artifacts/*.omlxm5`."""
+    """Match a model folder against `.cache/b0/artifacts/*.{miv,omlxm5}`."""
     cache_dirs: list[Path] = []
     env_cache = os.environ.get("OMLX_M5RT_ARTIFACT_DIR", "").strip()
     if env_cache:
@@ -1562,19 +1590,20 @@ def _search_artifact_cache(model_dir: Path) -> Path | None:
     for cache_dir in cache_dirs:
         if not cache_dir.is_dir():
             continue
-        for art in sorted(cache_dir.glob("*.omlxm5")):
-            if not art.is_file():
-                continue
-            conv = _read_json(Path(f"{art}.conversion.json")) or {}
-            if config_sha and conv.get("source_config_sha256") == config_sha:
-                return art.resolve()
-            source_repo = str(conv.get("source_repo") or "")
-            repo_tail = source_repo.rsplit("/", 1)[-1]
-            if model_slug and (
-                _normalize_slug(repo_tail) == model_slug
-                or _normalize_slug(art.stem) == model_slug
-            ):
-                slug_match = slug_match or art.resolve()
+        for ext in M5RT_ARTIFACT_EXTENSIONS:
+            for art in sorted(cache_dir.glob(f"*{ext}")):
+                if not art.is_file() or art.name.startswith("."):
+                    continue
+                conv = _read_json(Path(f"{art}.conversion.json")) or {}
+                if config_sha and conv.get("source_config_sha256") == config_sha:
+                    return art.resolve()
+                source_repo = str(conv.get("source_repo") or "")
+                repo_tail = source_repo.rsplit("/", 1)[-1]
+                if model_slug and (
+                    _normalize_slug(repo_tail) == model_slug
+                    or _normalize_slug(art.stem) == model_slug
+                ):
+                    slug_match = slug_match or art.resolve()
     return slug_match
 
 
@@ -1628,6 +1657,8 @@ def _resolve_target_artifact(
         for ext in extensions
         for p in sorted(model_dir.glob(f"*{ext}"))
         if p.is_file()
+        and not p.name.startswith(".")
+        and p.name.lower() not in ("mtp.miv", "mtp.omlxm5")
     ]
     if len(local_candidates) == 1:
         return local_candidates[0].resolve(), ""
@@ -1858,6 +1889,8 @@ def resolve_spi_provider_target(
     manifest: dict[str, Any],
     model_settings: object | None = None,
     draft_candidates: Iterable[str] = (),
+    *,
+    allow_auto_convert: bool = True,
 ) -> tuple[M5Target | None, str]:
     """Check whether a Path B SPI provider can serve `model_path`, returning `(M5Target, reason)`."""
     model_dir = Path(model_path).expanduser()
@@ -1900,16 +1933,6 @@ def resolve_spi_provider_target(
             "",
         )
 
-    artifact_path, reason = _resolve_target_artifact(
-        model_dir,
-        model_settings,
-        manifest=manifest,
-        engine_id=engine_id,
-        provider_id=provider_id,
-    )
-    if artifact_path is None:
-        return None, reason
-
     metallib_dir, reason = _resolve_metallib_dir(
         model_dir,
         binary,
@@ -1931,6 +1954,28 @@ def resolve_spi_provider_target(
     if reason:
         return None, reason
 
+    artifact_path, art_reason = _resolve_target_artifact(
+        model_dir,
+        model_settings,
+        manifest=manifest,
+        engine_id=engine_id,
+        provider_id=provider_id,
+    )
+    auto_convert_output: Path | None = None
+    if artifact_path is None:
+        if allow_auto_convert:
+            can_conv, _ = can_convert_provider_model(
+                model_dir,
+                binary=binary,
+                manifest=manifest,
+                model_settings=model_settings,
+                is_builtin=False,
+            )
+            if can_conv:
+                auto_convert_output = _converter_output_path(model_dir, manifest, is_builtin=False)
+        if auto_convert_output is None:
+            return None, art_reason
+
     return (
         M5Target(
             binary=binary,
@@ -1939,6 +1984,7 @@ def resolve_spi_provider_target(
             draft_dir=draft_dir,
             draft_artifact_path=draft_art,
             fake=False,
+            auto_convert_output=auto_convert_output,
         ),
         "",
     )
@@ -1949,6 +1995,8 @@ def resolve_m5rt_target(
     configured_binary: str | None,
     model_settings: object | None = None,
     draft_candidates: Iterable[str] = (),
+    *,
+    allow_auto_convert: bool = True,
 ) -> tuple[M5Target | None, str]:
     """Check whether `m5rt` can serve `model_path`, returning `(M5Target, reason)`."""
     model_dir = Path(model_path).expanduser()
@@ -1973,10 +2021,6 @@ def resolve_m5rt_target(
             "",
         )
 
-    artifact_path, reason = _resolve_target_artifact(model_dir, model_settings)
-    if artifact_path is None:
-        return None, reason
-
     metallib_dir, reason = _resolve_metallib_dir(model_dir, binary, model_settings)
     if metallib_dir is None:
         return None, reason
@@ -1987,6 +2031,23 @@ def resolve_m5rt_target(
     if reason:
         return None, reason
 
+    artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings)
+    auto_convert_output: Path | None = None
+    if artifact_path is None:
+        if allow_auto_convert:
+            manifest = _builtin_m5rt_manifest()
+            can_conv, _ = can_convert_provider_model(
+                model_dir,
+                binary=binary,
+                manifest=manifest,
+                model_settings=model_settings,
+                is_builtin=True,
+            )
+            if can_conv:
+                auto_convert_output = _converter_output_path(model_dir, manifest, is_builtin=True)
+        if auto_convert_output is None:
+            return None, art_reason
+
     return (
         M5Target(
             binary=binary,
@@ -1995,6 +2056,7 @@ def resolve_m5rt_target(
             draft_dir=draft_dir,
             draft_artifact_path=draft_art,
             fake=False,
+            auto_convert_output=auto_convert_output,
         ),
         "",
     )
@@ -2231,7 +2293,16 @@ def _resolve_effective_speculative(
         target_art = (
             target.artifact_path
             if target is not None and target.artifact_path is not None
-            else (model_dir / "model.omlxm5" if model_dir is not None else None)
+            else (
+                (
+                    model_dir / "model.miv"
+                    if (model_dir / "model.miv").is_file()
+                    or not (model_dir / "model.omlxm5").is_file()
+                    else model_dir / "model.omlxm5"
+                )
+                if model_dir is not None
+                else None
+            )
         )
         if (
             target is not None
@@ -2241,7 +2312,9 @@ def _resolve_effective_speculative(
             spec_backend = "dflash2"
         elif mtp_art_path is not None and mtp_art_path.is_file():
             spec_backend = "mtp"
-        elif model_dir is not None and (model_dir / "mtp.omlxm5").is_file():
+        elif model_dir is not None and (
+            (model_dir / "mtp.miv").is_file() or (model_dir / "mtp.omlxm5").is_file()
+        ):
             spec_backend = "mtp"
         else:
             embedded_mtp = inspect_omlxm5_has_mtp_weights(target_art)
@@ -2416,7 +2489,16 @@ def m5rt_memory_estimate(
     context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
     vocab_size = max(256, int(text_cfg.get("vocab_size") or 248320))
 
-    weights = target.artifact_path.stat().st_size if target.artifact_path else 0
+    if target.artifact_path is not None:
+        weights = target.artifact_path.stat().st_size
+    else:
+        try:
+            st_bytes = sum(
+                f.stat().st_size for f in mdir.glob("*.safetensors") if f.is_file()
+            )
+        except OSError:
+            st_bytes = 0
+        weights = int(st_bytes * 1.02) if st_bytes > 0 else 0
     draft = (
         target.draft_artifact_path.stat().st_size
         if target.draft_artifact_path
@@ -2635,9 +2717,11 @@ def build_m5rt_options(
     if mtp_art_raw and "mtp_artifact" not in overrides:
         overrides["mtp_artifact"] = str(Path(str(mtp_art_raw)).expanduser())
     elif spec_backend == "mtp" and "mtp_artifact" not in overrides:
-        companion_mtp = mdir / "mtp.omlxm5"
-        if companion_mtp.is_file():
-            overrides["mtp_artifact"] = str(companion_mtp.resolve())
+        for mtp_name in ("mtp.miv", "mtp.omlxm5"):
+            companion_mtp = mdir / mtp_name
+            if companion_mtp.is_file():
+                overrides["mtp_artifact"] = str(companion_mtp.resolve())
+                break
 
     rolling_prefix_cache = _parse_optional_toggle(
         opts.get("rolling_prefix_cache"), f"{eff_engine_id}.rolling_prefix_cache"
@@ -2975,6 +3059,45 @@ def _build_spi_provider_plugin(
             manifest=manifest_copy,
         )
 
+    def _can_auto_convert_fast(
+        model_path: str | Path,
+        model_settings: object | None = None,
+    ) -> bool:
+        return can_auto_convert_provider_fast(
+            model_path,
+            binary_path=binary_path,
+            manifest=manifest_copy,
+            model_settings=model_settings,
+            is_builtin=False,
+        )
+
+    def _can_convert(
+        model_path: str | Path,
+        model_settings: object | None = None,
+    ) -> tuple[bool, str]:
+        return can_convert_provider_model(
+            model_path,
+            binary_path_hint=binary_path,
+            manifest=manifest_copy,
+            model_settings=model_settings,
+            is_builtin=False,
+        )
+
+    def _convert_model(
+        model_path: str | Path,
+        *,
+        source_repo: str | None = None,
+        model_settings: object | None = None,
+    ) -> dict[str, Any]:
+        return convert_provider_model(
+            model_path,
+            source_repo=source_repo,
+            binary_path_hint=binary_path,
+            manifest=manifest_copy,
+            model_settings=model_settings,
+            is_builtin=False,
+        )
+
     return ExternalEnginePlugin(
         id=engine_id,
         label=label,
@@ -2985,6 +3108,9 @@ def _build_spi_provider_plugin(
         runtime_signature=_runtime_sig,
         supported_standard_settings=supported_standard,
         detect_adapted=_detect,
+        can_auto_convert_fast=_can_auto_convert_fast,
+        can_convert=_can_convert,
+        convert_model=_convert_model,
         options_schema=options_schema,
         provider_id=provider_id,
     )
@@ -3077,7 +3203,7 @@ def external_engine_mtp_compatibility(
         if isinstance(raw_mtp_art, (str, Path)) and str(raw_mtp_art).strip():
             if Path(str(raw_mtp_art)).expanduser().is_file():
                 return True, ""
-        if (mdir / "mtp.omlxm5").is_file():
+        if (mdir / "mtp.miv").is_file() or (mdir / "mtp.omlxm5").is_file():
             return True, ""
 
         art_path: Path | None = None
@@ -3093,6 +3219,8 @@ def external_engine_mtp_compatibility(
             probe = detect_adapted(mdir, model_settings)
             if probe.adapted and probe.artifact_path is not None:
                 art_path = probe.artifact_path
+            elif (mdir / "model.miv").is_file():
+                art_path = mdir / "model.miv"
             elif (mdir / "model.omlxm5").is_file():
                 art_path = mdir / "model.omlxm5"
 
@@ -3102,11 +3230,11 @@ def external_engine_mtp_compatibility(
         if embedded_mtp is False and art_path is not None:
             return False, (
                 f"{M5RT_ENGINE_LABEL} artifact '{art_path.name}' contains no embedded MTP "
-                "weights and no companion mtp.omlxm5 was found."
+                "weights and no companion mtp.miv / mtp.omlxm5 was found."
             )
         if _config_json_has_mtp(cfg):
             return True, ""
-        return False, "model has no MTP heads in config and no companion mtp.omlxm5"
+        return False, "model has no MTP heads in config and no companion mtp.miv / mtp.omlxm5"
 
     # Path B provider that explicitly declared "mtp_enabled"
     manifest = _spi_provider_manifest_for_engine(external_engine) or {}
@@ -3120,9 +3248,13 @@ def external_engine_mtp_compatibility(
             f"model_type={raw_model_type!r} is not supported by '{external_engine}' MTP "
             f"(supported: {', '.join(supported_types)})"
         )
-    if (mdir / "mtp.omlxm5").is_file() or _config_json_has_mtp(cfg):
+    if (
+        (mdir / "mtp.miv").is_file()
+        or (mdir / "mtp.omlxm5").is_file()
+        or _config_json_has_mtp(cfg)
+    ):
         return True, ""
-    return False, "model has no MTP heads in config and no companion mtp.omlxm5"
+    return False, "model has no MTP heads in config and no companion mtp.miv / mtp.omlxm5"
 
 
 def external_engine_dflash_compatibility(
@@ -4298,6 +4430,42 @@ class M5SidecarEngine(BaseEngine):
         self._runtime_failed_reason_override = None
         await asyncio.to_thread(self._load_tokenizer)
 
+        if (
+            not self._target.fake
+            and self._target.artifact_path is None
+            and self._target.auto_convert_output is not None
+        ):
+            logger.info(
+                "%s: auto-repacking weights in %s -> %s on first load",
+                self._target.binary.label,
+                self._path,
+                self._target.auto_convert_output.name,
+            )
+            conv = await asyncio.to_thread(
+                convert_provider_model,
+                self._path,
+                source_repo=self._model_id,
+                binary=self._target.binary,
+                manifest=self._provider_manifest,
+                is_builtin=self._is_builtin_m5rt,
+            )
+            built_art = Path(str(conv["artifact_path"])).resolve()
+            self._target = replace(
+                self._target,
+                artifact_path=built_art,
+                auto_convert_output=None,
+            )
+            if (
+                self._options.speculative_backend == "mtp"
+                and "mtp_artifact" not in self._options.path_overrides
+                and not (self._path / "mtp.miv").is_file()
+                and not (self._path / "mtp.omlxm5").is_file()
+                and inspect_omlxm5_has_mtp_weights(built_art) is False
+            ):
+                self._options = replace(
+                    self._options, speculative_backend="none", draft_tokens=0
+                )
+
         self._socket_path = _short_socket_path(self.external_engine_id)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         command = [str(self._target.binary.path), "--socket", str(self._socket_path)]
@@ -5211,7 +5379,7 @@ class M5SidecarEngine(BaseEngine):
 
 
 # ---------------------------------------------------------------------------
-# In-App .safetensors -> .omlxm5 Conversion Helpers (oMLX-extend)
+# In-App & First-Load .safetensors -> .miv / SPI Converter Helpers (oMLX-extend)
 # ---------------------------------------------------------------------------
 
 from contextlib import suppress
@@ -5221,153 +5389,522 @@ _CONVERT_LOCKS_GUARD = threading.Lock()
 _CONVERT_LOCKS: dict[str, threading.Lock] = {}
 
 
-def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
-    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
-    for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
-        raw_env = os.environ.get(env_key, "").strip()
-        if raw_env:
-            p = Path(raw_env).expanduser()
-            if p.is_file():
-                return p
+def _has_valid_safetensors_header(model_dir: Path) -> bool:
+    """Fast O(1) 9-byte check confirming at least one non-stub `.safetensors` file exists."""
+    try:
+        entries = [
+            f
+            for f in model_dir.iterdir()
+            if f.is_file()
+            and f.suffix.lower() == ".safetensors"
+            and not f.name.startswith(".")
+        ]
+    except OSError:
+        return False
+    for sf in entries:
+        try:
+            fsize = sf.stat().st_size
+            if fsize < 16:
+                continue
+            with sf.open("rb") as fh:
+                head = fh.read(9)
+            if len(head) < 9:
+                continue
+            (hdr_len,) = struct.unpack("<Q", head[:8])
+            if 2 <= hdr_len <= min(64 * 1024 * 1024, fsize - 8) and head[8] == ord("{"):
+                return True
+        except OSError:
+            continue
+    return False
 
-    binary, _ = find_m5rt_binary(configured_binary)
-    if binary is not None:
-        # Provider layout: <provider>/versions/<ver>/bin/mseries_backendd -> ../tools/m5_artifact.py
-        cand = binary.path.resolve().parent.parent / "tools" / "m5_artifact.py"
-        if cand.is_file():
-            return cand
-        # Also check un-resolved symlink parent (`current/tools/m5_artifact.py`)
-        cand_sym = binary.path.parent.parent / "tools" / "m5_artifact.py"
-        if cand_sym.is_file():
-            return cand_sym
 
-    # Monorepo / source checkout fallback: <repo>/miv/tools/m5_artifact.py
-    with suppress(Exception):
-        repo_cand = Path(__file__).resolve().parents[3] / "miv" / "tools" / "m5_artifact.py"
-        if repo_cand.is_file():
-            return repo_cand
-
+def _converter_spec_for_manifest(
+    manifest: dict[str, Any] | None, *, is_builtin: bool
+) -> dict[str, Any] | None:
+    raw = manifest.get("converter") if isinstance(manifest, dict) else None
+    if isinstance(raw, dict) and raw.get("entrypoint"):
+        return dict(raw)
+    if is_builtin:
+        return dict(M5RT_DEFAULT_CONVERTER)
     return None
 
 
-def can_convert_to_omlxm5(
+def _converter_output_path(
+    model_dir: Path, manifest: dict[str, Any] | None, *, is_builtin: bool
+) -> Path:
+    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin) or {}
+    out_name = str(spec.get("output_filename") or "").strip()
+    if not out_name:
+        ext = str(spec.get("artifact_extension") or "").strip()
+        if not ext:
+            exts = _normalize_extensions(
+                manifest.get("artifact_extensions") if isinstance(manifest, dict) else None
+            )
+            ext = exts[0] if exts else ".miv"
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        out_name = f"model{ext}"
+    return model_dir / Path(out_name).name
+
+
+def _config_matches_converter_quant(
+    cfg: dict[str, Any],
+    converter_spec: dict[str, Any],
+    *,
+    is_builtin: bool,
+) -> tuple[bool, str]:
+    """Verify `config.json` matches the converter's supported quantization modes."""
+    raw_modes = converter_spec.get("supported_quant_modes")
+    if not isinstance(raw_modes, (list, tuple)) or not raw_modes:
+        return True, ""
+    allowed_modes = {str(m).strip().lower() for m in raw_modes if isinstance(m, str) and m.strip()}
+    if not allowed_modes:
+        return True, ""
+
+    text_cfg = _text_config(cfg)
+    quant = (
+        cfg.get("quantization")
+        or cfg.get("quantization_config")
+        or text_cfg.get("quantization")
+        or text_cfg.get("quantization_config")
+        or {}
+    )
+    qcfg = cfg.get("quantization_config") or text_cfg.get("quantization_config") or {}
+    if not isinstance(quant, dict):
+        quant = {}
+    if not isinstance(qcfg, dict):
+        qcfg = {}
+
+    mode = str(quant.get("mode") or "").strip().lower()
+    fmt = str(qcfg.get("format") or quant.get("format") or "").strip().lower()
+
+    if mode == "affine" and "affine" in allowed_modes:
+        if is_builtin:
+            bits = quant.get("bits")
+            gs = quant.get("group_size")
+            if bits not in (3, 4, 5, 6, 8) or gs not in (64, 128):
+                return (
+                    False,
+                    f"affine quantization bits={bits!r}, group_size={gs!r} is not supported "
+                    "(expected bits in {3,4,5,6,8} and group_size in {64,128})",
+                )
+        return True, ""
+
+    if mode == "mxfp4" and "mxfp4" in allowed_modes:
+        return True, ""
+
+    if fmt == "mxfp4-pack-quantized" and "mxfp4-pack-quantized" in allowed_modes:
+        return True, ""
+
+    if not mode and not fmt and ({"bf16", "fp16", "unquantized"} & allowed_modes):
+        return True, ""
+
+    return (
+        False,
+        f"checkpoint quantization is not in {sorted(allowed_modes)} "
+        f"(mode={mode or 'none'!r}, format={fmt or 'none'!r})",
+    )
+
+
+def find_provider_converter_tool_fast(
+    binary_path: Path | None,
+    manifest: dict[str, Any] | None = None,
+    *,
+    is_builtin: bool = False,
+) -> Path | None:
+    """Locate a provider's bundled converter script in O(1) without spawning subprocesses."""
+    if is_builtin:
+        for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
+            raw_env = os.environ.get(env_key, "").strip()
+            if raw_env:
+                p = Path(raw_env).expanduser()
+                if p.is_file():
+                    return p
+
+    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin)
+    if spec is None:
+        return None
+    rel_entry = str(spec.get("entrypoint") or "").strip()
+    if not rel_entry:
+        return None
+
+    rel_path = Path(rel_entry)
+    if rel_path.is_absolute():
+        return rel_path if rel_path.is_file() else None
+
+    if isinstance(manifest, dict) and manifest.get("_provider_dir"):
+        pdir_cand = Path(str(manifest["_provider_dir"])) / rel_path
+        if pdir_cand.is_file():
+            return pdir_cand
+
+    if binary_path is not None:
+        for base in (binary_path.resolve().parent.parent, binary_path.parent.parent):
+            cand = base / rel_path
+            if cand.is_file():
+                return cand
+
+    if is_builtin:
+        repo_cand = _REPO_ROOT / "miv" / "tools" / "m5_artifact.py"
+        if repo_cand.is_file():
+            if binary_path is not None:
+                with suppress(OSError, ValueError):
+                    if binary_path.resolve().is_relative_to(_REPO_ROOT.resolve()):
+                        return repo_cand
+            elif not os.environ.get("OMLX_PROVIDERS_DIR", "").strip():
+                return repo_cand
+    return None
+
+
+def _find_m5rt_binary_path_fast(configured_binary: str | None = None) -> tuple[Path | None, dict[str, Any] | None]:
+    """Fast O(1) resolution of `(binary_path, provider_manifest)` with zero subprocess spawn."""
+    if configured_binary and str(configured_binary).strip():
+        cand = Path(str(configured_binary).strip()).expanduser()
+        if _executable(cand):
+            manifest = None
+            for parent in (cand.resolve().parent, cand.resolve().parent.parent):
+                manifest = _read_provider_manifest(parent)
+                if manifest is not None:
+                    break
+            return cand.resolve(), manifest
+        return None, None
+    for env_key in ("NINFER_METAL_BIN", "OMLX_M5RT_BIN"):
+        env_bin = os.environ.get(env_key, "").strip()
+        if env_bin:
+            cand = Path(env_bin).expanduser()
+            if _executable(cand):
+                manifest = None
+                for parent in (cand.resolve().parent, cand.resolve().parent.parent):
+                    manifest = _read_provider_manifest(parent)
+                    if manifest is not None:
+                        break
+                return cand.resolve(), manifest
+            return None, None
+    prov_cands = _discover_provider_candidates()
+    if prov_cands:
+        return prov_cands[0]
+    path_cand = _find_in_path(("mseries_backendd", "mseries-backendd"))
+    if path_cand is not None:
+        return path_cand.resolve(), None
+    repo_daemons = _iter_repo_build_daemons()
+    if repo_daemons:
+        return repo_daemons[0], None
+    return None, None
+
+
+def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
+    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
+    bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
+    tool = find_provider_converter_tool_fast(
+        bin_path, inst_manifest or _builtin_m5rt_manifest(), is_builtin=True
+    )
+    if tool is not None:
+        return tool
+    # Fallback for explicit custom `configured_binary` wrapper scripts in tests/dev
+    with suppress(Exception):
+        repo_cand = _REPO_ROOT / "miv" / "tools" / "m5_artifact.py"
+        if repo_cand.is_file() and not os.environ.get("OMLX_PROVIDERS_DIR", "").strip():
+            return repo_cand
+    return None
+
+
+def can_auto_convert_provider_fast(
+    model_path: str | Path,
+    *,
+    binary_path: Path | None,
+    manifest: dict[str, Any],
+    model_settings: object | None = None,
+    is_builtin: bool = False,
+) -> bool:
+    """Pure O(1) zero-subprocess check whether `model_path` can auto-repack on first Load."""
+    if not model_path or binary_path is None:
+        return False
+    model_dir = Path(model_path).expanduser()
+    if not model_dir.is_dir():
+        return False
+    if _probe_provider_adapted(model_dir, manifest, model_settings).adapted:
+        return False
+    if is_builtin and _search_artifact_cache(model_dir) is not None:
+        return False
+
+    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin)
+    if spec is None:
+        return False
+    if find_provider_converter_tool_fast(binary_path, manifest, is_builtin=is_builtin) is None:
+        return False
+
+    # Verify required metallibs exist before claiming auto-route
+    dummy_bin = M5Binary(
+        path=binary_path,
+        version=M5RT_DEFAULT_VERSION,
+        protocol_version=2,
+        auto_detected=True,
+        provider_manifest=manifest,
+    )
+    mdir_resolved, mdir_err = _resolve_metallib_dir(
+        model_dir,
+        dummy_bin,
+        model_settings,
+        engine_id=str(manifest.get("engine_id") or M5RT_ENGINE_ID),
+        provider_id=str(manifest.get("provider_id") or M5RT_PROVIDER_ID),
+    )
+    if mdir_err or (is_builtin and mdir_resolved is None):
+        return False
+
+    cfg = _read_json(model_dir / "config.json")
+    if cfg is None:
+        return False
+
+    supported_types = {
+        str(m).strip().lower()
+        for m in (manifest.get("supported_model_types") or ())
+        if isinstance(m, str) and m.strip()
+    }
+    model_types = _extract_model_type_tokens(cfg)
+    if supported_types and (not model_types or not (model_types & supported_types)):
+        return False
+
+    quant_ok, _ = _config_matches_converter_quant(cfg, spec, is_builtin=is_builtin)
+    if not quant_ok:
+        return False
+
+    if not _has_valid_safetensors_header(model_dir):
+        return False
+
+    return os.access(model_dir, os.W_OK)
+
+
+def can_auto_convert_m5rt_fast(
     model_path: str | Path,
     configured_binary: str | None = None,
     model_settings: object | None = None,
+) -> bool:
+    """Fast O(1) zero-subprocess check whether `m5rt` (`miv`) can auto-repack `model_path`."""
+    bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
+    if bin_path is None:
+        return False
+    manifest = _builtin_m5rt_manifest()
+    if isinstance(inst_manifest, dict) and inst_manifest.get("_provider_dir"):
+        manifest["_provider_dir"] = inst_manifest["_provider_dir"]
+    return can_auto_convert_provider_fast(
+        model_path,
+        binary_path=bin_path,
+        manifest=manifest,
+        model_settings=model_settings,
+        is_builtin=True,
+    )
+
+
+def can_convert_provider_model(
+    model_path: str | Path,
+    *,
+    binary: M5Binary | None = None,
+    binary_path_hint: Path | None = None,
+    configured_binary: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    model_settings: object | None = None,
+    is_builtin: bool = True,
 ) -> tuple[bool, str]:
-    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.omlxm5`."""
+    """Return `(True, '')` when `model_path` has `.safetensors` convertible for this provider."""
     if not model_path:
         return False, "model_path is empty"
     model_dir = Path(model_path).expanduser()
     if not model_dir.is_dir():
         return False, f"model directory not found: {model_dir}"
 
-    if detect_adapted(model_dir, model_settings).adapted:
-        return False, "model already has .omlxm5 weights"
+    eff_manifest = dict(manifest) if isinstance(manifest, dict) else (
+        _builtin_m5rt_manifest() if is_builtin else {}
+    )
+    if _probe_provider_adapted(model_dir, eff_manifest, model_settings).adapted:
+        return False, "model already has repacked microkernel weights"
+
+    spec = _converter_spec_for_manifest(eff_manifest, is_builtin=is_builtin)
+    if spec is None:
+        return False, "provider manifest does not declare a weight converter"
 
     cfg_path = model_dir / "config.json"
     if not cfg_path.is_file():
         return False, "config.json not found"
-    try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return False, f"failed to parse config.json: {exc}"
-    if not isinstance(cfg, dict):
-        return False, "config.json is not a JSON object"
+    cfg = _read_json(cfg_path)
+    if cfg is None:
+        return False, "config.json is not a valid JSON object"
 
-    model_types = _extract_model_type_tokens(cfg)
-    manifest = _builtin_m5rt_manifest()
     supported_types = {
         str(m).strip().lower()
-        for m in (manifest.get("supported_model_types") or M5RT_SUPPORTED_MODEL_TYPES)
+        for m in (
+            eff_manifest.get("supported_model_types")
+            or (M5RT_SUPPORTED_MODEL_TYPES if is_builtin else ())
+        )
         if isinstance(m, str) and m.strip()
     }
-    if not model_types or not (model_types & supported_types):
+    model_types = _extract_model_type_tokens(cfg)
+    if supported_types and (not model_types or not (model_types & supported_types)):
         return False, f"model_type is not in {sorted(supported_types)}"
 
-    try:
-        has_safetensors = any(
-            f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
-        )
-    except OSError:
-        has_safetensors = False
-    if not has_safetensors:
-        return False, "no .safetensors weights found in model directory"
+    quant_ok, quant_reason = _config_matches_converter_quant(
+        cfg, spec, is_builtin=is_builtin
+    )
+    if not quant_ok:
+        return False, quant_reason
+
+    if not _has_valid_safetensors_header(model_dir):
+        return False, "no valid .safetensors weights found in model directory"
 
     if not os.access(model_dir, os.W_OK):
         return False, f"model directory is not writable: {model_dir}"
 
-    binary, bin_reason = find_m5rt_binary(configured_binary)
-    if binary is None:
-        return False, bin_reason
-    tool = find_m5_artifact_tool(configured_binary)
+    resolved_bin = binary
+    if resolved_bin is None:
+        if is_builtin:
+            resolved_bin, bin_reason = find_m5rt_binary(configured_binary)
+            if resolved_bin is None:
+                return False, bin_reason
+        elif binary_path_hint is not None:
+            proto_raw = eff_manifest.get("protocol_version")
+            fb_proto = proto_raw if isinstance(proto_raw, int) and not isinstance(proto_raw, bool) else 2
+            resolved_bin, bin_reason = inspect_m5rt_binary(
+                binary_path_hint,
+                auto_detected=True,
+                provider_manifest=eff_manifest,
+                allow_generic=True,
+                fallback_protocol=fb_proto,
+            )
+            if resolved_bin is None:
+                return False, bin_reason
+        else:
+            return False, "provider binary not found"
+
+    if isinstance(resolved_bin.provider_manifest, dict) and resolved_bin.provider_manifest.get("_provider_dir"):
+        eff_manifest.setdefault("_provider_dir", resolved_bin.provider_manifest["_provider_dir"])
+
+    tool = find_provider_converter_tool_fast(
+        resolved_bin.path, eff_manifest, is_builtin=is_builtin
+    )
+    if tool is None and is_builtin:
+        tool = find_m5_artifact_tool(configured_binary)
     if tool is None:
-        return False, "m5_artifact.py converter tool not found in installed miv bundle"
+        return False, f"converter tool '{spec.get('entrypoint')}' not found in installed provider bundle"
 
     return True, ""
 
 
-def convert_model_to_omlxm5(
+def convert_provider_model(
     model_path: str | Path,
     *,
     source_repo: str | None = None,
+    binary: M5Binary | None = None,
+    binary_path_hint: Path | None = None,
     configured_binary: str | None = None,
+    manifest: dict[str, Any] | None = None,
     model_settings: object | None = None,
-    nax_pretile: bool = True,
+    nax_pretile: bool | None = None,
+    is_builtin: bool = True,
 ) -> dict[str, Any]:
-    """Convert `.safetensors` weights in `model_path` to `model.omlxm5` atomically."""
+    """Atomically repack `.safetensors` weights in `model_path` alongside original weights."""
     model_dir = Path(model_path).expanduser().resolve()
-    lock_key = str(model_dir)
+    eff_manifest = dict(manifest) if isinstance(manifest, dict) else (
+        _builtin_m5rt_manifest() if is_builtin else {}
+    )
+    out_path = _converter_output_path(model_dir, eff_manifest, is_builtin=is_builtin)
+    lock_key = f"{model_dir}::{out_path.name}"
     with _CONVERT_LOCKS_GUARD:
         lock = _CONVERT_LOCKS.setdefault(lock_key, threading.Lock())
 
     with lock:
-        existing_probe = detect_adapted(model_dir, model_settings)
-        out_path = model_dir / "model.omlxm5"
-        if existing_probe.adapted and out_path.is_file():
+        existing_probe = _probe_provider_adapted(model_dir, eff_manifest, model_settings)
+        if existing_probe.adapted and existing_probe.artifact_path is not None and existing_probe.artifact_path.is_file():
+            art = existing_probe.artifact_path
             return {
-                "artifact_path": str(out_path),
-                "artifact_bytes": out_path.stat().st_size,
+                "artifact_path": str(art),
+                "artifact_bytes": art.stat().st_size,
+                "artifact_format": art.suffix.lstrip(".").lower() or "miv",
                 "already_existed": True,
             }
 
-        ok, reason = can_convert_to_omlxm5(model_dir, configured_binary, model_settings)
+        ok, reason = can_convert_provider_model(
+            model_dir,
+            binary=binary,
+            binary_path_hint=binary_path_hint,
+            configured_binary=configured_binary,
+            manifest=eff_manifest,
+            model_settings=model_settings,
+            is_builtin=is_builtin,
+        )
         if not ok:
-            raise ValueError(f"Cannot convert model to .omlxm5: {reason}")
+            raise ValueError(f"Cannot convert model to {out_path.suffix}: {reason}")
 
-        tool = find_m5_artifact_tool(configured_binary)
+        resolved_bin = binary
+        if resolved_bin is None:
+            if is_builtin:
+                resolved_bin, _ = find_m5rt_binary(configured_binary)
+            elif binary_path_hint is not None:
+                resolved_bin, _ = inspect_m5rt_binary(
+                    binary_path_hint,
+                    auto_detected=True,
+                    provider_manifest=eff_manifest,
+                    allow_generic=True,
+                    fallback_protocol=2,
+                )
+        if resolved_bin is not None and isinstance(resolved_bin.provider_manifest, dict):
+            if resolved_bin.provider_manifest.get("_provider_dir"):
+                eff_manifest.setdefault("_provider_dir", resolved_bin.provider_manifest["_provider_dir"])
+
+        tool = (
+            find_provider_converter_tool_fast(
+                resolved_bin.path if resolved_bin else binary_path_hint,
+                eff_manifest,
+                is_builtin=is_builtin,
+            )
+            or (find_m5_artifact_tool(configured_binary) if is_builtin else None)
+        )
         if tool is None:
-            raise ValueError("m5_artifact.py converter tool not found")
+            raise ValueError("Provider converter tool not found")
+
+        spec = _converter_spec_for_manifest(eff_manifest, is_builtin=is_builtin) or {}
+        subcommand = str(spec.get("subcommand") or "").strip()
+        default_args = [
+            str(a) for a in (spec.get("default_args") or ()) if isinstance(a, str) and a.strip()
+        ]
+        if is_builtin and nax_pretile is False:
+            default_args = [a for a in default_args if a != "--nax-pretile"]
+        elif is_builtin and nax_pretile is True and "--nax-pretile" not in default_args:
+            default_args.append("--nax-pretile")
 
         repo_label = (source_repo or "").strip() or model_dir.name
-        tmp_out = model_dir / f".model.omlxm5.tmp.{os.getpid()}"
+        tmp_out = model_dir / f".{out_path.name}.tmp.{os.getpid()}"
         try:
-            cmd = [
-                sys.executable,
-                str(tool),
-                "convert",
-                "--source",
-                str(model_dir),
-                "--output",
-                str(tmp_out),
-                "--source-repo",
-                repo_label,
-            ]
-            if nax_pretile:
-                cmd.append("--nax-pretile")
+            if tool.suffix.lower() == ".py":
+                cmd = [sys.executable, str(tool)]
+            else:
+                cmd = [str(tool)]
+            if subcommand:
+                cmd.append(subcommand)
+            cmd.extend(
+                [
+                    "--source",
+                    str(model_dir),
+                    "--output",
+                    str(tmp_out),
+                    "--source-repo",
+                    repo_label,
+                    *default_args,
+                ]
+            )
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "").strip()
                 if len(detail) > 600:
                     detail = detail[-600:]
                 raise ValueError(
-                    f"m5_artifact.py convert failed (exit {proc.returncode}): {detail}"
+                    f"{tool.name} convert failed (exit {proc.returncode}): {detail}"
                 )
-            if not tmp_out.is_file() or tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
-                raise ValueError("Converter finished without producing a valid .omlxm5 file")
-            with tmp_out.open("rb") as fh:
-                if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
-                    raise ValueError("Converted file does not have a valid OMLXM5A1 header")
+            if not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                raise ValueError(f"Converter finished without producing {out_path.name}")
+            if is_builtin:
+                if tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
+                    raise ValueError("Converter produced a truncated .miv container")
+                with tmp_out.open("rb") as fh:
+                    if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
+                        raise ValueError("Converted .miv file does not have a valid OMLXM5A1 header")
             os.replace(tmp_out, out_path)
         finally:
             with suppress(OSError):
@@ -5377,5 +5914,179 @@ def convert_model_to_omlxm5(
         return {
             "artifact_path": str(out_path),
             "artifact_bytes": out_path.stat().st_size,
+            "artifact_format": out_path.suffix.lstrip(".").lower() or "miv",
             "already_existed": False,
         }
+
+
+def can_convert_to_miv(
+    model_path: str | Path,
+    configured_binary: str | None = None,
+    model_settings: object | None = None,
+) -> tuple[bool, str]:
+    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.miv`."""
+    return can_convert_provider_model(
+        model_path,
+        configured_binary=configured_binary,
+        manifest=_builtin_m5rt_manifest(),
+        model_settings=model_settings,
+        is_builtin=True,
+    )
+
+
+def convert_model_to_miv(
+    model_path: str | Path,
+    *,
+    source_repo: str | None = None,
+    configured_binary: str | None = None,
+    model_settings: object | None = None,
+    nax_pretile: bool = True,
+) -> dict[str, Any]:
+    """Convert `.safetensors` weights in `model_path` to `model.miv` atomically alongside `.safetensors`."""
+    return convert_provider_model(
+        model_path,
+        source_repo=source_repo,
+        configured_binary=configured_binary,
+        manifest=_builtin_m5rt_manifest(),
+        model_settings=model_settings,
+        nax_pretile=nax_pretile,
+        is_builtin=True,
+    )
+
+
+# Backward-compatible aliases for external callers / tests
+can_convert_to_omlxm5 = can_convert_to_miv
+convert_model_to_omlxm5 = convert_model_to_miv
+
+
+def detect_model_weight_format_info(
+    model_path: str | Path | None,
+    *,
+    model_format: str | None = None,
+    active_external_engine: str | None = None,
+    model_settings: object | None = None,
+    configured_m5rt_binary: str | None = None,
+) -> dict[str, Any]:
+    """Return O(1) weight-format metadata for `/admin/api/models` UI badges."""
+    if model_format == "gguf":
+        return {
+            "weight_format": "gguf",
+            "has_miv_weights": False,
+            "pending_auto_repack": False,
+            "repack_target_format": None,
+        }
+    if not model_path:
+        return {
+            "weight_format": model_format or "safetensors",
+            "has_miv_weights": False,
+            "pending_auto_repack": False,
+            "repack_target_format": None,
+        }
+    mdir = Path(str(model_path)).expanduser()
+    if not mdir.is_dir():
+        return {
+            "weight_format": model_format or "safetensors",
+            "has_miv_weights": False,
+            "pending_auto_repack": False,
+            "repack_target_format": None,
+        }
+
+    has_safetensors = False
+    has_miv_file = False
+    has_omlxm5_file = False
+    try:
+        for f in mdir.iterdir():
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            low_name = f.name.lower()
+            suf = f.suffix.lower()
+            if suf in (".safetensors", ".bin"):
+                has_safetensors = True
+            elif suf == ".miv" and low_name != "mtp.miv":
+                has_miv_file = True
+            elif suf == ".omlxm5" and low_name != "mtp.omlxm5":
+                has_omlxm5_file = True
+    except OSError:
+        pass
+
+    # Also check Path B custom artifact extensions when routed to a Path B engine
+    custom_art_fmt: str | None = None
+    repack_target_fmt: str | None = None
+    if active_external_engine and active_external_engine not in ("splash", "stock", M5RT_ENGINE_ID):
+        p_manifest = _spi_provider_manifest_for_engine(active_external_engine)
+        if p_manifest is not None:
+            p_probe = _probe_provider_adapted(mdir, p_manifest, model_settings)
+            if p_probe.adapted and p_probe.artifact_path is not None:
+                custom_art_fmt = p_probe.artifact_path.suffix.lstrip(".").lower() or "miv"
+            else:
+                out_p = _converter_output_path(mdir, p_manifest, is_builtin=False)
+                repack_target_fmt = out_p.suffix.lstrip(".").lower() or "miv"
+
+    has_microkernel_weights = bool(has_miv_file or has_omlxm5_file or custom_art_fmt)
+    on_disk_microkernel_fmt = (
+        custom_art_fmt
+        or ("miv" if has_miv_file else ("omlxm5" if has_omlxm5_file else None))
+    )
+
+    # When running on Stock MLX (or explicitly overridden to "stock"), the active format is safetensors
+    if not active_external_engine or active_external_engine in ("stock", "splash"):
+        active_fmt = (
+            "safetensors"
+            if has_safetensors
+            else (on_disk_microkernel_fmt or model_format or "safetensors")
+        )
+        return {
+            "weight_format": active_fmt,
+            "has_miv_weights": has_microkernel_weights,
+            "pending_auto_repack": False,
+            "repack_target_format": None,
+        }
+
+    # Active engine is m5rt or a Path B microkernel
+    if on_disk_microkernel_fmt is not None:
+        return {
+            "weight_format": on_disk_microkernel_fmt,
+            "has_miv_weights": True,
+            "pending_auto_repack": False,
+            "repack_target_format": None,
+        }
+
+    # Check `.cache/b0/artifacts` hit for m5rt
+    if active_external_engine == M5RT_ENGINE_ID:
+        cached = _search_artifact_cache(mdir)
+        if cached is not None:
+            return {
+                "weight_format": cached.suffix.lstrip(".").lower() or "miv",
+                "has_miv_weights": True,
+                "pending_auto_repack": False,
+                "repack_target_format": None,
+            }
+        if can_auto_convert_m5rt_fast(mdir, configured_m5rt_binary, model_settings):
+            return {
+                "weight_format": "safetensors",
+                "has_miv_weights": False,
+                "pending_auto_repack": True,
+                "repack_target_format": "miv",
+            }
+    elif repack_target_fmt is not None:
+        plugin = get_external_engine_plugin(active_external_engine)
+        if plugin is not None:
+            ok_conv = False
+            if callable(plugin.can_auto_convert_fast):
+                ok_conv = bool(plugin.can_auto_convert_fast(mdir, model_settings))
+            elif callable(plugin.can_convert):
+                ok_conv, _ = plugin.can_convert(mdir, model_settings)
+            if ok_conv:
+                return {
+                    "weight_format": "safetensors",
+                    "has_miv_weights": False,
+                    "pending_auto_repack": True,
+                    "repack_target_format": repack_target_fmt,
+                }
+
+    return {
+        "weight_format": "safetensors" if has_safetensors else (model_format or "safetensors"),
+        "has_miv_weights": has_microkernel_weights,
+        "pending_auto_repack": False,
+        "repack_target_format": None,
+    }

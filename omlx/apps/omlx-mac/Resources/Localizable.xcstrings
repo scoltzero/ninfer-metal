@@ -61176,6 +61176,222 @@
           }
         }
       }
+    },
+    "models.format.miv_colocated.help" : {
+      "comment" : "Tooltip when repacked .miv weights sit alongside original .safetensors; placeholder is format name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Repacked .%@ Metal 4 microkernel weights (co-located alongside original .safetensors)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已重排 .%@ Metal 4 微内核权重（与原 .safetensors 同目录并存）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已重排 .%@ Metal 4 微核心權重（與原 .safetensors 同目錄並存）。"
+          }
+        }
+      }
+    },
+    "models.format.miv_only.help" : {
+      "comment" : "Tooltip for a pure .miv microkernel weight folder; placeholder is format name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pure .%@ Metal 4 microkernel weights (no .safetensors in folder)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "纯 .%@ Metal 4 微内核权重（目录内无原 .safetensors）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "純 .%@ Metal 4 微核心權重（目錄內無原 .safetensors）。"
+          }
+        }
+      }
+    },
+    "models.format.pending_repack.help" : {
+      "comment" : "Tooltip when a convertible .safetensors model will auto-repack on first Load; placeholder is target format",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Currently .safetensors; first Load automatically repacks .%@ alongside original weights."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "当前为 .safetensors；首次点击加载将在同目录自动重排生成 .%@（保留原权重）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "目前為 .safetensors；首次點擊載入將在同目錄自動重排生成 .%@（保留原權重）。"
+          }
+        }
+      }
+    },
+    "models.format.safetensors.help" : {
+      "comment" : "Tooltip for standard .safetensors model format badge",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard .safetensors weights"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通用 .safetensors 权重"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通用 .safetensors 權重"
+          }
+        }
+      }
+    },
+    "models.format.safetensors_with_miv.help" : {
+      "comment" : "Tooltip when a model runs on .safetensors while .miv also exists in the directory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Running on original .safetensors weights (.miv weights are also present in this folder)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "当前使用原 .safetensors 权重运行（同目录已包含重排后的 .miv 权重）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "目前使用原 .safetensors 權重執行（同目錄已包含重排後的 .miv 權重）。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.auto_repack_hint" : {
+      "comment" : "Sublabel when a convertible .safetensors model will auto-repack to .miv on first Load; placeholder is engine name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto-routed to %@. First Load automatically repacks .miv alongside original .safetensors."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已自动路由至 %@；首次加载将在同目录自动重排生成 .miv（保留原 .safetensors）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已自動路由至 %@；首次載入將在同目錄自動重排生成 .miv（保留原 .safetensors）。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.convert_miv" : {
+      "comment" : "Action that repacks .safetensors weights to .miv alongside original weights",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Convert to .miv"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "转换为 .miv"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "轉換為 .miv"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.converting_miv" : {
+      "comment" : "Status badge while repacking .safetensors weights to .miv",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Repacking .miv…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在重排 .miv…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在重排 .miv…"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.miv_only" : {
+      "comment" : "Sublabel for the external engine toggle of a pure .miv model without Stock MLX .safetensors weights",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pure .miv models run on a Metal 4 microkernel only."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "纯 .miv 模型仅支持通过 Metal 4 微内核运行。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "純 .miv 模型僅支援透過 Metal 4 微核心執行。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

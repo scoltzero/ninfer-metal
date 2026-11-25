@@ -355,21 +355,32 @@ find_omlxm5_in_dir(const std::filesystem::path &dir) {
   if (!std::filesystem::is_directory(dir, ec)) {
     return std::nullopt;
   }
-  for (const char *preferred : {"model.omlxm5", "draft.omlxm5"}) {
+  for (const char *preferred :
+       {"model.miv", "draft.miv", "model.omlxm5", "draft.omlxm5"}) {
     const auto cand = dir / preferred;
     if (std::filesystem::is_regular_file(cand, ec)) {
       return cand;
     }
   }
-  std::vector<std::filesystem::path> matches;
-  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-    if (entry.is_regular_file(ec) && entry.path().extension() == ".omlxm5") {
+  for (const char *ext : {".miv", ".omlxm5"}) {
+    std::vector<std::filesystem::path> matches;
+    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (!entry.is_regular_file(ec) || entry.path().extension() != ext) {
+        continue;
+      }
+      const auto fname = entry.path().filename().string();
+      if (!fname.empty() && fname.front() == '.') {
+        continue;
+      }
+      if (fname == "mtp.miv" || fname == "mtp.omlxm5") {
+        continue;
+      }
       matches.push_back(entry.path());
     }
-  }
-  if (!matches.empty()) {
-    std::sort(matches.begin(), matches.end());
-    return matches.front();
+    if (!matches.empty()) {
+      std::sort(matches.begin(), matches.end());
+      return matches.front();
+    }
   }
   return std::nullopt;
 }
@@ -593,7 +604,7 @@ void resolve_auto_speculative(ModelServeConfig &model_cfg) {
     }
   }
 
-  // 2) MTP external artifact (`mtp.omlxm5`) or embedded MTP weights.
+  // 2) MTP external artifact (`mtp.miv` / `mtp.omlxm5`) or embedded MTP weights.
   if (!model_cfg.mtp_artifact.empty() &&
       std::filesystem::is_regular_file(model_cfg.mtp_artifact, ec)) {
     model_cfg.spec_backend = SpeculativeBackend::mtp;
@@ -602,17 +613,24 @@ void resolve_auto_speculative(ModelServeConfig &model_cfg) {
   }
   if (!model_cfg.model_dir.empty()) {
     const std::filesystem::path model_dir(model_cfg.model_dir);
-    const auto mtp_file = model_dir / "mtp.omlxm5";
-    if (std::filesystem::is_regular_file(mtp_file, ec)) {
-      model_cfg.spec_backend = SpeculativeBackend::mtp;
-      model_cfg.mtp_artifact = mtp_file.string();
-      model_cfg.spec_backend_auto = false;
-      return;
+    for (const char *mtp_name : {"mtp.miv", "mtp.omlxm5"}) {
+      const auto mtp_file = model_dir / mtp_name;
+      if (std::filesystem::is_regular_file(mtp_file, ec)) {
+        model_cfg.spec_backend = SpeculativeBackend::mtp;
+        model_cfg.mtp_artifact = mtp_file.string();
+        model_cfg.spec_backend_auto = false;
+        return;
+      }
     }
 
+    const std::filesystem::path default_art =
+        std::filesystem::is_regular_file(model_dir / "model.miv", ec) ||
+                !std::filesystem::is_regular_file(model_dir / "model.omlxm5", ec)
+            ? (model_dir / "model.miv")
+            : (model_dir / "model.omlxm5");
     const std::filesystem::path target_art =
         !model_cfg.artifact.empty() ? std::filesystem::path(model_cfg.artifact)
-                                    : (model_dir / "model.omlxm5");
+                                    : default_art;
     bool inspected_real_artifact = false;
     if (std::filesystem::is_regular_file(target_art, ec)) {
       try {

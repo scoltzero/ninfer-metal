@@ -30,8 +30,23 @@
         "qwen3_8_moe"
       ],
       "artifact_extensions": [
+        ".miv",
         ".omlxm5"
       ],
+      "converter": {
+        "entrypoint": "tools/m5_artifact.py",
+        "subcommand": "convert",
+        "output_filename": "model.miv",
+        "artifact_extension": ".miv",
+        "default_args": [
+          "--nax-pretile"
+        ],
+        "supported_quant_modes": [
+          "affine",
+          "mxfp4",
+          "mxfp4-pack-quantized"
+        ]
+      },
       "core_abi": 1,
       "protocol_version": 2,
       "min_omlx_extend_version": "0.8.0-extend",
@@ -55,8 +70,20 @@
       "llama"
     ],
     "artifact_extensions": [
-      ".omlxm5"
+      ".llama-m5",
+      ".miv"
     ],
+    "converter": {
+      "entrypoint": "tools/repack_artifact.py",
+      "subcommand": "convert",
+      "output_filename": "model.llama-m5",
+      "artifact_extension": ".llama-m5",
+      "default_args": [],
+      "supported_quant_modes": [
+        "affine",
+        "mxfp4"
+      ]
+    },
     "core_abi": 1,
     "protocol_version": 2,
     "min_omlx_extend_version": "0.8.0-extend",

@@ -2653,15 +2653,16 @@ class TestPathBMultiMicrokernelSidecars:
         assert m5_mod.discover_ninfer_metal_toml_path() == custom_toml
 
 
-class TestMix1PureOmlxm5DiscoveryAndConversion:
-    def test_pure_omlxm5_discovery_with_stale_index_and_hf_cache(self, tmp_path: Path):
+class TestMivDiscoveryAutoRepackAndFoundryConverter:
+    def test_pure_miv_and_legacy_omlxm5_discovery_with_stale_index_and_hf_cache(
+        self, tmp_path: Path
+    ):
         from omlx.model_discovery import discover_models
 
         models_root = tmp_path / "models"
         models_root.mkdir()
 
-        # 1) Pure .omlxm5 local folder that still retains model.safetensors.index.json
-        #    after user deleted the redundant .safetensors shards to save disk space.
+        # 1) Pure .miv local folder that still retains model.safetensors.index.json
         pure_dir = models_root / "Qwen3.8-27B-PureMiv"
         pure_dir.mkdir()
         (pure_dir / "config.json").write_text(
@@ -2680,10 +2681,10 @@ class TestMix1PureOmlxm5DiscoveryAndConversion:
             ),
             encoding="utf-8",
         )
-        omlxm5_payload = b"OMLXM5A1" + (b"\x00" * 4096)
-        (pure_dir / "model.omlxm5").write_bytes(omlxm5_payload)
+        miv_payload = b"OMLXM5A1" + (b"\x00" * 4096)
+        (pure_dir / "model.miv").write_bytes(miv_payload)
 
-        # 2) Pure .omlxm5 HF Hub cache snapshot
+        # 2) Legacy pure .omlxm5 HF Hub cache snapshot remains backward-compatible
         hf_snap = (
             models_root
             / "models--scoltzero--Qwen3.5-9B-miv"
@@ -2699,22 +2700,22 @@ class TestMix1PureOmlxm5DiscoveryAndConversion:
             json.dumps({"model_type": "qwen3_5", "hidden_size": 2048}),
             encoding="utf-8",
         )
-        (hf_snap / "model.omlxm5").write_bytes(omlxm5_payload)
+        (hf_snap / "model.omlxm5").write_bytes(miv_payload)
 
         discovered = discover_models(models_root)
         assert "Qwen3.8-27B-PureMiv" in discovered
-        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "omlxm5"
-        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(omlxm5_payload)
+        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "miv"
+        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(miv_payload)
 
         assert "scoltzero--Qwen3.5-9B-miv" in discovered
         assert discovered["scoltzero--Qwen3.5-9B-miv"].model_format == "omlxm5"
 
-    def test_can_convert_and_convert_model_to_omlxm5_atomic(
+    def test_can_convert_to_miv_colocated_and_bf16_guard(
         self, tmp_path: Path, monkeypatch
     ):
-        # Fake provider layout with bin/mseries_backendd and tools/m5_artifact.py
         prov_root = tmp_path / "provider"
         (prov_root / "bin").mkdir(parents=True)
+        (prov_root / "metallib").mkdir(parents=True)
         (prov_root / "tools").mkdir(parents=True)
         fake_bin = prov_root / "bin" / "mseries_backendd"
         fake_bin.write_text(
@@ -2722,6 +2723,7 @@ class TestMix1PureOmlxm5DiscoveryAndConversion:
             encoding="utf-8",
         )
         fake_bin.chmod(0o755)
+        (prov_root / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
         fake_tool = prov_root / "tools" / "m5_artifact.py"
         fake_tool.write_text(
             "import pathlib, sys\n"
@@ -2731,26 +2733,241 @@ class TestMix1PureOmlxm5DiscoveryAndConversion:
         )
         monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
 
-        qwen_dir = tmp_path / "Qwen3.5-Unconverted"
-        qwen_dir.mkdir()
-        (qwen_dir / "config.json").write_text(
+        # Unquantized BF16 Qwen checkpoint must NOT claim auto-conversion (stays on Stock MLX)
+        bf16_dir = tmp_path / "Qwen3.5-BF16"
+        bf16_dir.mkdir()
+        (bf16_dir / "config.json").write_text(
             json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
         )
-        (qwen_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+        (bf16_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+        bf16_ok, _ = m5_mod.can_convert_to_miv(bf16_dir, str(fake_bin))
+        assert bf16_ok is False
+        assert m5_mod.can_auto_convert_m5rt_fast(bf16_dir, str(fake_bin)) is False
 
-        ok, reason = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
+        # Quantized 4-bit affine Qwen checkpoint converts in-place to model.miv alongside model.safetensors
+        qwen_dir = tmp_path / "Qwen3.5-4bit"
+        qwen_dir.mkdir()
+        (qwen_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
+                }
+            ),
+            encoding="utf-8",
+        )
+        orig_st_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00{}      "
+        (qwen_dir / "model.safetensors").write_bytes(orig_st_bytes)
+
+        ok, reason = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
         assert ok is True and reason == ""
+        fmt_before = m5_mod.detect_model_weight_format_info(
+            qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
+        )
+        assert fmt_before["weight_format"] == "safetensors"
+        assert fmt_before["pending_auto_repack"] is True
+        assert fmt_before["repack_target_format"] == "miv"
 
-        res = m5_mod.convert_model_to_omlxm5(
-            qwen_dir, source_repo="Qwen/Qwen3.5-9B", configured_binary=str(fake_bin)
+        res = m5_mod.convert_model_to_miv(
+            qwen_dir, source_repo="mlx-community/Qwen3.5-9B-4bit", configured_binary=str(fake_bin)
         )
         assert res["already_existed"] is False
-        assert (qwen_dir / "model.omlxm5").is_file()
+        assert res["artifact_format"] == "miv"
+        assert (qwen_dir / "model.miv").is_file()
+        # Original .safetensors remains intact right next to model.miv!
+        assert (qwen_dir / "model.safetensors").read_bytes() == orig_st_bytes
         assert m5_mod.detect_adapted(qwen_dir).adapted is True
 
-        # Subsequent check reports already adapted (not convertible again)
-        ok_after, _ = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
+        fmt_after = m5_mod.detect_model_weight_format_info(
+            qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
+        )
+        assert fmt_after["weight_format"] == "miv"
+        assert fmt_after["has_miv_weights"] is True
+        assert fmt_after["pending_auto_repack"] is False
+
+        # When overridden back to Stock MLX, active weight_format reports "safetensors"
+        fmt_stock = m5_mod.detect_model_weight_format_info(
+            qwen_dir, active_external_engine="stock", configured_m5rt_binary=str(fake_bin)
+        )
+        assert fmt_stock["weight_format"] == "safetensors"
+        assert fmt_stock["has_miv_weights"] is True
+
+        ok_after, _ = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
         assert ok_after is False
+
+    async def test_auto_repack_on_first_load_and_foundry_path_b_converter(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # Set up both Path A (io.ninfer.metal -> .miv) and Path B (io.community.llama-metal -> .llama-m5)
+        providers_root = tmp_path / "Providers"
+        miv_ver = providers_root / "io.ninfer.metal" / "versions" / "miv-v0.01"
+        (miv_ver / "bin").mkdir(parents=True)
+        (miv_ver / "metallib").mkdir(parents=True)
+        (miv_ver / "tools").mkdir(parents=True)
+        miv_sock_srv = _MockUdsSidecarServer(
+            Path("/tmp") / f"m5-autorepack-{os.getpid()}.sock",
+            support_push=True,
+            support_v2_coexistence=True,
+            token_plan=[[65, 66]],
+        )
+        await miv_sock_srv.start()
+        try:
+            miv_bin = _fake_daemon_script(miv_ver / "bin" / "mseries_backendd", "miv-v0.01", protocol=2)
+            (miv_ver / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+            (miv_ver / "tools" / "m5_artifact.py").write_text(
+                "import pathlib, sys\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+                "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 256)\n",
+                encoding="utf-8",
+            )
+            (miv_ver / "provider.json").write_text(
+                json.dumps(
+                    {
+                        "provider_id": "io.ninfer.metal",
+                        "engine_id": "m5rt",
+                        "protocol_version": 2,
+                        "entrypoint": "bin/mseries_backendd",
+                        "metallib_dir": "metallib",
+                        "supported_model_types": ["qwen3_5"],
+                        "artifact_extensions": [".miv", ".omlxm5"],
+                        "converter": {
+                            "entrypoint": "tools/m5_artifact.py",
+                            "subcommand": "convert",
+                            "output_filename": "model.miv",
+                            "artifact_extension": ".miv",
+                            "default_args": ["--nax-pretile"],
+                            "supported_quant_modes": ["affine", "mxfp4"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (providers_root / "io.ninfer.metal" / "current").symlink_to(miv_ver)
+
+            # Path B provider with Microkernel Foundry `converter` contract
+            llama_ver = providers_root / "io.community.llama-metal" / "versions" / "0.2.0"
+            (llama_ver / "bin").mkdir(parents=True)
+            (llama_ver / "tools").mkdir(parents=True)
+            _fake_daemon_script(llama_ver / "bin" / "llama_backendd", "0.2.0", protocol=2)
+            (llama_ver / "tools" / "repack_llama.py").write_text(
+                "import pathlib, sys\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+                "out.write_bytes(b'LLAMAM5!' + b'\\x00' * 256)\n",
+                encoding="utf-8",
+            )
+            (llama_ver / "provider.json").write_text(
+                json.dumps(
+                    {
+                        "provider_id": "io.community.llama-metal",
+                        "engine_id": "llama-metal",
+                        "display_name": "Community Llama Metal 4",
+                        "protocol_version": 2,
+                        "entrypoint": "bin/llama_backendd",
+                        "supported_model_types": ["llama"],
+                        "artifact_extensions": [".llama-m5"],
+                        "converter": {
+                            "entrypoint": "tools/repack_llama.py",
+                            "subcommand": "convert",
+                            "output_filename": "model.llama-m5",
+                            "artifact_extension": ".llama-m5",
+                            "supported_quant_modes": ["affine"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (providers_root / "io.community.llama-metal" / "current").symlink_to(llama_ver)
+
+            monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(providers_root))
+            monkeypatch.delenv("OMLX_M5RT_BIN", raising=False)
+            monkeypatch.delenv("NINFER_METAL_BIN", raising=False)
+            monkeypatch.setattr(m5_mod.importlib.metadata, "entry_points", lambda group=None: [])
+
+            # Create unrepacked quantized Qwen & Llama checkpoints
+            qwen_unrepacked = tmp_path / "models" / "Qwen3.5-Mirror"
+            qwen_unrepacked.mkdir(parents=True)
+            (qwen_unrepacked / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3_5",
+                        "vocab_size": 512,
+                        "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (qwen_unrepacked / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+
+            llama_unrepacked = tmp_path / "models" / "Llama3-Mirror"
+            llama_unrepacked.mkdir(parents=True)
+            (llama_unrepacked / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "llama",
+                        "vocab_size": 512,
+                        "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (llama_unrepacked / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+
+            gs = GlobalSettings(base_path=tmp_path / "base")
+            monkeypatch.setattr("omlx.engine_pool.get_global_settings", lambda: gs)
+            pool = EnginePool()
+            for mid, mdir in (("Qwen3.5-Mirror", qwen_unrepacked), ("Llama3-Mirror", llama_unrepacked)):
+                pool._entries[mid] = EngineEntry(
+                    model_id=mid,
+                    model_path=str(mdir),
+                    model_type="llm",
+                    engine_type="batched",
+                    estimated_size=4096,
+                )
+
+            # Fast O(1) auto-route BEFORE conversion (zero subprocess!)
+            with patch.object(m5_mod.subprocess, "run", side_effect=AssertionError("must not spawn")):
+                assert pool.external_engine_id("Qwen3.5-Mirror", ModelSettings()) == "m5rt"
+                assert pool.external_engine_id("Llama3-Mirror", ModelSettings()) == "llama-metal"
+                assert pool.external_engine_id("Qwen3.5-Mirror", ModelSettings(external_engine="stock")) is None
+
+            # Verify m5rt_target sets auto_convert_output = model.miv when not yet converted
+            target, err = pool.m5rt_target("Qwen3.5-Mirror", ModelSettings())
+            assert err == "" and target is not None
+            assert target.artifact_path is None
+            assert target.auto_convert_output == qwen_unrepacked / "model.miv"
+
+            # Verify first Load (`engine.start()`) auto-repacks model.miv in-place and passes it to load RPC!
+            eng = pool._external_engine_for(pool._entries["Qwen3.5-Mirror"], ModelSettings(), "batched")
+            assert isinstance(eng, M5SidecarEngine)
+            monkeypatch.setattr(m5_mod, "_short_socket_path", lambda _eid=None: miv_sock_srv.socket_path)
+            real_popen = m5_mod.subprocess.Popen
+            monkeypatch.setattr(
+                m5_mod.subprocess,
+                "Popen",
+                lambda cmd, *a, **kw: (
+                    SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None, wait=lambda: 0)
+                    if isinstance(cmd, list) and "m5rt-watchdog" in cmd
+                    else real_popen(cmd, *a, **kw)
+                ),
+            )
+            await eng.start()
+            try:
+                assert (qwen_unrepacked / "model.miv").is_file()
+                assert (qwen_unrepacked / "model.safetensors").is_file()
+                assert Path(miv_sock_srv.load_params[-1]["path_overrides"]["artifact"]).name == "model.miv"
+            finally:
+                eng._process = None
+                await eng.stop()
+
+            # Also verify Path B Foundry converter produces model.llama-m5 alongside model.safetensors
+            llama_plugin = m5_mod.get_external_engine_plugin("llama-metal")
+            assert llama_plugin is not None and llama_plugin.convert_model is not None
+            llama_res = llama_plugin.convert_model(llama_unrepacked, source_repo="meta-llama/Llama-3-8B-4bit")
+            assert Path(llama_res["artifact_path"]).name == "model.llama-m5"
+            assert (llama_unrepacked / "model.llama-m5").is_file()
+            assert (llama_unrepacked / "model.safetensors").is_file()
+        finally:
+            await miv_sock_srv.close()
 
 
 

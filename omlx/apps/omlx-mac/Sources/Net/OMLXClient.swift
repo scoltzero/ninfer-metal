@@ -145,7 +145,7 @@ final class OMLXClient: ObservableObject {
 
     @discardableResult
     func loadModel(id: String) async throws -> SimpleStatusResponse {
-        try await postEmpty(AdminAPI.loadModel(id))
+        try await postEmpty(AdminAPI.loadModel(id), timeout: 1800)
     }
 
     @discardableResult
@@ -204,8 +204,13 @@ final class OMLXClient: ObservableObject {
     }
 
     @discardableResult
+    func convertModelToMiv(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.convertMiv(id), timeout: 1800)
+    }
+
+    @discardableResult
     func convertModelToOMLXM5(id: String) async throws -> SimpleStatusResponse {
-        try await postEmpty(AdminAPI.convertOMLXM5(id), timeout: 1800)
+        try await convertModelToMiv(id: id)
     }
 
     // MARK: - Prefill Accelerator

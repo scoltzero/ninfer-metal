@@ -1140,18 +1140,28 @@ def detect_reasoning_effort(
     return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
-def _has_omlxm5_weights(model_dir: Path) -> bool:
-    """True when ``model_dir`` contains a primary ``.omlxm5`` microkernel weight file."""
+_MICROKERNEL_WEIGHT_EXTS = (".miv", ".omlxm5")
+_MTP_COMPANION_NAMES = frozenset({"mtp.miv", "mtp.omlxm5"})
+
+
+def _primary_microkernel_weight_format(model_dir: Path) -> str | None:
+    """Return ``'miv'`` or ``'omlxm5'`` when ``model_dir`` has a primary microkernel weight file."""
     try:
-        return any(
-            f.is_file()
-            and f.suffix == ".omlxm5"
-            and not f.name.startswith(".")
-            and f.name.lower() != "mtp.omlxm5"
-            for f in model_dir.iterdir()
-        )
+        entries = [f for f in model_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
     except OSError:
-        return False
+        return None
+    for ext, fmt in ((".miv", "miv"), (".omlxm5", "omlxm5")):
+        if any(
+            f.suffix.lower() == ext and f.name.lower() not in _MTP_COMPANION_NAMES
+            for f in entries
+        ):
+            return fmt
+    return None
+
+
+def _has_omlxm5_weights(model_dir: Path) -> bool:
+    """True when ``model_dir`` contains a primary ``.miv`` or ``.omlxm5`` microkernel weight file."""
+    return _primary_microkernel_weight_format(model_dir) is not None
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1187,11 +1197,14 @@ def estimate_model_size(model_path: Path) -> int:
         for f in model_path.glob("**/*.safetensors"):
             total_size += f.stat().st_size
 
-    # Fallback: pure .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
+    # Fallback: pure .miv / .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
     if total_size == 0:
-        for f in model_path.glob("*.omlxm5"):
-            if f.is_file() and not f.name.startswith("."):
-                total_size += f.stat().st_size
+        for ext in _MICROKERNEL_WEIGHT_EXTS:
+            for f in model_path.glob(f"*{ext}"):
+                if f.is_file() and not f.name.startswith("."):
+                    total_size += f.stat().st_size
+            if total_size > 0:
+                break
 
     if total_size == 0:
         raise ValueError(f"No model weights found in {model_path}")
@@ -1870,7 +1883,9 @@ def _register_model(
         except OSError:
             has_mlx_weights = False
         model_format = (
-            "omlxm5" if (not has_mlx_weights and _has_omlxm5_weights(model_dir)) else None
+            _primary_microkernel_weight_format(model_dir)
+            if not has_mlx_weights
+            else None
         )
 
         models[model_id] = DiscoveredModel(

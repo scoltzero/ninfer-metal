@@ -541,7 +541,10 @@ ProviderResolution resolve_provider(const ModelServeConfig &model_entry,
   }
 
   // 3b) Path B match by topology, model_type, and artifact extension (with
-  //     strict no-hijack rules for built-in .omlxm5 / Qwen models).
+  //     strict no-hijack rules for built-in .miv / .omlxm5 Qwen models).
+  const auto is_builtin_miv_ext = [](const std::string &ext) {
+    return ext == ".miv" || ext == ".omlxm5";
+  };
   const std::string explicit_ext =
       !model_entry.artifact.empty()
           ? normalize_extension(
@@ -552,12 +555,14 @@ ProviderResolution resolve_provider(const ModelServeConfig &model_entry,
                                            .string())
                  : std::string{});
 
-  const bool dir_has_omlxm5 = std::any_of(
+  const bool dir_has_builtin_art = std::any_of(
       meta.top_level_files.begin(), meta.top_level_files.end(),
-      [](const std::filesystem::path &p) {
-        return normalize_extension(p.extension().string()) == ".omlxm5";
+      [&](const std::filesystem::path &p) {
+        return is_builtin_miv_ext(
+            normalize_extension(p.extension().string()));
       });
-  if (explicit_ext == ".omlxm5" || (explicit_ext.empty() && dir_has_omlxm5)) {
+  if (is_builtin_miv_ext(explicit_ext) ||
+      (explicit_ext.empty() && dir_has_builtin_art)) {
     return ProviderResolution{
         .use_sidecar = false,
         .provider_id = "io.ninfer.metal",
@@ -565,7 +570,7 @@ ProviderResolution resolve_provider(const ModelServeConfig &model_entry,
         .resolved_artifact_path =
             !model_entry.artifact.empty() ? model_entry.artifact
                                           : meta.pack_artifact,
-        .reason = "built-in .omlxm5 inproc miv",
+        .reason = "built-in .miv/.omlxm5 inproc miv",
     };
   }
 
@@ -614,9 +619,8 @@ ProviderResolution resolve_provider(const ModelServeConfig &model_entry,
     }
     const bool custom_ext_matched =
         ext_matched &&
-        normalize_extension(
-            std::filesystem::path(matched_art).extension().string()) !=
-            ".omlxm5";
+        !is_builtin_miv_ext(normalize_extension(
+            std::filesystem::path(matched_art).extension().string()));
 
     int score = 0;
     std::string reason;

@@ -18,9 +18,9 @@
 - Metal 4 执行运行时（`MetalContext`、`MTL4CommandQueue`、双缓冲 `ar_pipe_[2]`、`< 2 GiB` Compute ICB 编码器、`read_write` 屏障反射）。
 - 共享分页 KV 与前缀内存管理（`KvPagePool`、`SharedKvArenaPool`、CoW 引用计数、`SharedPrefixCache`、`UmaCheckpointPool`）。
 - 通用 NAX 与解码原语（`mxfp4_nax`、`affine_nax`、`bf16_nax`、`moe_nax`、零 `uitofp` QMV、两阶段并行 `Argmax`、`Split-KV` / `Flash-NAX`）。
-- `.omlxm5` 容器加载器、`ExecutionIdentityFields`、`24 MHz` 硬件计数器、原生独立 OpenAI 服务（`ninfer-metal-serve`）以及 Provider SPI v2 守护进程（`mseries_backendd`）。
+- `.miv`（兼容旧版 `.omlxm5`）容器加载器、随包权重重排转换器（`tools/m5_artifact.py`）、`ExecutionIdentityFields`、`24 MHz` 硬件计数器、原生独立 OpenAI 服务（`ninfer-metal-serve`）以及 Provider SPI v2 守护进程（`mseries_backendd`）。
 
-**你的 PR 补充内容与运行范围：** 补充目标架构的计算图、权重映射，以及在冷 DRAM 微探针上较通用原语净增益 **`>= +10%–12%`** 的专属内核（例如 MLA、GeGLU、Softcap 或自定义 MoE 路由）。复用 `libninfer_metal_substrate` 可避免多架构间的代码与常驻内存重复，使模型同时原生运行在独立 `ninfer-metal-serve` 与 `oMLX-extend` 中，并在[支持的模型清单](README.md)中标注贡献者署名。
+**你的 PR 补充内容与运行范围：** 补充目标架构的计算图、权重映射、配套的 `.safetensors → .miv` 重排转换规则，以及在冷 DRAM 微探针上较通用原语净增益 **`>= +10%–12%`** 的专属内核（例如 MLA、GeGLU、Softcap 或自定义 MoE 路由）。复用 `libninfer_metal_substrate` 可避免多架构间的代码与常驻内存重复，使模型同时原生运行在独立 `ninfer-metal-serve` 与 `oMLX-extend` 中（支持镜像站下载通用 `.safetensors` 后首次点击 `Load` 自动同目录重排生成 `.miv` 并保留原权重），并在[支持的模型清单](README.md)中标注贡献者署名。
 
 ### 路径 B：并行 Sidecar → PR 或 Issue → 原项目仓库署名
 
@@ -30,7 +30,7 @@
 ~/Library/Application Support/oMLX/Providers/<provider_id>/versions/<vA.B.C>/
 ```
 
-通过原子 `current` 符号链接暴露，并在 `provider.json` 中声明 `supported_topologies`、`supported_model_types` 与 `artifact_extensions`。就绪后提交 PR 或新建 Issue：维护者会将其登记至 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)，供用户通过 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) 安装和更新，同时在[支持的模型清单](README.md)中附上原始仓库直链。
+通过原子 `current` 符号链接暴露，并在 `provider.json` 中声明 `supported_topologies`、`supported_model_types`、`artifact_extensions` 以及必选的随包重排转换器 `converter`（标准参数契约 `--source <dir> --output <file> --source-repo <id>`，重排产物与原 `.safetensors` 同目录并存），使从镜像源下载的标准模型在 `oMLX-extend` 首次加载或点击一键转换时即可自动完成重排。就绪后提交 PR 或新建 Issue：维护者会将其登记至 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)，供用户通过 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) 安装和更新，同时在[支持的模型清单](README.md)中附上原始仓库直链。
 
 **统一多微内核宿主：** `oMLX-extend` 与独立服务 `ninfer-metal-serve --providers-dir` 均原生扫描 `Providers/*/current/provider.json`，在同一端口上并行运行多个路径 A（**`miv 核心后端`**）与路径 B 微内核，并统一执行 UMA 内存预算仲裁与 `gpu_contended` 调度（在 `oMLX-extend` 中同时兼容 Stock MLX）。在 `oMLX` macOS 应用中，已安装的路径 B 微内核会自动出现在 **`Integrations → External Engines`** 卡片列表，并在 **`Models`** 页面显示引擎徽章（见 [`oMLX-extend` 可视化上手指南](omlx-extend-guide.md)）。微内核作者只需实现 Metal 4 推理核心与 Sidecar SPI v2 守护进程；HTTP/SSE 服务、分词、聊天模板与多模型调度均由两种宿主直接承接。
 

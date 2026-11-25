@@ -58,7 +58,10 @@ struct ModelSettingsScreen: View {
                 model: vm.model,
                 engineId: vm.headerEngineId,
                 engineLabel: vm.headerEnginePillLabel,
-                engineTooltip: vm.headerEngineTooltip
+                engineTooltip: vm.headerEngineTooltip,
+                canConvertMiv: vm.canConvertMiv,
+                isConvertingMiv: vm.isConvertingOMLXM5,
+                onConvertMiv: { Task { await vm.convertModelToMiv(client: services.client) } }
             )
             TopPage(vm: vm, client: services.client) { services.modelDetailPage = $0 }
         case .profiles:
@@ -137,6 +140,9 @@ private struct Header: View {
     let engineId: String
     let engineLabel: String
     let engineTooltip: String
+    let canConvertMiv: Bool
+    let isConvertingMiv: Bool
+    let onConvertMiv: () -> Void
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -165,7 +171,32 @@ private struct Header: View {
             }
             .layoutPriority(1)
             Spacer(minLength: 8)
-            if model != nil, model?.virtual != true {
+            if let m = model, m.virtual != true {
+                if canConvertMiv || isConvertingMiv {
+                    Button(action: onConvertMiv) {
+                        HStack(spacing: 5) {
+                            if isConvertingMiv {
+                                ProgressView().controlSize(.mini)
+                                Text(String(localized: "settings.advanced.external_engine.converting_miv",
+                                            defaultValue: "Repacking .miv…",
+                                            comment: "Status badge while repacking .safetensors weights to .miv"))
+                            } else {
+                                Text(String(localized: "settings.advanced.external_engine.convert_miv",
+                                            defaultValue: "Convert to .miv",
+                                            comment: "Action that repacks .safetensors weights to .miv alongside original weights"))
+                            }
+                        }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(isConvertingMiv)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                WeightFormatPill(
+                    label: m.weightFormatBadgeLabel,
+                    kind: m.weightFormatPillKind,
+                    tooltip: m.weightFormatTooltip
+                )
+                .fixedSize(horizontal: true, vertical: false)
                 EngineBadgePill(
                     engineId: engineId,
                     label: engineLabel,
@@ -1992,12 +2023,17 @@ private struct ExternalEngineRow: View {
                           comment: "Hint shown when an adapted model is overridden back to Stock MLX")
         }
         if isOMLXM5Only {
-            return String(localized: "settings.advanced.external_engine.omlxm5_only",
-                          defaultValue: "Pure .omlxm5 models run on a Metal 4 microkernel only.",
-                          comment: "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights")
+            return String(localized: "settings.advanced.external_engine.miv_only",
+                          defaultValue: "Pure .miv models run on a Metal 4 microkernel only.",
+                          comment: "Sublabel for the external engine toggle of a pure .miv model without Stock MLX .safetensors weights")
         }
         if vm.isAutoRoutedExternalEngine {
             let autoName = vm.externalEngineDisplayName(for: vm.autoExternalEngine)
+            if vm.model?.pendingAutoRepack == true {
+                return String(localized: "settings.advanced.external_engine.auto_repack_hint",
+                              defaultValue: "Auto-routed to \(autoName). First Load automatically repacks .miv alongside original .safetensors.",
+                              comment: "Sublabel when a convertible .safetensors model will auto-repack to .miv on first Load; placeholder is engine name")
+            }
             return String(localized: "settings.advanced.external_engine.auto_routed",
                           defaultValue: "Auto-routed to \(autoName) for this adapted model. Turn off to use Stock MLX.",
                           comment: "Sublabel when an adapted model is automatically routed to an external engine; placeholder is engine name")
@@ -2035,20 +2071,20 @@ private struct ExternalEngineRow: View {
                     .disabled(draftStarted)
                     .help(draftError ?? "")
                 }
-                if vm.canConvertOMLXM5 || vm.isConvertingOMLXM5 {
+                if vm.canConvertMiv || vm.isConvertingOMLXM5 {
                     Button {
-                        Task { await vm.convertModelToOMLXM5(client: client) }
+                        Task { await vm.convertModelToMiv(client: client) }
                     } label: {
                         HStack(spacing: 5) {
                             if vm.isConvertingOMLXM5 {
                                 ProgressView().controlSize(.mini)
-                                Text(String(localized: "settings.advanced.external_engine.converting_omlxm5",
-                                            defaultValue: "Converting…",
-                                            comment: "Button label while converting .safetensors weights to .omlxm5"))
+                                Text(String(localized: "settings.advanced.external_engine.converting_miv",
+                                            defaultValue: "Repacking .miv…",
+                                            comment: "Status badge while repacking .safetensors weights to .miv"))
                             } else {
-                                Text(String(localized: "settings.advanced.external_engine.convert_omlxm5",
-                                            defaultValue: "Convert to .omlxm5",
-                                            comment: "Button that converts .safetensors weights to .omlxm5 for miv Core Backend"))
+                                Text(String(localized: "settings.advanced.external_engine.convert_miv",
+                                            defaultValue: "Convert to .miv",
+                                            comment: "Action that repacks .safetensors weights to .miv alongside original weights"))
                             }
                         }
                     }

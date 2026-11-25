@@ -36,8 +36,23 @@
     "qwen3_8_moe"
   ],
   "artifact_extensions": [
+    ".miv",
     ".omlxm5"
   ],
+  "converter": {
+    "entrypoint": "tools/m5_artifact.py",
+    "subcommand": "convert",
+    "output_filename": "model.miv",
+    "artifact_extension": ".miv",
+    "default_args": [
+      "--nax-pretile"
+    ],
+    "supported_quant_modes": [
+      "affine",
+      "mxfp4",
+      "mxfp4-pack-quantized"
+    ]
+  },
   "capabilities": [
     "ar",
     "mtp",

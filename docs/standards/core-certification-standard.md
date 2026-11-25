@@ -31,7 +31,7 @@
 | **分页 KV 池** | `KvPagePool`、`SharedKvArenaPool`、物理页 CoW 引用计数、`retained_kv_pages_` 唯一页计费 | 仅注册本架构 `(kv_heads, head_dim, kv_dtype)` 几何 |
 | **前缀与 UMA 快照** | `SharedPrefixCache`、`UmaCheckpointPool`（`32 MiB` 量子化、`supersede_entry_id` `1×` 覆写、pinned 保护） | 仅实现架构专属递推状态的 GPU 快照回调（若有） |
 | **通用 NAX 原语** | `mxfp4_nax`、`affine_nax`、`bf16_nax`、`moe_nax`、`row_exact` 零 `uitofp` QMV、两阶段并行 `Argmax`、统一 `Split-KV` / `Flash-NAX` | 仅在通用原语无法表达的算子（如 MLA、GeGLU、Softcap、Lightning Attention、Sigmoid+Bias 路由）上新增专属核 |
-| **身份与制品契约** | `.omlxm5` 容器读取器、`ExecutionIdentityFields`、`kernel_bundle_id`、`execution_artifact_digest` | 仅注册 `topology_id` 与权重映射 |
+| **身份与制品契约** | `.miv`（兼容历史 `.omlxm5`）容器读取器、配套重排转换脚本、`ExecutionIdentityFields`、`kernel_bundle_id`、`execution_artifact_digest` | 仅注册 `topology_id`、权重映射与本架构重排规则 |
 | **标定与观测** | Stage B `H0`/`H1` 探针、`24 MHz` `HwCounterCollector`、校准表加载器 | 仅补充本架构专属 `H1` 扫描项 |
 | **双模前端** | Sidecar UDS NDJSON RPC（`ninfer-metal sidecar` / `mseries_backendd`）与独立前端（`ninfer-metal serve`） | 禁止模块自建通信协议或 HTTP 服务器 |
 
@@ -75,6 +75,15 @@
   "min_omlx_extend_version": "0.8.0-extend",
   "entrypoint": "bin/mseries_backendd",
   "metallib_dir": "metallib",
+  "artifact_extensions": [".miv", ".omlxm5"],
+  "converter": {
+    "entrypoint": "tools/m5_artifact.py",
+    "subcommand": "convert",
+    "output_filename": "model.miv",
+    "artifact_extension": ".miv",
+    "default_args": ["--nax-pretile"],
+    "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"]
+  },
   "supported_topologies": ["qwen35_hybrid_dense_v1", "qwen36_hybrid_moe256_k8_shared_v1"],
   "supported_quant_formats": ["mxfp4_e2m1_g32_e8m0_v1", "oq_affine_q4_g64_bf16_v1", "oq_affine_q5_g64_bf16_v1", "oq_affine_q6_g64_bf16_v1", "oq_affine_q8_g64_bf16_v1"],
   "supported_kv_formats": ["bf16", "affine4_g128"],
@@ -95,6 +104,7 @@
 ```
 
 - **零虚假能力（Zero Phantom Capabilities）**：`provider.json` 与 `hello` 声明的每一项 `supported_kv_formats`、`supported_speculative`、`supported_topologies` 必须具备可执行的底层算子与对应 CTest；仅在参数解析白名单放行但运行时报错的选项禁止声明。
+- **随包权重重排转换器（Mandatory Bundled Weight Converter）**：凡使用硬件预重排容器（如 `.miv` 或自定义后缀）而非直接读取通用 `.safetensors` 的 Path A / Path B 微内核，必须在发布包内随附重排脚本并在 `provider.json` 的 `converter` 字段声明标准 CLI 契约（接收 `--source <model_dir> --output <tmp_file> --source-repo <repo_id>`，原子生成同目录目标权重文件且**严禁删除或覆盖原 `.safetensors`**），以保证用户从 Hugging Face / 镜像站下载通用模型后，在 `oMLX-extend` 中首次点击 `Load` 或点击一键转换即可自动完成重排。
 - **UI 同步**：映射到 `oMLX-extend` 原生设置的键通过 `supported_standard_settings` 声明，核心专属项通过 `options_schema` 暴露。
 
 ### 2.2 `hello` 握手、`core_abi` 与回退边界

@@ -96,8 +96,16 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var prefillHelper: PrefillHelperStatusDTO? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
-    /// "gguf" for a GGUF file, which only an external engine serves.
+    /// "gguf", "miv", or "omlxm5" when only an external engine serves the model.
     var modelFormat: String? = nil
+    /// Active weight container format (`"miv"`, `"omlxm5"`, `"safetensors"`, `"gguf"`).
+    var weightFormat: String? = nil
+    /// True when repacked microkernel weights (`.miv` / `.omlxm5`) exist in the model directory.
+    var hasMivWeights: Bool? = nil
+    /// True when the model currently has `.safetensors` and will auto-repack to `.miv` on first Load.
+    var pendingAutoRepack: Bool? = nil
+    /// Target format suffix when `pendingAutoRepack` is true (e.g. `"miv"`).
+    var repackTargetFormat: String? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -116,7 +124,84 @@ extension ModelDTO {
 
     var isInHFCache: Bool { sourceType == "hf_cache" }
     var isGGUF: Bool { modelFormat == "gguf" }
-    var isOMLXM5Only: Bool { modelFormat == "omlxm5" }
+    var isMivOnly: Bool { modelFormat == "miv" || modelFormat == "omlxm5" }
+    var isOMLXM5Only: Bool { isMivOnly }
+
+    var canConvertMiv: Bool {
+        externalEngines?.contains(where: { $0.canConvert == true }) == true
+    }
+
+    var effectiveWeightFormat: String {
+        if let wf = weightFormat, !wf.isEmpty {
+            return wf.lowercased()
+        }
+        if isGGUF { return "gguf" }
+        if let mf = modelFormat, !mf.isEmpty {
+            return mf.lowercased()
+        }
+        return "safetensors"
+    }
+
+    var weightFormatBadgeLabel: String {
+        if pendingAutoRepack == true {
+            let target = (repackTargetFormat?.isEmpty == false) ? repackTargetFormat! : "miv"
+            return "safetensors → .\(target)"
+        }
+        let fmt = effectiveWeightFormat
+        switch fmt {
+        case "gguf":
+            return "GGUF"
+        case "safetensors":
+            return "safetensors"
+        default:
+            return fmt.hasPrefix(".") ? fmt : ".\(fmt)"
+        }
+    }
+
+    var weightFormatTooltip: String {
+        if pendingAutoRepack == true {
+            let target = (repackTargetFormat?.isEmpty == false) ? repackTargetFormat! : "miv"
+            return String(
+                localized: "models.format.pending_repack.help",
+                defaultValue: "Currently .safetensors; first Load automatically repacks .\(target) alongside original weights.",
+                comment: "Tooltip when a convertible .safetensors model will auto-repack on first Load; placeholder is target format"
+            )
+        }
+        let fmt = effectiveWeightFormat
+        if fmt == "gguf" {
+            return String(
+                localized: "models.library.gguf.help",
+                defaultValue: "A GGUF file, served by an external engine",
+                comment: "Tooltip on the GGUF badge in the model library"
+            )
+        }
+        if fmt == "safetensors" {
+            if hasMivWeights == true {
+                return String(
+                    localized: "models.format.safetensors_with_miv.help",
+                    defaultValue: "Running on original .safetensors weights (.miv weights are also present in this folder).",
+                    comment: "Tooltip when a model runs on .safetensors while .miv also exists in the directory"
+                )
+            }
+            return String(
+                localized: "models.format.safetensors.help",
+                defaultValue: "Standard .safetensors weights",
+                comment: "Tooltip for standard .safetensors model format badge"
+            )
+        }
+        if isMivOnly {
+            return String(
+                localized: "models.format.miv_only.help",
+                defaultValue: "Pure .\(fmt) Metal 4 microkernel weights (no .safetensors in folder).",
+                comment: "Tooltip for a pure .miv microkernel weight folder; placeholder is format name"
+            )
+        }
+        return String(
+            localized: "models.format.miv_colocated.help",
+            defaultValue: "Repacked .\(fmt) Metal 4 microkernel weights (co-located alongside original .safetensors).",
+            comment: "Tooltip when repacked .miv weights sit alongside original .safetensors; placeholder is format name"
+        )
+    }
 
     /// Localized display name for a given engine ID, translating built-in `m5rt`
     /// while preserving manifest display names for Path B providers and Splash.

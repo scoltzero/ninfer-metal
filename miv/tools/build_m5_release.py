@@ -104,7 +104,16 @@ PROVIDER_SUPPORTED_MODEL_TYPES = [
     "qwen3_8_moe",
 ]
 
-PROVIDER_ARTIFACT_EXTENSIONS = [".omlxm5"]
+PROVIDER_ARTIFACT_EXTENSIONS = [".miv", ".omlxm5"]
+
+PROVIDER_CONVERTER = {
+    "entrypoint": "tools/m5_artifact.py",
+    "subcommand": "convert",
+    "output_filename": "model.miv",
+    "artifact_extension": ".miv",
+    "default_args": ["--nax-pretile"],
+    "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
+}
 
 SUPPORTED_STANDARD_SETTINGS = [
     "max_context_window",
@@ -640,6 +649,7 @@ def main() -> int:
         "supported_topologies": PROVIDER_SUPPORTED_TOPOLOGIES,
         "supported_model_types": PROVIDER_SUPPORTED_MODEL_TYPES,
         "artifact_extensions": PROVIDER_ARTIFACT_EXTENSIONS,
+        "converter": PROVIDER_CONVERTER,
         "capabilities": PROVIDER_CAPABILITIES,
         "kv_formats": PROVIDER_KV_FORMATS,
         "supported_standard_settings": SUPPORTED_STANDARD_SETTINGS,

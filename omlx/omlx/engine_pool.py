@@ -42,6 +42,7 @@ from .engine.m5_sidecar import (
     M5RT_ENGINE_LABEL,
     M5RT_PROVIDER_ID,
     M5Target,
+    can_auto_convert_m5rt_fast,
     create_m5rt_pool_engine,
     detect_adapted,
     discover_external_engine_plugins,
@@ -2511,44 +2512,60 @@ class EnginePool:
                 gs, provider_id=M5RT_PROVIDER_ID, engine_id=M5RT_ENGINE_ID
             )
             m5_probe = detect_adapted(model_path, model_settings)
-            m5_available = bool(
+            m5_has_bin = has_m5rt_binary_candidate(gs.integrations.m5rt_path)
+            m5_available = bool(m5_enabled and m5_probe.adapted and m5_has_bin)
+            m5_auto_convertible = bool(
                 m5_enabled
-                and m5_probe.adapted
-                and has_m5rt_binary_candidate(gs.integrations.m5rt_path)
+                and not m5_probe.adapted
+                and m5_has_bin
+                and can_auto_convert_m5rt_fast(
+                    model_path, gs.integrations.m5rt_path, model_settings
+                )
             )
             explicit_plugin_match: str | None = None
             topology_plugin_match: str | None = None
+            convertible_plugin_match: str | None = None
             for _, plugin in sorted(discover_external_engine_plugins().items()):
                 if not is_microkernel_enabled(
                     gs, provider_id=plugin.provider_id, engine_id=plugin.id
                 ):
                     continue
-                if not callable(plugin.detect_adapted):
-                    continue
-                try:
-                    sig = inspect.signature(plugin.detect_adapted)
-                    params = list(sig.parameters.values())
-                    accepts_two = len(params) >= 2 or any(
-                        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
-                    )
-                    res = (
-                        plugin.detect_adapted(model_path, model_settings)
-                        if accepts_two
-                        else plugin.detect_adapted(model_path)
-                    )
-                except Exception:
-                    continue
-                if not bool(getattr(res, "adapted", res)):
-                    continue
-                if bool(getattr(res, "explicit_provider_match", False)):
-                    explicit_plugin_match = explicit_plugin_match or plugin.id
-                else:
-                    topology_plugin_match = topology_plugin_match or plugin.id
+                adapted_hit = False
+                if callable(plugin.detect_adapted):
+                    try:
+                        sig = inspect.signature(plugin.detect_adapted)
+                        params = list(sig.parameters.values())
+                        accepts_two = len(params) >= 2 or any(
+                            p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+                        )
+                        res = (
+                            plugin.detect_adapted(model_path, model_settings)
+                            if accepts_two
+                            else plugin.detect_adapted(model_path)
+                        )
+                        if bool(getattr(res, "adapted", res)):
+                            adapted_hit = True
+                            if bool(getattr(res, "explicit_provider_match", False)):
+                                explicit_plugin_match = explicit_plugin_match or plugin.id
+                            else:
+                                topology_plugin_match = topology_plugin_match or plugin.id
+                    except Exception:
+                        pass
+                if (
+                    not adapted_hit
+                    and convertible_plugin_match is None
+                    and callable(getattr(plugin, "can_auto_convert_fast", None))
+                ):
+                    try:
+                        if plugin.can_auto_convert_fast(model_path, model_settings):
+                            convertible_plugin_match = plugin.id
+                    except Exception:
+                        pass
 
             # Deterministic routing priority:
             # 1. Explicit provider_id/engine_id match
-            # 2. Topology + extension Path B plugin match
-            # 3. Built-in m5rt match
+            # 2. Already-repacked artifact match (Path B then built-in m5rt)
+            # 3. Auto-convertible .safetensors match (built-in m5rt for Qwen, else Path B)
             if explicit_plugin_match is not None:
                 return explicit_plugin_match
             if m5_available and bool(getattr(m5_probe, "explicit_provider_match", False)):
@@ -2557,6 +2574,10 @@ class EnginePool:
                 return topology_plugin_match
             if m5_available:
                 return M5RT_ENGINE_ID
+            if m5_auto_convertible:
+                return M5RT_ENGINE_ID
+            if convertible_plugin_match is not None:
+                return convertible_plugin_match
         return None
 
     def _validate_selected_external_engine(

@@ -18,9 +18,9 @@
 - Metal 4 執行期（`MetalContext`、`MTL4CommandQueue`、雙緩衝 `ar_pipe_[2]`、`< 2 GiB` Compute ICB 編碼器、`read_write` 屏障反射）。
 - 共享分頁 KV 與前綴記憶體（`KvPagePool`、`SharedKvArenaPool`、CoW 參考計數、`SharedPrefixCache`、`UmaCheckpointPool`）。
 - 通用 NAX 與解碼原語（`mxfp4_nax`、`affine_nax`、`bf16_nax`、`moe_nax`、零 `uitofp` QMV、兩階段平行 `Argmax`、`Split-KV` / `Flash-NAX`）。
-- `.omlxm5` 容器載入器、`ExecutionIdentityFields`、`24 MHz` 硬體計數器、原生獨立 OpenAI 伺服器（`ninfer-metal-serve`）與 Provider SPI v2 常駐程式（`mseries_backendd`）。
+- `.miv`（相容舊版 `.omlxm5`）容器載入器、隨附權重重排轉換器（`tools/m5_artifact.py`）、`ExecutionIdentityFields`、`24 MHz` 硬體計數器、原生獨立 OpenAI 伺服器（`ninfer-metal-serve`）與 Provider SPI v2 常駐程式（`mseries_backendd`）。
 
-**你的 PR 補充內容與執行範圍：** 補充目標架構的計算層圖、權重對應，以及在冷 DRAM 微探針上比通用原語快 **`>= +10%–12%`** 的架構專屬核心（例如 MLA、GeGLU、Softcap 或自訂 MoE 路由器）。重用 `libninfer_metal_substrate` 可避免多架構間的程式碼與常駐記憶體重複，讓模型同時原生執行於獨立 `ninfer-metal-serve` 與 `oMLX-extend`，並於[支援的模型清單](README.md)標註貢獻者署名。
+**你的 PR 補充內容與執行範圍：** 補充目標架構的計算層圖、權重對應、配套的 `.safetensors → .miv` 重排轉換規則，以及在冷 DRAM 微探針上比通用原語快 **`>= +10%–12%`** 的架構專屬核心（例如 MLA、GeGLU、Softcap 或自訂 MoE 路由器）。重用 `libninfer_metal_substrate` 可避免多架構間的程式碼與常駐記憶體重複，讓模型同時原生執行於獨立 `ninfer-metal-serve` 與 `oMLX-extend`（支援首次點擊 `Load` 自動同目錄重排生成 `.miv` 並保留原權重），並於[支援的模型清單](README.md)標註貢獻者署名。
 
 ### 路徑 B：平行 Sidecar → PR 或 Issue → 原始專案儲存庫署名
 
@@ -30,7 +30,7 @@
 ~/Library/Application Support/oMLX/Providers/<provider_id>/versions/<vA.B.C>/
 ```
 
-透過原子 `current` 符號連結暴露，並在 `provider.json` 宣告 `supported_topologies`、`supported_model_types` 與 `artifact_extensions`。就緒後發送 PR 或開啟 Issue：維護者會將其登錄至 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)，供使用者透過 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) 安裝與更新，同時在[支援的模型清單](README.md)附上原始儲存庫直連。
+透過原子 `current` 符號連結暴露，並在 `provider.json` 宣告 `supported_topologies`、`supported_model_types`、`artifact_extensions` 與必選的隨附重排轉換器 `converter`（`--source <dir> --output <file> --source-repo <id>`，與原 `.safetensors` 同目錄並存）。就緒後發送 PR 或開啟 Issue：維護者會將其登錄至 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)，供使用者透過 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) 安裝與更新，同時在[支援的模型清單](README.md)附上原始儲存庫直連。
 
 **統一多微核心宿主：** `oMLX-extend` 與獨立伺服器 `ninfer-metal-serve --providers-dir` 皆原生探索 `Providers/*/current/provider.json`，在同一連接埠上平行執行多個路徑 A（**`miv 核心後端`**）與路徑 B 微核心，並統一執行 UMA 記憶體預算仲裁與 `gpu_contended` 排程（於 `oMLX-extend` 中同時相容原版 MLX）。在 `oMLX` macOS 應用程式中，已安裝的路徑 B 微核心會自動顯示於 **`Integrations → External Engines`** 卡片清單，並在 **`Models`** 畫面標示執行引擎徽章（見 [`oMLX-extend` 視覺化上手指南](omlx-extend-guide.md)）。微核心作者只需實作 Metal 4 推論核心與 Sidecar SPI v2 常駐程式；HTTP/SSE 服務、分詞、聊天範本與多模型排程皆由兩種宿主直接承接。
 

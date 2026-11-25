@@ -1633,21 +1633,27 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    var canConvertOMLXM5: Bool {
-        model?.externalEngines?.contains(where: { !$0.compatible && $0.canConvert == true }) == true
+    var canConvertMiv: Bool {
+        model?.canConvertMiv == true
     }
 
-    func convertModelToOMLXM5(client: OMLXClient) async {
-        guard !isConvertingOMLXM5, canConvertOMLXM5 else { return }
+    var canConvertOMLXM5: Bool { canConvertMiv }
+
+    func convertModelToMiv(client: OMLXClient) async {
+        guard !isConvertingOMLXM5, canConvertMiv else { return }
         isConvertingOMLXM5 = true
         defer { isConvertingOMLXM5 = false }
 
         do {
-            _ = try await client.convertModelToOMLXM5(id: modelID)
+            _ = try await client.convertModelToMiv(id: modelID)
             await load(modelID: modelID, client: client, preservingEdits: false)
         } catch {
             lastError = error.omlxDescription
         }
+    }
+
+    func convertModelToOMLXM5(client: OMLXClient) async {
+        await convertModelToMiv(client: client)
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the

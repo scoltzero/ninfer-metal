@@ -1036,24 +1036,30 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.headerEngineId, "llama-metal")
     }
 
-    func testCanConvertOMLXM5AndPureOMLXM5Detection() throws {
+    func testMivFormatBadgesAutoRepackAndPureMivDetection() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
 
+        // 1) Downloaded quantized .safetensors model pending auto-repack on first Load
         let convertibleJSON = Data(#"""
         {
-          "id": "Qwen3.5-9B",
+          "id": "Qwen3.5-9B-4bit",
           "loaded": false,
           "is_loading": false,
           "estimated_size": 1000,
           "config_model_type": "qwen3_5",
+          "weight_format": "safetensors",
+          "has_miv_weights": false,
+          "pending_auto_repack": true,
+          "repack_target_format": "miv",
+          "auto_external_engine": "m5rt",
           "external_engines": [
             {
               "id": "m5rt",
               "label": "miv Core Backend",
-              "compatible": false,
+              "compatible": true,
               "can_convert": true,
-              "reason": "Convert weights to .omlxm5 to run this model on miv Core Backend."
+              "reason": ""
             }
           ]
         }
@@ -1062,9 +1068,32 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         let vm = ModelSettingsScreenVM()
         vm.model = convertibleModel
         vm.modelID = convertibleModel.id
+        XCTAssertTrue(vm.canConvertMiv)
         XCTAssertTrue(vm.canConvertOMLXM5)
-        XCTAssertFalse(convertibleModel.isOMLXM5Only)
+        XCTAssertFalse(convertibleModel.isMivOnly)
+        XCTAssertEqual(convertibleModel.weightFormatBadgeLabel, "safetensors → .miv")
+        XCTAssertEqual(convertibleModel.resolvedEngineId, "m5rt")
 
+        // 2) Repacked .miv model co-located alongside original .safetensors
+        let repackedJSON = Data(#"""
+        {
+          "id": "Qwen3.8-27B-4bit",
+          "loaded": true,
+          "is_loading": false,
+          "estimated_size": 16000,
+          "config_model_type": "qwen3_8",
+          "weight_format": "miv",
+          "has_miv_weights": true,
+          "pending_auto_repack": false,
+          "auto_external_engine": "m5rt"
+        }
+        """#.utf8)
+        let repackedModel = try decoder.decode(ModelDTO.self, from: repackedJSON)
+        XCTAssertFalse(repackedModel.isMivOnly)
+        XCTAssertEqual(repackedModel.weightFormatBadgeLabel, ".miv")
+        XCTAssertEqual(repackedModel.resolvedEngineId, "m5rt")
+
+        // 3) Pure .miv model (and legacy .omlxm5 compatibility)
         let pureJSON = Data(#"""
         {
           "id": "Qwen3.8-PureMiv",
@@ -1072,12 +1101,16 @@ final class ModelSettingsScreenVMTests: XCTestCase {
           "is_loading": false,
           "estimated_size": 2000,
           "config_model_type": "qwen3_8",
-          "model_format": "omlxm5",
+          "model_format": "miv",
+          "weight_format": "miv",
+          "has_miv_weights": true,
           "auto_external_engine": "m5rt"
         }
         """#.utf8)
         let pureModel = try decoder.decode(ModelDTO.self, from: pureJSON)
+        XCTAssertTrue(pureModel.isMivOnly)
         XCTAssertTrue(pureModel.isOMLXM5Only)
+        XCTAssertEqual(pureModel.weightFormatBadgeLabel, ".miv")
         XCTAssertEqual(pureModel.resolvedEngineId, "m5rt")
     }
 }

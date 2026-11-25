@@ -12,6 +12,7 @@ final class ModelsScreenVM {
     /// trash glyph and the whole row's button-stack is disabled to prevent
     /// double-tap deletes against a model the server is still unloading.
     private(set) var deletingID: String?
+    private(set) var convertingID: String?
 
     /// Files tab of the model card opened from an update badge.
     var updateTarget: ModelCardTarget?
@@ -144,6 +145,22 @@ final class ModelsScreenVM {
             defer { Task { @MainActor [weak self] in self?.deletingID = nil } }
             do {
                 _ = try await client.deleteHFModel(modelName: id)
+                await self?.refresh()
+                self?.lastError = nil
+            } catch {
+                guard let self else { return }
+                self.lastError = error.omlxDescription
+            }
+        }
+    }
+
+    func convertToMiv(id: String, client: OMLXClient) {
+        guard convertingID == nil else { return }
+        convertingID = id
+        Task { [weak self] in
+            defer { Task { @MainActor [weak self] in self?.convertingID = nil } }
+            do {
+                _ = try await client.convertModelToMiv(id: id)
                 await self?.refresh()
                 self?.lastError = nil
             } catch {

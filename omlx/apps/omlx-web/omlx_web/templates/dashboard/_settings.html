@@ -1844,6 +1844,10 @@
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
+                                            <span x-show="!model.virtual && model.model_format !== 'gguf'" x-cloak
+                                                  :class="model.pending_auto_repack ? 'bg-amber-50 text-amber-700 border-amber-200 font-mono' : ((model.weight_format && model.weight_format !== 'safetensors') ? 'bg-teal-50 text-teal-700 border-teal-200 font-mono' : 'bg-neutral-100 text-neutral-500 border-neutral-200 font-mono')"
+                                                  class="badge"
+                                                  x-text="modelWeightFormatLabel(model)"></span>
                                             <template x-for="engine in (model.external_engines || []).filter(e => e.compatible)" :key="engine.id">
                                                 <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200"
                                                       @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.external_engine_tooltip').replace('{engine}', engine.label))"

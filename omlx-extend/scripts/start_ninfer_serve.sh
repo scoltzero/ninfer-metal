@@ -385,22 +385,24 @@ if [[ -n "${CONFIG_FILE}" && -f "${CONFIG_FILE}" ]]; then
   )
 fi
 
-# 4. Auto-discover first model containing `model.omlxm5` if none specified on CLI or TOML.
+# 4. Auto-discover first model containing `model.miv` (or legacy `model.omlxm5`) if none specified on CLI or TOML.
 discover_first_model_dir() {
-  local root found
+  local root found artifact_name
   local roots=("./models")
   if [[ -d "${REPO_ROOT}/models" && "${REPO_ROOT}/models" != "./models" ]]; then
     roots+=("${REPO_ROOT}/models")
   fi
   roots+=("${HOME}/Library/Application Support/oMLX/models")
 
-  for root in "${roots[@]}"; do
-    [[ -d "${root}" ]] || continue
-    found="$(find "${root}" -maxdepth 3 -type f -name 'model.omlxm5' 2>/dev/null | LC_ALL=C sort | head -n 1 || true)"
-    if [[ -n "${found}" ]]; then
-      dirname "${found}"
-      return 0
-    fi
+  for artifact_name in "model.miv" "model.omlxm5"; do
+    for root in "${roots[@]}"; do
+      [[ -d "${root}" ]] || continue
+      found="$(find "${root}" -maxdepth 3 -type f -name "${artifact_name}" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)"
+      if [[ -n "${found}" ]]; then
+        dirname "${found}"
+        return 0
+      fi
+    done
   done
   return 1
 }
@@ -487,7 +489,7 @@ if [[ -z "${EFFECTIVE_MODEL}" ]]; then
     printf '\n'
     exit 0
   fi
-  echo "No model.omlxm5 found in ./models/ or ~/Library/Application Support/oMLX/models/. Usage: $0 /path/to/model-dir [extra ninfer-metal-serve args...]" >&2
+  echo "No model.miv (or model.omlxm5) found in ./models/ or ~/Library/Application Support/oMLX/models/. Usage: $0 /path/to/model-dir [extra ninfer-metal-serve args...]" >&2
   exit 2
 fi
 

@@ -313,7 +313,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/apps/omlx-mac/Resources/Localizable.xcstrings b/apps/omlx-mac/Resources/Localizable.xcstrings
-index a9c9fb7..17346d4 100644
+index a9c9fb7..eee0e6f 100644
 --- a/apps/omlx-mac/Resources/Localizable.xcstrings
 +++ b/apps/omlx-mac/Resources/Localizable.xcstrings
 @@ -14660,6 +14660,18 @@
@@ -426,7 +426,7 @@ index a9c9fb7..17346d4 100644
          }
        }
      },
-@@ -60020,6 +60086,1096 @@
+@@ -60020,6 +60086,1312 @@
            }
          }
        }
@@ -1520,6 +1520,222 @@ index a9c9fb7..17346d4 100644
 +          }
 +        }
 +      }
++    },
++    "models.format.miv_colocated.help" : {
++      "comment" : "Tooltip when repacked .miv weights sit alongside original .safetensors; placeholder is format name",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Repacked .%@ Metal 4 microkernel weights (co-located alongside original .safetensors)."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "已重排 .%@ Metal 4 微内核权重（与原 .safetensors 同目录并存）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "已重排 .%@ Metal 4 微核心權重（與原 .safetensors 同目錄並存）。"
++          }
++        }
++      }
++    },
++    "models.format.miv_only.help" : {
++      "comment" : "Tooltip for a pure .miv microkernel weight folder; placeholder is format name",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Pure .%@ Metal 4 microkernel weights (no .safetensors in folder)."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "纯 .%@ Metal 4 微内核权重（目录内无原 .safetensors）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "純 .%@ Metal 4 微核心權重（目錄內無原 .safetensors）。"
++          }
++        }
++      }
++    },
++    "models.format.pending_repack.help" : {
++      "comment" : "Tooltip when a convertible .safetensors model will auto-repack on first Load; placeholder is target format",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Currently .safetensors; first Load automatically repacks .%@ alongside original weights."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "当前为 .safetensors；首次点击加载将在同目录自动重排生成 .%@（保留原权重）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "目前為 .safetensors；首次點擊載入將在同目錄自動重排生成 .%@（保留原權重）。"
++          }
++        }
++      }
++    },
++    "models.format.safetensors.help" : {
++      "comment" : "Tooltip for standard .safetensors model format badge",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Standard .safetensors weights"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "通用 .safetensors 权重"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "通用 .safetensors 權重"
++          }
++        }
++      }
++    },
++    "models.format.safetensors_with_miv.help" : {
++      "comment" : "Tooltip when a model runs on .safetensors while .miv also exists in the directory",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Running on original .safetensors weights (.miv weights are also present in this folder)."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "当前使用原 .safetensors 权重运行（同目录已包含重排后的 .miv 权重）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "目前使用原 .safetensors 權重執行（同目錄已包含重排後的 .miv 權重）。"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.auto_repack_hint" : {
++      "comment" : "Sublabel when a convertible .safetensors model will auto-repack to .miv on first Load; placeholder is engine name",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Auto-routed to %@. First Load automatically repacks .miv alongside original .safetensors."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "已自动路由至 %@；首次加载将在同目录自动重排生成 .miv（保留原 .safetensors）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "已自動路由至 %@；首次載入將在同目錄自動重排生成 .miv（保留原 .safetensors）。"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.convert_miv" : {
++      "comment" : "Action that repacks .safetensors weights to .miv alongside original weights",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Convert to .miv"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "转换为 .miv"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "轉換為 .miv"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.converting_miv" : {
++      "comment" : "Status badge while repacking .safetensors weights to .miv",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Repacking .miv…"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正在重排 .miv…"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正在重排 .miv…"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.miv_only" : {
++      "comment" : "Sublabel for the external engine toggle of a pure .miv model without Stock MLX .safetensors weights",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Pure .miv models run on a Metal 4 microkernel only."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "纯 .miv 模型仅支持通过 Metal 4 微内核运行。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "純 .miv 模型僅支援透過 Metal 4 微核心執行。"
++          }
++        }
++      }
      }
    },
    "version" : "1.0"
@@ -2013,10 +2229,10 @@ index 2291b42..db09ba1 100644
  
  private struct MarkItDownSection: View {
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
-index 2cc8864..8fa6150 100644
+index 2cc8864..74592b1 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
 +++ b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
-@@ -54,7 +54,12 @@ struct ModelSettingsScreen: View {
+@@ -54,7 +54,15 @@ struct ModelSettingsScreen: View {
      private var page: some View {
          switch services.modelDetailPage {
          case nil:
@@ -2025,12 +2241,15 @@ index 2cc8864..8fa6150 100644
 +                model: vm.model,
 +                engineId: vm.headerEngineId,
 +                engineLabel: vm.headerEnginePillLabel,
-+                engineTooltip: vm.headerEngineTooltip
++                engineTooltip: vm.headerEngineTooltip,
++                canConvertMiv: vm.canConvertMiv,
++                isConvertingMiv: vm.isConvertingOMLXM5,
++                onConvertMiv: { Task { await vm.convertModelToMiv(client: services.client) } }
 +            )
              TopPage(vm: vm, client: services.client) { services.modelDetailPage = $0 }
          case .profiles:
              ProfilesTab(
-@@ -73,7 +78,7 @@ struct ModelSettingsScreen: View {
+@@ -73,7 +81,7 @@ struct ModelSettingsScreen: View {
              )
              .padding(.top, 14)
          case .acceleration:
@@ -2039,7 +2258,7 @@ index 2cc8864..8fa6150 100644
                  VStack(alignment: .leading, spacing: 16) {
                      AccelerationSection(vm: vm, client: services.client)
                      if vm.prefillHelperSupported {
-@@ -87,11 +92,15 @@ struct ModelSettingsScreen: View {
+@@ -87,11 +95,15 @@ struct ModelSettingsScreen: View {
                                  NSWorkspace.shared.open(url)
                              }
                          }
@@ -2056,23 +2275,51 @@ index 2cc8864..8fa6150 100644
          case .advanced:
              AdvancedPage(vm: vm, client: services.client)
          case .experimental:
-@@ -125,6 +134,9 @@ struct ModelSettingsScreen: View {
+@@ -125,6 +137,12 @@ struct ModelSettingsScreen: View {
  
  private struct Header: View {
      let model: ModelDTO?
 +    let engineId: String
 +    let engineLabel: String
 +    let engineTooltip: String
++    let canConvertMiv: Bool
++    let isConvertingMiv: Bool
++    let onConvertMiv: () -> Void
      @Environment(\.omlxTheme) private var theme
  
      var body: some View {
-@@ -152,7 +164,15 @@ private struct Header: View {
+@@ -152,7 +170,40 @@ private struct Header: View {
                  }
              }
              .layoutPriority(1)
 -            Spacer()
 +            Spacer(minLength: 8)
-+            if model != nil, model?.virtual != true {
++            if let m = model, m.virtual != true {
++                if canConvertMiv || isConvertingMiv {
++                    Button(action: onConvertMiv) {
++                        HStack(spacing: 5) {
++                            if isConvertingMiv {
++                                ProgressView().controlSize(.mini)
++                                Text(String(localized: "settings.advanced.external_engine.converting_miv",
++                                            defaultValue: "Repacking .miv…",
++                                            comment: "Status badge while repacking .safetensors weights to .miv"))
++                            } else {
++                                Text(String(localized: "settings.advanced.external_engine.convert_miv",
++                                            defaultValue: "Convert to .miv",
++                                            comment: "Action that repacks .safetensors weights to .miv alongside original weights"))
++                            }
++                        }
++                    }
++                    .buttonStyle(.omlx(.normal, size: .small))
++                    .disabled(isConvertingMiv)
++                    .fixedSize(horizontal: true, vertical: false)
++                }
++                WeightFormatPill(
++                    label: m.weightFormatBadgeLabel,
++                    kind: m.weightFormatPillKind,
++                    tooltip: m.weightFormatTooltip
++                )
++                .fixedSize(horizontal: true, vertical: false)
 +                EngineBadgePill(
 +                    engineId: engineId,
 +                    label: engineLabel,
@@ -2083,7 +2330,7 @@ index 2cc8864..8fa6150 100644
          }
          .padding(.horizontal, 14)
          .padding(.bottom, 10)
-@@ -972,11 +992,20 @@ private struct TopPage: View {
+@@ -972,11 +1023,20 @@ private struct TopPage: View {
      private func pageRow(
          _ page: ModelSettingsPage, symbol: String, gradient: [Color], isLast: Bool = false
      ) -> some View {
@@ -2106,7 +2353,7 @@ index 2cc8864..8fa6150 100644
                        action: { open(page) }) {
              Squircle(systemSymbol: symbol, gradient: gradient)
          }
-@@ -1451,15 +1480,23 @@ private struct GrammarEditor: View {
+@@ -1451,15 +1511,23 @@ private struct GrammarEditor: View {
  
  // MARK: - Engine pages
  
@@ -2133,7 +2380,7 @@ index 2cc8864..8fa6150 100644
                  HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
                                        defaultValue: "These settings do not apply while an external engine serves this model.",
                                        comment: "Note above MLX-only settings while an external engine serves the model"),
-@@ -1468,7 +1505,7 @@ private struct EnginePage<Content: View>: View {
+@@ -1468,7 +1536,7 @@ private struct EnginePage<Content: View>: View {
                      .padding(.bottom, 8)
              }
              content()
@@ -2142,7 +2389,7 @@ index 2cc8864..8fa6150 100644
          }
          .padding(.top, 14)
      }
-@@ -1801,8 +1838,9 @@ private struct MemorySavingSection: View {
+@@ -1801,8 +1869,9 @@ private struct MemorySavingSection: View {
                      RowSwitch(isOn: vm.bind($vm.ssdNgramOffload, save: {
                          Task { await vm.save(.ssdNgramOffload, client: client) }
                      }))
@@ -2153,7 +2400,7 @@ index 2cc8864..8fa6150 100644
              }
              if vm.moeExpertOffloadSupported {
                  Row(label: String(localized: "settings.memory.moe_offload.label",
-@@ -1810,9 +1848,10 @@ private struct MemorySavingSection: View {
+@@ -1810,9 +1879,10 @@ private struct MemorySavingSection: View {
                                    comment: "Row label for the MoE expert offload toggle"),
                      sublabel: moeSublabel) {
                      RowSwitch(isOn: vm.bindProfile($vm.moeExpertOffloadEnabled))
@@ -2165,7 +2412,7 @@ index 2cc8864..8fa6150 100644
                  if vm.moeExpertOffloadEnabled {
                      Row(label: String(localized: "settings.memory.moe_offload.resident.label",
                                        defaultValue: "Resident Experts",
-@@ -1824,7 +1863,9 @@ private struct MemorySavingSection: View {
+@@ -1824,7 +1894,9 @@ private struct MemorySavingSection: View {
                                       comment: "Sublabel for the MoE resident expert share")) {
                          TextInput(text: vm.bindProfile($vm.moeExpertOffloadResidentPercent),
                                    placeholder: "25", mono: true, suffix: "%", width: .controlCompact)
@@ -2175,7 +2422,7 @@ index 2cc8864..8fa6150 100644
                  }
              }
              Row(label: String(localized: "settings.experimental.turboquant.label",
-@@ -1848,10 +1889,12 @@ private struct MemorySavingSection: View {
+@@ -1848,10 +1920,12 @@ private struct MemorySavingSection: View {
                          }
                      }
                      RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
@@ -2189,7 +2436,7 @@ index 2cc8864..8fa6150 100644
          }
      }
  
-@@ -1895,6 +1938,7 @@ private struct ExternalEngineRow: View {
+@@ -1895,6 +1969,7 @@ private struct ExternalEngineRow: View {
      }
  
      private var isGGUF: Bool { vm.model?.isGGUF == true }
@@ -2197,7 +2444,7 @@ index 2cc8864..8fa6150 100644
  
      private var draftRepo: String? {
          let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
-@@ -1902,12 +1946,62 @@ private struct ExternalEngineRow: View {
+@@ -1902,12 +1977,67 @@ private struct ExternalEngineRow: View {
          return engine.draftRepo
      }
  
@@ -2247,12 +2494,17 @@ index 2cc8864..8fa6150 100644
 +                          comment: "Hint shown when an adapted model is overridden back to Stock MLX")
 +        }
 +        if isOMLXM5Only {
-+            return String(localized: "settings.advanced.external_engine.omlxm5_only",
-+                          defaultValue: "Pure .omlxm5 models run on a Metal 4 microkernel only.",
-+                          comment: "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights")
++            return String(localized: "settings.advanced.external_engine.miv_only",
++                          defaultValue: "Pure .miv models run on a Metal 4 microkernel only.",
++                          comment: "Sublabel for the external engine toggle of a pure .miv model without Stock MLX .safetensors weights")
 +        }
 +        if vm.isAutoRoutedExternalEngine {
 +            let autoName = vm.externalEngineDisplayName(for: vm.autoExternalEngine)
++            if vm.model?.pendingAutoRepack == true {
++                return String(localized: "settings.advanced.external_engine.auto_repack_hint",
++                              defaultValue: "Auto-routed to \(autoName). First Load automatically repacks .miv alongside original .safetensors.",
++                              comment: "Sublabel when a convertible .safetensors model will auto-repack to .miv on first Load; placeholder is engine name")
++            }
 +            return String(localized: "settings.advanced.external_engine.auto_routed",
 +                          defaultValue: "Auto-routed to \(autoName) for this adapted model. Turn off to use Stock MLX.",
 +                          comment: "Sublabel when an adapted model is automatically routed to an external engine; placeholder is engine name")
@@ -2260,7 +2512,7 @@ index 2cc8864..8fa6150 100644
          if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
              return reason
          }
-@@ -1941,21 +2035,39 @@ private struct ExternalEngineRow: View {
+@@ -1941,21 +2071,39 @@ private struct ExternalEngineRow: View {
                      .disabled(draftStarted)
                      .help(draftError ?? "")
                  }
@@ -2270,20 +2522,20 @@ index 2cc8864..8fa6150 100644
 -                          options: engines
 -                              .filter { $0.compatible || $0.id == vm.externalEngine }
 -                              .map { ($0.id, $0.label) })
-+                if vm.canConvertOMLXM5 || vm.isConvertingOMLXM5 {
++                if vm.canConvertMiv || vm.isConvertingOMLXM5 {
 +                    Button {
-+                        Task { await vm.convertModelToOMLXM5(client: client) }
++                        Task { await vm.convertModelToMiv(client: client) }
 +                    } label: {
 +                        HStack(spacing: 5) {
 +                            if vm.isConvertingOMLXM5 {
 +                                ProgressView().controlSize(.mini)
-+                                Text(String(localized: "settings.advanced.external_engine.converting_omlxm5",
-+                                            defaultValue: "Converting…",
-+                                            comment: "Button label while converting .safetensors weights to .omlxm5"))
++                                Text(String(localized: "settings.advanced.external_engine.converting_miv",
++                                            defaultValue: "Repacking .miv…",
++                                            comment: "Status badge while repacking .safetensors weights to .miv"))
 +                            } else {
-+                                Text(String(localized: "settings.advanced.external_engine.convert_omlxm5",
-+                                            defaultValue: "Convert to .omlxm5",
-+                                            comment: "Button that converts .safetensors weights to .omlxm5 for miv Core Backend"))
++                                Text(String(localized: "settings.advanced.external_engine.convert_miv",
++                                            defaultValue: "Convert to .miv",
++                                            comment: "Action that repacks .safetensors weights to .miv alongside original weights"))
 +                            }
 +                        }
 +                    }
@@ -2308,7 +2560,7 @@ index 2cc8864..8fa6150 100644
              }
          }
      }
-@@ -2230,9 +2342,10 @@ private struct AccelerationSection: View {
+@@ -2230,9 +2378,10 @@ private struct AccelerationSection: View {
                                comment: "Row label for the Lightning MTP toggle"),
                  sublabel: mtpSublabel) {
                  RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
@@ -2320,7 +2572,7 @@ index 2cc8864..8fa6150 100644
              if vm.mtpEnabled {
                  Row(label: String(localized: "settings.acceleration.mtp.depth.label",
                                    defaultValue: "Adaptive max depth",
-@@ -2246,6 +2359,8 @@ private struct AccelerationSection: View {
+@@ -2246,6 +2395,8 @@ private struct AccelerationSection: View {
                          options: ModelSettingsScreenVM.mtpDepthOptions
                      )
                  }
@@ -2329,7 +2581,7 @@ index 2cc8864..8fa6150 100644
              }
  
              if vm.canImportMtplxSidecar {
-@@ -2277,9 +2392,10 @@ private struct AccelerationSection: View {
+@@ -2277,9 +2428,10 @@ private struct AccelerationSection: View {
                                comment: "Row label for the DFlash toggle"),
                  sublabel: dflashSublabel) {
                  RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
@@ -2341,7 +2593,7 @@ index 2cc8864..8fa6150 100644
              if vm.dflashEnabled {
                  Row(label: String(localized: "settings.experimental.dflash.draft.label",
                                    defaultValue: "DFlash Draft Model",
-@@ -2290,6 +2406,8 @@ private struct AccelerationSection: View {
+@@ -2290,6 +2442,8 @@ private struct AccelerationSection: View {
                          options: vm.draftModelOptions()
                      )
                  }
@@ -2350,7 +2602,7 @@ index 2cc8864..8fa6150 100644
                  Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
                                    defaultValue: "Draft Quantization",
                                    comment: "Row label for the DFlash draft quantization toggle"),
-@@ -2298,6 +2416,8 @@ private struct AccelerationSection: View {
+@@ -2298,6 +2452,8 @@ private struct AccelerationSection: View {
                                       comment: "Sublabel for the DFlash draft quantization toggle")) {
                      RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                  }
@@ -2359,7 +2611,7 @@ index 2cc8864..8fa6150 100644
                  if vm.dflashDraftQuantEnabled {
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
                                        defaultValue: "Weight Bits",
-@@ -2308,6 +2428,8 @@ private struct AccelerationSection: View {
+@@ -2308,6 +2464,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
                          )
                      }
@@ -2368,7 +2620,7 @@ index 2cc8864..8fa6150 100644
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
                                        defaultValue: "Group Size",
                                        comment: "Row label for the DFlash draft quantization group size picker")) {
-@@ -2317,6 +2439,8 @@ private struct AccelerationSection: View {
+@@ -2317,6 +2475,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
                          )
                      }
@@ -2377,7 +2629,7 @@ index 2cc8864..8fa6150 100644
                  }
                  Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                    defaultValue: "Verify Mode",
-@@ -2330,6 +2454,8 @@ private struct AccelerationSection: View {
+@@ -2330,6 +2490,8 @@ private struct AccelerationSection: View {
                          options: ModelSettingsScreenVM.dflashVerifyModeOptions
                      )
                  }
@@ -2386,7 +2638,7 @@ index 2cc8864..8fa6150 100644
                  Row(label: String(localized: "settings.experimental.dflash.window_size.label",
                                    defaultValue: "Draft Window Size",
                                    comment: "Row label for the DFlash draft sliding-attention window size field"),
-@@ -2339,6 +2465,8 @@ private struct AccelerationSection: View {
+@@ -2339,6 +2501,8 @@ private struct AccelerationSection: View {
                      TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
                                placeholder: "2048", mono: true, width: .controlCompact)
                  }
@@ -2395,7 +2647,7 @@ index 2cc8864..8fa6150 100644
                  Row(label: String(localized: "settings.experimental.dflash.block_size.label",
                                    defaultValue: "Runtime Block Size",
                                    comment: "Row label for the DFlash runtime block size field"),
-@@ -2348,6 +2476,8 @@ private struct AccelerationSection: View {
+@@ -2348,6 +2512,8 @@ private struct AccelerationSection: View {
                      TextInput(text: vm.bindProfile($vm.dflashBlockSize),
                                placeholder: "checkpoint", mono: true, width: .controlCompact)
                  }
@@ -2404,7 +2656,7 @@ index 2cc8864..8fa6150 100644
              }
  
              // VLM MTP reveals the draft-model picker and block-size field
-@@ -2358,9 +2488,10 @@ private struct AccelerationSection: View {
+@@ -2358,9 +2524,10 @@ private struct AccelerationSection: View {
                  sublabel: vlmMtpSublabel,
                  isLast: !vm.vlmMtpEnabled && !hasFamilyRows) {
                  RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
@@ -2416,7 +2668,7 @@ index 2cc8864..8fa6150 100644
              if vm.vlmMtpEnabled {
                  Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
                                    defaultValue: "VLM Draft Model",
-@@ -2400,6 +2531,8 @@ private struct AccelerationSection: View {
+@@ -2400,6 +2567,8 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                      }))
                  }
@@ -2425,7 +2677,7 @@ index 2cc8864..8fa6150 100644
              }
              if vm.isQwen4Exp {
                  Row(label: String(localized: "settings.acceleration.qwen4_wide_decode.label",
-@@ -2413,6 +2546,8 @@ private struct AccelerationSection: View {
+@@ -2413,6 +2582,8 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                      }))
                  }
@@ -2434,7 +2686,7 @@ index 2cc8864..8fa6150 100644
              }
              // The A8 rows do not depend on an ANE backend, which several A8 families lack.
              if vm.showsA8Prefill {
-@@ -2425,9 +2560,10 @@ private struct AccelerationSection: View {
+@@ -2425,9 +2596,10 @@ private struct AccelerationSection: View {
                                      comment: "Warning on the INT8 prefill row: INT8 activations can lower output quality"),
                      isLast: !vm.a8PrefillEnabled) {
                      RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
@@ -2447,14 +2699,33 @@ index 2cc8864..8fa6150 100644
                      Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
                                        defaultValue: "Minimum Prompt Tokens",
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift
-index 8a940ec..6e24a93 100644
+index 8a940ec..bec2063 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift
 +++ b/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift
-@@ -138,6 +138,13 @@ private struct ActiveModelsSection: View {
+@@ -28,10 +28,12 @@ struct ModelsScreen: View {
+                 models: vm.libraryModels,
+                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
+                 deletingID: vm.deletingID,
++                convertingID: vm.convertingID,
+                 updates: vm,
+                 onCheckUpdates: { Task { await vm.checkForUpdates(client: services.client) } },
+                 onLoad: { id in vm.load(id: id, client: services.client) },
+                 onUnload: { id in vm.unload(id: id, client: services.client) },
++                onConvertMiv: { id in vm.convertToMiv(id: id, client: services.client) },
+                 onOpenSettings: { id in services.modelDetailID = id },
+                 onRequestRemove: { id in vm.pendingRemoveID = id },
+                 onToggleFavorite: { id, fav in vm.setFavorite(id: id, favorite: fav, client: services.client) }
+@@ -138,6 +140,19 @@ private struct ActiveModelsSection: View {
                                  ModelAliasText(alias: alias)
                              }
                              Spacer(minLength: 8)
 +                            if m.virtual != true {
++                                WeightFormatPill(
++                                    label: m.weightFormatBadgeLabel,
++                                    kind: m.weightFormatPillKind,
++                                    tooltip: m.weightFormatTooltip
++                                )
++                                .fixedSize(horizontal: true, vertical: false)
 +                                EngineBadgePill(
 +                                    engineId: m.resolvedEngineId,
 +                                    label: m.compactEngineBadgeLabel,
@@ -2464,15 +2735,65 @@ index 8a940ec..6e24a93 100644
                              ActiveBadge(model: m)
                              Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
                                  .font(.omlxMono(DesignTokens.FontSize.subheadline))
-@@ -323,6 +330,7 @@ private struct LibraryRow: View {
+@@ -190,10 +205,12 @@ private struct LibrarySection: View {
+     let models: [ModelDTO]
+     let isModelLoaded: (String) -> Bool
+     let deletingID: String?
++    let convertingID: String?
+     let updates: ModelsScreenVM
+     let onCheckUpdates: () -> Void
+     let onLoad: (String) -> Void
+     let onUnload: (String) -> Void
++    let onConvertMiv: (String) -> Void
+     let onOpenSettings: (String) -> Void
+     let onRequestRemove: (String) -> Void
+     let onToggleFavorite: (String, Bool) -> Void
+@@ -260,9 +277,11 @@ private struct LibrarySection: View {
+                         isLast: idx == models.count - 1,
+                         isLoaded: isModelLoaded(m.id),
+                         deletingID: deletingID,
++                        convertingID: convertingID,
+                         updates: updates,
+                         onLoad: onLoad,
+                         onUnload: onUnload,
++                        onConvertMiv: onConvertMiv,
+                         onOpenSettings: onOpenSettings,
+                         onRequestRemove: onRequestRemove,
+                         onToggleFavorite: onToggleFavorite
+@@ -279,9 +298,11 @@ private struct LibraryRow: View {
+     let isLast: Bool
+     let isLoaded: Bool
+     let deletingID: String?
++    let convertingID: String?
+     let updates: ModelsScreenVM
+     let onLoad: (String) -> Void
+     let onUnload: (String) -> Void
++    let onConvertMiv: (String) -> Void
+     let onOpenSettings: (String) -> Void
+     let onRequestRemove: (String) -> Void
+     let onToggleFavorite: (String, Bool) -> Void
+@@ -305,6 +326,10 @@ private struct LibraryRow: View {
+             if let alias = model.displayAlias {
+                 Button(Self.copyAliasLabel) { copy(alias) }
+             }
++            if model.canConvertMiv {
++                Button(Self.convertMivLabel) { onConvertMiv(model.id) }
++                    .disabled(convertingID != nil)
++            }
+             Button(Self.settingsLabel) { onOpenSettings(model.id) }
+             Divider()
+             Button(Self.removeLabel, role: .destructive) { onRequestRemove(model.id) }
+@@ -323,6 +348,9 @@ private struct LibraryRow: View {
                          .foregroundStyle(theme.text)
                          .lineLimit(1)
                          .truncationMode(.tail)
++                    weightFormatBadge
 +                    activeEngineBadge
++                    convertingBadge
                      updateBadge
                  }
                  details
-@@ -408,10 +416,13 @@ private struct LibraryRow: View {
+@@ -408,10 +436,13 @@ private struct LibraryRow: View {
                                  defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
                                  comment: "Tooltip on the HF cache badge in the model library")))
          }
@@ -2488,10 +2809,37 @@ index 8a940ec..6e24a93 100644
                                  comment: "Tooltip on the external engine badge in the model library; placeholder is the engine name")))
          }
          if model.isGGUF {
-@@ -440,6 +451,18 @@ private struct LibraryRow: View {
+@@ -440,6 +471,45 @@ private struct LibraryRow: View {
          .help(Self.removeLabel)
      }
  
++    @ViewBuilder
++    private var weightFormatBadge: some View {
++        if model.virtual != true {
++            WeightFormatPill(
++                label: model.weightFormatBadgeLabel,
++                kind: model.weightFormatPillKind,
++                tooltip: model.weightFormatTooltip
++            )
++            .fixedSize(horizontal: true, vertical: false)
++        }
++    }
++
++    @ViewBuilder
++    private var convertingBadge: some View {
++        if convertingID == model.id {
++            HStack(spacing: 4) {
++                ProgressView().controlSize(.mini)
++                Text(String(localized: "settings.advanced.external_engine.converting_miv",
++                            defaultValue: "Repacking .miv…",
++                            comment: "Status badge while repacking .safetensors weights to .miv"))
++                    .font(.omlxText(DesignTokens.FontSize.caption, weight: .medium))
++                    .foregroundStyle(theme.textSecondary)
++            }
++            .fixedSize(horizontal: true, vertical: false)
++        }
++    }
++
 +    @ViewBuilder
 +    private var activeEngineBadge: some View {
 +        if model.virtual != true && (model.resolvedEngineId != "mlx" || model.isStockEngineOverride) {
@@ -2507,6 +2855,19 @@ index 8a940ec..6e24a93 100644
      @ViewBuilder
      private var updateBadge: some View {
          if let update = updates.update(for: model.id) {
+@@ -485,6 +555,12 @@ private struct LibraryRow: View {
+                defaultValue: "Remove from disk",
+                comment: "Tooltip on the trash button that deletes a model from local storage")
+     }
++
++    private static var convertMivLabel: String {
++        String(localized: "settings.advanced.external_engine.convert_miv",
++               defaultValue: "Convert to .miv",
++               comment: "Action that repacks .safetensors weights to .miv alongside original weights")
++    }
+ }
+ 
+ /// Load control: load when idle, a loaded mark that turns into unload under the pointer.
 diff --git a/apps/omlx-mac/Sources/AppView/ViewModels/IntegrationsScreenVM.swift b/apps/omlx-mac/Sources/AppView/ViewModels/IntegrationsScreenVM.swift
 index 0f7a2eb..5011218 100644
 --- a/apps/omlx-mac/Sources/AppView/ViewModels/IntegrationsScreenVM.swift
@@ -2751,7 +3112,7 @@ index 0f7a2eb..5011218 100644
          let models = try await client.listModels().models
          availableModels = models.map { $0.id }
 diff --git a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
-index 0fd23d0..e620480 100644
+index 0fd23d0..c5d23aa 100644
 --- a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
 +++ b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
 @@ -243,6 +243,7 @@ final class ModelSettingsScreenVM {
@@ -2874,31 +3235,37 @@ index 0fd23d0..e620480 100644
      // Embedding audio tower. Empty seconds keeps the 30 s processor default.
      var embeddingAudioEnabled: Bool = false
      var embeddingAudioMaxSeconds: String = ""
-@@ -1542,6 +1633,23 @@ final class ModelSettingsScreenVM {
+@@ -1542,6 +1633,29 @@ final class ModelSettingsScreenVM {
          }
      }
  
-+    var canConvertOMLXM5: Bool {
-+        model?.externalEngines?.contains(where: { !$0.compatible && $0.canConvert == true }) == true
++    var canConvertMiv: Bool {
++        model?.canConvertMiv == true
 +    }
 +
-+    func convertModelToOMLXM5(client: OMLXClient) async {
-+        guard !isConvertingOMLXM5, canConvertOMLXM5 else { return }
++    var canConvertOMLXM5: Bool { canConvertMiv }
++
++    func convertModelToMiv(client: OMLXClient) async {
++        guard !isConvertingOMLXM5, canConvertMiv else { return }
 +        isConvertingOMLXM5 = true
 +        defer { isConvertingOMLXM5 = false }
 +
 +        do {
-+            _ = try await client.convertModelToOMLXM5(id: modelID)
++            _ = try await client.convertModelToMiv(id: modelID)
 +            await load(modelID: modelID, client: client, preservingEdits: false)
 +        } catch {
 +            lastError = error.omlxDescription
 +        }
 +    }
 +
++    func convertModelToOMLXM5(client: OMLXClient) async {
++        await convertModelToMiv(client: client)
++    }
++
      /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
      /// other speculative-decoding / KV-quant features. Mirrors the HTML
      /// editor's gating so the toggle disables itself and surfaces why.
-@@ -1632,7 +1740,17 @@ final class ModelSettingsScreenVM {
+@@ -1632,7 +1746,17 @@ final class ModelSettingsScreenVM {
                                comment: "Profile banner title when the model uses server defaults")
              }
              return profileDisplayName(scope: activeProfileScope, name: name)
@@ -2917,7 +3284,7 @@ index 0fd23d0..e620480 100644
              if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
              return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
          case .advanced:
-@@ -1696,9 +1814,11 @@ final class ModelSettingsScreenVM {
+@@ -1696,9 +1820,11 @@ final class ModelSettingsScreenVM {
              }
          case .advanced:
              if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
@@ -2932,6 +3299,41 @@ index 0fd23d0..e620480 100644
              }
              if trustRemoteCode {
                  items.append(String(localized: "settings.advanced.trust_remote_code.label",
+diff --git a/apps/omlx-mac/Sources/AppView/ViewModels/ModelsScreenVM.swift b/apps/omlx-mac/Sources/AppView/ViewModels/ModelsScreenVM.swift
+index 9025b03..7ae9477 100644
+--- a/apps/omlx-mac/Sources/AppView/ViewModels/ModelsScreenVM.swift
++++ b/apps/omlx-mac/Sources/AppView/ViewModels/ModelsScreenVM.swift
+@@ -12,6 +12,7 @@ final class ModelsScreenVM {
+     /// trash glyph and the whole row's button-stack is disabled to prevent
+     /// double-tap deletes against a model the server is still unloading.
+     private(set) var deletingID: String?
++    private(set) var convertingID: String?
+ 
+     /// Files tab of the model card opened from an update badge.
+     var updateTarget: ModelCardTarget?
+@@ -153,6 +154,22 @@ final class ModelsScreenVM {
+         }
+     }
+ 
++    func convertToMiv(id: String, client: OMLXClient) {
++        guard convertingID == nil else { return }
++        convertingID = id
++        Task { [weak self] in
++            defer { Task { @MainActor [weak self] in self?.convertingID = nil } }
++            do {
++                _ = try await client.convertModelToMiv(id: id)
++                await self?.refresh()
++                self?.lastError = nil
++            } catch {
++                guard let self else { return }
++                self.lastError = error.omlxDescription
++            }
++        }
++    }
++
+     private func refresh() async {
+         guard let client else { return }
+         do {
 diff --git a/apps/omlx-mac/Sources/Net/DTO/GlobalSettingsDTO.swift b/apps/omlx-mac/Sources/Net/DTO/GlobalSettingsDTO.swift
 index 3092c54..8e83021 100644
 --- a/apps/omlx-mac/Sources/Net/DTO/GlobalSettingsDTO.swift
@@ -3172,7 +3574,7 @@ index 3092c54..8e83021 100644
      /// an MCP config file consumed by every integration launcher (Claude
      /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
 diff --git a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
-index b7902d2..c619e89 100644
+index b7902d2..be10a6d 100644
 --- a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 +++ b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 @@ -54,6 +54,14 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
@@ -3190,11 +3592,106 @@ index b7902d2..c619e89 100644
      /// True when the model is structurally compatible with DFlash (block
      /// diffusion speculative decoding). The toggle stays disabled when false.
      let dflashCompatible: Bool?
-@@ -108,6 +116,115 @@ extension ModelDTO {
+@@ -88,8 +96,16 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
+     var prefillHelper: PrefillHelperStatusDTO? = nil
+     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
+     var sourceType: String? = nil
+-    /// "gguf" for a GGUF file, which only an external engine serves.
++    /// "gguf", "miv", or "omlxm5" when only an external engine serves the model.
+     var modelFormat: String? = nil
++    /// Active weight container format (`"miv"`, `"omlxm5"`, `"safetensors"`, `"gguf"`).
++    var weightFormat: String? = nil
++    /// True when repacked microkernel weights (`.miv` / `.omlxm5`) exist in the model directory.
++    var hasMivWeights: Bool? = nil
++    /// True when the model currently has `.safetensors` and will auto-repack to `.miv` on first Load.
++    var pendingAutoRepack: Bool? = nil
++    /// Target format suffix when `pendingAutoRepack` is true (e.g. `"miv"`).
++    var repackTargetFormat: String? = nil
+     /// True for builtin virtual entries (e.g. the MarkItDown document
+     /// converter) that have no real load/unload lifecycle.
+     let virtual: Bool?
+@@ -108,6 +124,192 @@ extension ModelDTO {
  
      var isInHFCache: Bool { sourceType == "hf_cache" }
      var isGGUF: Bool { modelFormat == "gguf" }
-+    var isOMLXM5Only: Bool { modelFormat == "omlxm5" }
++    var isMivOnly: Bool { modelFormat == "miv" || modelFormat == "omlxm5" }
++    var isOMLXM5Only: Bool { isMivOnly }
++
++    var canConvertMiv: Bool {
++        externalEngines?.contains(where: { $0.canConvert == true }) == true
++    }
++
++    var effectiveWeightFormat: String {
++        if let wf = weightFormat, !wf.isEmpty {
++            return wf.lowercased()
++        }
++        if isGGUF { return "gguf" }
++        if let mf = modelFormat, !mf.isEmpty {
++            return mf.lowercased()
++        }
++        return "safetensors"
++    }
++
++    var weightFormatBadgeLabel: String {
++        if pendingAutoRepack == true {
++            let target = (repackTargetFormat?.isEmpty == false) ? repackTargetFormat! : "miv"
++            return "safetensors → .\(target)"
++        }
++        let fmt = effectiveWeightFormat
++        switch fmt {
++        case "gguf":
++            return "GGUF"
++        case "safetensors":
++            return "safetensors"
++        default:
++            return fmt.hasPrefix(".") ? fmt : ".\(fmt)"
++        }
++    }
++
++    var weightFormatTooltip: String {
++        if pendingAutoRepack == true {
++            let target = (repackTargetFormat?.isEmpty == false) ? repackTargetFormat! : "miv"
++            return String(
++                localized: "models.format.pending_repack.help",
++                defaultValue: "Currently .safetensors; first Load automatically repacks .\(target) alongside original weights.",
++                comment: "Tooltip when a convertible .safetensors model will auto-repack on first Load; placeholder is target format"
++            )
++        }
++        let fmt = effectiveWeightFormat
++        if fmt == "gguf" {
++            return String(
++                localized: "models.library.gguf.help",
++                defaultValue: "A GGUF file, served by an external engine",
++                comment: "Tooltip on the GGUF badge in the model library"
++            )
++        }
++        if fmt == "safetensors" {
++            if hasMivWeights == true {
++                return String(
++                    localized: "models.format.safetensors_with_miv.help",
++                    defaultValue: "Running on original .safetensors weights (.miv weights are also present in this folder).",
++                    comment: "Tooltip when a model runs on .safetensors while .miv also exists in the directory"
++                )
++            }
++            return String(
++                localized: "models.format.safetensors.help",
++                defaultValue: "Standard .safetensors weights",
++                comment: "Tooltip for standard .safetensors model format badge"
++            )
++        }
++        if isMivOnly {
++            return String(
++                localized: "models.format.miv_only.help",
++                defaultValue: "Pure .\(fmt) Metal 4 microkernel weights (no .safetensors in folder).",
++                comment: "Tooltip for a pure .miv microkernel weight folder; placeholder is format name"
++            )
++        }
++        return String(
++            localized: "models.format.miv_colocated.help",
++            defaultValue: "Repacked .\(fmt) Metal 4 microkernel weights (co-located alongside original .safetensors).",
++            comment: "Tooltip when repacked .miv weights sit alongside original .safetensors; placeholder is format name"
++        )
++    }
 +
 +    /// Localized display name for a given engine ID, translating built-in `m5rt`
 +    /// while preserving manifest display names for Path B providers and Splash.
@@ -3306,7 +3803,7 @@ index b7902d2..c619e89 100644
  }
  
  /// One entry of `external_engines` in GET /admin/api/models.
-@@ -118,6 +235,10 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
+@@ -118,6 +320,10 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
      let reason: String?
      /// Hugging Face repo of the draft the engine lacks, when one provides it.
      var draftRepo: String? = nil
@@ -3318,18 +3815,19 @@ index b7902d2..c619e89 100644
  
  struct ModelSettingsDTO: Codable, Equatable, Sendable {
 diff --git a/apps/omlx-mac/Sources/Net/Endpoints.swift b/apps/omlx-mac/Sources/Net/Endpoints.swift
-index a38dc54..0351176 100644
+index a38dc54..73a788c 100644
 --- a/apps/omlx-mac/Sources/Net/Endpoints.swift
 +++ b/apps/omlx-mac/Sources/Net/Endpoints.swift
-@@ -31,6 +31,7 @@ enum AdminAPI {
+@@ -31,6 +31,8 @@ enum AdminAPI {
      static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
      static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
      static func importMtplx(_ id: String) -> String { "\(models)/\(id)/import-mtplx" }
-+    static func convertOMLXM5(_ id: String) -> String { "\(models)/\(id)/convert-omlxm5" }
++    static func convertMiv(_ id: String) -> String { "\(models)/\(id)/convert-miv" }
++    static func convertOMLXM5(_ id: String) -> String { convertMiv(id) }
      // Prefill Accelerator (needs the server's cluster setting on).
      static let prefillHelper = "\(prefix)/prefill-helper"
      static let prefillHelperCandidates = "\(prefillHelper)/candidates"
-@@ -132,4 +133,20 @@ enum AdminAPI {
+@@ -132,4 +134,20 @@ enum AdminAPI {
      static let contextBenchStart   = "\(prefix)/bench/context/start"
      static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
      static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
@@ -3351,22 +3849,36 @@ index a38dc54..0351176 100644
 +    }
  }
 diff --git a/apps/omlx-mac/Sources/Net/OMLXClient.swift b/apps/omlx-mac/Sources/Net/OMLXClient.swift
-index 50ec8e7..0bbd319 100644
+index 50ec8e7..5272a25 100644
 --- a/apps/omlx-mac/Sources/Net/OMLXClient.swift
 +++ b/apps/omlx-mac/Sources/Net/OMLXClient.swift
-@@ -203,6 +203,11 @@ final class OMLXClient: ObservableObject {
+@@ -145,7 +145,7 @@ final class OMLXClient: ObservableObject {
+ 
+     @discardableResult
+     func loadModel(id: String) async throws -> SimpleStatusResponse {
+-        try await postEmpty(AdminAPI.loadModel(id))
++        try await postEmpty(AdminAPI.loadModel(id), timeout: 1800)
+     }
+ 
+     @discardableResult
+@@ -203,6 +203,16 @@ final class OMLXClient: ObservableObject {
          try await postEmpty(AdminAPI.importMtplx(id))
      }
  
 +    @discardableResult
++    func convertModelToMiv(id: String) async throws -> SimpleStatusResponse {
++        try await postEmpty(AdminAPI.convertMiv(id), timeout: 1800)
++    }
++
++    @discardableResult
 +    func convertModelToOMLXM5(id: String) async throws -> SimpleStatusResponse {
-+        try await postEmpty(AdminAPI.convertOMLXM5(id), timeout: 1800)
++        try await convertModelToMiv(id: id)
 +    }
 +
      // MARK: - Prefill Accelerator
  
      func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {
-@@ -601,6 +606,38 @@ final class OMLXClient: ObservableObject {
+@@ -601,6 +611,38 @@ final class OMLXClient: ObservableObject {
          try await postEmpty(AdminAPI.contextBenchCancel(benchId))
      }
  
@@ -3405,7 +3917,7 @@ index 50ec8e7..0bbd319 100644
      // MARK: - Core request
  
      private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
-@@ -619,12 +656,12 @@ final class OMLXClient: ObservableObject {
+@@ -619,12 +661,12 @@ final class OMLXClient: ObservableObject {
          return try await request("PUT", path: path, body: data)
      }
  
@@ -3423,10 +3935,10 @@ index 50ec8e7..0bbd319 100644
  
      /// DELETE with a JSON body. The /admin/api/sub-keys endpoint is the
 diff --git a/apps/omlx-mac/Sources/Theme/Components/StatusPill.swift b/apps/omlx-mac/Sources/Theme/Components/StatusPill.swift
-index 5b1957c..183db0e 100644
+index 5b1957c..b486872 100644
 --- a/apps/omlx-mac/Sources/Theme/Components/StatusPill.swift
 +++ b/apps/omlx-mac/Sources/Theme/Components/StatusPill.swift
-@@ -58,6 +58,92 @@ struct StatusPill: View {
+@@ -58,6 +58,155 @@ struct StatusPill: View {
      }
  }
  
@@ -3512,6 +4024,69 @@ index 5b1957c..183db0e 100644
 +            return (indigo, indigo.opacity(0.16))
 +        case .neutral:
 +            return (theme.textSecondary, theme.codeBg)
++        }
++    }
++}
++
++/// Monospaced weight-format badge used on `Models` rows and `ModelSettingsScreen.Header`
++/// to distinguish `.miv` microkernel weights, pending auto-repack `.safetensors → .miv`,
++/// legacy `.omlxm5`, `safetensors`, and `GGUF`.
++struct WeightFormatPill: View {
++    enum StyleKind {
++        case miv
++        case pendingRepack
++        case neutral
++    }
++
++    let label: String
++    let kind: StyleKind
++    var tooltip: String? = nil
++
++    @Environment(\.omlxTheme) private var theme
++
++    var body: some View {
++        let style = palette
++        Text(label)
++            .font(.omlxMono(DesignTokens.FontSize.caption, weight: .medium))
++            .foregroundStyle(style.text)
++            .lineLimit(1)
++            .padding(.horizontal, 6)
++            .padding(.vertical, 2)
++            .background(
++                RoundedRectangle(cornerRadius: 4, style: .continuous)
++                    .fill(style.bg)
++            )
++            .overlay(
++                RoundedRectangle(cornerRadius: 4, style: .continuous)
++                    .strokeBorder(style.border, lineWidth: 0.5)
++            )
++            .help(tooltip ?? label)
++    }
++
++    private var palette: (text: Color, bg: Color, border: Color) {
++        switch kind {
++        case .miv:
++            let teal = Color(nsColor: .systemTeal)
++            return (teal, teal.opacity(0.14), teal.opacity(0.35))
++        case .pendingRepack:
++            let amber = Color(nsColor: .systemOrange)
++            return (amber, amber.opacity(0.14), amber.opacity(0.35))
++        case .neutral:
++            return (theme.textSecondary, theme.codeBg, theme.groupBorder)
++        }
++    }
++}
++
++extension ModelDTO {
++    var weightFormatPillKind: WeightFormatPill.StyleKind {
++        if pendingAutoRepack == true {
++            return .pendingRepack
++        }
++        switch effectiveWeightFormat {
++        case "safetensors", "gguf", "bin":
++            return .neutral
++        default:
++            return .miv
 +        }
 +    }
 +}
@@ -3963,10 +4538,10 @@ index 0039ee7..25eefaa 100644
          // Direct file-level parse so a catalog corruption (extra trailing
          // comma, bad nesting) shows up here rather than as a missing-string
 diff --git a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
-index 2e40221..6614306 100644
+index 2e40221..b6e1260 100644
 --- a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
 +++ b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
-@@ -983,6 +983,103 @@ final class ModelSettingsScreenVMTests: XCTestCase {
+@@ -983,6 +983,136 @@ final class ModelSettingsScreenVMTests: XCTestCase {
          model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
          return model
      }
@@ -4023,24 +4598,30 @@ index 2e40221..6614306 100644
 +        XCTAssertEqual(vm.headerEngineId, "llama-metal")
 +    }
 +
-+    func testCanConvertOMLXM5AndPureOMLXM5Detection() throws {
++    func testMivFormatBadgesAutoRepackAndPureMivDetection() throws {
 +        let decoder = JSONDecoder()
 +        decoder.keyDecodingStrategy = .convertFromSnakeCase
 +
++        // 1) Downloaded quantized .safetensors model pending auto-repack on first Load
 +        let convertibleJSON = Data(#"""
 +        {
-+          "id": "Qwen3.5-9B",
++          "id": "Qwen3.5-9B-4bit",
 +          "loaded": false,
 +          "is_loading": false,
 +          "estimated_size": 1000,
 +          "config_model_type": "qwen3_5",
++          "weight_format": "safetensors",
++          "has_miv_weights": false,
++          "pending_auto_repack": true,
++          "repack_target_format": "miv",
++          "auto_external_engine": "m5rt",
 +          "external_engines": [
 +            {
 +              "id": "m5rt",
 +              "label": "miv Core Backend",
-+              "compatible": false,
++              "compatible": true,
 +              "can_convert": true,
-+              "reason": "Convert weights to .omlxm5 to run this model on miv Core Backend."
++              "reason": ""
 +            }
 +          ]
 +        }
@@ -4049,9 +4630,32 @@ index 2e40221..6614306 100644
 +        let vm = ModelSettingsScreenVM()
 +        vm.model = convertibleModel
 +        vm.modelID = convertibleModel.id
++        XCTAssertTrue(vm.canConvertMiv)
 +        XCTAssertTrue(vm.canConvertOMLXM5)
-+        XCTAssertFalse(convertibleModel.isOMLXM5Only)
++        XCTAssertFalse(convertibleModel.isMivOnly)
++        XCTAssertEqual(convertibleModel.weightFormatBadgeLabel, "safetensors → .miv")
++        XCTAssertEqual(convertibleModel.resolvedEngineId, "m5rt")
 +
++        // 2) Repacked .miv model co-located alongside original .safetensors
++        let repackedJSON = Data(#"""
++        {
++          "id": "Qwen3.8-27B-4bit",
++          "loaded": true,
++          "is_loading": false,
++          "estimated_size": 16000,
++          "config_model_type": "qwen3_8",
++          "weight_format": "miv",
++          "has_miv_weights": true,
++          "pending_auto_repack": false,
++          "auto_external_engine": "m5rt"
++        }
++        """#.utf8)
++        let repackedModel = try decoder.decode(ModelDTO.self, from: repackedJSON)
++        XCTAssertFalse(repackedModel.isMivOnly)
++        XCTAssertEqual(repackedModel.weightFormatBadgeLabel, ".miv")
++        XCTAssertEqual(repackedModel.resolvedEngineId, "m5rt")
++
++        // 3) Pure .miv model (and legacy .omlxm5 compatibility)
 +        let pureJSON = Data(#"""
 +        {
 +          "id": "Qwen3.8-PureMiv",
@@ -4059,12 +4663,16 @@ index 2e40221..6614306 100644
 +          "is_loading": false,
 +          "estimated_size": 2000,
 +          "config_model_type": "qwen3_8",
-+          "model_format": "omlxm5",
++          "model_format": "miv",
++          "weight_format": "miv",
++          "has_miv_weights": true,
 +          "auto_external_engine": "m5rt"
 +        }
 +        """#.utf8)
 +        let pureModel = try decoder.decode(ModelDTO.self, from: pureJSON)
++        XCTAssertTrue(pureModel.isMivOnly)
 +        XCTAssertTrue(pureModel.isOMLXM5Only)
++        XCTAssertEqual(pureModel.weightFormatBadgeLabel, ".miv")
 +        XCTAssertEqual(pureModel.resolvedEngineId, "m5rt")
 +    }
  }
@@ -4148,7 +4756,7 @@ index 75fd00b..3917edd 100644
    "modal.model_settings.trust_remote_code": "信任远程代码",
    "modal.model_settings.trust_remote_code_hint": "允许模型仓库在加载时运行任意 Python 代码。请仅对可信的发布者启用。",
 diff --git a/apps/omlx-web/omlx_web/static/js/dashboard.js b/apps/omlx-web/omlx_web/static/js/dashboard.js
-index 62235bb..dd5ec9a 100644
+index 62235bb..e0aabcb 100644
 --- a/apps/omlx-web/omlx_web/static/js/dashboard.js
 +++ b/apps/omlx-web/omlx_web/static/js/dashboard.js
 @@ -332,6 +332,7 @@
@@ -4168,30 +4776,42 @@ index 62235bb..dd5ec9a 100644
                      model_format: model?.model_format || null,
                      trust_remote_code: s.trust_remote_code || false,
                      embedding_audio_enabled: s.embedding_audio_enabled || false,
-@@ -4848,13 +4851,69 @@
+@@ -4848,13 +4851,81 @@
                  return this.modelSettings.model_format === 'gguf';
              },
  
 -            // A GGUF runs on an external engine even when its settings pick none.
 +            isOmlxm5OnlyModel() {
-+                return this.modelSettings.model_format === 'omlxm5';
++                return this.modelSettings.model_format === 'miv' || this.modelSettings.model_format === 'omlxm5';
 +            },
 +
 +            canConvertOmlxm5() {
 +                const engines = this.modelSettings.external_engines || [];
-+                return engines.some(e => !e.compatible && e.can_convert);
++                return engines.some(e => e.can_convert);
++            },
++
++            modelWeightFormatLabel(model) {
++                if (!model || model.virtual) return '';
++                if (model.pending_auto_repack) {
++                    const target = model.repack_target_format || 'miv';
++                    return `safetensors → .${target}`;
++                }
++                const fmt = (model.weight_format || model.model_format || 'safetensors').toLowerCase();
++                if (fmt === 'gguf') return 'GGUF';
++                if (fmt === 'safetensors') return 'safetensors';
++                return fmt.startsWith('.') ? fmt : `.${fmt}`;
 +            },
 +
 +            async convertModelOmlxm5() {
 +                if (!this.selectedModel || this.convertingOmlxm5) return;
 +                this.convertingOmlxm5 = true;
 +                try {
-+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-omlxm5`, {
++                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-miv`, {
 +                        method: 'POST',
 +                    });
 +                    const data = await response.json().catch(() => ({}));
 +                    if (!response.ok) {
-+                        alert(data.detail || 'Failed to convert model to .omlxm5');
++                        alert(data.detail || 'Failed to convert model to .miv');
 +                        return;
 +                    }
 +                    if (data.message) alert(data.message);
@@ -4240,7 +4860,7 @@ index 62235bb..dd5ec9a 100644
                  const engines = this.modelSettings.external_engines || [];
                  const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
 diff --git a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
-index 2e9a43b..4d7e904 100644
+index 2e9a43b..df7ae0d 100644
 --- a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 +++ b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 @@ -521,10 +521,10 @@
@@ -4350,7 +4970,7 @@ index 2e9a43b..4d7e904 100644
 +                                            :disabled="convertingOmlxm5"
 +                                            :class="convertingOmlxm5 ? 'opacity-50 cursor-not-allowed' : ''"
 +                                            class="mt-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all inline-flex items-center gap-1.5">
-+                                        <span x-text="convertingOmlxm5 ? 'Converting…' : 'Convert to .omlxm5'"></span>
++                                        <span x-text="convertingOmlxm5 ? 'Repacking .miv…' : 'Convert to .miv'"></span>
 +                                    </button>
                                  </div>
                                  <button type="button"
@@ -4364,11 +4984,26 @@ index 2e9a43b..4d7e904 100644
                                          ]"
                                          role="switch"
                                          :aria-checked="effectiveExternalEngine() ? 'true' : 'false'"
+diff --git a/apps/omlx-web/omlx_web/templates/dashboard/_settings.html b/apps/omlx-web/omlx_web/templates/dashboard/_settings.html
+index 869cf2d..0a5ebfc 100644
+--- a/apps/omlx-web/omlx_web/templates/dashboard/_settings.html
++++ b/apps/omlx-web/omlx_web/templates/dashboard/_settings.html
+@@ -1844,6 +1844,10 @@
+                                             <span x-show="model.settings?.model_alias" x-cloak
+                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
+                                                   x-text="model.settings?.model_alias"></span>
++                                            <span x-show="!model.virtual && model.model_format !== 'gguf'" x-cloak
++                                                  :class="model.pending_auto_repack ? 'bg-amber-50 text-amber-700 border-amber-200 font-mono' : ((model.weight_format && model.weight_format !== 'safetensors') ? 'bg-teal-50 text-teal-700 border-teal-200 font-mono' : 'bg-neutral-100 text-neutral-500 border-neutral-200 font-mono')"
++                                                  class="badge"
++                                                  x-text="modelWeightFormatLabel(model)"></span>
+                                             <template x-for="engine in (model.external_engines || []).filter(e => e.compatible)" :key="engine.id">
+                                                 <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200"
+                                                       @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.external_engine_tooltip').replace('{engine}', engine.label))"
 diff --git a/omlx/admin/routes.py b/omlx/admin/routes.py
-index 39132d8..d274708 100644
+index 39132d8..9170c09 100644
 --- a/omlx/admin/routes.py
 +++ b/omlx/admin/routes.py
-@@ -45,6 +45,33 @@ from .._version import __version__ as _omlx_version
+@@ -45,6 +45,37 @@ from .._version import __version__ as _omlx_version
  from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
  from ..api.openai_models import _coerce_tool_call_arguments
  from ..api.utils import _try_parse_json
@@ -4378,12 +5013,16 @@ index 39132d8..d274708 100644
 +    M5RT_ENGINE_LABEL,
 +    M5RT_PROVIDER_ID,
 +    apply_m5rt_model_settings_update,
++    can_convert_to_miv,
 +    can_convert_to_omlxm5,
++    convert_model_to_miv,
 +    convert_model_to_omlxm5,
++    detect_model_weight_format_info,
 +    discover_external_engine_plugins,
 +    external_engine_dflash_compatibility,
 +    external_engine_mtp_compatibility,
 +    find_m5rt_binary,
++    get_external_engine_plugin,
 +    get_external_engine_supported_settings,
 +    get_external_engines,
 +    inspect_m5rt_binary,
@@ -4402,7 +5041,7 @@ index 39132d8..d274708 100644
  from ..engine.splash import (
      EXTERNAL_ENGINES,
      SPLASH_INSTALL_HINT,
-@@ -499,8 +526,12 @@ class ModelSettingsRequest(BaseModel):
+@@ -499,8 +530,12 @@ class ModelSettingsRequest(BaseModel):
      specprefill_draft_model: str | None = None
      specprefill_keep_pct: float | None = None
      specprefill_threshold: int | None = None
@@ -4416,7 +5055,7 @@ index 39132d8..d274708 100644
      # DFlash (block diffusion speculative decoding)
      dflash_enabled: bool | None = None
      dflash_draft_model: str | None = None
-@@ -908,6 +939,8 @@ class GlobalSettingsRequest(BaseModel):
+@@ -908,6 +943,8 @@ class GlobalSettingsRequest(BaseModel):
      splash_max_memory_gb: float | None = None
      splash_ssd_cache_gb: float | None = None
      splash_ane_prefill: bool | None = None
@@ -4425,7 +5064,7 @@ index 39132d8..d274708 100644
  
      # UI settings
      ui_language: str | None = None
-@@ -1084,8 +1117,12 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
+@@ -1084,8 +1121,12 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
  _PAROQUANT_DFLASH_MODEL_TYPES = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
  
  
@@ -4439,7 +5078,7 @@ index 39132d8..d274708 100644
      model_type = model_info.get("config_model_type")
      is_paro, paro_reason = _paroquant_compat_for_model(model_info)
      if is_paro and model_type not in _PAROQUANT_DFLASH_MODEL_TYPES:
-@@ -1099,23 +1136,71 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
+@@ -1099,23 +1140,83 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
          return []
      if model_info.get("is_helper"):
          return []
@@ -4503,18 +5142,30 @@ index 39132d8..d274708 100644
          }
 -        for engine_id, label in EXTERNAL_ENGINES.items()
 -    ]
-+        if engine_id == M5RT_ENGINE_ID and not compatible:
++        if engine_id == M5RT_ENGINE_ID:
 +            m5rt_cfg_path = (
 +                global_settings.integrations.m5rt_path if global_settings else None
 +            )
-+            can_conv, _ = can_convert_to_omlxm5(
++            can_conv, _ = can_convert_to_miv(
 +                model_info.get("model_path") or "", m5rt_cfg_path, settings
 +            )
 +            if can_conv:
 +                row["can_convert"] = True
-+                row["reason"] = (
-+                    "Convert weights to .omlxm5 to run this model on miv Core Backend."
-+                )
++                if not compatible:
++                    row["reason"] = (
++                        "Convert weights to .miv (or click Load to auto-repack) for miv Core Backend."
++                    )
++        elif engine_id != "splash":
++            plugin_obj = plugins.get(engine_id)
++            if plugin_obj is not None and callable(getattr(plugin_obj, "can_convert", None)):
++                try:
++                    p_can_conv, _ = plugin_obj.can_convert(
++                        model_info.get("model_path") or "", settings
++                    )
++                    if p_can_conv:
++                        row["can_convert"] = True
++                except Exception:
++                    pass
 +        supported = list(get_external_engine_supported_settings(engine_id))
 +        if supported:
 +            row["supported_standard_settings"] = supported
@@ -4523,7 +5174,7 @@ index 39132d8..d274708 100644
  
  
  def _entry_is_diffusion_model(entry) -> bool:
-@@ -1170,6 +1255,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
+@@ -1170,6 +1271,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
      settings["moe_expert_offload_resident_fraction"] = 0.25
      settings["specprefill_enabled"] = False
      settings["external_engine"] = None
@@ -4534,7 +5185,7 @@ index 39132d8..d274708 100644
      settings["dflash_enabled"] = False
      settings["mtp_enabled"] = False
      settings["vlm_mtp_enabled"] = False
-@@ -1266,7 +1355,9 @@ _MTP_EXTERNAL_ENGINE_REASON = (
+@@ -1266,7 +1371,9 @@ _MTP_EXTERNAL_ENGINE_REASON = (
  
  
  def _mtp_compat_for_model(
@@ -4545,7 +5196,7 @@ index 39132d8..d274708 100644
  ) -> tuple[bool, str]:
      """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
  
-@@ -1295,8 +1386,10 @@ def _mtp_compat_for_model(
+@@ -1295,8 +1402,10 @@ def _mtp_compat_for_model(
          _is_mtp_compatible,
      )
  
@@ -4558,7 +5209,7 @@ index 39132d8..d274708 100644
  
      is_paro, paro_reason = _paroquant_compat_for_model(model_info)
      if is_paro:
-@@ -2523,6 +2616,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2523,6 +2632,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
          await asyncio.to_thread(
              find_splash_binary, global_settings.integrations.splash_path
          )
@@ -4568,7 +5219,7 @@ index 39132d8..d274708 100644
  
      # Get engine pool status
      status = engine_pool.get_status()
-@@ -2556,14 +2652,88 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2556,14 +2668,88 @@ async def list_models(is_admin: bool = Depends(require_admin)):
      models = []
      # M1/M2 GPUs (families 13/14) have no native bf16 ALU path.
      fp16_recast_gpu = get_apple_gpu_generation() in (13, 14)
@@ -4660,7 +5311,37 @@ index 39132d8..d274708 100644
          )
          external_engines = _external_engines_for_model(
              engine_pool, model_info, settings
-@@ -2709,6 +2879,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2657,6 +2843,20 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+                     exc_info=True,
+                 )
+ 
++        fmt_info = detect_model_weight_format_info(
++            model_info.get("model_path"),
++            model_format=model_info.get("model_format"),
++            active_external_engine=(
++                serving_engine_id
++                if serving_engine_id and serving_engine_id != "mlx"
++                else active_ext_engine
++            ),
++            model_settings=settings,
++            configured_m5rt_binary=(
++                global_settings.integrations.m5rt_path if global_settings else None
++            ),
++        )
++
+         model_data = {
+             "id": model_id,
+             "model_path": model_info.get("model_path", ""),
+@@ -2704,11 +2904,19 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+             "source_type": model_info.get("source_type", "local"),
+             "source_repo_id": model_info.get("source_repo_id"),
+             "model_format": model_info.get("model_format"),
++            "weight_format": fmt_info["weight_format"],
++            "has_miv_weights": fmt_info["has_miv_weights"],
++            "pending_auto_repack": fmt_info["pending_auto_repack"],
++            "repack_target_format": fmt_info["repack_target_format"],
+             "source_path": model_info.get("source_path"),
+             "distributed": model_info.get("distributed", False),
              "cluster": model_info.get("cluster"),
              "last_access": model_info.get("last_access"),
              "external_engines": external_engines,
@@ -4671,16 +5352,17 @@ index 39132d8..d274708 100644
              "dflash_compatible": compat_ok,
              "dflash_compatibility_reason": compat_reason,
              "mtp_compatible": mtp_compat_ok,
-@@ -3042,6 +3216,55 @@ async def import_mtplx(
+@@ -3042,6 +3250,83 @@ async def import_mtplx(
      return {"status": "ok", "model_id": model_id, **result}
  
  
++@router.post("/api/models/{model_id}/convert-miv")
 +@router.post("/api/models/{model_id}/convert-omlxm5")
-+async def convert_model_omlxm5(
++async def convert_model_miv(
 +    model_id: str,
 +    is_admin: bool = Depends(_require_admin_or_bearer),
 +):
-+    """Convert a supported Qwen `.safetensors` checkpoint to `model.omlxm5` for `miv`."""
++    """Repack a supported `.safetensors` checkpoint to `.miv` (or Path B format) alongside original weights."""
 +    engine_pool = _get_engine_pool()
 +    if engine_pool is None:
 +        raise HTTPException(status_code=503, detail="Engine pool not initialized")
@@ -4694,20 +5376,46 @@ index 39132d8..d274708 100644
 +    model_settings = (
 +        settings_mgr.get_settings(model_id) if settings_mgr is not None else None
 +    )
++    repo_label = getattr(entry, "source_repo_id", None) or model_id
 +
 +    try:
-+        result = await asyncio.to_thread(
-+            convert_model_to_omlxm5,
-+            entry.model_path,
-+            source_repo=getattr(entry, "source_repo_id", None) or model_id,
-+            configured_binary=m5rt_cfg_path,
-+            model_settings=model_settings,
-+            nax_pretile=True,
++        m5_ok, m5_reason = can_convert_to_miv(
++            entry.model_path, m5rt_cfg_path, model_settings
 +        )
++        if m5_ok:
++            result = await asyncio.to_thread(
++                convert_model_to_miv,
++                entry.model_path,
++                source_repo=repo_label,
++                configured_binary=m5rt_cfg_path,
++                model_settings=model_settings,
++                nax_pretile=True,
++            )
++            target_label = M5RT_ENGINE_LABEL
++        else:
++            plugin_converted = None
++            for _, plugin in sorted(discover_external_engine_plugins().items()):
++                if not callable(plugin.can_convert) or not callable(plugin.convert_model):
++                    continue
++                p_ok, _ = plugin.can_convert(entry.model_path, model_settings)
++                if p_ok:
++                    plugin_converted = (
++                        plugin.label,
++                        await asyncio.to_thread(
++                            plugin.convert_model,
++                            entry.model_path,
++                            source_repo=repo_label,
++                            model_settings=model_settings,
++                        ),
++                    )
++                    break
++            if plugin_converted is None:
++                raise ValueError(f"Cannot convert model to .miv: {m5_reason}")
++            target_label, result = plugin_converted
 +    except ValueError as exc:
 +        raise HTTPException(status_code=400, detail=str(exc)) from exc
 +
-+    # Clear any prior Stock MLX override so auto-routing to miv Core Backend activates immediately.
++    # Clear any prior Stock MLX override so auto-routing activates immediately.
 +    if (
 +        settings_mgr is not None
 +        and model_settings is not None
@@ -4718,16 +5426,17 @@ index 39132d8..d274708 100644
 +        if callable(save_fn):
 +            save_fn(model_id, model_settings)
 +
-+    logger.info("Converted model '%s' to .omlxm5 (%s)", model_id, result.get("artifact_path"))
++    art_fmt = result.get("artifact_format") or "miv"
++    logger.info("Converted model '%s' to .%s (%s)", model_id, art_fmt, result.get("artifact_path"))
 +    if getattr(entry, "engine", None) is not None:
-+        result["message"] = "Converted to .omlxm5. Reload the model to switch to miv Core Backend."
++        result["message"] = f"Converted to .{art_fmt}. Reload the model to switch to {target_label}."
 +    return {"status": "ok", "model_id": model_id, **result}
 +
 +
  @router.post("/api/reload")
  async def reload_models(is_admin: bool = Depends(require_admin)):
      """Reload models: re-read model settings, re-discover models, preload pinned."""
-@@ -3479,33 +3702,77 @@ async def update_model_settings(
+@@ -3479,33 +3764,77 @@ async def update_model_settings(
          current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
      if "specprefill_threshold" in sent:
          current_settings.specprefill_threshold = request.specprefill_threshold or None
@@ -4739,10 +5448,10 @@ index 39132d8..d274708 100644
 +        raise HTTPException(status_code=400, detail=str(exc)) from exc
      if "external_engine" in sent:
          engine_id = None if is_diffusion_model else request.external_engine or None
-+        if engine_id == "stock" and getattr(entry, "model_format", None) == "omlxm5":
++        if engine_id == "stock" and getattr(entry, "model_format", None) in ("miv", "omlxm5"):
 +            raise HTTPException(
 +                status_code=400,
-+                detail="Pure .omlxm5 models have no Stock MLX .safetensors weights on disk.",
++                detail="Pure .miv / .omlxm5 models have no Stock MLX .safetensors weights on disk.",
 +            )
          # Check only a change: a client may resend the stored value, and a
          # launcher or draft removed later must not block other fields.
@@ -4817,7 +5526,7 @@ index 39132d8..d274708 100644
              )
              if not compat_ok:
                  raise HTTPException(status_code=400, detail=compat_reason)
-@@ -3550,12 +3817,19 @@ async def update_model_settings(
+@@ -3550,12 +3879,19 @@ async def update_model_settings(
          if new_mtp_enabled:
              # Same gate as the toggle status in the model list, which also
              # accepts MiniMax M3.1 through its bundled dspark/ draft.
@@ -4843,7 +5552,7 @@ index 39132d8..d274708 100644
              )
              if not compat_ok:
                  raise HTTPException(status_code=400, detail=compat_reason)
-@@ -4887,6 +5161,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
+@@ -4887,6 +5223,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
      await asyncio.to_thread(
          find_splash_binary, global_settings.integrations.splash_path
      )
@@ -4853,7 +5562,7 @@ index 39132d8..d274708 100644
      return _global_settings_response(global_settings)
  
  
-@@ -4938,6 +5215,97 @@ def _splash_status(global_settings) -> dict:
+@@ -4938,6 +5277,97 @@ def _splash_status(global_settings) -> dict:
      }
  
  
@@ -4951,7 +5660,7 @@ index 39132d8..d274708 100644
  def _global_settings_response(global_settings):
      from ..settings import get_auto_ssd_cache_size
  
-@@ -5113,8 +5481,12 @@ def _global_settings_response(global_settings):
+@@ -5113,8 +5543,12 @@ def _global_settings_response(global_settings):
              "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
              "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
              "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -4965,7 +5674,7 @@ index 39132d8..d274708 100644
          "system": {
              "total_memory_bytes": memory_info["total_bytes"],
              "total_memory": memory_info["total_formatted"],
-@@ -6071,6 +6443,25 @@ async def update_global_settings(
+@@ -6071,6 +6505,25 @@ async def update_global_settings(
              request.splash_ane_prefill
          )
          integrations_changed = True
@@ -4991,7 +5700,7 @@ index 39132d8..d274708 100644
      if "markitdown_enabled" in request.model_fields_set:
          global_settings.integrations.markitdown_enabled = bool(
              request.markitdown_enabled
-@@ -10290,3 +10681,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
+@@ -10290,3 +10743,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
      if not success:
          raise HTTPException(status_code=404, detail="Task not found or still active")
      return {"success": True}
@@ -5109,10 +5818,10 @@ index 39132d8..d274708 100644
 +        )
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..4091c56
+index 0000000..edded80
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,5381 @@
+@@ -0,0 +1,6092 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -5140,7 +5849,7 @@ index 0000000..4091c56
 +import zlib
 +from collections import OrderedDict
 +from collections.abc import AsyncIterator, Callable, Iterable
-+from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
 +from pathlib import Path
 +from typing import Any
 +
@@ -5181,7 +5890,15 @@ index 0000000..4091c56
 +    "qwen3_8",
 +    "qwen3_8_moe",
 +)
-+M5RT_ARTIFACT_EXTENSIONS: tuple[str, ...] = (".omlxm5",)
++M5RT_ARTIFACT_EXTENSIONS: tuple[str, ...] = (".miv", ".omlxm5")
++M5RT_DEFAULT_CONVERTER: dict[str, Any] = {
++    "entrypoint": "tools/m5_artifact.py",
++    "subcommand": "convert",
++    "output_filename": "model.miv",
++    "artifact_extension": ".miv",
++    "default_args": ["--nax-pretile"],
++    "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
++}
 +M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
 +    "max_context_window",
 +    "mtp_enabled",
@@ -5259,6 +5976,9 @@ index 0000000..4091c56
 +    runtime_signature: Callable[..., Any] | None = None
 +    supported_standard_settings: tuple[str, ...] = ()
 +    detect_adapted: Callable[..., ProbeResult | bool] | None = None
++    can_auto_convert_fast: Callable[..., bool] | None = None
++    can_convert: Callable[..., tuple[bool, str]] | None = None
++    convert_model: Callable[..., dict[str, Any]] | None = None
 +    options_schema: tuple[dict[str, Any], ...] = ()
 +    provider_id: str | None = None
 +
@@ -5466,6 +6186,7 @@ index 0000000..4091c56
 +    draft_dir: Path | None = None
 +    draft_artifact_path: Path | None = None
 +    fake: bool = False
++    auto_convert_output: Path | None = None
 +
 +
 +@dataclass(frozen=True)
@@ -6290,6 +7011,7 @@ index 0000000..4091c56
 +        "supported_topologies": list(M5RT_SUPPORTED_TOPOLOGIES),
 +        "supported_model_types": list(M5RT_SUPPORTED_MODEL_TYPES),
 +        "artifact_extensions": list(M5RT_ARTIFACT_EXTENSIONS),
++        "converter": dict(M5RT_DEFAULT_CONVERTER),
 +    }
 +    for root in _provider_root_dirs():
 +        if not root.is_dir():
@@ -6297,10 +7019,21 @@ index 0000000..4091c56
 +        installed = _read_provider_manifest(root)
 +        if installed is None:
 +            continue
-+        for key in ("supported_topologies", "supported_model_types", "artifact_extensions"):
++        for key in ("supported_topologies", "supported_model_types"):
 +            vals = installed.get(key)
 +            if isinstance(vals, list) and vals:
 +                manifest[key] = vals
++        inst_exts = installed.get("artifact_extensions")
++        if isinstance(inst_exts, list) and inst_exts:
++            merged_exts = list(M5RT_ARTIFACT_EXTENSIONS)
++            for ext in _normalize_extensions(inst_exts):
++                if ext not in merged_exts:
++                    merged_exts.append(ext)
++            manifest["artifact_extensions"] = merged_exts
++        if isinstance(installed.get("converter"), dict):
++            manifest["converter"] = dict(installed["converter"])
++        if installed.get("_provider_dir"):
++            manifest["_provider_dir"] = installed["_provider_dir"]
 +        break
 +    return manifest
 +
@@ -6562,8 +7295,8 @@ index 0000000..4091c56
 +        if is_builtin or explicit_provider_match or topology_matched or model_type_matched:
 +            return True
 +        # Non-builtin Path B providers without an explicit provider/topology/model_type
-+        # match may only auto-claim custom non-.omlxm5 artifact extensions.
-+        return ext != ".omlxm5"
++        # match may only auto-claim custom non-.miv/.omlxm5 artifact extensions.
++        return ext not in (".miv", ".omlxm5")
 +
 +    # (c) Artifact resolution matching manifest artifact_extensions
 +    if pack_meta is not None:
@@ -6632,8 +7365,12 @@ index 0000000..4091c56
 +                reason=f"fixture parent model{ext}",
 +                explicit_provider_match=explicit_provider_match,
 +            )
-+        if ext != ".omlxm5" and mdir.is_dir():
-+            custom_matches = [p for p in sorted(mdir.glob(f"*{ext}")) if p.is_file()]
++        if ext not in (".miv", ".omlxm5") and mdir.is_dir():
++            custom_matches = [
++                p
++                for p in sorted(mdir.glob(f"*{ext}"))
++                if p.is_file() and not p.name.startswith(".")
++            ]
 +            if len(custom_matches) == 1:
 +                return ProbeResult(
 +                    adapted=True,
@@ -6662,7 +7399,7 @@ index 0000000..4091c56
 +
 +
 +def _search_artifact_cache(model_dir: Path) -> Path | None:
-+    """Match a model folder against `.cache/b0/artifacts/*.omlxm5`."""
++    """Match a model folder against `.cache/b0/artifacts/*.{miv,omlxm5}`."""
 +    cache_dirs: list[Path] = []
 +    env_cache = os.environ.get("OMLX_M5RT_ARTIFACT_DIR", "").strip()
 +    if env_cache:
@@ -6677,19 +7414,20 @@ index 0000000..4091c56
 +    for cache_dir in cache_dirs:
 +        if not cache_dir.is_dir():
 +            continue
-+        for art in sorted(cache_dir.glob("*.omlxm5")):
-+            if not art.is_file():
-+                continue
-+            conv = _read_json(Path(f"{art}.conversion.json")) or {}
-+            if config_sha and conv.get("source_config_sha256") == config_sha:
-+                return art.resolve()
-+            source_repo = str(conv.get("source_repo") or "")
-+            repo_tail = source_repo.rsplit("/", 1)[-1]
-+            if model_slug and (
-+                _normalize_slug(repo_tail) == model_slug
-+                or _normalize_slug(art.stem) == model_slug
-+            ):
-+                slug_match = slug_match or art.resolve()
++        for ext in M5RT_ARTIFACT_EXTENSIONS:
++            for art in sorted(cache_dir.glob(f"*{ext}")):
++                if not art.is_file() or art.name.startswith("."):
++                    continue
++                conv = _read_json(Path(f"{art}.conversion.json")) or {}
++                if config_sha and conv.get("source_config_sha256") == config_sha:
++                    return art.resolve()
++                source_repo = str(conv.get("source_repo") or "")
++                repo_tail = source_repo.rsplit("/", 1)[-1]
++                if model_slug and (
++                    _normalize_slug(repo_tail) == model_slug
++                    or _normalize_slug(art.stem) == model_slug
++                ):
++                    slug_match = slug_match or art.resolve()
 +    return slug_match
 +
 +
@@ -6743,6 +7481,8 @@ index 0000000..4091c56
 +        for ext in extensions
 +        for p in sorted(model_dir.glob(f"*{ext}"))
 +        if p.is_file()
++        and not p.name.startswith(".")
++        and p.name.lower() not in ("mtp.miv", "mtp.omlxm5")
 +    ]
 +    if len(local_candidates) == 1:
 +        return local_candidates[0].resolve(), ""
@@ -6973,6 +7713,8 @@ index 0000000..4091c56
 +    manifest: dict[str, Any],
 +    model_settings: object | None = None,
 +    draft_candidates: Iterable[str] = (),
++    *,
++    allow_auto_convert: bool = True,
 +) -> tuple[M5Target | None, str]:
 +    """Check whether a Path B SPI provider can serve `model_path`, returning `(M5Target, reason)`."""
 +    model_dir = Path(model_path).expanduser()
@@ -7015,16 +7757,6 @@ index 0000000..4091c56
 +            "",
 +        )
 +
-+    artifact_path, reason = _resolve_target_artifact(
-+        model_dir,
-+        model_settings,
-+        manifest=manifest,
-+        engine_id=engine_id,
-+        provider_id=provider_id,
-+    )
-+    if artifact_path is None:
-+        return None, reason
-+
 +    metallib_dir, reason = _resolve_metallib_dir(
 +        model_dir,
 +        binary,
@@ -7046,6 +7778,28 @@ index 0000000..4091c56
 +    if reason:
 +        return None, reason
 +
++    artifact_path, art_reason = _resolve_target_artifact(
++        model_dir,
++        model_settings,
++        manifest=manifest,
++        engine_id=engine_id,
++        provider_id=provider_id,
++    )
++    auto_convert_output: Path | None = None
++    if artifact_path is None:
++        if allow_auto_convert:
++            can_conv, _ = can_convert_provider_model(
++                model_dir,
++                binary=binary,
++                manifest=manifest,
++                model_settings=model_settings,
++                is_builtin=False,
++            )
++            if can_conv:
++                auto_convert_output = _converter_output_path(model_dir, manifest, is_builtin=False)
++        if auto_convert_output is None:
++            return None, art_reason
++
 +    return (
 +        M5Target(
 +            binary=binary,
@@ -7054,6 +7808,7 @@ index 0000000..4091c56
 +            draft_dir=draft_dir,
 +            draft_artifact_path=draft_art,
 +            fake=False,
++            auto_convert_output=auto_convert_output,
 +        ),
 +        "",
 +    )
@@ -7064,6 +7819,8 @@ index 0000000..4091c56
 +    configured_binary: str | None,
 +    model_settings: object | None = None,
 +    draft_candidates: Iterable[str] = (),
++    *,
++    allow_auto_convert: bool = True,
 +) -> tuple[M5Target | None, str]:
 +    """Check whether `m5rt` can serve `model_path`, returning `(M5Target, reason)`."""
 +    model_dir = Path(model_path).expanduser()
@@ -7088,10 +7845,6 @@ index 0000000..4091c56
 +            "",
 +        )
 +
-+    artifact_path, reason = _resolve_target_artifact(model_dir, model_settings)
-+    if artifact_path is None:
-+        return None, reason
-+
 +    metallib_dir, reason = _resolve_metallib_dir(model_dir, binary, model_settings)
 +    if metallib_dir is None:
 +        return None, reason
@@ -7102,6 +7855,23 @@ index 0000000..4091c56
 +    if reason:
 +        return None, reason
 +
++    artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings)
++    auto_convert_output: Path | None = None
++    if artifact_path is None:
++        if allow_auto_convert:
++            manifest = _builtin_m5rt_manifest()
++            can_conv, _ = can_convert_provider_model(
++                model_dir,
++                binary=binary,
++                manifest=manifest,
++                model_settings=model_settings,
++                is_builtin=True,
++            )
++            if can_conv:
++                auto_convert_output = _converter_output_path(model_dir, manifest, is_builtin=True)
++        if auto_convert_output is None:
++            return None, art_reason
++
 +    return (
 +        M5Target(
 +            binary=binary,
@@ -7110,6 +7880,7 @@ index 0000000..4091c56
 +            draft_dir=draft_dir,
 +            draft_artifact_path=draft_art,
 +            fake=False,
++            auto_convert_output=auto_convert_output,
 +        ),
 +        "",
 +    )
@@ -7346,7 +8117,16 @@ index 0000000..4091c56
 +        target_art = (
 +            target.artifact_path
 +            if target is not None and target.artifact_path is not None
-+            else (model_dir / "model.omlxm5" if model_dir is not None else None)
++            else (
++                (
++                    model_dir / "model.miv"
++                    if (model_dir / "model.miv").is_file()
++                    or not (model_dir / "model.omlxm5").is_file()
++                    else model_dir / "model.omlxm5"
++                )
++                if model_dir is not None
++                else None
++            )
 +        )
 +        if (
 +            target is not None
@@ -7356,7 +8136,9 @@ index 0000000..4091c56
 +            spec_backend = "dflash2"
 +        elif mtp_art_path is not None and mtp_art_path.is_file():
 +            spec_backend = "mtp"
-+        elif model_dir is not None and (model_dir / "mtp.omlxm5").is_file():
++        elif model_dir is not None and (
++            (model_dir / "mtp.miv").is_file() or (model_dir / "mtp.omlxm5").is_file()
++        ):
 +            spec_backend = "mtp"
 +        else:
 +            embedded_mtp = inspect_omlxm5_has_mtp_weights(target_art)
@@ -7531,7 +8313,16 @@ index 0000000..4091c56
 +    context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
 +    vocab_size = max(256, int(text_cfg.get("vocab_size") or 248320))
 +
-+    weights = target.artifact_path.stat().st_size if target.artifact_path else 0
++    if target.artifact_path is not None:
++        weights = target.artifact_path.stat().st_size
++    else:
++        try:
++            st_bytes = sum(
++                f.stat().st_size for f in mdir.glob("*.safetensors") if f.is_file()
++            )
++        except OSError:
++            st_bytes = 0
++        weights = int(st_bytes * 1.02) if st_bytes > 0 else 0
 +    draft = (
 +        target.draft_artifact_path.stat().st_size
 +        if target.draft_artifact_path
@@ -7750,9 +8541,11 @@ index 0000000..4091c56
 +    if mtp_art_raw and "mtp_artifact" not in overrides:
 +        overrides["mtp_artifact"] = str(Path(str(mtp_art_raw)).expanduser())
 +    elif spec_backend == "mtp" and "mtp_artifact" not in overrides:
-+        companion_mtp = mdir / "mtp.omlxm5"
-+        if companion_mtp.is_file():
-+            overrides["mtp_artifact"] = str(companion_mtp.resolve())
++        for mtp_name in ("mtp.miv", "mtp.omlxm5"):
++            companion_mtp = mdir / mtp_name
++            if companion_mtp.is_file():
++                overrides["mtp_artifact"] = str(companion_mtp.resolve())
++                break
 +
 +    rolling_prefix_cache = _parse_optional_toggle(
 +        opts.get("rolling_prefix_cache"), f"{eff_engine_id}.rolling_prefix_cache"
@@ -8090,6 +8883,45 @@ index 0000000..4091c56
 +            manifest=manifest_copy,
 +        )
 +
++    def _can_auto_convert_fast(
++        model_path: str | Path,
++        model_settings: object | None = None,
++    ) -> bool:
++        return can_auto_convert_provider_fast(
++            model_path,
++            binary_path=binary_path,
++            manifest=manifest_copy,
++            model_settings=model_settings,
++            is_builtin=False,
++        )
++
++    def _can_convert(
++        model_path: str | Path,
++        model_settings: object | None = None,
++    ) -> tuple[bool, str]:
++        return can_convert_provider_model(
++            model_path,
++            binary_path_hint=binary_path,
++            manifest=manifest_copy,
++            model_settings=model_settings,
++            is_builtin=False,
++        )
++
++    def _convert_model(
++        model_path: str | Path,
++        *,
++        source_repo: str | None = None,
++        model_settings: object | None = None,
++    ) -> dict[str, Any]:
++        return convert_provider_model(
++            model_path,
++            source_repo=source_repo,
++            binary_path_hint=binary_path,
++            manifest=manifest_copy,
++            model_settings=model_settings,
++            is_builtin=False,
++        )
++
 +    return ExternalEnginePlugin(
 +        id=engine_id,
 +        label=label,
@@ -8100,6 +8932,9 @@ index 0000000..4091c56
 +        runtime_signature=_runtime_sig,
 +        supported_standard_settings=supported_standard,
 +        detect_adapted=_detect,
++        can_auto_convert_fast=_can_auto_convert_fast,
++        can_convert=_can_convert,
++        convert_model=_convert_model,
 +        options_schema=options_schema,
 +        provider_id=provider_id,
 +    )
@@ -8192,7 +9027,7 @@ index 0000000..4091c56
 +        if isinstance(raw_mtp_art, (str, Path)) and str(raw_mtp_art).strip():
 +            if Path(str(raw_mtp_art)).expanduser().is_file():
 +                return True, ""
-+        if (mdir / "mtp.omlxm5").is_file():
++        if (mdir / "mtp.miv").is_file() or (mdir / "mtp.omlxm5").is_file():
 +            return True, ""
 +
 +        art_path: Path | None = None
@@ -8208,6 +9043,8 @@ index 0000000..4091c56
 +            probe = detect_adapted(mdir, model_settings)
 +            if probe.adapted and probe.artifact_path is not None:
 +                art_path = probe.artifact_path
++            elif (mdir / "model.miv").is_file():
++                art_path = mdir / "model.miv"
 +            elif (mdir / "model.omlxm5").is_file():
 +                art_path = mdir / "model.omlxm5"
 +
@@ -8217,11 +9054,11 @@ index 0000000..4091c56
 +        if embedded_mtp is False and art_path is not None:
 +            return False, (
 +                f"{M5RT_ENGINE_LABEL} artifact '{art_path.name}' contains no embedded MTP "
-+                "weights and no companion mtp.omlxm5 was found."
++                "weights and no companion mtp.miv / mtp.omlxm5 was found."
 +            )
 +        if _config_json_has_mtp(cfg):
 +            return True, ""
-+        return False, "model has no MTP heads in config and no companion mtp.omlxm5"
++        return False, "model has no MTP heads in config and no companion mtp.miv / mtp.omlxm5"
 +
 +    # Path B provider that explicitly declared "mtp_enabled"
 +    manifest = _spi_provider_manifest_for_engine(external_engine) or {}
@@ -8235,9 +9072,13 @@ index 0000000..4091c56
 +            f"model_type={raw_model_type!r} is not supported by '{external_engine}' MTP "
 +            f"(supported: {', '.join(supported_types)})"
 +        )
-+    if (mdir / "mtp.omlxm5").is_file() or _config_json_has_mtp(cfg):
++    if (
++        (mdir / "mtp.miv").is_file()
++        or (mdir / "mtp.omlxm5").is_file()
++        or _config_json_has_mtp(cfg)
++    ):
 +        return True, ""
-+    return False, "model has no MTP heads in config and no companion mtp.omlxm5"
++    return False, "model has no MTP heads in config and no companion mtp.miv / mtp.omlxm5"
 +
 +
 +def external_engine_dflash_compatibility(
@@ -9413,6 +10254,42 @@ index 0000000..4091c56
 +        self._runtime_failed_reason_override = None
 +        await asyncio.to_thread(self._load_tokenizer)
 +
++        if (
++            not self._target.fake
++            and self._target.artifact_path is None
++            and self._target.auto_convert_output is not None
++        ):
++            logger.info(
++                "%s: auto-repacking weights in %s -> %s on first load",
++                self._target.binary.label,
++                self._path,
++                self._target.auto_convert_output.name,
++            )
++            conv = await asyncio.to_thread(
++                convert_provider_model,
++                self._path,
++                source_repo=self._model_id,
++                binary=self._target.binary,
++                manifest=self._provider_manifest,
++                is_builtin=self._is_builtin_m5rt,
++            )
++            built_art = Path(str(conv["artifact_path"])).resolve()
++            self._target = replace(
++                self._target,
++                artifact_path=built_art,
++                auto_convert_output=None,
++            )
++            if (
++                self._options.speculative_backend == "mtp"
++                and "mtp_artifact" not in self._options.path_overrides
++                and not (self._path / "mtp.miv").is_file()
++                and not (self._path / "mtp.omlxm5").is_file()
++                and inspect_omlxm5_has_mtp_weights(built_art) is False
++            ):
++                self._options = replace(
++                    self._options, speculative_backend="none", draft_tokens=0
++                )
++
 +        self._socket_path = _short_socket_path(self.external_engine_id)
 +        self._log_path.parent.mkdir(parents=True, exist_ok=True)
 +        command = [str(self._target.binary.path), "--socket", str(self._socket_path)]
@@ -10326,7 +11203,7 @@ index 0000000..4091c56
 +
 +
 +# ---------------------------------------------------------------------------
-+# In-App .safetensors -> .omlxm5 Conversion Helpers (oMLX-extend)
++# In-App & First-Load .safetensors -> .miv / SPI Converter Helpers (oMLX-extend)
 +# ---------------------------------------------------------------------------
 +
 +from contextlib import suppress
@@ -10336,153 +11213,522 @@ index 0000000..4091c56
 +_CONVERT_LOCKS: dict[str, threading.Lock] = {}
 +
 +
-+def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
-+    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
-+    for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
-+        raw_env = os.environ.get(env_key, "").strip()
-+        if raw_env:
-+            p = Path(raw_env).expanduser()
-+            if p.is_file():
-+                return p
++def _has_valid_safetensors_header(model_dir: Path) -> bool:
++    """Fast O(1) 9-byte check confirming at least one non-stub `.safetensors` file exists."""
++    try:
++        entries = [
++            f
++            for f in model_dir.iterdir()
++            if f.is_file()
++            and f.suffix.lower() == ".safetensors"
++            and not f.name.startswith(".")
++        ]
++    except OSError:
++        return False
++    for sf in entries:
++        try:
++            fsize = sf.stat().st_size
++            if fsize < 16:
++                continue
++            with sf.open("rb") as fh:
++                head = fh.read(9)
++            if len(head) < 9:
++                continue
++            (hdr_len,) = struct.unpack("<Q", head[:8])
++            if 2 <= hdr_len <= min(64 * 1024 * 1024, fsize - 8) and head[8] == ord("{"):
++                return True
++        except OSError:
++            continue
++    return False
 +
-+    binary, _ = find_m5rt_binary(configured_binary)
-+    if binary is not None:
-+        # Provider layout: <provider>/versions/<ver>/bin/mseries_backendd -> ../tools/m5_artifact.py
-+        cand = binary.path.resolve().parent.parent / "tools" / "m5_artifact.py"
-+        if cand.is_file():
-+            return cand
-+        # Also check un-resolved symlink parent (`current/tools/m5_artifact.py`)
-+        cand_sym = binary.path.parent.parent / "tools" / "m5_artifact.py"
-+        if cand_sym.is_file():
-+            return cand_sym
 +
-+    # Monorepo / source checkout fallback: <repo>/miv/tools/m5_artifact.py
-+    with suppress(Exception):
-+        repo_cand = Path(__file__).resolve().parents[3] / "miv" / "tools" / "m5_artifact.py"
-+        if repo_cand.is_file():
-+            return repo_cand
-+
++def _converter_spec_for_manifest(
++    manifest: dict[str, Any] | None, *, is_builtin: bool
++) -> dict[str, Any] | None:
++    raw = manifest.get("converter") if isinstance(manifest, dict) else None
++    if isinstance(raw, dict) and raw.get("entrypoint"):
++        return dict(raw)
++    if is_builtin:
++        return dict(M5RT_DEFAULT_CONVERTER)
 +    return None
 +
 +
-+def can_convert_to_omlxm5(
++def _converter_output_path(
++    model_dir: Path, manifest: dict[str, Any] | None, *, is_builtin: bool
++) -> Path:
++    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin) or {}
++    out_name = str(spec.get("output_filename") or "").strip()
++    if not out_name:
++        ext = str(spec.get("artifact_extension") or "").strip()
++        if not ext:
++            exts = _normalize_extensions(
++                manifest.get("artifact_extensions") if isinstance(manifest, dict) else None
++            )
++            ext = exts[0] if exts else ".miv"
++        if not ext.startswith("."):
++            ext = f".{ext}"
++        out_name = f"model{ext}"
++    return model_dir / Path(out_name).name
++
++
++def _config_matches_converter_quant(
++    cfg: dict[str, Any],
++    converter_spec: dict[str, Any],
++    *,
++    is_builtin: bool,
++) -> tuple[bool, str]:
++    """Verify `config.json` matches the converter's supported quantization modes."""
++    raw_modes = converter_spec.get("supported_quant_modes")
++    if not isinstance(raw_modes, (list, tuple)) or not raw_modes:
++        return True, ""
++    allowed_modes = {str(m).strip().lower() for m in raw_modes if isinstance(m, str) and m.strip()}
++    if not allowed_modes:
++        return True, ""
++
++    text_cfg = _text_config(cfg)
++    quant = (
++        cfg.get("quantization")
++        or cfg.get("quantization_config")
++        or text_cfg.get("quantization")
++        or text_cfg.get("quantization_config")
++        or {}
++    )
++    qcfg = cfg.get("quantization_config") or text_cfg.get("quantization_config") or {}
++    if not isinstance(quant, dict):
++        quant = {}
++    if not isinstance(qcfg, dict):
++        qcfg = {}
++
++    mode = str(quant.get("mode") or "").strip().lower()
++    fmt = str(qcfg.get("format") or quant.get("format") or "").strip().lower()
++
++    if mode == "affine" and "affine" in allowed_modes:
++        if is_builtin:
++            bits = quant.get("bits")
++            gs = quant.get("group_size")
++            if bits not in (3, 4, 5, 6, 8) or gs not in (64, 128):
++                return (
++                    False,
++                    f"affine quantization bits={bits!r}, group_size={gs!r} is not supported "
++                    "(expected bits in {3,4,5,6,8} and group_size in {64,128})",
++                )
++        return True, ""
++
++    if mode == "mxfp4" and "mxfp4" in allowed_modes:
++        return True, ""
++
++    if fmt == "mxfp4-pack-quantized" and "mxfp4-pack-quantized" in allowed_modes:
++        return True, ""
++
++    if not mode and not fmt and ({"bf16", "fp16", "unquantized"} & allowed_modes):
++        return True, ""
++
++    return (
++        False,
++        f"checkpoint quantization is not in {sorted(allowed_modes)} "
++        f"(mode={mode or 'none'!r}, format={fmt or 'none'!r})",
++    )
++
++
++def find_provider_converter_tool_fast(
++    binary_path: Path | None,
++    manifest: dict[str, Any] | None = None,
++    *,
++    is_builtin: bool = False,
++) -> Path | None:
++    """Locate a provider's bundled converter script in O(1) without spawning subprocesses."""
++    if is_builtin:
++        for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
++            raw_env = os.environ.get(env_key, "").strip()
++            if raw_env:
++                p = Path(raw_env).expanduser()
++                if p.is_file():
++                    return p
++
++    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin)
++    if spec is None:
++        return None
++    rel_entry = str(spec.get("entrypoint") or "").strip()
++    if not rel_entry:
++        return None
++
++    rel_path = Path(rel_entry)
++    if rel_path.is_absolute():
++        return rel_path if rel_path.is_file() else None
++
++    if isinstance(manifest, dict) and manifest.get("_provider_dir"):
++        pdir_cand = Path(str(manifest["_provider_dir"])) / rel_path
++        if pdir_cand.is_file():
++            return pdir_cand
++
++    if binary_path is not None:
++        for base in (binary_path.resolve().parent.parent, binary_path.parent.parent):
++            cand = base / rel_path
++            if cand.is_file():
++                return cand
++
++    if is_builtin:
++        repo_cand = _REPO_ROOT / "miv" / "tools" / "m5_artifact.py"
++        if repo_cand.is_file():
++            if binary_path is not None:
++                with suppress(OSError, ValueError):
++                    if binary_path.resolve().is_relative_to(_REPO_ROOT.resolve()):
++                        return repo_cand
++            elif not os.environ.get("OMLX_PROVIDERS_DIR", "").strip():
++                return repo_cand
++    return None
++
++
++def _find_m5rt_binary_path_fast(configured_binary: str | None = None) -> tuple[Path | None, dict[str, Any] | None]:
++    """Fast O(1) resolution of `(binary_path, provider_manifest)` with zero subprocess spawn."""
++    if configured_binary and str(configured_binary).strip():
++        cand = Path(str(configured_binary).strip()).expanduser()
++        if _executable(cand):
++            manifest = None
++            for parent in (cand.resolve().parent, cand.resolve().parent.parent):
++                manifest = _read_provider_manifest(parent)
++                if manifest is not None:
++                    break
++            return cand.resolve(), manifest
++        return None, None
++    for env_key in ("NINFER_METAL_BIN", "OMLX_M5RT_BIN"):
++        env_bin = os.environ.get(env_key, "").strip()
++        if env_bin:
++            cand = Path(env_bin).expanduser()
++            if _executable(cand):
++                manifest = None
++                for parent in (cand.resolve().parent, cand.resolve().parent.parent):
++                    manifest = _read_provider_manifest(parent)
++                    if manifest is not None:
++                        break
++                return cand.resolve(), manifest
++            return None, None
++    prov_cands = _discover_provider_candidates()
++    if prov_cands:
++        return prov_cands[0]
++    path_cand = _find_in_path(("mseries_backendd", "mseries-backendd"))
++    if path_cand is not None:
++        return path_cand.resolve(), None
++    repo_daemons = _iter_repo_build_daemons()
++    if repo_daemons:
++        return repo_daemons[0], None
++    return None, None
++
++
++def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
++    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
++    bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
++    tool = find_provider_converter_tool_fast(
++        bin_path, inst_manifest or _builtin_m5rt_manifest(), is_builtin=True
++    )
++    if tool is not None:
++        return tool
++    # Fallback for explicit custom `configured_binary` wrapper scripts in tests/dev
++    with suppress(Exception):
++        repo_cand = _REPO_ROOT / "miv" / "tools" / "m5_artifact.py"
++        if repo_cand.is_file() and not os.environ.get("OMLX_PROVIDERS_DIR", "").strip():
++            return repo_cand
++    return None
++
++
++def can_auto_convert_provider_fast(
++    model_path: str | Path,
++    *,
++    binary_path: Path | None,
++    manifest: dict[str, Any],
++    model_settings: object | None = None,
++    is_builtin: bool = False,
++) -> bool:
++    """Pure O(1) zero-subprocess check whether `model_path` can auto-repack on first Load."""
++    if not model_path or binary_path is None:
++        return False
++    model_dir = Path(model_path).expanduser()
++    if not model_dir.is_dir():
++        return False
++    if _probe_provider_adapted(model_dir, manifest, model_settings).adapted:
++        return False
++    if is_builtin and _search_artifact_cache(model_dir) is not None:
++        return False
++
++    spec = _converter_spec_for_manifest(manifest, is_builtin=is_builtin)
++    if spec is None:
++        return False
++    if find_provider_converter_tool_fast(binary_path, manifest, is_builtin=is_builtin) is None:
++        return False
++
++    # Verify required metallibs exist before claiming auto-route
++    dummy_bin = M5Binary(
++        path=binary_path,
++        version=M5RT_DEFAULT_VERSION,
++        protocol_version=2,
++        auto_detected=True,
++        provider_manifest=manifest,
++    )
++    mdir_resolved, mdir_err = _resolve_metallib_dir(
++        model_dir,
++        dummy_bin,
++        model_settings,
++        engine_id=str(manifest.get("engine_id") or M5RT_ENGINE_ID),
++        provider_id=str(manifest.get("provider_id") or M5RT_PROVIDER_ID),
++    )
++    if mdir_err or (is_builtin and mdir_resolved is None):
++        return False
++
++    cfg = _read_json(model_dir / "config.json")
++    if cfg is None:
++        return False
++
++    supported_types = {
++        str(m).strip().lower()
++        for m in (manifest.get("supported_model_types") or ())
++        if isinstance(m, str) and m.strip()
++    }
++    model_types = _extract_model_type_tokens(cfg)
++    if supported_types and (not model_types or not (model_types & supported_types)):
++        return False
++
++    quant_ok, _ = _config_matches_converter_quant(cfg, spec, is_builtin=is_builtin)
++    if not quant_ok:
++        return False
++
++    if not _has_valid_safetensors_header(model_dir):
++        return False
++
++    return os.access(model_dir, os.W_OK)
++
++
++def can_auto_convert_m5rt_fast(
 +    model_path: str | Path,
 +    configured_binary: str | None = None,
 +    model_settings: object | None = None,
++) -> bool:
++    """Fast O(1) zero-subprocess check whether `m5rt` (`miv`) can auto-repack `model_path`."""
++    bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
++    if bin_path is None:
++        return False
++    manifest = _builtin_m5rt_manifest()
++    if isinstance(inst_manifest, dict) and inst_manifest.get("_provider_dir"):
++        manifest["_provider_dir"] = inst_manifest["_provider_dir"]
++    return can_auto_convert_provider_fast(
++        model_path,
++        binary_path=bin_path,
++        manifest=manifest,
++        model_settings=model_settings,
++        is_builtin=True,
++    )
++
++
++def can_convert_provider_model(
++    model_path: str | Path,
++    *,
++    binary: M5Binary | None = None,
++    binary_path_hint: Path | None = None,
++    configured_binary: str | None = None,
++    manifest: dict[str, Any] | None = None,
++    model_settings: object | None = None,
++    is_builtin: bool = True,
 +) -> tuple[bool, str]:
-+    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.omlxm5`."""
++    """Return `(True, '')` when `model_path` has `.safetensors` convertible for this provider."""
 +    if not model_path:
 +        return False, "model_path is empty"
 +    model_dir = Path(model_path).expanduser()
 +    if not model_dir.is_dir():
 +        return False, f"model directory not found: {model_dir}"
 +
-+    if detect_adapted(model_dir, model_settings).adapted:
-+        return False, "model already has .omlxm5 weights"
++    eff_manifest = dict(manifest) if isinstance(manifest, dict) else (
++        _builtin_m5rt_manifest() if is_builtin else {}
++    )
++    if _probe_provider_adapted(model_dir, eff_manifest, model_settings).adapted:
++        return False, "model already has repacked microkernel weights"
++
++    spec = _converter_spec_for_manifest(eff_manifest, is_builtin=is_builtin)
++    if spec is None:
++        return False, "provider manifest does not declare a weight converter"
 +
 +    cfg_path = model_dir / "config.json"
 +    if not cfg_path.is_file():
 +        return False, "config.json not found"
-+    try:
-+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-+    except Exception as exc:
-+        return False, f"failed to parse config.json: {exc}"
-+    if not isinstance(cfg, dict):
-+        return False, "config.json is not a JSON object"
++    cfg = _read_json(cfg_path)
++    if cfg is None:
++        return False, "config.json is not a valid JSON object"
 +
-+    model_types = _extract_model_type_tokens(cfg)
-+    manifest = _builtin_m5rt_manifest()
 +    supported_types = {
 +        str(m).strip().lower()
-+        for m in (manifest.get("supported_model_types") or M5RT_SUPPORTED_MODEL_TYPES)
++        for m in (
++            eff_manifest.get("supported_model_types")
++            or (M5RT_SUPPORTED_MODEL_TYPES if is_builtin else ())
++        )
 +        if isinstance(m, str) and m.strip()
 +    }
-+    if not model_types or not (model_types & supported_types):
++    model_types = _extract_model_type_tokens(cfg)
++    if supported_types and (not model_types or not (model_types & supported_types)):
 +        return False, f"model_type is not in {sorted(supported_types)}"
 +
-+    try:
-+        has_safetensors = any(
-+            f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
-+        )
-+    except OSError:
-+        has_safetensors = False
-+    if not has_safetensors:
-+        return False, "no .safetensors weights found in model directory"
++    quant_ok, quant_reason = _config_matches_converter_quant(
++        cfg, spec, is_builtin=is_builtin
++    )
++    if not quant_ok:
++        return False, quant_reason
++
++    if not _has_valid_safetensors_header(model_dir):
++        return False, "no valid .safetensors weights found in model directory"
 +
 +    if not os.access(model_dir, os.W_OK):
 +        return False, f"model directory is not writable: {model_dir}"
 +
-+    binary, bin_reason = find_m5rt_binary(configured_binary)
-+    if binary is None:
-+        return False, bin_reason
-+    tool = find_m5_artifact_tool(configured_binary)
++    resolved_bin = binary
++    if resolved_bin is None:
++        if is_builtin:
++            resolved_bin, bin_reason = find_m5rt_binary(configured_binary)
++            if resolved_bin is None:
++                return False, bin_reason
++        elif binary_path_hint is not None:
++            proto_raw = eff_manifest.get("protocol_version")
++            fb_proto = proto_raw if isinstance(proto_raw, int) and not isinstance(proto_raw, bool) else 2
++            resolved_bin, bin_reason = inspect_m5rt_binary(
++                binary_path_hint,
++                auto_detected=True,
++                provider_manifest=eff_manifest,
++                allow_generic=True,
++                fallback_protocol=fb_proto,
++            )
++            if resolved_bin is None:
++                return False, bin_reason
++        else:
++            return False, "provider binary not found"
++
++    if isinstance(resolved_bin.provider_manifest, dict) and resolved_bin.provider_manifest.get("_provider_dir"):
++        eff_manifest.setdefault("_provider_dir", resolved_bin.provider_manifest["_provider_dir"])
++
++    tool = find_provider_converter_tool_fast(
++        resolved_bin.path, eff_manifest, is_builtin=is_builtin
++    )
++    if tool is None and is_builtin:
++        tool = find_m5_artifact_tool(configured_binary)
 +    if tool is None:
-+        return False, "m5_artifact.py converter tool not found in installed miv bundle"
++        return False, f"converter tool '{spec.get('entrypoint')}' not found in installed provider bundle"
 +
 +    return True, ""
 +
 +
-+def convert_model_to_omlxm5(
++def convert_provider_model(
 +    model_path: str | Path,
 +    *,
 +    source_repo: str | None = None,
++    binary: M5Binary | None = None,
++    binary_path_hint: Path | None = None,
 +    configured_binary: str | None = None,
++    manifest: dict[str, Any] | None = None,
 +    model_settings: object | None = None,
-+    nax_pretile: bool = True,
++    nax_pretile: bool | None = None,
++    is_builtin: bool = True,
 +) -> dict[str, Any]:
-+    """Convert `.safetensors` weights in `model_path` to `model.omlxm5` atomically."""
++    """Atomically repack `.safetensors` weights in `model_path` alongside original weights."""
 +    model_dir = Path(model_path).expanduser().resolve()
-+    lock_key = str(model_dir)
++    eff_manifest = dict(manifest) if isinstance(manifest, dict) else (
++        _builtin_m5rt_manifest() if is_builtin else {}
++    )
++    out_path = _converter_output_path(model_dir, eff_manifest, is_builtin=is_builtin)
++    lock_key = f"{model_dir}::{out_path.name}"
 +    with _CONVERT_LOCKS_GUARD:
 +        lock = _CONVERT_LOCKS.setdefault(lock_key, threading.Lock())
 +
 +    with lock:
-+        existing_probe = detect_adapted(model_dir, model_settings)
-+        out_path = model_dir / "model.omlxm5"
-+        if existing_probe.adapted and out_path.is_file():
++        existing_probe = _probe_provider_adapted(model_dir, eff_manifest, model_settings)
++        if existing_probe.adapted and existing_probe.artifact_path is not None and existing_probe.artifact_path.is_file():
++            art = existing_probe.artifact_path
 +            return {
-+                "artifact_path": str(out_path),
-+                "artifact_bytes": out_path.stat().st_size,
++                "artifact_path": str(art),
++                "artifact_bytes": art.stat().st_size,
++                "artifact_format": art.suffix.lstrip(".").lower() or "miv",
 +                "already_existed": True,
 +            }
 +
-+        ok, reason = can_convert_to_omlxm5(model_dir, configured_binary, model_settings)
++        ok, reason = can_convert_provider_model(
++            model_dir,
++            binary=binary,
++            binary_path_hint=binary_path_hint,
++            configured_binary=configured_binary,
++            manifest=eff_manifest,
++            model_settings=model_settings,
++            is_builtin=is_builtin,
++        )
 +        if not ok:
-+            raise ValueError(f"Cannot convert model to .omlxm5: {reason}")
++            raise ValueError(f"Cannot convert model to {out_path.suffix}: {reason}")
 +
-+        tool = find_m5_artifact_tool(configured_binary)
++        resolved_bin = binary
++        if resolved_bin is None:
++            if is_builtin:
++                resolved_bin, _ = find_m5rt_binary(configured_binary)
++            elif binary_path_hint is not None:
++                resolved_bin, _ = inspect_m5rt_binary(
++                    binary_path_hint,
++                    auto_detected=True,
++                    provider_manifest=eff_manifest,
++                    allow_generic=True,
++                    fallback_protocol=2,
++                )
++        if resolved_bin is not None and isinstance(resolved_bin.provider_manifest, dict):
++            if resolved_bin.provider_manifest.get("_provider_dir"):
++                eff_manifest.setdefault("_provider_dir", resolved_bin.provider_manifest["_provider_dir"])
++
++        tool = (
++            find_provider_converter_tool_fast(
++                resolved_bin.path if resolved_bin else binary_path_hint,
++                eff_manifest,
++                is_builtin=is_builtin,
++            )
++            or (find_m5_artifact_tool(configured_binary) if is_builtin else None)
++        )
 +        if tool is None:
-+            raise ValueError("m5_artifact.py converter tool not found")
++            raise ValueError("Provider converter tool not found")
++
++        spec = _converter_spec_for_manifest(eff_manifest, is_builtin=is_builtin) or {}
++        subcommand = str(spec.get("subcommand") or "").strip()
++        default_args = [
++            str(a) for a in (spec.get("default_args") or ()) if isinstance(a, str) and a.strip()
++        ]
++        if is_builtin and nax_pretile is False:
++            default_args = [a for a in default_args if a != "--nax-pretile"]
++        elif is_builtin and nax_pretile is True and "--nax-pretile" not in default_args:
++            default_args.append("--nax-pretile")
 +
 +        repo_label = (source_repo or "").strip() or model_dir.name
-+        tmp_out = model_dir / f".model.omlxm5.tmp.{os.getpid()}"
++        tmp_out = model_dir / f".{out_path.name}.tmp.{os.getpid()}"
 +        try:
-+            cmd = [
-+                sys.executable,
-+                str(tool),
-+                "convert",
-+                "--source",
-+                str(model_dir),
-+                "--output",
-+                str(tmp_out),
-+                "--source-repo",
-+                repo_label,
-+            ]
-+            if nax_pretile:
-+                cmd.append("--nax-pretile")
++            if tool.suffix.lower() == ".py":
++                cmd = [sys.executable, str(tool)]
++            else:
++                cmd = [str(tool)]
++            if subcommand:
++                cmd.append(subcommand)
++            cmd.extend(
++                [
++                    "--source",
++                    str(model_dir),
++                    "--output",
++                    str(tmp_out),
++                    "--source-repo",
++                    repo_label,
++                    *default_args,
++                ]
++            )
 +            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
 +            if proc.returncode != 0:
 +                detail = (proc.stderr or proc.stdout or "").strip()
 +                if len(detail) > 600:
 +                    detail = detail[-600:]
 +                raise ValueError(
-+                    f"m5_artifact.py convert failed (exit {proc.returncode}): {detail}"
++                    f"{tool.name} convert failed (exit {proc.returncode}): {detail}"
 +                )
-+            if not tmp_out.is_file() or tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
-+                raise ValueError("Converter finished without producing a valid .omlxm5 file")
-+            with tmp_out.open("rb") as fh:
-+                if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
-+                    raise ValueError("Converted file does not have a valid OMLXM5A1 header")
++            if not tmp_out.is_file() or tmp_out.stat().st_size == 0:
++                raise ValueError(f"Converter finished without producing {out_path.name}")
++            if is_builtin:
++                if tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
++                    raise ValueError("Converter produced a truncated .miv container")
++                with tmp_out.open("rb") as fh:
++                    if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
++                        raise ValueError("Converted .miv file does not have a valid OMLXM5A1 header")
 +            os.replace(tmp_out, out_path)
 +        finally:
 +            with suppress(OSError):
@@ -10492,8 +11738,182 @@ index 0000000..4091c56
 +        return {
 +            "artifact_path": str(out_path),
 +            "artifact_bytes": out_path.stat().st_size,
++            "artifact_format": out_path.suffix.lstrip(".").lower() or "miv",
 +            "already_existed": False,
 +        }
++
++
++def can_convert_to_miv(
++    model_path: str | Path,
++    configured_binary: str | None = None,
++    model_settings: object | None = None,
++) -> tuple[bool, str]:
++    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.miv`."""
++    return can_convert_provider_model(
++        model_path,
++        configured_binary=configured_binary,
++        manifest=_builtin_m5rt_manifest(),
++        model_settings=model_settings,
++        is_builtin=True,
++    )
++
++
++def convert_model_to_miv(
++    model_path: str | Path,
++    *,
++    source_repo: str | None = None,
++    configured_binary: str | None = None,
++    model_settings: object | None = None,
++    nax_pretile: bool = True,
++) -> dict[str, Any]:
++    """Convert `.safetensors` weights in `model_path` to `model.miv` atomically alongside `.safetensors`."""
++    return convert_provider_model(
++        model_path,
++        source_repo=source_repo,
++        configured_binary=configured_binary,
++        manifest=_builtin_m5rt_manifest(),
++        model_settings=model_settings,
++        nax_pretile=nax_pretile,
++        is_builtin=True,
++    )
++
++
++# Backward-compatible aliases for external callers / tests
++can_convert_to_omlxm5 = can_convert_to_miv
++convert_model_to_omlxm5 = convert_model_to_miv
++
++
++def detect_model_weight_format_info(
++    model_path: str | Path | None,
++    *,
++    model_format: str | None = None,
++    active_external_engine: str | None = None,
++    model_settings: object | None = None,
++    configured_m5rt_binary: str | None = None,
++) -> dict[str, Any]:
++    """Return O(1) weight-format metadata for `/admin/api/models` UI badges."""
++    if model_format == "gguf":
++        return {
++            "weight_format": "gguf",
++            "has_miv_weights": False,
++            "pending_auto_repack": False,
++            "repack_target_format": None,
++        }
++    if not model_path:
++        return {
++            "weight_format": model_format or "safetensors",
++            "has_miv_weights": False,
++            "pending_auto_repack": False,
++            "repack_target_format": None,
++        }
++    mdir = Path(str(model_path)).expanduser()
++    if not mdir.is_dir():
++        return {
++            "weight_format": model_format or "safetensors",
++            "has_miv_weights": False,
++            "pending_auto_repack": False,
++            "repack_target_format": None,
++        }
++
++    has_safetensors = False
++    has_miv_file = False
++    has_omlxm5_file = False
++    try:
++        for f in mdir.iterdir():
++            if not f.is_file() or f.name.startswith("."):
++                continue
++            low_name = f.name.lower()
++            suf = f.suffix.lower()
++            if suf in (".safetensors", ".bin"):
++                has_safetensors = True
++            elif suf == ".miv" and low_name != "mtp.miv":
++                has_miv_file = True
++            elif suf == ".omlxm5" and low_name != "mtp.omlxm5":
++                has_omlxm5_file = True
++    except OSError:
++        pass
++
++    # Also check Path B custom artifact extensions when routed to a Path B engine
++    custom_art_fmt: str | None = None
++    repack_target_fmt: str | None = None
++    if active_external_engine and active_external_engine not in ("splash", "stock", M5RT_ENGINE_ID):
++        p_manifest = _spi_provider_manifest_for_engine(active_external_engine)
++        if p_manifest is not None:
++            p_probe = _probe_provider_adapted(mdir, p_manifest, model_settings)
++            if p_probe.adapted and p_probe.artifact_path is not None:
++                custom_art_fmt = p_probe.artifact_path.suffix.lstrip(".").lower() or "miv"
++            else:
++                out_p = _converter_output_path(mdir, p_manifest, is_builtin=False)
++                repack_target_fmt = out_p.suffix.lstrip(".").lower() or "miv"
++
++    has_microkernel_weights = bool(has_miv_file or has_omlxm5_file or custom_art_fmt)
++    on_disk_microkernel_fmt = (
++        custom_art_fmt
++        or ("miv" if has_miv_file else ("omlxm5" if has_omlxm5_file else None))
++    )
++
++    # When running on Stock MLX (or explicitly overridden to "stock"), the active format is safetensors
++    if not active_external_engine or active_external_engine in ("stock", "splash"):
++        active_fmt = (
++            "safetensors"
++            if has_safetensors
++            else (on_disk_microkernel_fmt or model_format or "safetensors")
++        )
++        return {
++            "weight_format": active_fmt,
++            "has_miv_weights": has_microkernel_weights,
++            "pending_auto_repack": False,
++            "repack_target_format": None,
++        }
++
++    # Active engine is m5rt or a Path B microkernel
++    if on_disk_microkernel_fmt is not None:
++        return {
++            "weight_format": on_disk_microkernel_fmt,
++            "has_miv_weights": True,
++            "pending_auto_repack": False,
++            "repack_target_format": None,
++        }
++
++    # Check `.cache/b0/artifacts` hit for m5rt
++    if active_external_engine == M5RT_ENGINE_ID:
++        cached = _search_artifact_cache(mdir)
++        if cached is not None:
++            return {
++                "weight_format": cached.suffix.lstrip(".").lower() or "miv",
++                "has_miv_weights": True,
++                "pending_auto_repack": False,
++                "repack_target_format": None,
++            }
++        if can_auto_convert_m5rt_fast(mdir, configured_m5rt_binary, model_settings):
++            return {
++                "weight_format": "safetensors",
++                "has_miv_weights": False,
++                "pending_auto_repack": True,
++                "repack_target_format": "miv",
++            }
++    elif repack_target_fmt is not None:
++        plugin = get_external_engine_plugin(active_external_engine)
++        if plugin is not None:
++            ok_conv = False
++            if callable(plugin.can_auto_convert_fast):
++                ok_conv = bool(plugin.can_auto_convert_fast(mdir, model_settings))
++            elif callable(plugin.can_convert):
++                ok_conv, _ = plugin.can_convert(mdir, model_settings)
++            if ok_conv:
++                return {
++                    "weight_format": "safetensors",
++                    "has_miv_weights": False,
++                    "pending_auto_repack": True,
++                    "repack_target_format": repack_target_fmt,
++                }
++
++    return {
++        "weight_format": "safetensors" if has_safetensors else (model_format or "safetensors"),
++        "has_miv_weights": has_microkernel_weights,
++        "pending_auto_repack": False,
++        "repack_target_format": None,
++    }
 diff --git a/omlx/engine/microkernel_manager.py b/omlx/engine/microkernel_manager.py
 new file mode 100644
 index 0000000..6dd9d31
@@ -11737,7 +13157,7 @@ index 99df632..316d6f8 100644
      supports_native_response_format = True
  
 diff --git a/omlx/engine_pool.py b/omlx/engine_pool.py
-index 65312ce..bf7838f 100644
+index 65312ce..ad3ad28 100644
 --- a/omlx/engine_pool.py
 +++ b/omlx/engine_pool.py
 @@ -16,6 +16,7 @@ from __future__ import annotations
@@ -11748,7 +13168,7 @@ index 65312ce..bf7838f 100644
  import json
  import logging
  import time
-@@ -36,6 +37,25 @@ from . import gguf
+@@ -36,6 +37,26 @@ from . import gguf
  from .engine import BaseEngine, BatchedEngine
  from .engine.decision import DecisionEngine
  from .engine.embedding import EmbeddingEngine
@@ -11757,6 +13177,7 @@ index 65312ce..bf7838f 100644
 +    M5RT_ENGINE_LABEL,
 +    M5RT_PROVIDER_ID,
 +    M5Target,
++    can_auto_convert_m5rt_fast,
 +    create_m5rt_pool_engine,
 +    detect_adapted,
 +    discover_external_engine_plugins,
@@ -11774,7 +13195,7 @@ index 65312ce..bf7838f 100644
  from .engine.reranker import RerankerEngine
  from .engine.splash import (
      EXTERNAL_ENGINES,
-@@ -94,7 +114,7 @@ from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
+@@ -94,7 +115,7 @@ from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
  from .prefill_helper.lending import lending_note
  from .prefill_helper.manager import prepare as prepare_prefill_helper
  from .scheduler import SchedulerConfig
@@ -11783,7 +13204,7 @@ index 65312ce..bf7838f 100644
  from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
  from .utils.fatal import exit_if_gpu_submissions_ignored, is_command_buffer_error
  from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
-@@ -118,6 +138,13 @@ def _gguf_model_root() -> Path | None:
+@@ -118,6 +139,13 @@ def _gguf_model_root() -> Path | None:
          return None
  
  
@@ -11797,7 +13218,7 @@ index 65312ce..bf7838f 100644
  def _touch_gpu() -> None:
      """Run one trivial kernel so the GPU stays out of its idle power state.
  
-@@ -453,9 +480,9 @@ class EnginePool:
+@@ -453,9 +481,9 @@ class EnginePool:
          self._entries: dict[str, EngineEntry] = {}
          self._lock = asyncio.Lock()
          self._current_model_memory = 0
@@ -11809,7 +13230,7 @@ index 65312ce..bf7838f 100644
          # Scanned model roots, kept for org-qualified display/upload names.
          self._model_dirs: list[Path] = []
          # LoRA adapter folders found in the model roots, by adapter id.
-@@ -622,13 +649,51 @@ class EnginePool:
+@@ -622,13 +650,51 @@ class EnginePool:
          base = self._entry_resident_size(entry) if base_size is None else base_size
          if self._distributed_deployment_for_entry(entry) is not None:
              return base
@@ -11862,7 +13283,7 @@ index 65312ce..bf7838f 100644
          qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
              entry, runtime_settings, log_decision=log_decision
          )
-@@ -1312,7 +1377,26 @@ class EnginePool:
+@@ -1312,7 +1378,26 @@ class EnginePool:
  
          # Security/load gates.
          add("trust_remote_code", bool(data.get("trust_remote_code", False)))
@@ -11890,7 +13311,7 @@ index 65312ce..bf7838f 100644
          add("index_cache_freq", normalized_index_cache_freq())
          # Embedding audio tower residency is decided at load. The audio length
          # only matters while the tower is loaded.
-@@ -2233,6 +2317,60 @@ class EnginePool:
+@@ -2233,6 +2318,60 @@ class EnginePool:
              self._splash_draft_candidates(model_settings),
          )
  
@@ -11951,7 +13372,7 @@ index 65312ce..bf7838f 100644
      def _splash_sizing_context(
          self, entry: EngineEntry, model_settings: object | None
      ) -> int | None:
-@@ -2297,7 +2435,7 @@ class EnginePool:
+@@ -2297,7 +2436,7 @@ class EnginePool:
      async def _check_splash_launcher(
          self, model_id: str, runtime_settings: object | None
      ) -> None:
@@ -11960,21 +13381,21 @@ index 65312ce..bf7838f 100644
  
          The first look at a launcher runs it to read its version.
          """
-@@ -2306,74 +2444,254 @@ class EnginePool:
+@@ -2306,74 +2445,274 @@ class EnginePool:
              get_settings = getattr(self._settings_manager, "get_settings", None)
              if callable(get_settings):
                  settings = get_settings(model_id)
 -        if self.external_engine_id(model_id, settings):
 +        engine_id = self.external_engine_id(model_id, settings)
 +        if engine_id == "splash":
++            await asyncio.to_thread(
++                find_splash_binary, _safe_global_settings().integrations.splash_path
++            )
++        elif engine_id == M5RT_ENGINE_ID:
              await asyncio.to_thread(
 -                find_splash_binary, get_global_settings().integrations.splash_path
-+                find_splash_binary, _safe_global_settings().integrations.splash_path
-             )
-+        elif engine_id == M5RT_ENGINE_ID:
-+            await asyncio.to_thread(
 +                find_m5rt_binary, _safe_global_settings().integrations.m5rt_path
-+            )
+             )
 +        elif engine_id:
 +            plugin = get_external_engine_plugin(engine_id)
 +            entry = self._entries.get(model_id)
@@ -12038,44 +13459,60 @@ index 65312ce..bf7838f 100644
 +                gs, provider_id=M5RT_PROVIDER_ID, engine_id=M5RT_ENGINE_ID
 +            )
 +            m5_probe = detect_adapted(model_path, model_settings)
-+            m5_available = bool(
++            m5_has_bin = has_m5rt_binary_candidate(gs.integrations.m5rt_path)
++            m5_available = bool(m5_enabled and m5_probe.adapted and m5_has_bin)
++            m5_auto_convertible = bool(
 +                m5_enabled
-+                and m5_probe.adapted
-+                and has_m5rt_binary_candidate(gs.integrations.m5rt_path)
++                and not m5_probe.adapted
++                and m5_has_bin
++                and can_auto_convert_m5rt_fast(
++                    model_path, gs.integrations.m5rt_path, model_settings
++                )
 +            )
 +            explicit_plugin_match: str | None = None
 +            topology_plugin_match: str | None = None
++            convertible_plugin_match: str | None = None
 +            for _, plugin in sorted(discover_external_engine_plugins().items()):
 +                if not is_microkernel_enabled(
 +                    gs, provider_id=plugin.provider_id, engine_id=plugin.id
 +                ):
 +                    continue
-+                if not callable(plugin.detect_adapted):
-+                    continue
-+                try:
-+                    sig = inspect.signature(plugin.detect_adapted)
-+                    params = list(sig.parameters.values())
-+                    accepts_two = len(params) >= 2 or any(
-+                        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
-+                    )
-+                    res = (
-+                        plugin.detect_adapted(model_path, model_settings)
-+                        if accepts_two
-+                        else plugin.detect_adapted(model_path)
-+                    )
-+                except Exception:
-+                    continue
-+                if not bool(getattr(res, "adapted", res)):
-+                    continue
-+                if bool(getattr(res, "explicit_provider_match", False)):
-+                    explicit_plugin_match = explicit_plugin_match or plugin.id
-+                else:
-+                    topology_plugin_match = topology_plugin_match or plugin.id
++                adapted_hit = False
++                if callable(plugin.detect_adapted):
++                    try:
++                        sig = inspect.signature(plugin.detect_adapted)
++                        params = list(sig.parameters.values())
++                        accepts_two = len(params) >= 2 or any(
++                            p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
++                        )
++                        res = (
++                            plugin.detect_adapted(model_path, model_settings)
++                            if accepts_two
++                            else plugin.detect_adapted(model_path)
++                        )
++                        if bool(getattr(res, "adapted", res)):
++                            adapted_hit = True
++                            if bool(getattr(res, "explicit_provider_match", False)):
++                                explicit_plugin_match = explicit_plugin_match or plugin.id
++                            else:
++                                topology_plugin_match = topology_plugin_match or plugin.id
++                    except Exception:
++                        pass
++                if (
++                    not adapted_hit
++                    and convertible_plugin_match is None
++                    and callable(getattr(plugin, "can_auto_convert_fast", None))
++                ):
++                    try:
++                        if plugin.can_auto_convert_fast(model_path, model_settings):
++                            convertible_plugin_match = plugin.id
++                    except Exception:
++                        pass
 +
 +            # Deterministic routing priority:
 +            # 1. Explicit provider_id/engine_id match
-+            # 2. Topology + extension Path B plugin match
-+            # 3. Built-in m5rt match
++            # 2. Already-repacked artifact match (Path B then built-in m5rt)
++            # 3. Auto-convertible .safetensors match (built-in m5rt for Qwen, else Path B)
 +            if explicit_plugin_match is not None:
 +                return explicit_plugin_match
 +            if m5_available and bool(getattr(m5_probe, "explicit_provider_match", False)):
@@ -12084,6 +13521,10 @@ index 65312ce..bf7838f 100644
 +                return topology_plugin_match
 +            if m5_available:
 +                return M5RT_ENGINE_ID
++            if m5_auto_convertible:
++                return M5RT_ENGINE_ID
++            if convertible_plugin_match is not None:
++                return convertible_plugin_match
          return None
  
 -    def _selected_splash_target(
@@ -12114,9 +13555,7 @@ index 65312ce..bf7838f 100644
              raise ModelLoadingError(
 -                entry.model_id, "Splash serves language models only"
 +                entry.model_id, f"{label} serves language models only"
-             )
--        target, reason = self.splash_target(entry.model_id, model_settings)
--        if target is None:
++            )
 +        if engine_id == "splash":
 +            target, reason = self.splash_target(entry.model_id, model_settings)
 +            if target is None:
@@ -12134,19 +13573,21 @@ index 65312ce..bf7838f 100644
 +            return engine_id, m5_target
 +        plugin = get_external_engine_plugin(engine_id)
 +        if plugin is None:
-             raise ModelLoadingError(
--                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
++            raise ModelLoadingError(
 +                entry.model_id, f"Unknown external engine '{engine_id}'"
              )
--        return target
+-        target, reason = self.splash_target(entry.model_id, model_settings)
+-        if target is None:
 +        gs = _safe_global_settings()
 +        if not is_microkernel_enabled(
 +            gs, provider_id=plugin.provider_id, engine_id=plugin.id
 +        ):
-+            raise ModelLoadingError(
+             raise ModelLoadingError(
+-                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
 +                entry.model_id,
 +                f"{plugin.label} is disabled in Integrations",
-+            )
+             )
+-        return target
 +        if callable(plugin.validator):
 +            ok, reason = plugin.validator(entry.model_path, model_settings, gs)
 +            if not ok:
@@ -12238,7 +13679,7 @@ index 65312ce..bf7838f 100644
          logger.info(
              "Serving %s through %s %s (%s)",
              entry.model_id,
-@@ -2381,7 +2699,6 @@ class EnginePool:
+@@ -2381,7 +2720,6 @@ class EnginePool:
              target.binary.version,
              target.binary.path,
          )
@@ -12246,7 +13687,7 @@ index 65312ce..bf7838f 100644
          integrations = settings.integrations
          cfg = self._scheduler_config
          cache_disk_bytes = 0
-@@ -2436,12 +2753,12 @@ class EnginePool:
+@@ -2436,12 +2774,12 @@ class EnginePool:
          )
  
      def external_process_memory_bytes(self) -> int:
@@ -12261,7 +13702,7 @@ index 65312ce..bf7838f 100644
                  continue
              try:
                  total += engine.process_memory_bytes()
-@@ -2449,6 +2766,68 @@ class EnginePool:
+@@ -2449,6 +2787,68 @@ class EnginePool:
                  logger.debug("external process memory read failed", exc_info=True)
          return total
  
@@ -12330,7 +13771,7 @@ index 65312ce..bf7838f 100644
      def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
          """Start the chosen Prefill Accelerator while this Mac loads the model."""
          node_id = getattr(settings, "prefill_helper_node_id", None)
-@@ -2746,6 +3125,7 @@ class EnginePool:
+@@ -2746,6 +3146,7 @@ class EnginePool:
          entry.last_access = time.time()
          if lease:
              entry.in_use += 1
@@ -12338,7 +13779,7 @@ index 65312ce..bf7838f 100644
          return entry.engine
  
      async def get_engine(
-@@ -2878,6 +3258,7 @@ class EnginePool:
+@@ -2878,6 +3279,7 @@ class EnginePool:
                      entry.last_access = time.time()
                      if _lease:
                          entry.in_use += 1
@@ -12346,7 +13787,7 @@ index 65312ce..bf7838f 100644
                      return entry.engine
  
              self._raise_if_model_path_missing_locked(model_id, entry)
-@@ -2934,9 +3315,11 @@ class EnginePool:
+@@ -2934,9 +3336,11 @@ class EnginePool:
              runtime_load_settings = (
                  load_settings if ngram_admission_override else runtime_settings
              )
@@ -12361,7 +13802,7 @@ index 65312ce..bf7838f 100644
              admission_size = self._entry_runtime_resident_size(
                  entry,
                  load_settings,
-@@ -3115,6 +3498,7 @@ class EnginePool:
+@@ -3115,6 +3519,7 @@ class EnginePool:
              self._validate_llm_engine_ready(model_id, loaded.engine)
              if _lease:
                  loaded.in_use += 1
@@ -12369,7 +13810,7 @@ index 65312ce..bf7838f 100644
              return loaded.engine
  
      async def _release_engine_lease(self, model_id: str) -> None:
-@@ -3124,6 +3508,7 @@ class EnginePool:
+@@ -3124,6 +3529,7 @@ class EnginePool:
              if entry.in_use > 0:
                  entry.in_use -= 1
                  entry.last_access = time.time()
@@ -12377,7 +13818,7 @@ index 65312ce..bf7838f 100644
              return
          async with self._lock:
              e = self._entries.get(model_id)
-@@ -3131,6 +3516,7 @@ class EnginePool:
+@@ -3131,6 +3537,7 @@ class EnginePool:
                  e.in_use -= 1
                  e.last_access = time.time()
              await self._unload_pending_if_idle_locked(model_id)
@@ -12385,7 +13826,7 @@ index 65312ce..bf7838f 100644
  
      def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
          self._lease_release_tasks.discard(task)
-@@ -3832,8 +4218,9 @@ class EnginePool:
+@@ -3832,8 +4239,9 @@ class EnginePool:
  
          logger.info(f"Unloading model: {model_id} (immediate abort)")
          distributed = self._distributed_deployment_for_entry(entry) is not None
@@ -12397,7 +13838,7 @@ index 65312ce..bf7838f 100644
          resident_size = self._entry_resident_size(entry)
          settle_size = (
              entry.runtime_settle_size
-@@ -3903,11 +4290,12 @@ class EnginePool:
+@@ -3903,11 +4311,12 @@ class EnginePool:
                  0,
                  self._current_model_memory - resident_size,
              )
@@ -12411,7 +13852,7 @@ index 65312ce..bf7838f 100644
              self._wake_process_memory_enforcer()
              return
  
-@@ -4114,9 +4502,9 @@ class EnginePool:
+@@ -4114,9 +4523,9 @@ class EnginePool:
      @staticmethod
      async def _start_engine(engine) -> None:
          """Drain startup before stopping an engine whose acquisition was cancelled."""
@@ -12424,7 +13865,7 @@ index 65312ce..bf7838f 100644
              await engine.start()
              return
          task = asyncio.create_task(engine.start())
-@@ -4389,7 +4777,7 @@ class EnginePool:
+@@ -4389,7 +4798,7 @@ class EnginePool:
                          prefill_eviction_callback=prefill_eviction_callback,
                      )
  
@@ -12433,7 +13874,7 @@ index 65312ce..bf7838f 100644
                  self._starting_external[model_id] = engine
              early_helper = hasattr(
                  type(engine), "prefill_helper"
-@@ -4397,9 +4785,8 @@ class EnginePool:
+@@ -4397,9 +4806,8 @@ class EnginePool:
              try:
                  await self._start_engine(engine)
              except Exception as start_error:
@@ -12445,7 +13886,7 @@ index 65312ce..bf7838f 100644
                      raise
                  if hy4_engram_on_ssd:
                      raise
-@@ -4506,10 +4893,13 @@ class EnginePool:
+@@ -4506,10 +4914,13 @@ class EnginePool:
                  )
  
              self._validate_llm_engine_ready(model_id, engine)
@@ -12463,7 +13904,7 @@ index 65312ce..bf7838f 100644
                  entry.runtime_estimated_size = resident_size
                  entry.runtime_settle_size = resident_size
              entry.engine = engine
-@@ -4688,8 +5078,8 @@ class EnginePool:
+@@ -4688,8 +5099,8 @@ class EnginePool:
  
              post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
              observed_delta = max(0, post_load_memory - pre_load_memory)
@@ -12474,7 +13915,7 @@ index 65312ce..bf7838f 100644
                  observed_delta = 0
              entry.actual_size = observed_delta or resident_size
  
-@@ -4864,10 +5254,11 @@ class EnginePool:
+@@ -4864,10 +5275,11 @@ class EnginePool:
              deployment = self._distributed_deployment_for_entry(e)
              actual_size = e.actual_size
              external_engine = None
@@ -12491,44 +13932,57 @@ index 65312ce..bf7838f 100644
                  {
                      "id": mid,
 diff --git a/omlx/model_discovery.py b/omlx/model_discovery.py
-index 4d68ffe..0ef5682 100644
+index 4d68ffe..23b1983 100644
 --- a/omlx/model_discovery.py
 +++ b/omlx/model_discovery.py
-@@ -1140,6 +1140,20 @@ def detect_reasoning_effort(
+@@ -1140,6 +1140,30 @@ def detect_reasoning_effort(
      return [level for level in REASONING_EFFORT_LEVELS if level in named]
  
  
-+def _has_omlxm5_weights(model_dir: Path) -> bool:
-+    """True when ``model_dir`` contains a primary ``.omlxm5`` microkernel weight file."""
++_MICROKERNEL_WEIGHT_EXTS = (".miv", ".omlxm5")
++_MTP_COMPANION_NAMES = frozenset({"mtp.miv", "mtp.omlxm5"})
++
++
++def _primary_microkernel_weight_format(model_dir: Path) -> str | None:
++    """Return ``'miv'`` or ``'omlxm5'`` when ``model_dir`` has a primary microkernel weight file."""
 +    try:
-+        return any(
-+            f.is_file()
-+            and f.suffix == ".omlxm5"
-+            and not f.name.startswith(".")
-+            and f.name.lower() != "mtp.omlxm5"
-+            for f in model_dir.iterdir()
-+        )
++        entries = [f for f in model_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
 +    except OSError:
-+        return False
++        return None
++    for ext, fmt in ((".miv", "miv"), (".omlxm5", "omlxm5")):
++        if any(
++            f.suffix.lower() == ext and f.name.lower() not in _MTP_COMPANION_NAMES
++            for f in entries
++        ):
++            return fmt
++    return None
++
++
++def _has_omlxm5_weights(model_dir: Path) -> bool:
++    """True when ``model_dir`` contains a primary ``.miv`` or ``.omlxm5`` microkernel weight file."""
++    return _primary_microkernel_weight_format(model_dir) is not None
 +
 +
  def estimate_model_size(model_path: Path) -> int:
      """
      Estimate model memory usage from safetensors/bin file sizes.
-@@ -1173,6 +1187,12 @@ def estimate_model_size(model_path: Path) -> int:
+@@ -1173,6 +1197,15 @@ def estimate_model_size(model_path: Path) -> int:
          for f in model_path.glob("**/*.safetensors"):
              total_size += f.stat().st_size
  
-+    # Fallback: pure .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
++    # Fallback: pure .miv / .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
 +    if total_size == 0:
-+        for f in model_path.glob("*.omlxm5"):
-+            if f.is_file() and not f.name.startswith("."):
-+                total_size += f.stat().st_size
++        for ext in _MICROKERNEL_WEIGHT_EXTS:
++            for f in model_path.glob(f"*{ext}"):
++                if f.is_file() and not f.name.startswith("."):
++                    total_size += f.stat().st_size
++            if total_size > 0:
++                break
 +
      if total_size == 0:
          raise ValueError(f"No model weights found in {model_path}")
  
-@@ -1300,6 +1320,16 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
+@@ -1300,6 +1333,16 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
      Returns (missing count, up to 3 example names, manifest description), or
      None when the directory is complete or makes no shard promises.
      """
@@ -12545,7 +13999,7 @@ index 4d68ffe..0ef5682 100644
      idx_path = model_dir / "model.safetensors.index.json"
      index_missing: tuple[int, list[str]] | None = None
      if idx_path.is_file():
-@@ -1674,6 +1704,11 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+@@ -1674,6 +1717,11 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
          except (OSError, ValueError, TypeError, KeyError) as error:
              logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
              return False
@@ -12557,7 +14011,7 @@ index 4d68ffe..0ef5682 100644
      if not list(model_dir.glob("model*.safetensors")):
          logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
          return False
-@@ -1827,6 +1862,17 @@ def _register_model(
+@@ -1827,6 +1875,19 @@ def _register_model(
          reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
          model_context_length = _read_model_context_length(model_dir)
  
@@ -12569,13 +14023,15 @@ index 4d68ffe..0ef5682 100644
 +        except OSError:
 +            has_mlx_weights = False
 +        model_format = (
-+            "omlxm5" if (not has_mlx_weights and _has_omlxm5_weights(model_dir)) else None
++            _primary_microkernel_weight_format(model_dir)
++            if not has_mlx_weights
++            else None
 +        )
 +
          models[model_id] = DiscoveredModel(
              model_id=model_id,
              model_path=str(model_dir),
-@@ -1842,6 +1888,7 @@ def _register_model(
+@@ -1842,6 +1903,7 @@ def _register_model(
              model_context_length=model_context_length,
              source_type=source_type,
              source_repo_id=source_repo_id,
@@ -12754,10 +14210,10 @@ index 8bbdd65..c7f2239 100644
  
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..e36f556
+index 0000000..582278a
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,2757 @@
+@@ -0,0 +1,2974 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -15413,15 +16869,16 @@ index 0000000..e36f556
 +        assert m5_mod.discover_ninfer_metal_toml_path() == custom_toml
 +
 +
-+class TestMix1PureOmlxm5DiscoveryAndConversion:
-+    def test_pure_omlxm5_discovery_with_stale_index_and_hf_cache(self, tmp_path: Path):
++class TestMivDiscoveryAutoRepackAndFoundryConverter:
++    def test_pure_miv_and_legacy_omlxm5_discovery_with_stale_index_and_hf_cache(
++        self, tmp_path: Path
++    ):
 +        from omlx.model_discovery import discover_models
 +
 +        models_root = tmp_path / "models"
 +        models_root.mkdir()
 +
-+        # 1) Pure .omlxm5 local folder that still retains model.safetensors.index.json
-+        #    after user deleted the redundant .safetensors shards to save disk space.
++        # 1) Pure .miv local folder that still retains model.safetensors.index.json
 +        pure_dir = models_root / "Qwen3.8-27B-PureMiv"
 +        pure_dir.mkdir()
 +        (pure_dir / "config.json").write_text(
@@ -15440,10 +16897,10 @@ index 0000000..e36f556
 +            ),
 +            encoding="utf-8",
 +        )
-+        omlxm5_payload = b"OMLXM5A1" + (b"\x00" * 4096)
-+        (pure_dir / "model.omlxm5").write_bytes(omlxm5_payload)
++        miv_payload = b"OMLXM5A1" + (b"\x00" * 4096)
++        (pure_dir / "model.miv").write_bytes(miv_payload)
 +
-+        # 2) Pure .omlxm5 HF Hub cache snapshot
++        # 2) Legacy pure .omlxm5 HF Hub cache snapshot remains backward-compatible
 +        hf_snap = (
 +            models_root
 +            / "models--scoltzero--Qwen3.5-9B-miv"
@@ -15459,22 +16916,22 @@ index 0000000..e36f556
 +            json.dumps({"model_type": "qwen3_5", "hidden_size": 2048}),
 +            encoding="utf-8",
 +        )
-+        (hf_snap / "model.omlxm5").write_bytes(omlxm5_payload)
++        (hf_snap / "model.omlxm5").write_bytes(miv_payload)
 +
 +        discovered = discover_models(models_root)
 +        assert "Qwen3.8-27B-PureMiv" in discovered
-+        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "omlxm5"
-+        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(omlxm5_payload)
++        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "miv"
++        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(miv_payload)
 +
 +        assert "scoltzero--Qwen3.5-9B-miv" in discovered
 +        assert discovered["scoltzero--Qwen3.5-9B-miv"].model_format == "omlxm5"
 +
-+    def test_can_convert_and_convert_model_to_omlxm5_atomic(
++    def test_can_convert_to_miv_colocated_and_bf16_guard(
 +        self, tmp_path: Path, monkeypatch
 +    ):
-+        # Fake provider layout with bin/mseries_backendd and tools/m5_artifact.py
 +        prov_root = tmp_path / "provider"
 +        (prov_root / "bin").mkdir(parents=True)
++        (prov_root / "metallib").mkdir(parents=True)
 +        (prov_root / "tools").mkdir(parents=True)
 +        fake_bin = prov_root / "bin" / "mseries_backendd"
 +        fake_bin.write_text(
@@ -15482,6 +16939,7 @@ index 0000000..e36f556
 +            encoding="utf-8",
 +        )
 +        fake_bin.chmod(0o755)
++        (prov_root / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
 +        fake_tool = prov_root / "tools" / "m5_artifact.py"
 +        fake_tool.write_text(
 +            "import pathlib, sys\n"
@@ -15491,26 +16949,241 @@ index 0000000..e36f556
 +        )
 +        monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
 +
-+        qwen_dir = tmp_path / "Qwen3.5-Unconverted"
-+        qwen_dir.mkdir()
-+        (qwen_dir / "config.json").write_text(
++        # Unquantized BF16 Qwen checkpoint must NOT claim auto-conversion (stays on Stock MLX)
++        bf16_dir = tmp_path / "Qwen3.5-BF16"
++        bf16_dir.mkdir()
++        (bf16_dir / "config.json").write_text(
 +            json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
 +        )
-+        (qwen_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
++        (bf16_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
++        bf16_ok, _ = m5_mod.can_convert_to_miv(bf16_dir, str(fake_bin))
++        assert bf16_ok is False
++        assert m5_mod.can_auto_convert_m5rt_fast(bf16_dir, str(fake_bin)) is False
 +
-+        ok, reason = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
++        # Quantized 4-bit affine Qwen checkpoint converts in-place to model.miv alongside model.safetensors
++        qwen_dir = tmp_path / "Qwen3.5-4bit"
++        qwen_dir.mkdir()
++        (qwen_dir / "config.json").write_text(
++            json.dumps(
++                {
++                    "model_type": "qwen3_5",
++                    "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
++                }
++            ),
++            encoding="utf-8",
++        )
++        orig_st_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00{}      "
++        (qwen_dir / "model.safetensors").write_bytes(orig_st_bytes)
++
++        ok, reason = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
 +        assert ok is True and reason == ""
++        fmt_before = m5_mod.detect_model_weight_format_info(
++            qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
++        )
++        assert fmt_before["weight_format"] == "safetensors"
++        assert fmt_before["pending_auto_repack"] is True
++        assert fmt_before["repack_target_format"] == "miv"
 +
-+        res = m5_mod.convert_model_to_omlxm5(
-+            qwen_dir, source_repo="Qwen/Qwen3.5-9B", configured_binary=str(fake_bin)
++        res = m5_mod.convert_model_to_miv(
++            qwen_dir, source_repo="mlx-community/Qwen3.5-9B-4bit", configured_binary=str(fake_bin)
 +        )
 +        assert res["already_existed"] is False
-+        assert (qwen_dir / "model.omlxm5").is_file()
++        assert res["artifact_format"] == "miv"
++        assert (qwen_dir / "model.miv").is_file()
++        # Original .safetensors remains intact right next to model.miv!
++        assert (qwen_dir / "model.safetensors").read_bytes() == orig_st_bytes
 +        assert m5_mod.detect_adapted(qwen_dir).adapted is True
 +
-+        # Subsequent check reports already adapted (not convertible again)
-+        ok_after, _ = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
++        fmt_after = m5_mod.detect_model_weight_format_info(
++            qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
++        )
++        assert fmt_after["weight_format"] == "miv"
++        assert fmt_after["has_miv_weights"] is True
++        assert fmt_after["pending_auto_repack"] is False
++
++        # When overridden back to Stock MLX, active weight_format reports "safetensors"
++        fmt_stock = m5_mod.detect_model_weight_format_info(
++            qwen_dir, active_external_engine="stock", configured_m5rt_binary=str(fake_bin)
++        )
++        assert fmt_stock["weight_format"] == "safetensors"
++        assert fmt_stock["has_miv_weights"] is True
++
++        ok_after, _ = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
 +        assert ok_after is False
++
++    async def test_auto_repack_on_first_load_and_foundry_path_b_converter(
++        self, tmp_path: Path, monkeypatch
++    ):
++        # Set up both Path A (io.ninfer.metal -> .miv) and Path B (io.community.llama-metal -> .llama-m5)
++        providers_root = tmp_path / "Providers"
++        miv_ver = providers_root / "io.ninfer.metal" / "versions" / "miv-v0.01"
++        (miv_ver / "bin").mkdir(parents=True)
++        (miv_ver / "metallib").mkdir(parents=True)
++        (miv_ver / "tools").mkdir(parents=True)
++        miv_sock_srv = _MockUdsSidecarServer(
++            Path("/tmp") / f"m5-autorepack-{os.getpid()}.sock",
++            support_push=True,
++            support_v2_coexistence=True,
++            token_plan=[[65, 66]],
++        )
++        await miv_sock_srv.start()
++        try:
++            miv_bin = _fake_daemon_script(miv_ver / "bin" / "mseries_backendd", "miv-v0.01", protocol=2)
++            (miv_ver / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
++            (miv_ver / "tools" / "m5_artifact.py").write_text(
++                "import pathlib, sys\n"
++                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
++                "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 256)\n",
++                encoding="utf-8",
++            )
++            (miv_ver / "provider.json").write_text(
++                json.dumps(
++                    {
++                        "provider_id": "io.ninfer.metal",
++                        "engine_id": "m5rt",
++                        "protocol_version": 2,
++                        "entrypoint": "bin/mseries_backendd",
++                        "metallib_dir": "metallib",
++                        "supported_model_types": ["qwen3_5"],
++                        "artifact_extensions": [".miv", ".omlxm5"],
++                        "converter": {
++                            "entrypoint": "tools/m5_artifact.py",
++                            "subcommand": "convert",
++                            "output_filename": "model.miv",
++                            "artifact_extension": ".miv",
++                            "default_args": ["--nax-pretile"],
++                            "supported_quant_modes": ["affine", "mxfp4"],
++                        },
++                    }
++                ),
++                encoding="utf-8",
++            )
++            (providers_root / "io.ninfer.metal" / "current").symlink_to(miv_ver)
++
++            # Path B provider with Microkernel Foundry `converter` contract
++            llama_ver = providers_root / "io.community.llama-metal" / "versions" / "0.2.0"
++            (llama_ver / "bin").mkdir(parents=True)
++            (llama_ver / "tools").mkdir(parents=True)
++            _fake_daemon_script(llama_ver / "bin" / "llama_backendd", "0.2.0", protocol=2)
++            (llama_ver / "tools" / "repack_llama.py").write_text(
++                "import pathlib, sys\n"
++                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
++                "out.write_bytes(b'LLAMAM5!' + b'\\x00' * 256)\n",
++                encoding="utf-8",
++            )
++            (llama_ver / "provider.json").write_text(
++                json.dumps(
++                    {
++                        "provider_id": "io.community.llama-metal",
++                        "engine_id": "llama-metal",
++                        "display_name": "Community Llama Metal 4",
++                        "protocol_version": 2,
++                        "entrypoint": "bin/llama_backendd",
++                        "supported_model_types": ["llama"],
++                        "artifact_extensions": [".llama-m5"],
++                        "converter": {
++                            "entrypoint": "tools/repack_llama.py",
++                            "subcommand": "convert",
++                            "output_filename": "model.llama-m5",
++                            "artifact_extension": ".llama-m5",
++                            "supported_quant_modes": ["affine"],
++                        },
++                    }
++                ),
++                encoding="utf-8",
++            )
++            (providers_root / "io.community.llama-metal" / "current").symlink_to(llama_ver)
++
++            monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(providers_root))
++            monkeypatch.delenv("OMLX_M5RT_BIN", raising=False)
++            monkeypatch.delenv("NINFER_METAL_BIN", raising=False)
++            monkeypatch.setattr(m5_mod.importlib.metadata, "entry_points", lambda group=None: [])
++
++            # Create unrepacked quantized Qwen & Llama checkpoints
++            qwen_unrepacked = tmp_path / "models" / "Qwen3.5-Mirror"
++            qwen_unrepacked.mkdir(parents=True)
++            (qwen_unrepacked / "config.json").write_text(
++                json.dumps(
++                    {
++                        "model_type": "qwen3_5",
++                        "vocab_size": 512,
++                        "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
++                    }
++                ),
++                encoding="utf-8",
++            )
++            (qwen_unrepacked / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
++
++            llama_unrepacked = tmp_path / "models" / "Llama3-Mirror"
++            llama_unrepacked.mkdir(parents=True)
++            (llama_unrepacked / "config.json").write_text(
++                json.dumps(
++                    {
++                        "model_type": "llama",
++                        "vocab_size": 512,
++                        "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
++                    }
++                ),
++                encoding="utf-8",
++            )
++            (llama_unrepacked / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
++
++            gs = GlobalSettings(base_path=tmp_path / "base")
++            monkeypatch.setattr("omlx.engine_pool.get_global_settings", lambda: gs)
++            pool = EnginePool()
++            for mid, mdir in (("Qwen3.5-Mirror", qwen_unrepacked), ("Llama3-Mirror", llama_unrepacked)):
++                pool._entries[mid] = EngineEntry(
++                    model_id=mid,
++                    model_path=str(mdir),
++                    model_type="llm",
++                    engine_type="batched",
++                    estimated_size=4096,
++                )
++
++            # Fast O(1) auto-route BEFORE conversion (zero subprocess!)
++            with patch.object(m5_mod.subprocess, "run", side_effect=AssertionError("must not spawn")):
++                assert pool.external_engine_id("Qwen3.5-Mirror", ModelSettings()) == "m5rt"
++                assert pool.external_engine_id("Llama3-Mirror", ModelSettings()) == "llama-metal"
++                assert pool.external_engine_id("Qwen3.5-Mirror", ModelSettings(external_engine="stock")) is None
++
++            # Verify m5rt_target sets auto_convert_output = model.miv when not yet converted
++            target, err = pool.m5rt_target("Qwen3.5-Mirror", ModelSettings())
++            assert err == "" and target is not None
++            assert target.artifact_path is None
++            assert target.auto_convert_output == qwen_unrepacked / "model.miv"
++
++            # Verify first Load (`engine.start()`) auto-repacks model.miv in-place and passes it to load RPC!
++            eng = pool._external_engine_for(pool._entries["Qwen3.5-Mirror"], ModelSettings(), "batched")
++            assert isinstance(eng, M5SidecarEngine)
++            monkeypatch.setattr(m5_mod, "_short_socket_path", lambda _eid=None: miv_sock_srv.socket_path)
++            real_popen = m5_mod.subprocess.Popen
++            monkeypatch.setattr(
++                m5_mod.subprocess,
++                "Popen",
++                lambda cmd, *a, **kw: (
++                    SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None, wait=lambda: 0)
++                    if isinstance(cmd, list) and "m5rt-watchdog" in cmd
++                    else real_popen(cmd, *a, **kw)
++                ),
++            )
++            await eng.start()
++            try:
++                assert (qwen_unrepacked / "model.miv").is_file()
++                assert (qwen_unrepacked / "model.safetensors").is_file()
++                assert Path(miv_sock_srv.load_params[-1]["path_overrides"]["artifact"]).name == "model.miv"
++            finally:
++                eng._process = None
++                await eng.stop()
++
++            # Also verify Path B Foundry converter produces model.llama-m5 alongside model.safetensors
++            llama_plugin = m5_mod.get_external_engine_plugin("llama-metal")
++            assert llama_plugin is not None and llama_plugin.convert_model is not None
++            llama_res = llama_plugin.convert_model(llama_unrepacked, source_repo="meta-llama/Llama-3-8B-4bit")
++            assert Path(llama_res["artifact_path"]).name == "model.llama-m5"
++            assert (llama_unrepacked / "model.llama-m5").is_file()
++            assert (llama_unrepacked / "model.safetensors").is_file()
++        finally:
++            await miv_sock_srv.close()
 +
 +
 +

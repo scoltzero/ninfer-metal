@@ -144,6 +144,69 @@ struct MicrokernelTagPill: View {
     }
 }
 
+/// Monospaced weight-format badge used on `Models` rows and `ModelSettingsScreen.Header`
+/// to distinguish `.miv` microkernel weights, pending auto-repack `.safetensors → .miv`,
+/// legacy `.omlxm5`, `safetensors`, and `GGUF`.
+struct WeightFormatPill: View {
+    enum StyleKind {
+        case miv
+        case pendingRepack
+        case neutral
+    }
+
+    let label: String
+    let kind: StyleKind
+    var tooltip: String? = nil
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        let style = palette
+        Text(label)
+            .font(.omlxMono(DesignTokens.FontSize.caption, weight: .medium))
+            .foregroundStyle(style.text)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(style.bg)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(style.border, lineWidth: 0.5)
+            )
+            .help(tooltip ?? label)
+    }
+
+    private var palette: (text: Color, bg: Color, border: Color) {
+        switch kind {
+        case .miv:
+            let teal = Color(nsColor: .systemTeal)
+            return (teal, teal.opacity(0.14), teal.opacity(0.35))
+        case .pendingRepack:
+            let amber = Color(nsColor: .systemOrange)
+            return (amber, amber.opacity(0.14), amber.opacity(0.35))
+        case .neutral:
+            return (theme.textSecondary, theme.codeBg, theme.groupBorder)
+        }
+    }
+}
+
+extension ModelDTO {
+    var weightFormatPillKind: WeightFormatPill.StyleKind {
+        if pendingAutoRepack == true {
+            return .pendingRepack
+        }
+        switch effectiveWeightFormat {
+        case "safetensors", "gguf", "bin":
+            return .neutral
+        default:
+            return .miv
+        }
+    }
+}
+
 #Preview("StatusPill") {
     VStack(alignment: .leading, spacing: 10) {
         StatusPill(status: .running)

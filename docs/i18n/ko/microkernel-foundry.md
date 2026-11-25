@@ -18,9 +18,9 @@
 - Metal 4 실행 런타임(`MetalContext`, `MTL4CommandQueue`, 더블 버퍼 `ar_pipe_[2]`, `< 2 GiB` Compute ICB 인코더, `read_write` 배리어 리플렉션).
 - 공유 페이지 기반 KV 및 프리픽스 메모리(`KvPagePool`, `SharedKvArenaPool`, CoW 참조 카운팅, `SharedPrefixCache`, `UmaCheckpointPool`).
 - 범용 NAX 및 디코딩 프리미티브(`mxfp4_nax`, `affine_nax`, `bf16_nax`, `moe_nax`, 제로 `uitofp` QMV, 2단계 병렬 `Argmax`, `Split-KV` / `Flash-NAX`).
-- `.omlxm5` 컨테이너 로더, `ExecutionIdentityFields`, `24 MHz` 하드웨어 카운터, 네이티브 독립 OpenAI 서버(`ninfer-metal-serve`), Provider SPI v2 데몬(`mseries_backendd`).
+- `.miv`(기존 `.omlxm5` 호환) 컨테이너 로더, 번들 가중치 재배치 변환기(`tools/m5_artifact.py`), `ExecutionIdentityFields`, `24 MHz` 하드웨어 카운터, 네이티브 독립 OpenAI 서버(`ninfer-metal-serve`), Provider SPI v2 데몬(`mseries_backendd`).
 
-**PR에 추가할 내용과 실행 범위:** 대상 아키텍처의 레이어 그래프, 가중치 매핑, 그리고 콜드 DRAM 마이크로프로브에서 범용 프리미티브보다 **`>= +10%–12%`** 이상 빠른 아키텍처 전용 커널(예: MLA, GeGLU, Softcap, 커스텀 MoE 라우터)을 추가합니다. `libninfer_metal_substrate`를 공유해 아키텍처 간 코드와 상주 메모리 중복을 없애며, 독립형 `ninfer-metal-serve`와 `oMLX-extend` 모두에서 네이티브로 실행되고 [지원 모델 목록](README.md)에 기여자 크레딧이 표기됩니다.
+**PR에 추가할 내용과 실행 범위:** 대상 아키텍처의 레이어 그래프, 가중치 매핑, `.safetensors → .miv` 가중치 재배치 규칙, 그리고 콜드 DRAM 마이크로프로브에서 범용 프리미티브보다 **`>= +10%–12%`** 이상 빠른 아키텍처 전용 커널(예: MLA, GeGLU, Softcap, 커스텀 MoE 라우터)을 추가합니다. `libninfer_metal_substrate`를 공유해 아키텍처 간 코드와 상주 메모리 중복을 없애며, 독립형 `ninfer-metal-serve`와 `oMLX-extend`(최초 `Load` 시 원본 가중치와 같은 폴더에 `.miv` 자동 생성 지원) 모두에서 네이티브로 실행되고 [지원 모델 목록](README.md)에 기여자 크레딧이 표기됩니다.
 
 ### 경로 B: 병렬 사이드카 → PR 또는 Issue → 원본 프로젝트 링크 표기
 
@@ -30,7 +30,7 @@
 ~/Library/Application Support/oMLX/Providers/<provider_id>/versions/<vA.B.C>/
 ```
 
-`supported_topologies`, `supported_model_types`, `artifact_extensions`를 선언한 `provider.json`과 함께 원자적 `current` 심볼릭 링크를 노출합니다. 준비되면 PR을 보내거나 Issue를 열어 주세요. 메인테이너가 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)에 등록해 사용자가 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh)로 설치·업데이트할 수 있게 하며, [지원 모델 목록](README.md)에 원본 저장소 직접 링크를 게시합니다.
+`supported_topologies`, `supported_model_types`, `artifact_extensions` 및 번들 `converter` 엔트리포인트(`--source <dir> --output <file> --source-repo <id>`)를 선언한 `provider.json`과 함께 원자적 `current` 심볼릭 링크를 노출합니다. 준비되면 PR을 보내거나 Issue를 열어 주세요. 메인테이너가 [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json)에 등록해 사용자가 [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh)로 설치·업데이트할 수 있게 하며, [지원 모델 목록](README.md)에 원본 저장소 직접 링크를 게시합니다.
 
 **통합 멀티 마이크로커널 호스팅:** **`oMLX-extend`와 독립 실행형 `ninfer-metal-serve --providers-dir` 모두** `Providers/*/current/provider.json`을 네이티브로 탐색하고 통합 UMA 예산 조정 및 `gpu_contended` 스케줄링 아래 여러 경로 A(**`miv Core Backend`**)와 경로 B 마이크로커널을 단일 포트에서 병렬 실행합니다(`oMLX-extend`에서는 Stock MLX와 함께 실행). `oMLX` macOS 앱에서는 설치된 경로 B 마이크로커널이 **`Integrations → External Engines`**에 카드로 자동 표시되고 **`Models`**에 활성 엔진 배지가 나타납니다([`oMLX-extend` 비주얼 가이드](omlx-extend-guide.md) 참고). 마이크로커널 작성자는 Metal 4 코어와 Sidecar SPI v2 데몬만 구현하면 되며, HTTP/SSE 서빙, 토크나이징, 채팅 템플릿, 멀티 모델 스케줄링은 두 호스트가 처리합니다.
 

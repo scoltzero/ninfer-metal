@@ -18,9 +18,9 @@
 - Metal 4 実行ランタイム（`MetalContext`、`MTL4CommandQueue`、ダブルバッファ `ar_pipe_[2]`、`< 2 GiB` Compute ICB エンコーダ、`read_write` バリアリフレクション）。
 - 共有ページ化 KV・プレフィックスメモリ（`KvPagePool`、`SharedKvArenaPool`、CoW 参照カウント、`SharedPrefixCache`、`UmaCheckpointPool`）。
 - 汎用 NAX・デコードプリミティブ（`mxfp4_nax`、`affine_nax`、`bf16_nax`、`moe_nax`、ゼロ `uitofp` QMV、2 段階並列 `Argmax`、`Split-KV` / `Flash-NAX`）。
-- `.omlxm5` コンテナローダ、`ExecutionIdentityFields`、`24 MHz` ハードウェアカウンタ、ネイティブ単体 OpenAI サーバー（`ninfer-metal-serve`）、Provider SPI v2 デーモン（`mseries_backendd`）。
+- `.miv`（旧 `.omlxm5` 互換）コンテナローダ、同梱ウェイト再配置コンバータ（`tools/m5_artifact.py`）、`ExecutionIdentityFields`、`24 MHz` ハードウェアカウンタ、ネイティブ単体 OpenAI サーバー（`ninfer-metal-serve`）、Provider SPI v2 デーモン（`mseries_backendd`）。
 
-**PR で追加する要素と実行範囲：** 対象アーキテクチャのレイヤーグラフ、ウェイトマッピング、およびコールド DRAM マイクロプローブで汎用プリミティブを **`>= +10%–12%`** 上回るアーキテクチャ固有カーネル（MLA、GeGLU、Softcap、カスタム MoE ルータなど）を追加する。`libninfer_metal_substrate` を共有することでアーキテクチャ間のコードと常駐メモリの重複を防ぎ、単体 `ninfer-metal-serve` と `oMLX-extend` の双方でネイティブ動作させ、[対応モデル一覧](README.md)にコントリビュータクレジットを記載する。
+**PR で追加する要素と実行範囲：** 対象アーキテクチャのレイヤーグラフ、ウェイトマッピング、`.safetensors → .miv` 再配置ルール、およびコールド DRAM マイクロプローブで汎用プリミティブを **`>= +10%–12%`** 上回るアーキテクチャ固有カーネル（MLA、GeGLU、Softcap、カスタム MoE ルータなど）を追加する。`libninfer_metal_substrate` を共有することでアーキテクチャ間のコードと常駐メモリの重複を防ぎ、単体 `ninfer-metal-serve` と `oMLX-extend`（初回 `Load` 時の同一ディレクトリ自動 `.miv` 変換に対応）の双方でネイティブ動作させ、[対応モデル一覧](README.md)にコントリビュータクレジットを記載する。
 
 ### ルート B：並列サイドカー → PR または Issue → オリジナルプロジェクトへのリンク記載
 
@@ -30,7 +30,7 @@
 ~/Library/Application Support/oMLX/Providers/<provider_id>/versions/<vA.B.C>/
 ```
 
-`supported_topologies`、`supported_model_types`、`artifact_extensions` を宣言した `provider.json` とともにアトミックな `current` シンボリックリンクを公開する。準備完了後に PR または Issue を提出すれば、メンテナが [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json) へ登録し、ユーザーが [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) で導入・更新できるようにしたうえで、[対応モデル一覧](README.md)にオリジナルリポジトリへの直接リンクを掲載する。
+`supported_topologies`、`supported_model_types`、`artifact_extensions`、および同梱 `converter` エントリポイント（`--source <dir> --output <file> --source-repo <id>`）を宣言した `provider.json` とともにアトミックな `current` シンボリックリンクを公開する。準備完了後に PR または Issue を提出すれば、メンテナが [`omlx-extend/registry/microkernels.json`](../../../omlx-extend/registry/microkernels.json) へ登録し、ユーザーが [`./omlx-extend/scripts/sync_microkernels.sh`](../../../omlx-extend/scripts/sync_microkernels.sh) で導入・更新できるようにしたうえで、[対応モデル一覧](README.md)にオリジナルリポジトリへの直接リンクを掲載する。
 
 **並列ホスト対応：** **`oMLX-extend` と単体 `ninfer-metal-serve --providers-dir` の双方**が `Providers/*/current/provider.json` をネイティブに自動検出し、統一 UMA 予算調停と `gpu_contended` スケジューリングのもとで複数のルート A（**`miv Core Backend`**）およびルート B マイクロカーネルを単一ポート上で並列実行する（`oMLX-extend` では Stock MLX とも共存）。`oMLX` macOS アプリでは、導入済みのルート B マイクロカーネルが **`Integrations → External Engines`** にカードとして自動表示され、**`Models`** にアクティブエンジンバッジが表示される（[`oMLX-extend` ビジュアルガイド](omlx-extend-guide.md) 参照）。マイクロカーネル作者が実装するのは Metal 4 コアと Sidecar SPI v2 デーモンのみであり、HTTP/SSE 配信、トークン化、チャットテンプレート、マルチモデルスケジューリングは双方のホストが担う。
 
