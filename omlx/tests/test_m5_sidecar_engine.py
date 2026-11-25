@@ -3294,6 +3294,45 @@ class TestDFlash2WhitelistAndAutoRepack:
         finally:
             await miv_sock_srv.close()
 
+    def test_missing_tokenizer_raises_for_real_vocab_but_allows_small_fixtures(self, tmp_path):
+        import omlx.engine.m5_sidecar as m5_mod
+
+        fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd")
+        binary, err = m5_mod.inspect_m5rt_binary(fake_bin, auto_detected=False)
+        assert err == "" and binary is not None
+
+        # 1) Real-model vocab (> 1024) without HF tokenizer files must fail fast with ModelLoadingError
+        real_dir = _write_test_model(
+            tmp_path / "models" / "Qwen3.8-27B-mxfp4",
+            vocab_size=248320,
+            with_tokenizer=False,
+        )
+        eng_real = M5SidecarEngine(
+            model_name=str(real_dir),
+            model_id="Qwen3.8-27B-mxfp4",
+            target=M5Target(binary=binary, artifact_path=real_dir / "model.omlxm5", metallib_dir=tmp_path),
+            log_dir=tmp_path / "logs",
+            options=M5Options(max_context=4096),
+        )
+        with pytest.raises(ModelLoadingError, match="missing HuggingFace tokenizer files"):
+            eng_real._load_tokenizer()
+
+        # 2) Small C++ unit-test fixture (vocab_size <= 1024) without HF tokenizer keeps byte fallback
+        fix_dir = _write_test_model(
+            tmp_path / "models" / "qwen-fixture",
+            vocab_size=257,
+            with_tokenizer=False,
+        )
+        eng_fix = M5SidecarEngine(
+            model_name=str(fix_dir),
+            model_id="qwen-fixture",
+            target=M5Target(binary=binary, artifact_path=fix_dir / "model.omlxm5", metallib_dir=tmp_path),
+            log_dir=tmp_path / "logs",
+            options=M5Options(max_context=4096),
+        )
+        eng_fix._load_tokenizer()
+        assert eng_fix.tokenizer is not None
+
 
 
 

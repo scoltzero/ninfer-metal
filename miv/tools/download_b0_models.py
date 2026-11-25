@@ -300,12 +300,35 @@ def atomic_json(path: Path, value: dict) -> None:
             os.unlink(temporary)
 
 
+AUX_TOKENIZER_FILES: tuple[str, ...] = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
+)
+
+
 def download_model(pin: ModelPin, root: Path) -> dict:
     metadata = api_metadata(pin)
     destination = root / pin.repo
     destination.mkdir(parents=True, exist_ok=True)
     report_files = []
-    for name in pin.files:
+    extra_files = tuple(
+        name
+        for name in AUX_TOKENIZER_FILES
+        if name not in pin.files
+        and name in metadata
+        and isinstance(metadata[name].get("size"), int)
+    )
+    for name in (*pin.files, *extra_files):
         if name not in metadata or not isinstance(metadata[name].get("size"), int):
             raise RuntimeError(f"{pin.repo}: missing size metadata for {name}")
         size = int(metadata[name]["size"])

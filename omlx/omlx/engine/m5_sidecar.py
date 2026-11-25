@@ -36,7 +36,7 @@ from ..api.utils import (
     _consolidate_system_messages,
     detect_and_strip_partial,
 )
-from ..exceptions import InvalidRequestError
+from ..exceptions import InvalidRequestError, ModelLoadingError
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -4252,12 +4252,19 @@ class M5SidecarEngine(BaseEngine):
             tok_len = len(self._tokenizer) if hasattr(self._tokenizer, "__len__") else 0
             if not text_cfg.get("vocab_size") and tok_len > 0:
                 self._vocab_size = max(self._vocab_size, tok_len)
-        else:
+        elif self._target.fake or self._vocab_size <= 1024:
             cfg_eos = text_cfg.get("eos_token_id", config.get("eos_token_id"))
             first_eos = cfg_eos[0] if isinstance(cfg_eos, list) and cfg_eos else cfg_eos
             self._tokenizer = _ByteFallbackTokenizer(
                 vocab_size=self._vocab_size,
                 eos_token_id=first_eos if isinstance(first_eos, int) else None,
+            )
+        else:
+            raise ModelLoadingError(
+                self._model_id,
+                f"{self._target.binary.label} cannot serve '{self._model_id}': "
+                f"missing HuggingFace tokenizer files (tokenizer.json / "
+                f"tokenizer_config.json / tokenizer.model / vocab.json) in {self._path}",
             )
 
         self._eos_token_ids = self._discover_eos_token_ids(config)
