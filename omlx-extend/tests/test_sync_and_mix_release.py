@@ -84,6 +84,19 @@ class TestResolveExtendTag:
         assert forced["extend_tag"] == "omlx-extend-v0.8.3-mix2"
         assert forced["already_released"] is True
 
+    def test_sync_workflow_does_not_clobber_upstream_repo_slug(self):
+        wf_text = (REPO_ROOT / ".github" / "workflows" / "sync-omlx-extend.yml").read_text(
+            encoding="utf-8"
+        )
+        # UPSTREAM_VERSION defines UPSTREAM_REPO=https://github.com/jundot/omlx,
+        # so sourcing it must happen inside a subshell to preserve owner/repo for gh api.
+        assert 'CURRENT_TAG="$(' in wf_text
+        assert "--latest=false" in wf_text
+        rel_text = (REPO_ROOT / ".github" / "workflows" / "release-ninfer-metal.yml").read_text(
+            encoding="utf-8"
+        )
+        assert '"!omlx-extend-*"' in rel_text
+
 
 class TestMergeXcstrings:
     def test_disjoint_additions_and_locale_edits_merge_cleanly(self):

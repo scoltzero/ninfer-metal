@@ -74,9 +74,13 @@ jobs:
           RELEASE_MODE="${{ inputs.release_mode || 'auto' }}"
           CURRENT_TAG=""
           if [[ -f omlx-extend/UPSTREAM_VERSION ]]; then
-            # shellcheck disable=SC1091
-            source omlx-extend/UPSTREAM_VERSION
-            CURRENT_TAG="${UPSTREAM_TAG:-}"
+            # Read UPSTREAM_TAG in a subshell so UPSTREAM_VERSION's full URL
+            # (UPSTREAM_REPO=https://github.com/...) never clobbers the owner/repo slug.
+            CURRENT_TAG="$(
+              # shellcheck disable=SC1091
+              source omlx-extend/UPSTREAM_VERSION
+              printf '%s' "${UPSTREAM_TAG:-}"
+            )"
           fi
 
           if [[ -n "${{ inputs.upstream_tag }}" ]]; then
