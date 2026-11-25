@@ -66,6 +66,67 @@ M5RT_SUPPORTED_MODEL_TYPES: tuple[str, ...] = (
     "qwen3_8",
     "qwen3_8_moe",
 )
+# Companion DFlash2 draft model whitelist for miv-supported Qwen3.5 / Qwen3.6 / Qwen3.8
+# Dense (0.8B / 2B / 4B / 9B / 27B) and MoE-256 (35B-A3B / 122B-A10B) target families.
+M5RT_SUPPORTED_DFLASH2_ARCHITECTURES: tuple[str, ...] = ("DFlash2DraftModel",)
+M5RT_SUPPORTED_DFLASH2_MODEL_TYPES: tuple[str, ...] = ("qwen3",)
+M5RT_SUPPORTED_DFLASH2_TARGET_GEOMETRIES: frozenset[tuple[int, int]] = frozenset(
+    {
+        (1024, 24),  # Qwen3.5 / Qwen3.6 / Qwen3.8 0.8B Dense
+        (2048, 24),  # Qwen3.5 / Qwen3.6 / Qwen3.8 2B Dense
+        (2560, 32),  # Qwen3.5 / Qwen3.6 / Qwen3.8 4B Dense
+        (4096, 32),  # Qwen3.5 / Qwen3.6 / Qwen3.8 9B Dense
+        (5120, 64),  # Qwen3.5 / Qwen3.6 / Qwen3.8 27B Dense
+        (2048, 40),  # Qwen3.5 / Qwen3.6 / Qwen3.8 35B-A3B MoE (256x k=8)
+        (3072, 48),  # Qwen3.5 / Qwen3.6 / Qwen3.8 122B-A10B MoE (256x k=8)
+    }
+)
+M5RT_SUPPORTED_DFLASH2_REPOS: tuple[str, ...] = (
+    "z-lab/Qwen3.8-27B-DFlash2",
+    "incoai/Qwen3.8-27B-DFlash2",
+    "z-lab/Qwen3.6-27B-DFlash2",
+    "incoai/Qwen3.6-27B-DFlash2",
+    "z-lab/Qwen3.5-27B-DFlash2",
+    "incoai/Qwen3.5-27B-DFlash2",
+    "z-lab/Qwen3.6-35B-A3B-DFlash2",
+    "incoai/Qwen3.6-35B-A3B-DFlash2",
+    "z-lab/Qwen3.5-35B-A3B-DFlash2",
+    "incoai/Qwen3.5-35B-A3B-DFlash2",
+    "z-lab/Qwen3.8-35B-A3B-DFlash2",
+    "incoai/Qwen3.8-35B-A3B-DFlash2",
+    "incoai/Ornith-1.5-122B-DFlash2",
+    "z-lab/Ornith-1.5-122B-DFlash2",
+    "z-lab/Qwen3.5-122B-A10B-DFlash2",
+    "incoai/Qwen3.5-122B-A10B-DFlash2",
+    "z-lab/Qwen3.6-122B-A10B-DFlash2",
+    "incoai/Qwen3.6-122B-A10B-DFlash2",
+    "z-lab/Qwen3.8-122B-A10B-DFlash2",
+    "incoai/Qwen3.8-122B-A10B-DFlash2",
+    "z-lab/Qwen3.5-9B-DFlash2",
+    "incoai/Qwen3.5-9B-DFlash2",
+    "z-lab/Qwen3.6-9B-DFlash2",
+    "incoai/Qwen3.6-9B-DFlash2",
+    "z-lab/Qwen3.8-9B-DFlash2",
+    "incoai/Qwen3.8-9B-DFlash2",
+    "z-lab/Qwen3.5-4B-DFlash2",
+    "incoai/Qwen3.5-4B-DFlash2",
+    "z-lab/Qwen3.6-4B-DFlash2",
+    "incoai/Qwen3.6-4B-DFlash2",
+    "z-lab/Qwen3.8-4B-DFlash2",
+    "incoai/Qwen3.8-4B-DFlash2",
+    "z-lab/Qwen3.5-2B-DFlash2",
+    "incoai/Qwen3.5-2B-DFlash2",
+    "z-lab/Qwen3.6-2B-DFlash2",
+    "incoai/Qwen3.6-2B-DFlash2",
+    "z-lab/Qwen3.8-2B-DFlash2",
+    "incoai/Qwen3.8-2B-DFlash2",
+    "z-lab/Qwen3.5-0.8B-DFlash2",
+    "incoai/Qwen3.5-0.8B-DFlash2",
+    "z-lab/Qwen3.6-0.8B-DFlash2",
+    "incoai/Qwen3.6-0.8B-DFlash2",
+    "z-lab/Qwen3.8-0.8B-DFlash2",
+    "incoai/Qwen3.8-0.8B-DFlash2",
+)
 M5RT_ARTIFACT_EXTENSIONS: tuple[str, ...] = (".miv", ".omlxm5")
 M5RT_DEFAULT_CONVERTER: dict[str, Any] = {
     "entrypoint": "tools/m5_artifact.py",
@@ -363,6 +424,7 @@ class M5Target:
     draft_artifact_path: Path | None = None
     fake: bool = False
     auto_convert_output: Path | None = None
+    auto_convert_draft_output: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1186,6 +1248,8 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
         "display_name": M5RT_ENGINE_LABEL,
         "supported_topologies": list(M5RT_SUPPORTED_TOPOLOGIES),
         "supported_model_types": list(M5RT_SUPPORTED_MODEL_TYPES),
+        "supported_draft_architectures": list(M5RT_SUPPORTED_DFLASH2_ARCHITECTURES),
+        "supported_dflash2_models": list(M5RT_SUPPORTED_DFLASH2_REPOS),
         "artifact_extensions": list(M5RT_ARTIFACT_EXTENSIONS),
         "converter": dict(M5RT_DEFAULT_CONVERTER),
     }
@@ -1771,6 +1835,96 @@ def _resolve_metallib_dir(
     return None, ""
 
 
+def _find_draft_artifact_in_dir(
+    resolved_dir: Path,
+    extensions: tuple[str, ...],
+    *,
+    model_dir: Path | None = None,
+    is_builtin: bool = True,
+) -> Path | None:
+    """Locate a companion DFlash2 artifact (`model.<ext>`, `draft.<ext>`, `*.<ext>`, or `.cache/b0/artifacts`)."""
+    parent_safe = False
+    if resolved_dir.name == "source":
+        try:
+            parent_safe = (
+                model_dir is None
+                or resolved_dir.parent.resolve() != model_dir.resolve()
+            )
+        except OSError:
+            parent_safe = False
+
+    for ext in extensions:
+        for cand in (resolved_dir / f"model{ext}", resolved_dir / f"draft{ext}"):
+            if cand.is_file():
+                return cand.resolve()
+        if parent_safe:
+            for cand in (
+                resolved_dir.parent / f"model{ext}",
+                resolved_dir.parent / f"draft{ext}",
+            ):
+                if cand.is_file():
+                    return cand.resolve()
+
+    for ext in extensions:
+        matches = [
+            p
+            for p in sorted(resolved_dir.glob(f"*{ext}"))
+            if p.is_file()
+            and not p.name.startswith(".")
+            and p.name.lower() not in ("mtp.miv", "mtp.omlxm5")
+        ]
+        if matches:
+            return matches[0].resolve()
+        if parent_safe:
+            parent_matches = [
+                p
+                for p in sorted(resolved_dir.parent.glob(f"*{ext}"))
+                if p.is_file()
+                and not p.name.startswith(".")
+                and p.name.lower() not in ("mtp.miv", "mtp.omlxm5")
+            ]
+            if parent_matches:
+                return parent_matches[0].resolve()
+
+    if is_builtin:
+        cached = _search_artifact_cache(resolved_dir)
+        if cached is not None:
+            return cached
+
+    return None
+
+
+def _dflash2_draft_matches_target(
+    draft_cfg: dict[str, Any] | None, target_cfg: dict[str, Any] | None
+) -> bool:
+    """Check whether a `DFlash2DraftModel` config matches the target model's geometry."""
+    if not isinstance(draft_cfg, dict) or not isinstance(target_cfg, dict):
+        return False
+    archs = draft_cfg.get("architectures") or ()
+    if not isinstance(archs, (list, tuple)) or "DFlash2DraftModel" not in archs:
+        return False
+    text_cfg = _text_config(target_cfg)
+    t_hidden = text_cfg.get("hidden_size")
+    t_vocab = text_cfg.get("vocab_size")
+    t_layers = text_cfg.get("num_hidden_layers")
+    if t_hidden is None or t_vocab is None:
+        return False
+    if draft_cfg.get("hidden_size") != t_hidden or draft_cfg.get("vocab_size") != t_vocab:
+        return False
+    d_target_layers = draft_cfg.get("num_target_layers")
+    if isinstance(t_layers, int) and t_layers > 0:
+        if isinstance(d_target_layers, int) and d_target_layers != t_layers:
+            return False
+        extra = draft_cfg.get("dflash_config")
+        if isinstance(extra, dict):
+            tids = extra.get("target_layer_ids")
+            if isinstance(tids, list) and any(
+                not isinstance(tid, int) or tid < 0 or tid >= t_layers for tid in tids
+            ):
+                return False
+    return True
+
+
 def _resolve_draft_target(
     model_dir: Path,
     model_settings: object | None,
@@ -1779,6 +1933,7 @@ def _resolve_draft_target(
     manifest: dict[str, Any] | None = None,
     engine_id: str = M5RT_ENGINE_ID,
     provider_id: str = M5RT_PROVIDER_ID,
+    allow_missing_artifact: bool = False,
 ) -> tuple[Path | None, Path | None, str]:
     is_builtin = (engine_id == M5RT_ENGINE_ID) and (provider_id in M5RT_BUILTIN_PROVIDER_IDS)
     extensions = _normalize_extensions(manifest.get("artifact_extensions") if manifest else None)
@@ -1819,18 +1974,12 @@ def _resolve_draft_target(
                 if (cdir / "config.json").is_file():
                     cfg_dir = cdir.resolve()
                     break
-            comp_art: Path | None = None
-            for ext in extensions:
-                for cand in (companion_dir / f"model{ext}", companion_dir / f"draft{ext}"):
-                    if cand.is_file():
-                        comp_art = cand.resolve()
-                        break
-                if comp_art is None:
-                    matches = [p for p in sorted(companion_dir.glob(f"*{ext}")) if p.is_file()]
-                    if matches:
-                        comp_art = matches[0].resolve()
-                if comp_art is not None:
-                    break
+            comp_art = _find_draft_artifact_in_dir(
+                cfg_dir or companion_dir,
+                extensions,
+                model_dir=model_dir,
+                is_builtin=is_builtin,
+            )
             if cfg_dir is not None and comp_art is not None:
                 return cfg_dir, comp_art, ""
         return None, None, ""
@@ -1852,32 +2001,52 @@ def _resolve_draft_target(
     draft_dir_raw = opts.get("draft_dir") or getattr(
         model_settings, "dflash_draft_model", None
     )
-    candidate_dirs: list[Path] = []
+    explicit_dirs: list[Path] = []
     if draft_dir_raw:
-        candidate_dirs.append(Path(str(draft_dir_raw)).expanduser())
+        explicit_dirs.append(Path(str(draft_dir_raw)).expanduser())
     if draft_art is not None:
-        candidate_dirs.extend([draft_art.parent / "source", draft_art.parent])
-    candidate_dirs.extend(Path(c).expanduser() for c in draft_candidates)
+        explicit_dirs.extend([draft_art.parent / "source", draft_art.parent])
+
+    discovered_dirs: list[Path] = []
+    companion_dir = model_dir / "dflash2"
+    if companion_dir.is_dir():
+        discovered_dirs.extend([companion_dir / "source", companion_dir])
+    discovered_dirs.extend(Path(c).expanduser() for c in draft_candidates)
 
     resolved_dir: Path | None = None
-    for cdir in candidate_dirs:
+    for cdir in explicit_dirs:
         if (cdir / "config.json").is_file():
             resolved_dir = cdir.resolve()
             break
 
-    if draft_art is None and resolved_dir is not None:
-        for ext in extensions:
-            for cand in (resolved_dir / f"model{ext}", resolved_dir.parent / f"model{ext}"):
-                if cand.is_file():
-                    draft_art = cand.resolve()
-                    break
-            if draft_art is not None:
+    if resolved_dir is None and discovered_dirs:
+        target_cfg = _read_json(model_dir / "config.json")
+        fallback_dir: Path | None = None
+        for cdir in discovered_dirs:
+            cfg_file = cdir / "config.json"
+            if not cfg_file.is_file():
+                continue
+            cand_resolved = cdir.resolve()
+            if fallback_dir is None:
+                fallback_dir = cand_resolved
+            if _dflash2_draft_matches_target(_read_json(cfg_file), target_cfg):
+                resolved_dir = cand_resolved
                 break
+        if resolved_dir is None:
+            resolved_dir = fallback_dir
+
+    if draft_art is None and resolved_dir is not None:
+        draft_art = _find_draft_artifact_in_dir(
+            resolved_dir,
+            extensions,
+            model_dir=model_dir,
+            is_builtin=is_builtin,
+        )
 
     if spec_backend == "dflash2":
         if resolved_dir is None:
             return None, None, "DFlash2 speculative backend requires a draft model directory with config.json"
-        if draft_art is None:
+        if draft_art is None and not allow_missing_artifact:
             return None, None, f"DFlash2 speculative backend requires a draft {'/'.join(extensions)} artifact"
 
     return resolved_dir, draft_art, ""
@@ -1943,6 +2112,7 @@ def resolve_spi_provider_target(
     if reason:
         return None, reason
 
+    extensions = _normalize_extensions(manifest.get("artifact_extensions"))
     draft_dir, draft_art, reason = _resolve_draft_target(
         model_dir,
         model_settings,
@@ -1950,9 +2120,30 @@ def resolve_spi_provider_target(
         manifest=manifest,
         engine_id=engine_id,
         provider_id=provider_id,
+        allow_missing_artifact=allow_auto_convert,
     )
     if reason:
         return None, reason
+
+    auto_convert_draft_output: Path | None = None
+    if draft_dir is not None and draft_art is None:
+        draft_conv_reason = ""
+        if allow_auto_convert:
+            can_draft_conv, draft_conv_reason = can_convert_provider_model(
+                draft_dir,
+                binary=binary,
+                manifest=manifest,
+                is_builtin=False,
+            )
+            if can_draft_conv:
+                auto_convert_draft_output = _converter_output_path(
+                    draft_dir, manifest, is_builtin=False
+                )
+        if auto_convert_draft_output is None:
+            base_msg = f"DFlash2 speculative backend requires a draft {'/'.join(extensions)} artifact"
+            if draft_conv_reason and _has_valid_safetensors_header(draft_dir):
+                return None, f"{base_msg} ({draft_conv_reason})"
+            return None, base_msg
 
     artifact_path, art_reason = _resolve_target_artifact(
         model_dir,
@@ -1985,6 +2176,7 @@ def resolve_spi_provider_target(
             draft_artifact_path=draft_art,
             fake=False,
             auto_convert_output=auto_convert_output,
+            auto_convert_draft_output=auto_convert_draft_output,
         ),
         "",
     )
@@ -2025,17 +2217,41 @@ def resolve_m5rt_target(
     if metallib_dir is None:
         return None, reason
 
+    manifest = _builtin_m5rt_manifest()
+    extensions = _normalize_extensions(manifest.get("artifact_extensions"))
     draft_dir, draft_art, reason = _resolve_draft_target(
-        model_dir, model_settings, draft_candidates
+        model_dir,
+        model_settings,
+        draft_candidates,
+        allow_missing_artifact=allow_auto_convert,
     )
     if reason:
         return None, reason
+
+    auto_convert_draft_output: Path | None = None
+    if draft_dir is not None and draft_art is None:
+        draft_conv_reason = ""
+        if allow_auto_convert:
+            can_draft_conv, draft_conv_reason = can_convert_provider_model(
+                draft_dir,
+                binary=binary,
+                manifest=manifest,
+                is_builtin=True,
+            )
+            if can_draft_conv:
+                auto_convert_draft_output = _converter_output_path(
+                    draft_dir, manifest, is_builtin=True
+                )
+        if auto_convert_draft_output is None:
+            base_msg = f"DFlash2 speculative backend requires a draft {'/'.join(extensions)} artifact"
+            if draft_conv_reason and _has_valid_safetensors_header(draft_dir):
+                return None, f"{base_msg} ({draft_conv_reason})"
+            return None, base_msg
 
     artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings)
     auto_convert_output: Path | None = None
     if artifact_path is None:
         if allow_auto_convert:
-            manifest = _builtin_m5rt_manifest()
             can_conv, _ = can_convert_provider_model(
                 model_dir,
                 binary=binary,
@@ -2057,6 +2273,7 @@ def resolve_m5rt_target(
             draft_artifact_path=draft_art,
             fake=False,
             auto_convert_output=auto_convert_output,
+            auto_convert_draft_output=auto_convert_draft_output,
         ),
         "",
     )
@@ -2306,7 +2523,10 @@ def _resolve_effective_speculative(
         )
         if (
             target is not None
-            and target.draft_artifact_path is not None
+            and (
+                target.draft_artifact_path is not None
+                or target.auto_convert_draft_output is not None
+            )
             and target.draft_dir is not None
         ):
             spec_backend = "dflash2"
@@ -2499,11 +2719,20 @@ def m5rt_memory_estimate(
         except OSError:
             st_bytes = 0
         weights = int(st_bytes * 1.02) if st_bytes > 0 else 0
-    draft = (
-        target.draft_artifact_path.stat().st_size
-        if target.draft_artifact_path
-        else 0
-    )
+    if target.draft_artifact_path is not None:
+        draft = target.draft_artifact_path.stat().st_size
+    elif target.draft_dir is not None and target.auto_convert_draft_output is not None:
+        try:
+            draft_st = sum(
+                f.stat().st_size
+                for f in target.draft_dir.glob("*.safetensors")
+                if f.is_file()
+            )
+        except OSError:
+            draft_st = 0
+        draft = int(draft_st * 1.01) if draft_st > 0 else 0
+    else:
+        draft = 0
     kv = _kv_bytes_per_token(text_cfg, kv_dtype) * context * max_concurrency
     workspace = max(64 * 1024**2, 1024 * vocab_size * 2 * max_concurrency)
     prefix_cache = _resolve_prefix_cache_bytes(
@@ -4455,6 +4684,7 @@ class M5SidecarEngine(BaseEngine):
                 artifact_path=built_art,
                 auto_convert_output=None,
             )
+            self._weights_size = None
             if (
                 self._options.speculative_backend == "mtp"
                 and "mtp_artifact" not in self._options.path_overrides
@@ -4465,6 +4695,35 @@ class M5SidecarEngine(BaseEngine):
                 self._options = replace(
                     self._options, speculative_backend="none", draft_tokens=0
                 )
+
+        if (
+            not self._target.fake
+            and self._target.draft_dir is not None
+            and self._target.draft_artifact_path is None
+            and self._target.auto_convert_draft_output is not None
+        ):
+            logger.info(
+                "%s: auto-repacking DFlash2 draft weights in %s -> %s on first load",
+                self._target.binary.label,
+                self._target.draft_dir,
+                self._target.auto_convert_draft_output.name,
+            )
+            draft_conv = await asyncio.to_thread(
+                convert_provider_model,
+                self._target.draft_dir,
+                source_repo=self._target.draft_dir.name,
+                binary=self._target.binary,
+                manifest=self._provider_manifest,
+                nax_pretile=False if self._is_builtin_m5rt else None,
+                is_builtin=self._is_builtin_m5rt,
+            )
+            built_draft_art = Path(str(draft_conv["artifact_path"])).resolve()
+            self._target = replace(
+                self._target,
+                draft_artifact_path=built_draft_art,
+                auto_convert_draft_output=None,
+            )
+            self._weights_size = None
 
         self._socket_path = _short_socket_path(self.external_engine_id)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5694,6 +5953,159 @@ def can_auto_convert_m5rt_fast(
     )
 
 
+def _is_dflash_family_architecture(cfg: dict[str, Any] | None) -> tuple[bool, str]:
+    """Return `(is_draft_arch, arch_name)` when `cfg` declares a DFlash draft architecture."""
+    if not isinstance(cfg, dict):
+        return False, ""
+    raw_archs = cfg.get("architectures") or ()
+    if isinstance(raw_archs, str):
+        raw_archs = (raw_archs,)
+    if not isinstance(raw_archs, (list, tuple)):
+        return False, ""
+    for item in raw_archs:
+        arch = str(item).strip()
+        if "dflash" in arch.lower() or arch.endswith("DraftModel"):
+            return True, arch
+    return False, ""
+
+
+def _is_supported_dflash2_draft_config(
+    cfg: dict[str, Any] | None,
+    manifest: dict[str, Any] | None = None,
+    *,
+    is_builtin: bool = True,
+) -> tuple[bool, str]:
+    """Verify whether `cfg` is a whitelisted DFlash2 draft checkpoint for this provider."""
+    if not isinstance(cfg, dict):
+        return False, "config.json is not a valid JSON object"
+
+    raw_archs = cfg.get("architectures") or ()
+    if isinstance(raw_archs, str):
+        archs = [raw_archs.strip()]
+    elif isinstance(raw_archs, (list, tuple)):
+        archs = [str(a).strip() for a in raw_archs if isinstance(a, str) and a.strip()]
+    else:
+        archs = []
+
+    allowed_draft_archs = [
+        str(a).strip()
+        for a in (
+            (manifest.get("supported_draft_architectures") if isinstance(manifest, dict) else None)
+            or (M5RT_SUPPORTED_DFLASH2_ARCHITECTURES if is_builtin else ())
+        )
+        if isinstance(a, str) and a.strip()
+    ]
+    if not allowed_draft_archs:
+        return False, "provider does not declare supported DFlash2 draft architectures"
+    if archs != ["DFlash2DraftModel"] and not (set(archs) & set(allowed_draft_archs)):
+        if any("dflash" in a.lower() for a in archs):
+            return (
+                False,
+                f"draft architecture {archs!r} is not supported (expected {allowed_draft_archs})",
+            )
+        return False, f"architectures {archs!r} is not a DFlash2 draft model"
+
+    if not is_builtin:
+        return True, ""
+
+    raw_mt = str(cfg.get("model_type") or "").strip().lower()
+    if raw_mt not in M5RT_SUPPORTED_DFLASH2_MODEL_TYPES:
+        return (
+            False,
+            f"DFlash2 draft model_type={raw_mt!r} is not in {list(M5RT_SUPPORTED_DFLASH2_MODEL_TYPES)}",
+        )
+    if cfg.get("is_causal", True) is not False:
+        return False, "DFlash2 draft config must set is_causal=false"
+
+    extra = cfg.get("dflash_config")
+    if not isinstance(extra, dict):
+        return False, "DFlash2 draft config is missing dflash_config object"
+
+    layer_count = cfg.get("num_hidden_layers")
+    layer_types = cfg.get("layer_types")
+    block_size = extra.get("block_size")
+    conv_kernel = extra.get("conv_kernel_size")
+    conv_group = extra.get("conv_group_size")
+    sel_rank = extra.get("selector_rank")
+    sel_topk = extra.get("selector_top_k")
+    target_lids = extra.get("target_layer_ids")
+    if (
+        not isinstance(layer_count, int)
+        or layer_count < 1
+        or layer_count > 5
+        or not isinstance(layer_types, list)
+        or len(layer_types) != layer_count
+        or any(lt != "sliding_attention" for lt in layer_types)
+        or conv_kernel != 2
+        or not isinstance(conv_group, int)
+        or conv_group <= 0
+        or not isinstance(sel_rank, int)
+        or sel_rank <= 0
+        or not isinstance(sel_topk, int)
+        or sel_topk <= 0
+        or not isinstance(block_size, int)
+        or block_size < 2
+        or block_size > 16
+        or not isinstance(target_lids, list)
+        or not target_lids
+    ):
+        return False, "DFlash2 draft config geometry does not match miv DFlash2 contract"
+
+    quant = cfg.get("quantization") or cfg.get("quantization_config") or {}
+    if isinstance(quant, dict) and (quant.get("mode") or quant.get("format")):
+        return False, "DFlash2 draft conversion requires an unquantized BF16 checkpoint"
+    raw_dtype = str(cfg.get("dtype") or cfg.get("torch_dtype") or "bfloat16").strip().lower()
+    if raw_dtype not in ("bfloat16", "bf16"):
+        return False, f"DFlash2 draft dtype={raw_dtype!r} is not supported (expected 'bfloat16')"
+
+    vocab_size = cfg.get("vocab_size")
+    hidden_size = cfg.get("hidden_size")
+    num_target_layers = cfg.get("num_target_layers")
+    if isinstance(vocab_size, int) and vocab_size >= 65536:
+        if vocab_size != 248320:
+            return (
+                False,
+                f"DFlash2 draft vocab_size={vocab_size} does not match supported Qwen3.5/3.6/3.8 models (248320)",
+            )
+        if isinstance(hidden_size, int) and isinstance(num_target_layers, int):
+            if (hidden_size, num_target_layers) not in M5RT_SUPPORTED_DFLASH2_TARGET_GEOMETRIES:
+                return (
+                    False,
+                    f"DFlash2 draft target geometry (hidden_size={hidden_size}, "
+                    f"num_target_layers={num_target_layers}) is not in supported Qwen3.5/3.6/3.8 "
+                    f"families {sorted(M5RT_SUPPORTED_DFLASH2_TARGET_GEOMETRIES)}",
+                )
+
+    return True, ""
+
+
+def _can_convert_dflash2_draft_fast(
+    model_dir: Path,
+    configured_binary: str | None = None,
+) -> bool:
+    """Fast O(1) zero-subprocess check whether `model_dir` is a convertible Qwen DFlash2 draft."""
+    if not model_dir.is_dir():
+        return False
+    manifest = _builtin_m5rt_manifest()
+    extensions = _normalize_extensions(manifest.get("artifact_extensions"))
+    if _find_draft_artifact_in_dir(model_dir, extensions, is_builtin=True) is not None:
+        return False
+    cfg = _read_json(model_dir / "config.json")
+    ok_df, _ = _is_supported_dflash2_draft_config(cfg, manifest, is_builtin=True)
+    if not ok_df:
+        return False
+    bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
+    if bin_path is None:
+        return False
+    if isinstance(inst_manifest, dict) and inst_manifest.get("_provider_dir"):
+        manifest["_provider_dir"] = inst_manifest["_provider_dir"]
+    if find_provider_converter_tool_fast(bin_path, manifest, is_builtin=True) is None:
+        return False
+    if not _has_valid_safetensors_header(model_dir):
+        return False
+    return os.access(model_dir, os.W_OK)
+
+
 def can_convert_provider_model(
     model_path: str | Path,
     *,
@@ -5728,23 +6140,34 @@ def can_convert_provider_model(
     if cfg is None:
         return False, "config.json is not a valid JSON object"
 
-    supported_types = {
-        str(m).strip().lower()
-        for m in (
-            eff_manifest.get("supported_model_types")
-            or (M5RT_SUPPORTED_MODEL_TYPES if is_builtin else ())
+    extensions = _normalize_extensions(eff_manifest.get("artifact_extensions"))
+    is_draft_arch, _ = _is_dflash_family_architecture(cfg)
+    if is_draft_arch:
+        if _find_draft_artifact_in_dir(model_dir, extensions, is_builtin=False) is not None:
+            return False, "model already has repacked microkernel weights"
+        draft_ok, draft_reason = _is_supported_dflash2_draft_config(
+            cfg, eff_manifest, is_builtin=is_builtin
         )
-        if isinstance(m, str) and m.strip()
-    }
-    model_types = _extract_model_type_tokens(cfg)
-    if supported_types and (not model_types or not (model_types & supported_types)):
-        return False, f"model_type is not in {sorted(supported_types)}"
+        if not draft_ok:
+            return False, draft_reason
+    else:
+        supported_types = {
+            str(m).strip().lower()
+            for m in (
+                eff_manifest.get("supported_model_types")
+                or (M5RT_SUPPORTED_MODEL_TYPES if is_builtin else ())
+            )
+            if isinstance(m, str) and m.strip()
+        }
+        model_types = _extract_model_type_tokens(cfg)
+        if supported_types and (not model_types or not (model_types & supported_types)):
+            return False, f"model_type is not in {sorted(supported_types)}"
 
-    quant_ok, quant_reason = _config_matches_converter_quant(
-        cfg, spec, is_builtin=is_builtin
-    )
-    if not quant_ok:
-        return False, quant_reason
+        quant_ok, quant_reason = _config_matches_converter_quant(
+            cfg, spec, is_builtin=is_builtin
+        )
+        if not quant_ok:
+            return False, quant_reason
 
     if not _has_valid_safetensors_header(model_dir):
         return False, "no valid .safetensors weights found in model directory"
@@ -5820,6 +6243,21 @@ def convert_provider_model(
                 "already_existed": True,
             }
 
+        cfg_for_conv = _read_json(model_dir / "config.json")
+        is_draft_arch, _ = _is_dflash_family_architecture(cfg_for_conv)
+        if is_draft_arch:
+            extensions = _normalize_extensions(eff_manifest.get("artifact_extensions"))
+            existing_draft_art = _find_draft_artifact_in_dir(
+                model_dir, extensions, is_builtin=False
+            )
+            if existing_draft_art is not None and existing_draft_art.is_file():
+                return {
+                    "artifact_path": str(existing_draft_art),
+                    "artifact_bytes": existing_draft_art.stat().st_size,
+                    "artifact_format": existing_draft_art.suffix.lstrip(".").lower() or "miv",
+                    "already_existed": True,
+                }
+
         ok, reason = can_convert_provider_model(
             model_dir,
             binary=binary,
@@ -5864,10 +6302,12 @@ def convert_provider_model(
         default_args = [
             str(a) for a in (spec.get("default_args") or ()) if isinstance(a, str) and a.strip()
         ]
-        if is_builtin and nax_pretile is False:
+        if is_builtin and (nax_pretile is False or is_draft_arch):
             default_args = [a for a in default_args if a != "--nax-pretile"]
         elif is_builtin and nax_pretile is True and "--nax-pretile" not in default_args:
             default_args.append("--nax-pretile")
+        if is_builtin and is_draft_arch and "--profile" not in default_args:
+            default_args.extend(["--profile", "dflash2_bf16"])
 
         repo_label = (source_repo or "").strip() or model_dir.name
         tmp_out = model_dir / f".{out_path.name}.tmp.{os.getpid()}"
@@ -6027,6 +6467,40 @@ def detect_model_weight_format_info(
         custom_art_fmt
         or ("miv" if has_miv_file else ("omlxm5" if has_omlxm5_file else None))
     )
+
+    # Companion DFlash2 helper checkpoints are not routed as standalone engines
+    # (`active_external_engine` is None unless overridden to `"stock"`), so surface
+    # `.miv` badge / pending-repack state directly when supported by miv.
+    if not active_external_engine:
+        cfg_local = _read_json(mdir / "config.json")
+        is_df_arch, _ = _is_dflash_family_architecture(cfg_local)
+        if is_df_arch:
+            ok_df, _ = _is_supported_dflash2_draft_config(
+                cfg_local, _builtin_m5rt_manifest(), is_builtin=True
+            )
+            if ok_df:
+                if on_disk_microkernel_fmt is not None:
+                    return {
+                        "weight_format": on_disk_microkernel_fmt,
+                        "has_miv_weights": True,
+                        "pending_auto_repack": False,
+                        "repack_target_format": None,
+                    }
+                cached_df = _search_artifact_cache(mdir)
+                if cached_df is not None:
+                    return {
+                        "weight_format": cached_df.suffix.lstrip(".").lower() or "miv",
+                        "has_miv_weights": True,
+                        "pending_auto_repack": False,
+                        "repack_target_format": None,
+                    }
+                if _can_convert_dflash2_draft_fast(mdir, configured_m5rt_binary):
+                    return {
+                        "weight_format": "safetensors",
+                        "has_miv_weights": False,
+                        "pending_auto_repack": True,
+                        "repack_target_format": "miv",
+                    }
 
     # When running on Stock MLX (or explicitly overridden to "stock"), the active format is safetensors
     if not active_external_engine or active_external_engine in ("stock", "splash"):

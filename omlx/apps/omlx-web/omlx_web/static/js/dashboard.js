@@ -4856,6 +4856,9 @@
             },
 
             canConvertOmlxm5() {
+                if (this.selectedModel?.can_convert || this.modelSettings.can_convert) {
+                    return true;
+                }
                 const engines = this.modelSettings.external_engines || [];
                 return engines.some(e => e.can_convert);
             },

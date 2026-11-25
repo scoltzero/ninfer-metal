@@ -2908,6 +2908,17 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "has_miv_weights": fmt_info["has_miv_weights"],
             "pending_auto_repack": fmt_info["pending_auto_repack"],
             "repack_target_format": fmt_info["repack_target_format"],
+            "can_convert": (
+                any(bool(r.get("can_convert")) for r in external_engines)
+                or (
+                    bool(fmt_info.get("pending_auto_repack"))
+                    and is_microkernel_enabled(
+                        global_settings,
+                        provider_id=M5RT_PROVIDER_ID,
+                        engine_id=M5RT_ENGINE_ID,
+                    )
+                )
+            ),
             "source_path": model_info.get("source_path"),
             "distributed": model_info.get("distributed", False),
             "cluster": model_info.get("cluster"),

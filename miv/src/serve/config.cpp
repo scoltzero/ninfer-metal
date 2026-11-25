@@ -1319,6 +1319,14 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   if (!resolved.artifact.empty()) {
     opts.path_overrides["artifact"] = resolved.artifact;
   }
+  if (resolved.draft_artifact.empty() &&
+      resolved.spec_backend == SpeculativeBackend::dflash2 &&
+      !resolved.draft_dir.empty()) {
+    if (const auto art = find_omlxm5_in_dir(resolved.draft_dir);
+        art.has_value()) {
+      resolved.draft_artifact = art->string();
+    }
+  }
   if (!resolved.draft_artifact.empty()) {
     opts.path_overrides["draft_artifact"] = resolved.draft_artifact;
   }

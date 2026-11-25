@@ -106,6 +106,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var pendingAutoRepack: Bool? = nil
     /// Target format suffix when `pendingAutoRepack` is true (e.g. `"miv"`).
     var repackTargetFormat: String? = nil
+    /// True when `.safetensors` weights (including companion DFlash2 drafts) can be repacked to `.miv`.
+    var canConvert: Bool? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -128,7 +130,7 @@ extension ModelDTO {
     var isOMLXM5Only: Bool { isMivOnly }
 
     var canConvertMiv: Bool {
-        externalEngines?.contains(where: { $0.canConvert == true }) == true
+        canConvert == true || externalEngines?.contains(where: { $0.canConvert == true }) == true
     }
 
     var effectiveWeightFormat: String {

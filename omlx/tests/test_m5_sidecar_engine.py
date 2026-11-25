@@ -2970,5 +2970,331 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             await miv_sock_srv.close()
 
 
+class TestDFlash2WhitelistAndAutoRepack:
+    """DFlash2 companion draft whitelist, first-Load auto-repack, and broadened artifact discovery."""
+
+    def test_dflash2_whitelist_conversion_and_format_badges(self, tmp_path: Path, monkeypatch):
+        prov_root = tmp_path / "Providers" / "io.ninfer.metal" / "versions" / "miv-v0.01"
+        (prov_root / "bin").mkdir(parents=True)
+        (prov_root / "metallib").mkdir(parents=True)
+        (prov_root / "tools").mkdir(parents=True)
+        fake_bin = _fake_daemon_script(prov_root / "bin" / "mseries_backendd", "miv-v0.01", protocol=2)
+        (prov_root / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+        captured_args_file = tmp_path / "converter_argv.json"
+        fake_tool = prov_root / "tools" / "m5_artifact.py"
+        fake_tool.write_text(
+            "import json, pathlib, struct, sys, zlib\n"
+            f"pathlib.Path({str(captured_args_file)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            "args = sys.argv[1:]\n"
+            "out = pathlib.Path(args[args.index('--output') + 1])\n"
+            "manifest = b'{\"objects\":[]}'\n"
+            "hdr_prefix = struct.pack('<8sIIQQQQII', b'OMLXM5A1', 1, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
+            "hdr = hdr_prefix + struct.pack('<II', zlib.crc32(hdr_prefix) & 0xFFFFFFFF, 0)\n"
+            "out.write_bytes(hdr + manifest)\n",
+            encoding="utf-8",
+        )
+        (prov_root.parent.parent / "current").symlink_to(prov_root)
+        monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(tmp_path / "Providers"))
+        monkeypatch.delenv("OMLX_M5RT_BIN", raising=False)
+        monkeypatch.delenv("NINFER_METAL_BIN", raising=False)
+
+        def _make_dflash2_cfg(hidden_size: int, target_layers: int, *, vocab_size: int = 248320, model_type: str = "qwen3", arch: str = "DFlash2DraftModel") -> dict:
+            return {
+                "architectures": [arch],
+                "model_type": model_type,
+                "is_causal": False,
+                "dtype": "bfloat16",
+                "hidden_size": hidden_size,
+                "intermediate_size": hidden_size * 3,
+                "vocab_size": vocab_size,
+                "num_hidden_layers": 5,
+                "num_target_layers": target_layers,
+                "layer_types": ["sliding_attention"] * 5,
+                "dflash_config": {
+                    "block_size": 8,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2,
+                    "mask_token_id": 100,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                    "target_layer_ids": [1, 5, 9, 13, 17],
+                },
+            }
+
+        orig_st_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00{}      "
+
+        # 1) All miv-supported Qwen3.5/3.6/3.8 Dense & MoE DFlash2 target geometries pass whitelist
+        for label, (h, tl) in (
+            ("Qwen3.8-27B-DFlash2", (5120, 64)),
+            ("Qwen3.6-35B-A3B-DFlash2", (2048, 40)),
+            ("Ornith-1.5-122B-DFlash2", (3072, 48)),
+            ("Qwen3.5-9B-DFlash2", (4096, 32)),
+            ("Qwen3.5-4B-DFlash2", (2560, 32)),
+            ("Qwen3.5-2B-DFlash2", (2048, 24)),
+            ("Qwen3.5-0.8B-DFlash2", (1024, 24)),
+        ):
+            ddir = tmp_path / label
+            ddir.mkdir()
+            (ddir / "config.json").write_text(json.dumps(_make_dflash2_cfg(h, tl)), encoding="utf-8")
+            (ddir / "model.safetensors").write_bytes(orig_st_bytes)
+            ok, reason = m5_mod.can_convert_to_miv(ddir, str(fake_bin))
+            assert ok is True and reason == "", f"{label}: {reason}"
+            # Helper DFlash2 models must NOT auto-route as standalone chat LLMs
+            assert m5_mod.detect_adapted(ddir).adapted is False
+            assert m5_mod.can_auto_convert_m5rt_fast(ddir, str(fake_bin)) is False
+
+        # 2) Convert 27B DFlash2 draft in-place and verify CLI flags & UI format badges
+        df27_dir = tmp_path / "Qwen3.8-27B-DFlash2"
+        fmt_before = m5_mod.detect_model_weight_format_info(
+            df27_dir, active_external_engine=None, configured_m5rt_binary=str(fake_bin)
+        )
+        assert fmt_before["weight_format"] == "safetensors"
+        assert fmt_before["pending_auto_repack"] is True
+        assert fmt_before["repack_target_format"] == "miv"
+
+        res = m5_mod.convert_model_to_miv(
+            df27_dir, source_repo="z-lab/Qwen3.8-27B-DFlash2", configured_binary=str(fake_bin)
+        )
+        assert res["already_existed"] is False
+        assert res["artifact_format"] == "miv"
+        assert (df27_dir / "model.miv").is_file()
+        argv_used = json.loads(captured_args_file.read_text(encoding="utf-8"))
+        assert "--nax-pretile" not in argv_used
+        assert argv_used[argv_used.index("--profile") + 1] == "dflash2_bf16"
+
+        fmt_after = m5_mod.detect_model_weight_format_info(
+            df27_dir, active_external_engine=None, configured_m5rt_binary=str(fake_bin)
+        )
+        assert fmt_after["weight_format"] == "miv"
+        assert fmt_after["has_miv_weights"] is True
+        assert fmt_after["pending_auto_repack"] is False
+        assert m5_mod.detect_adapted(df27_dir).adapted is False
+        ok_again, _ = m5_mod.can_convert_to_miv(df27_dir, str(fake_bin))
+        assert ok_again is False
+
+        # 3) Reject DFlash v1, non-Qwen Flint-DFlash2, and unsupported 512-expert Flash-Next geometry
+        for bad_name, bad_cfg in (
+            ("Qwen3.5-9B-DFlash-v1", _make_dflash2_cfg(4096, 32, arch="DFlashDraftModel")),
+            ("Flint-DFlash2", _make_dflash2_cfg(2048, 49, vocab_size=150144, model_type="flint")),
+            ("Qwen3.8-Flash-Next-DFlash2", _make_dflash2_cfg(2560, 48)),
+        ):
+            bdir = tmp_path / bad_name
+            bdir.mkdir()
+            (bdir / "config.json").write_text(json.dumps(bad_cfg), encoding="utf-8")
+            (bdir / "model.safetensors").write_bytes(orig_st_bytes)
+            b_ok, b_reason = m5_mod.can_convert_to_miv(bdir, str(fake_bin))
+            assert b_ok is False and b_reason != ""
+
+    async def test_dflash2_auto_repack_on_first_load_and_artifact_discovery(
+        self, tmp_path: Path, monkeypatch
+    ):
+        providers_root = tmp_path / "Providers"
+        miv_ver = providers_root / "io.ninfer.metal" / "versions" / "miv-v0.01"
+        (miv_ver / "bin").mkdir(parents=True)
+        (miv_ver / "metallib").mkdir(parents=True)
+        (miv_ver / "tools").mkdir(parents=True)
+        miv_sock_srv = _MockUdsSidecarServer(
+            Path("/tmp") / f"m5-df2-{os.getpid()}.sock",
+            support_push=True,
+            support_v2_coexistence=True,
+            token_plan=[[65, 66]],
+        )
+        await miv_sock_srv.start()
+        try:
+            _fake_daemon_script(miv_ver / "bin" / "mseries_backendd", "miv-v0.01", protocol=2)
+            (miv_ver / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+            (miv_ver / "metallib" / "omlx_m5_dflash2_program.metallib").write_bytes(b"MTLB")
+            (miv_ver / "tools" / "m5_artifact.py").write_text(
+                "import pathlib, struct, sys, zlib\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+                "manifest = b'{\"objects\":[]}'\n"
+                "hdr_prefix = struct.pack('<8sIIQQQQII', b'OMLXM5A1', 1, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
+                "hdr = hdr_prefix + struct.pack('<II', zlib.crc32(hdr_prefix) & 0xFFFFFFFF, 0)\n"
+                "out.write_bytes(hdr + manifest)\n",
+                encoding="utf-8",
+            )
+            (miv_ver / "provider.json").write_text(
+                json.dumps(
+                    {
+                        "provider_id": "io.ninfer.metal",
+                        "engine_id": "m5rt",
+                        "display_name": "miv Core Backend",
+                        "protocol_version": 2,
+                        "entrypoint": "bin/mseries_backendd",
+                        "metallib_dir": "metallib",
+                        "supported_model_types": ["qwen3_5", "qwen3_6", "qwen3_8"],
+                        "artifact_extensions": [".miv", ".omlxm5"],
+                        "converter": {
+                            "entrypoint": "tools/m5_artifact.py",
+                            "subcommand": "convert",
+                            "output_filename": "model.miv",
+                            "artifact_extension": ".miv",
+                            "default_args": ["--nax-pretile"],
+                            "supported_quant_modes": ["affine", "mxfp4"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (providers_root / "io.ninfer.metal" / "current").symlink_to(miv_ver)
+            monkeypatch.setenv("OMLX_PROVIDERS_DIR", str(providers_root))
+            monkeypatch.setattr(m5_mod, "_DEFAULT_ARTIFACT_CACHE_RELPATH", tmp_path / "isolated_repo_cache")
+            monkeypatch.delenv("OMLX_M5RT_ARTIFACT_DIR", raising=False)
+            monkeypatch.delenv("OMLX_M5RT_BIN", raising=False)
+            monkeypatch.delenv("NINFER_METAL_BIN", raising=False)
+
+            qwen_27b = tmp_path / "models" / "Qwen3.8-27B-mxfp4"
+            qwen_27b.mkdir(parents=True)
+            (qwen_27b / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3_5",
+                        "hidden_size": 5120,
+                        "num_hidden_layers": 64,
+                        "num_key_value_heads": 8,
+                        "head_dim": 128,
+                        "vocab_size": 248320,
+                        "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (qwen_27b / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+
+            # Unrelated 9B DFlash v1 helper in pool + matching 27B DFlash2 helper (unrepacked .safetensors)
+            df_9b_v1 = tmp_path / "models" / "Qwen3.5-9B-DFlash"
+            df_9b_v1.mkdir(parents=True)
+            (df_9b_v1 / "config.json").write_text(
+                json.dumps({"architectures": ["DFlashDraftModel"], "model_type": "qwen3", "hidden_size": 4096, "vocab_size": 248320}),
+                encoding="utf-8",
+            )
+
+            df_27b = tmp_path / "models" / "Qwen3.8-27B-DFlash2"
+            df_27b.mkdir(parents=True)
+            (df_27b / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2DraftModel"],
+                        "model_type": "qwen3",
+                        "is_causal": False,
+                        "dtype": "bfloat16",
+                        "hidden_size": 5120,
+                        "intermediate_size": 17408,
+                        "vocab_size": 248320,
+                        "num_hidden_layers": 5,
+                        "num_target_layers": 64,
+                        "layer_types": ["sliding_attention"] * 5,
+                        "dflash_config": {
+                            "block_size": 8,
+                            "conv_group_size": 16,
+                            "conv_kernel_size": 2,
+                            "mask_token_id": 248070,
+                            "selector_rank": 256,
+                            "selector_top_k": 16,
+                            "target_layer_ids": [5, 19, 33, 47, 61],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (df_27b / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00" + b"{}" + b" " * 4096)
+
+            gs = GlobalSettings(base_path=tmp_path / "base")
+            monkeypatch.setattr("omlx.engine_pool.get_global_settings", lambda: gs)
+            pool = EnginePool()
+            pool._entries["Qwen3.8-27B-mxfp4"] = EngineEntry(
+                model_id="Qwen3.8-27B-mxfp4",
+                model_path=str(qwen_27b),
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=4096,
+            )
+            pool._entries["Qwen3.5-9B-DFlash"] = EngineEntry(
+                model_id="Qwen3.5-9B-DFlash",
+                model_path=str(df_9b_v1),
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=1024,
+                is_helper=True,
+            )
+            pool._entries["Qwen3.8-27B-DFlash2"] = EngineEntry(
+                model_id="Qwen3.8-27B-DFlash2",
+                model_path=str(df_27b),
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=2048,
+                is_helper=True,
+            )
+
+            # Without explicit dflash_draft_model, candidate scan picks matching 27B DFlash2 over 9B DFlash v1!
+            ms = ModelSettings(
+                dflash_enabled=True,
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="turboquant",
+                turboquant_kv_bits=4.0,
+            )
+            target, err = pool.m5rt_target("Qwen3.8-27B-mxfp4", ms)
+            assert err == "" and target is not None
+            assert target.draft_dir == df_27b.resolve()
+            assert target.draft_artifact_path is None
+            assert target.auto_convert_output == qwen_27b / "model.miv"
+            assert target.auto_convert_draft_output == df_27b / "model.miv"
+
+            # First Load auto-repacks BOTH target model.miv AND draft model.miv + enables affine4_g128 KV!
+            eng = pool._external_engine_for(pool._entries["Qwen3.8-27B-mxfp4"], ms, "batched")
+            assert isinstance(eng, M5SidecarEngine)
+            monkeypatch.setattr(m5_mod, "_short_socket_path", lambda _eid=None: miv_sock_srv.socket_path)
+            monkeypatch.setattr(eng, "_load_tokenizer", lambda: None)
+            real_popen = m5_mod.subprocess.Popen
+            monkeypatch.setattr(
+                m5_mod.subprocess,
+                "Popen",
+                lambda cmd, *a, **kw: (
+                    SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None, wait=lambda: 0)
+                    if isinstance(cmd, list) and "m5rt-watchdog" in cmd
+                    else real_popen(cmd, *a, **kw)
+                ),
+            )
+            await eng.start()
+            try:
+                assert (qwen_27b / "model.miv").is_file()
+                assert (df_27b / "model.miv").is_file()
+                lp = miv_sock_srv.load_params[-1]
+                assert lp["kv_dtype"] == "affine4_g128"
+                assert lp["speculative"]["backend"] == "dflash2"
+                assert Path(lp["path_overrides"]["artifact"]) == (qwen_27b / "model.miv").resolve()
+                assert Path(lp["path_overrides"]["draft_artifact"]) == (df_27b / "model.miv").resolve()
+            finally:
+                eng._process = None
+                await eng.stop()
+
+            # Verify broadened draft filename discovery: draft.miv, custom *.omlxm5, and .cache/b0/artifacts
+            (df_27b / "model.miv").rename(df_27b / "qwen38-27b-dflash2.omlxm5")
+            t_custom, err_custom = pool.m5rt_target("Qwen3.8-27B-mxfp4", ms)
+            assert err_custom == "" and t_custom is not None
+            assert t_custom.draft_artifact_path == (df_27b / "qwen38-27b-dflash2.omlxm5").resolve()
+
+            cache_dir = tmp_path / "artifact_cache"
+            cache_dir.mkdir()
+            cached_art = cache_dir / "qwen38-27b-dflash2.miv"
+            (df_27b / "qwen38-27b-dflash2.omlxm5").rename(cached_art)
+            monkeypatch.setenv("OMLX_M5RT_ARTIFACT_DIR", str(cache_dir))
+            t_cached, err_cached = pool.m5rt_target("Qwen3.8-27B-mxfp4", ms)
+            assert err_cached == "" and t_cached is not None
+            assert t_cached.draft_artifact_path == cached_art.resolve()
+
+            # Verify companion dflash2/ subfolder without its own artifact does NOT steal parent model.miv
+            monkeypatch.delenv("OMLX_M5RT_ARTIFACT_DIR", raising=False)
+            sub_df = qwen_27b / "dflash2"
+            sub_df.mkdir()
+            (sub_df / "config.json").write_text((df_27b / "config.json").read_text(encoding="utf-8"), encoding="utf-8")
+            ms_sub = ModelSettings(dflash_enabled=True, dflash_draft_model=str(sub_df))
+            t_sub, err_sub = m5_mod.resolve_m5rt_target(qwen_27b, None, ms_sub, allow_auto_convert=False)
+            assert t_sub is None and "requires a draft .miv/.omlxm5 artifact" in err_sub
+        finally:
+            await miv_sock_srv.close()
+
+
+
 
 
