@@ -1,0 +1,16 @@
+{"id":"code-01","category":"code","text":"Implement a deterministic LRU cache in Python and explain its time complexity."}
+{"id":"code-02","category":"code","text":"Review this requirement and propose edge cases for a streaming JSON parser."}
+{"id":"code-03","category":"code","text":"Write a C++20 function that cancels a queued task without leaking resources."}
+{"id":"reasoning-01","category":"reasoning","text":"A machine processes 12 jobs per hour. Explain how many jobs two machines process in 7.5 hours."}
+{"id":"reasoning-02","category":"reasoning","text":"Compare two implementation plans and identify which dependency must be resolved first."}
+{"id":"reasoning-03","category":"reasoning","text":"Given three independent failure probabilities, derive the probability that at least one failure occurs."}
+{"id":"chat-story-01","category":"chat-story","text":"Write a short dialogue between an engineer and a reviewer about a difficult performance regression."}
+{"id":"chat-story-02","category":"chat-story","text":"Describe a quiet workshop where a prototype is tested before dawn."}
+{"id":"chat-story-03","category":"chat-story","text":"用自然的中文写一段工程师排查偶发故障的经历。"}
+{"id":"structured-01","category":"structured","text":"Return JSON with keys status, risks, and next_steps for a software release review."}
+{"id":"structured-02","category":"structured","text":"Create a Markdown table comparing latency, throughput, and memory usage."}
+{"id":"structured-03","category":"structured","text":"List five test cases as objects with id, input, and expected fields."}
+{"id":"translation-01","category":"translation","text":"Translate into Chinese: The optimized path remains disabled until the hardware gate passes."}
+{"id":"translation-02","category":"translation","text":"Translate into English: 这项测试只能证明正确性，不能证明目标机性能。"}
+{"id":"translation-03","category":"translation","text":"Translate into Chinese: Cancellation must release every state slot and KV page."}
+

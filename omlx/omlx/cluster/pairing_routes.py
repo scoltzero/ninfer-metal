@@ -1,0 +1,323 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Cluster pairing endpoints (Module B).
+
+Two routers, both under ``/api/cluster``:
+
+* ``pair_router`` — unauthenticated joiner-facing endpoints. The pair request
+  carries a salted PBKDF2 verifier binding the node and both SSH identities,
+  and the coordinator binds enrollment to the HTTP source address. The served
+  cluster key is separately encrypted under a code-derived key, so the admin's
+  approve step remains the sole trust decision.
+* ``pair_admin_router`` — admin-facing approve/deny.  Mounted with
+  ``Depends(require_admin)`` exactly like the existing cluster router.
+
+An invite only asks the other Mac's user to show a code; it never starts a
+join there, so the joiner still chooses which Mac it trusts.
+
+Both are wired in ``omlx/server.py:_register_cluster_routes``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from pydantic import BaseModel, ConfigDict, Field
+
+from .discovery_routes import ProbeRateLimiter, discovery_service_or_none
+from .pairing import (
+    CODE_DIGITS,
+    EnrollmentDriveError,
+    PairingCodeError,
+    PairingError,
+    PairingExpiredError,
+    PairingLockoutError,
+    PairingManager,
+    PairingStateError,
+    get_pairing_manager,
+)
+
+pair_router = APIRouter(prefix="/api/cluster", tags=["cluster-pairing"])
+pair_admin_router = APIRouter(prefix="/api/cluster", tags=["cluster-pairing-admin"])
+
+_get_pairing_manager: Any = get_pairing_manager
+pair_request_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=8)
+pair_status_rate_limiter = ProbeRateLimiter(rate_per_second=5.0, burst=20)
+pair_invite_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=4)
+
+
+def set_pairing_manager_getter(getter: Any) -> None:
+    """Inject the server-owned manager without importing ``omlx.server``."""
+
+    global _get_pairing_manager
+    _get_pairing_manager = getter
+
+
+def _manager() -> PairingManager:
+    try:
+        return _get_pairing_manager()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class PairRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=255)
+    friendly_name: str = Field(min_length=1, max_length=255)
+    caps: dict[str, Any] = Field(default_factory=dict)
+    code_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cancel_token_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    code_salt: str = Field(min_length=24, max_length=64)
+    http_port: int | None = Field(default=None, ge=1, le=65535)
+    addrs: list[str] = Field(default_factory=list, max_length=8)
+    # Absent for an agent-controlled peer (caps.control == "agent").
+    ssh_public_key: str | None = Field(default=None, min_length=32, max_length=8192)
+    ssh_host_public_key: str | None = Field(
+        default=None, min_length=32, max_length=8192
+    )
+
+
+class PairApproveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=255)
+    code: str = Field(pattern=rf"^[0-9]{{{CODE_DIGITS}}}$")
+
+
+class PairDenyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=255)
+
+
+class PairJoinBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    coordinator_addr: str = Field(min_length=1, max_length=255)
+
+
+@pair_admin_router.post("/pair/join")
+async def cluster_pair_join(body: PairJoinBody, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await asyncio.to_thread(
+            _manager().ui_session.begin, body.coordinator_addr
+        )
+    except PairingStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+
+
+@pair_admin_router.get("/pair/join")
+async def cluster_pair_join_state(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return await asyncio.to_thread(_manager().ui_session.poll)
+
+
+@pair_admin_router.post("/pair/join/cancel")
+async def cluster_pair_join_cancel():
+    try:
+        return await asyncio.to_thread(_manager().ui_session.cancel)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+
+
+@pair_admin_router.delete("/pair/join/cleanup")
+async def cluster_forget_join_cleanup():
+    """Abandon only pending local cleanup, without unpairing any device."""
+    try:
+        return await asyncio.to_thread(_manager().ui_session.forget_cleanup)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not save the local cleanup change."
+        ) from exc
+
+
+def _pairing_http_error(exc: PairingError) -> HTTPException:
+    if isinstance(exc, PairingLockoutError):
+        return HTTPException(status_code=423, detail=str(exc))
+    if isinstance(exc, PairingExpiredError):
+        return HTTPException(status_code=410, detail=str(exc))
+    if isinstance(exc, PairingCodeError):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, EnrollmentDriveError):
+        return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, PairingStateError):
+        return HTTPException(status_code=404, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@pair_router.post("/pair/request", status_code=202)
+async def cluster_pair_request(body: PairRequestBody, request: Request):
+    """Register a joiner's request as awaiting_approval (code never crosses)."""
+
+    manager = _manager()
+    payload = body.model_dump()
+    source = request.client.host if request.client is not None else ""
+    if not pair_request_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair request rate limit exceeded")
+    try:
+        ipaddress.ip_address(source.split("%", 1)[0])
+    except ValueError:
+        payload["addrs"] = []
+    else:
+        # Never enroll an arbitrary address supplied in the public JSON body.
+        # The HTTP source is the only coordinator-observed endpoint.
+        payload["addrs"] = [source]
+    try:
+        snapshot = await asyncio.to_thread(manager.handle_join_request, payload)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    return snapshot
+
+
+class PairInviteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=255)
+
+
+def _discovered(node_id: str) -> Any:
+    """An unpaired Mac that discovery found and verified here."""
+    service = discovery_service_or_none()
+    if service is None:
+        return None
+    for peer in service.peers():
+        if peer.node_id == node_id and not peer.paired:
+            return peer
+    return None
+
+
+def _send_invite(manager: PairingManager, node_id: str) -> bool:
+    peer = _discovered(node_id)
+    service = discovery_service_or_none()
+    if peer is None or service is None or not peer.http_port:
+        return False
+    health = service.address_health(node_id)
+    usable = []
+    for item in peer.addrs:
+        try:
+            ip = ipaddress.ip_address(item["ip"])
+        except ValueError:
+            continue
+        # A scope-less link-local or this Mac's own loopback cannot reach it.
+        if ip.version == 4 and not ip.is_loopback:
+            usable.append(str(ip))
+    invite: dict[str, Any] = {"node_id": manager.node_id}
+    if peer.caps.control == "agent":
+        # A helper daemon joins at the invite's source address and this port.
+        invite["http_port"] = manager.http_port
+    for addr in sorted(
+        usable, key=lambda ip: health.get(ip, {}).get("state") != "verified"
+    ):
+        try:
+            manager._http_post(
+                f"http://{addr}:{peer.http_port}/api/cluster/pair/invited",
+                invite,
+                3.0,
+            )
+        except Exception:
+            continue
+        return True
+    return False
+
+
+@pair_admin_router.post("/pair/invite")
+async def cluster_pair_invite(body: PairInviteBody):
+    """Ask a discovered Mac to offer joining this one (best effort)."""
+    return {"sent": await asyncio.to_thread(_send_invite, _manager(), body.node_id)}
+
+
+@pair_router.post("/pair/invited", status_code=202)
+async def cluster_pair_invited(body: PairInviteBody, request: Request):
+    """Another Mac asks this one to join it; only its dashboard prompt changes."""
+    source = request.client.host if request.client is not None else ""
+    if not pair_invite_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair invite rate limit exceeded")
+    if _discovered(body.node_id) is None:
+        raise HTTPException(status_code=404, detail="unknown Mac")
+    _manager().ui_session.offer_invite(body.node_id)
+    return {"ok": True}
+
+
+@pair_admin_router.get("/pair/invite")
+async def cluster_pair_invite_state():
+    node_id = _manager().ui_session.current_invite()
+    peer = _discovered(node_id) if node_id else None
+    if peer is None:
+        return {"invite": None}
+    return {"invite": {"node_id": node_id, "name": peer.friendly_name}}
+
+
+@pair_admin_router.delete("/pair/invite")
+async def cluster_pair_invite_dismiss():
+    _manager().ui_session.dismiss_invite()
+    return {"invite": None}
+
+
+class PairCancelRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=255)
+    token: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+@pair_router.post("/pair/request/cancel")
+async def cluster_pair_cancel_request(body: PairCancelRequestBody):
+    try:
+        return await asyncio.to_thread(
+            _manager().cancel_join_request, body.node_id, body.token
+        )
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+
+
+@pair_router.get("/pair/status/{node_id}")
+async def cluster_pair_status(node_id: str, request: Request):
+    """Joiner poll: pending/approved/denied plus the wrapped cluster key."""
+
+    manager = _manager()
+    source = request.client.host if request.client is not None else ""
+    if not pair_status_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair status rate limit exceeded")
+    if not node_id or len(node_id) > 255:
+        raise HTTPException(status_code=400, detail="invalid node_id")
+    return await asyncio.to_thread(manager.join_status, node_id)
+
+
+@pair_admin_router.post("/pair/approve")
+async def cluster_pair_approve(body: PairApproveBody):
+    """Type the code shown on the joiner; verify, issue cluster key, enroll."""
+
+    manager = _manager()
+    try:
+        result = await asyncio.to_thread(manager.approve, body.node_id, body.code)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    try:
+        from .discovery import get_discovery_service
+
+        get_discovery_service().mark_paired(body.node_id)
+    except Exception:
+        # Pairing remains authoritative when discovery is disabled or stopped.
+        pass
+    return result
+
+
+@pair_admin_router.post("/pair/deny")
+async def cluster_pair_deny(body: PairDenyBody):
+    """Refuse a pending join request (audit-logged)."""
+
+    manager = _manager()
+    try:
+        denied = await asyncio.to_thread(manager.deny, body.node_id)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    if not denied:
+        raise HTTPException(status_code=404, detail="no pending join request")
+    return {"ok": True, "node_id": body.node_id, "state": "denied"}
+
+

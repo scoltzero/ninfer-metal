@@ -1,0 +1,1032 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for unequal-memory model layout and pipeline planning."""
+
+import json
+import struct
+
+import pytest
+from mlx_lm.models.pipeline import PipelineMixin
+
+from omlx.cluster.deployment import _assignment_from_dict
+from omlx.cluster.planner import (
+    ModelLayout,
+    NodeBudget,
+    PipelineAssignment,
+    PlanningError,
+    apply_pipeline_assignment,
+    inspect_safetensors_layout,
+    install_unequal_pipeline_plan,
+    plan_hybrid,
+    plan_proportional_pipeline,
+    plan_unequal_pipeline,
+    synthetic_model_layout,
+    with_mtp_head,
+)
+
+GIB = 1024**3
+
+
+def _write_safetensors(path, tensors):
+    offset = 0
+    header = {}
+    for name, size in tensors:
+        header[name] = {
+            "dtype": "U8",
+            "shape": [size],
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"\0" * offset)
+
+
+def test_inspect_safetensors_layout_reads_headers_without_loading_tensors(tmp_path):
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_proj.weight", 200),
+            ("model.layers.0.mlp.down_proj.weight", 300),
+            ("model.layers.1.self_attn.q_proj.weight", 400),
+            ("model.norm.weight", 50),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.fixed_weight_bytes == 150
+    assert layout.layer_weight_bytes == (500, 400)
+    assert layout.total_weight_bytes == 1050
+    assert layout.tensor_count == 5
+
+
+def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
+    header = {
+        "model.layers.0.weight": {
+            "dtype": "U8",
+            "shape": [10],
+            "data_offsets": [0, 10],
+        }
+    }
+    encoded = json.dumps(header).encode()
+    (tmp_path / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded
+    )
+
+    with pytest.raises(PlanningError, match="invalid data offsets"):
+        inspect_safetensors_layout(tmp_path)
+
+
+def test_inspect_safetensors_layout_rejects_overlapping_offsets(tmp_path):
+    header = {
+        "model.layers.0.first": {
+            "dtype": "U8",
+            "shape": [8],
+            "data_offsets": [0, 8],
+        },
+        "model.layers.0.second": {
+            "dtype": "U8",
+            "shape": [6],
+            "data_offsets": [4, 10],
+        },
+    }
+    encoded = json.dumps(header).encode()
+    (tmp_path / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + b"\0" * 10
+    )
+
+    with pytest.raises(PlanningError, match="overlapping"):
+        inspect_safetensors_layout(tmp_path)
+
+
+def test_mtp_layers_past_the_declared_depth_are_not_decoder_layers(tmp_path):
+    """DeepSeek/GLM MTP heads live at index ``num_hidden_layers`` and up.
+
+    The runtime model never instantiates them, so counting them as decoder
+    layers put the last stage boundary past the model and activation failed
+    with ``end_layer`` beyond the loaded layers.
+    """
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_proj.weight", 500),
+            ("model.layers.1.self_attn.q_proj.weight", 400),
+            ("model.layers.2.eh_proj.weight", 900),  # the MTP head
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.layer_count == 2
+    assert layout.layer_weight_bytes == (500, 400)
+
+
+def test_layers_past_an_undeclared_depth_are_kept(tmp_path):
+    """No config.json means no declared depth to trim against."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.layers.0.weight", 500),
+            ("model.layers.1.weight", 400),
+            ("model.layers.2.weight", 900),
+        ],
+    )
+
+    assert inspect_safetensors_layout(tmp_path).layer_count == 3
+
+
+def test_vision_tower_weights_are_not_charged_to_decoder_layers(tmp_path):
+    """Ranks load the text model only; vision_tower.blocks.N is not layer N."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("vision_tower.blocks.0.attn.qkv.weight", 700),
+            ("vision_tower.patch_embed.proj.weight", 300),
+            ("language_model.model.embed_tokens.weight", 100),
+            ("language_model.model.layers.0.self_attn.q_proj.weight", 500),
+            ("language_model.model.layers.1.self_attn.q_proj.weight", 400),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.fixed_weight_bytes == 100
+    assert layout.layer_weight_bytes == (500, 400)
+
+
+def test_lightning_mtp_head_is_measured_apart_and_charged_to_rank_zero(
+    tmp_path, monkeypatch
+):
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.draft_test",
+        types.SimpleNamespace(
+            CLUSTER_UNLOADED_WEIGHT_PREFIXES=("mtp.",),
+            CLUSTER_MTP_WEIGHT_PREFIXES=("mtp.",),
+        ),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "draft_test", "num_hidden_layers": 2})
+    )
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.layers.0.weight", 500),
+            ("model.layers.1.weight", 400),
+            ("mtp.fc.weight", 300),
+        ],
+    )
+    layout = inspect_safetensors_layout(tmp_path)
+    assert layout.layer_weight_bytes == (500, 400)
+    assert layout.mtp_weight_bytes == 300
+    assert ModelLayout.from_dict(layout.to_dict()) == layout
+    # Plans without the head keep their serialized form, and so their hash.
+    assert "mtp_weight_bytes" not in ModelLayout("plain", 0, (1,)).to_dict()
+
+    model = ModelLayout(
+        "draft",
+        0,
+        (10 * GIB,) * 8,
+        tensor_parallel_heads=8,
+        mtp_weight_bytes=5 * GIB,
+    )
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=256 * GIB, rank=1),
+    ]
+    # Rank zero holds the last layers, so the head rides on the last one.
+    studio, mobile = plan_unequal_pipeline(with_mtp_head(model), nodes).assignments
+    assert studio.layer_weight_bytes - 5 * GIB == 10 * GIB * studio.layer_count
+    assert mobile.layer_weight_bytes == 10 * GIB * mobile.layer_count
+    # Tensor parallelism replicates the head on rank zero only.
+    tp = plan_hybrid(
+        model, nodes, tensor_parallel_size=2, head_rank_extra_bytes=5 * GIB
+    )
+    assert [item.fixed_weight_bytes for item in tp.assignments] == [5 * GIB, 0]
+    with pytest.raises(PlanningError, match="no Lightning MTP head"):
+        with_mtp_head(ModelLayout("plain", 0, (1,)))
+
+
+def test_unequal_planner_gives_more_layers_to_larger_mac():
+    model = synthetic_model_layout(
+        total_weight_bytes=300 * GIB,
+        layer_count=80,
+    )
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=128 * GIB, rank=1),
+    ]
+
+    plan = plan_unequal_pipeline(model, nodes)
+    studio, mobile = plan.assignments
+
+    assert studio.rank == 0
+    assert studio.layer_count > mobile.layer_count
+    assert mobile.start_layer == 0
+    assert mobile.end_layer == studio.start_layer
+    assert studio.end_layer == 80
+    assert all(item.headroom_bytes >= 0 for item in plan.assignments)
+    assert len(plan.plan_hash) == 64
+
+
+def test_stages_start_only_where_the_architecture_allows():
+    """DeepSeek V4.1 layers read KV that an earlier source layer keeps."""
+
+    layers = (10 * GIB,) * 8
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=256 * GIB, rank=1),
+    ]
+    free = ModelLayout("free", 0, layers)
+    restricted = ModelLayout("restricted", 0, layers, pipeline_stage_starts=(2, 6))
+
+    assert plan_unequal_pipeline(free, nodes).assignments[1].end_layer == 4
+    assert plan_unequal_pipeline(restricted, nodes).assignments[1].end_layer in (2, 6)
+    with pytest.raises(PlanningError, match="only at layers 2, 6"):
+        plan_proportional_pipeline(restricted, nodes)
+    # An unrestricted layout keeps its serialized form, and so its plan hash.
+    assert "pipeline_stage_starts" not in free.to_dict()
+    assert ModelLayout.from_dict(restricted.to_dict()) == restricted
+
+
+def test_unequal_planner_accounts_for_replicated_fixed_weights_and_reserve():
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=4 * GIB,
+        layer_weight_bytes=(8 * GIB,) * 6,
+    )
+    nodes = [
+        NodeBudget(
+            node_id="large",
+            capacity_bytes=40 * GIB,
+            reserve_bytes=4 * GIB,
+            rank=0,
+        ),
+        NodeBudget(
+            node_id="small",
+            capacity_bytes=24 * GIB,
+            reserve_bytes=4 * GIB,
+            rank=1,
+        ),
+    ]
+
+    plan = plan_unequal_pipeline(model, nodes)
+
+    assert plan.cluster_resident_weight_bytes == model.total_weight_bytes + 4 * GIB
+    assert all(item.headroom_bytes >= 0 for item in plan.assignments)
+
+
+def test_unequal_planner_rejects_model_that_does_not_fit():
+    model = synthetic_model_layout(
+        total_weight_bytes=400 * GIB,
+        layer_count=80,
+    )
+    nodes = [
+        NodeBudget(node_id="large", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="small", capacity_bytes=128 * GIB, rank=1),
+    ]
+
+    with pytest.raises(PlanningError, match="does not fit"):
+        plan_unequal_pipeline(model, nodes)
+
+
+def test_three_node_weight_targets_choose_the_nearest_contiguous_split():
+    model = synthetic_model_layout(
+        total_weight_bytes=120 * GIB,
+        layer_count=12,
+    )
+    nodes = [
+        NodeBudget(
+            node_id="coordinator",
+            capacity_bytes=80 * GIB,
+            target_weight_bytes=20 * GIB,
+            rank=0,
+        ),
+        NodeBudget(
+            node_id="studio",
+            capacity_bytes=100 * GIB,
+            target_weight_bytes=70 * GIB,
+            rank=1,
+        ),
+        NodeBudget(
+            node_id="mini",
+            capacity_bytes=60 * GIB,
+            target_weight_bytes=30 * GIB,
+            rank=2,
+        ),
+    ]
+
+    plan = plan_unequal_pipeline(model, nodes)
+    weights = {
+        item.node_id: item.layer_weight_bytes + item.fixed_weight_bytes
+        for item in plan.assignments
+    }
+
+    assert weights == {
+        "coordinator": 20 * GIB,
+        "studio": 70 * GIB,
+        "mini": 30 * GIB,
+    }
+    assert [
+        (item.start_layer, item.end_layer)
+        for item in sorted(plan.assignments, key=lambda item: item.start_layer)
+    ] == [(0, 3), (3, 10), (10, 12)]
+
+
+def test_synthetic_layout_has_bounded_layer_count():
+    with pytest.raises(ValueError, match="2048 layer limit"):
+        synthetic_model_layout(total_weight_bytes=1, layer_count=2049)
+
+
+def test_apply_pipeline_assignment_uses_explicit_range():
+    class Group:
+        @staticmethod
+        def rank():
+            return 1
+
+        @staticmethod
+        def size():
+            return 2
+
+    class PipelineModel:
+        def __init__(self):
+            self.layers = list(range(8))
+
+    assignments = [
+        PipelineAssignment(
+            node_id="large",
+            rank=0,
+            start_layer=3,
+            end_layer=8,
+            layer_weight_bytes=5,
+            fixed_weight_bytes=0,
+            reserve_bytes=0,
+            capacity_bytes=10,
+        ),
+        PipelineAssignment(
+            node_id="small",
+            rank=1,
+            start_layer=0,
+            end_layer=3,
+            layer_weight_bytes=3,
+            fixed_weight_bytes=0,
+            reserve_bytes=0,
+            capacity_bytes=10,
+        ),
+    ]
+    model = PipelineModel()
+
+    apply_pipeline_assignment(model, Group(), assignments)
+
+    assert model.pipeline_rank == 1
+    assert model.pipeline_size == 2
+    assert model.start_idx == 0
+    assert model.end_idx == 3
+    assert model.layers == [0, 1, 2]
+
+
+def test_planned_pipeline_accepts_the_split_model_overrides_forward():
+    # qwen3_next, qwen3_5 and ministral3 call super().pipeline(group, split=split)
+    # and then index the layers the plan assigned.
+    class Group:
+        @staticmethod
+        def rank():
+            return 0
+
+        @staticmethod
+        def size():
+            return 2
+
+    class HybridModel(PipelineMixin):
+        def __init__(self):
+            super().__init__()
+            self.layers = list(range(8))
+
+        def pipeline(self, group, split=None):
+            super().pipeline(group, split=split)
+            self.first_local_layer = self.pipeline_layers[0]
+
+    assignments = [
+        PipelineAssignment("large", 0, 3, 8, 5, 0, 0, 10),
+        PipelineAssignment("small", 1, 0, 3, 3, 0, 0, 10),
+    ]
+    model = HybridModel()
+
+    with install_unequal_pipeline_plan(assignments):
+        model.pipeline(Group())
+
+    assert (model.start_idx, model.end_idx) == (3, 8)
+    assert model.first_local_layer == 3
+
+
+# --- The node role travels on the plan, because nothing else reaches a rank --
+
+
+def test_the_planner_puts_each_nodes_role_on_its_own_assignment():
+    """One plan, two Macs, two different roles.
+
+    The launcher emits a single argv for the whole cluster, so this is the only
+    place a per-Mac setting can be written down.
+    """
+
+    from omlx.cluster.planner import plan_hybrid
+
+    model = synthetic_model_layout(total_weight_bytes=60 * GIB, layer_count=8)
+    nodes = [
+        NodeBudget(
+            node_id="studio",
+            capacity_bytes=256 * GIB,
+            rank=0,
+            role="headless",
+        ),
+        NodeBudget(
+            node_id="macbook",
+            capacity_bytes=107 * GIB,
+            reserve_bytes=32 * GIB,
+            rank=1,
+            role="workstation",
+        ),
+    ]
+
+    unequal = plan_unequal_pipeline(model, nodes)
+    hybrid = plan_hybrid(model, nodes, tensor_parallel_size=1)
+
+    for plan in (unequal, hybrid):
+        by_id = {item.node_id: item.role for item in plan.assignments}
+        assert by_id == {"studio": "headless", "macbook": "workstation"}
+
+
+def test_tp_width_one_is_exactly_the_pipeline_plan_the_launcher_recomputes():
+    """Autoconfigure and activation must sign the same unequal-memory cut."""
+
+    from omlx.cluster.planner import ModelLayout, plan_hybrid
+
+    model = ModelLayout(
+        source="uneven",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=tuple(
+            size * GIB
+            for size in (2, 4, 6, 1, 1, 5, 1, 3, 5, 1, 5, 2, 1, 1, 4, 4, 1, 2)
+        ),
+    )
+    nodes = [
+        NodeBudget(
+            node_id="laptop",
+            capacity_bytes=62 * GIB,
+            reserve_bytes=11 * GIB,
+            rank=0,
+        ),
+        NodeBudget(
+            node_id="studio",
+            capacity_bytes=162 * GIB,
+            reserve_bytes=8 * GIB,
+            rank=1,
+        ),
+    ]
+
+    pipeline = plan_unequal_pipeline(model, nodes)
+    automatic = plan_hybrid(model, nodes, tensor_parallel_size=1)
+
+    assert automatic.assignments == pipeline.assignments
+    assert automatic.plan_hash == pipeline.plan_hash
+    assert automatic.pipeline_stages == 2
+
+
+def test_the_planner_puts_each_nodes_memory_tier_on_its_own_assignment():
+    from omlx.cluster.planner import plan_hybrid
+
+    model = synthetic_model_layout(total_weight_bytes=60 * GIB, layer_count=8)
+    nodes = [
+        NodeBudget(
+            node_id="studio",
+            capacity_bytes=256 * GIB,
+            rank=0,
+            memory_guard_tier="aggressive",
+        ),
+        NodeBudget(
+            node_id="macbook",
+            capacity_bytes=107 * GIB,
+            reserve_bytes=32 * GIB,
+            rank=1,
+            memory_guard_tier="safe",
+        ),
+    ]
+
+    for plan in (
+        plan_unequal_pipeline(model, nodes),
+        plan_hybrid(model, nodes, tensor_parallel_size=1),
+    ):
+        assert {
+            item.node_id: item.memory_guard_tier for item in plan.assignments
+        } == {"studio": "aggressive", "macbook": "safe"}
+
+
+def test_a_memory_tier_changes_the_plan_hash_and_typos_are_refused():
+    model = synthetic_model_layout(total_weight_bytes=60 * GIB, layer_count=8)
+
+    def planned(tier):
+        return plan_unequal_pipeline(
+            model,
+            [
+                NodeBudget(
+                    node_id="studio",
+                    capacity_bytes=256 * GIB,
+                    rank=0,
+                    memory_guard_tier=tier,
+                ),
+                NodeBudget(
+                    node_id="macbook",
+                    capacity_bytes=200 * GIB,
+                    rank=1,
+                ),
+            ],
+        )
+
+    assert planned("safe").plan_hash != planned("aggressive").plan_hash
+    with pytest.raises(ValueError, match="unknown memory guard tier"):
+        NodeBudget(
+            node_id="macbook",
+            capacity_bytes=100 * GIB,
+            memory_guard_tier="extreme",
+        )
+
+
+def test_a_node_role_changes_the_plan_hash():
+    """Same layers, different admission fraction: a different plan.
+
+    If the hash ignored the role, a headless plan the user previewed and a
+    workstation plan that launched would be indistinguishable to every
+    staleness check between here and the rank.
+    """
+
+    from omlx.cluster.planner import plan_hybrid
+
+    model = synthetic_model_layout(total_weight_bytes=60 * GIB, layer_count=8)
+
+    def _plan(role, planner):
+        return planner(
+            model,
+            [
+                NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+                NodeBudget(node_id="macbook", capacity_bytes=200 * GIB, rank=1, role=role),
+            ],
+        )
+
+    for planner in (plan_unequal_pipeline, plan_hybrid):
+        headless = _plan("headless", planner)
+        workstation = _plan("workstation", planner)
+        assert [item.layer_count for item in headless.assignments] == [
+            item.layer_count for item in workstation.assignments
+        ]
+        assert headless.plan_hash != workstation.plan_hash
+
+
+def test_an_unset_role_plans_exactly_as_before():
+    model = synthetic_model_layout(total_weight_bytes=60 * GIB, layer_count=8)
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="macbook", capacity_bytes=107 * GIB, rank=1),
+    ]
+
+    plan = plan_unequal_pipeline(model, nodes)
+
+    assert [item.role for item in plan.assignments] == ["", ""]
+
+
+def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
+    """The fallback direction is the dangerous one.
+
+    ``role_for()`` maps anything unrecognised to headless — 0.90 of the Mac —
+    which is right for a label in the UI and wrong for the number a rank
+    admits against. A plan does not get to guess.
+    """
+
+    with pytest.raises(ValueError, match="unknown node role"):
+        NodeBudget(node_id="macbook", capacity_bytes=100 * GIB, role="Workstaton")
+    with pytest.raises(ValueError, match="unknown node role"):
+        PipelineAssignment(
+            node_id="macbook",
+            rank=0,
+            start_layer=0,
+            end_layer=1,
+            layer_weight_bytes=1,
+            fixed_weight_bytes=0,
+            reserve_bytes=0,
+            capacity_bytes=10,
+            role="laptop",
+        )
+    # Case and padding are the UI's business, not a reason to refuse a launch.
+    assert NodeBudget(
+        node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
+    ).role == "workstation"
+
+
+def test_nemotron_h_quant_group_divisors_cap_tp_degree():
+    """Quantized even-split row-parallel dims contribute their group counts.
+
+    The Nemotron-H MoE routed experts use a custom *uneven* split (29 groups),
+    so 29 must NOT appear as a strict divisor. But the shared-expert down_proj
+    (3712 / 64 = 58 groups) uses the even ``shard_inplace`` path, so 58 must be
+    present — capping the model at TP=2 for the quantization reason as well as
+    the ``num_key_value_heads=2`` reason.
+    """
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 58 in divisors, divisors  # shared down_proj even-split group count
+    assert 29 not in divisors, divisors  # routed fc2 handled by the uneven path
+    assert all(v % 2 == 0 for v in divisors)  # TP=2 stays viable
+    assert not all(v % 4 == 0 for v in divisors)  # TP=4 rejected (58 % 4 != 0)
+
+
+def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
+    """Without a quantization block there are no group-count constraints."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+    }
+    divisors = _tensor_parallel_divisors(config)
+    assert 58 not in divisors
+    assert set(divisors) == {32, 2, 64, 8}
+
+
+def test_deepseek_v41_tensor_plan_keeps_the_shared_kv_head_whole():
+    from omlx.cluster.planner import (
+        _supports_tensor_parallel,
+        _tensor_parallel_divisors,
+    )
+    from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+    assert apply_deepseek_v41_mlx_lm_patch()
+    affine = {"bits": 3, "mode": "affine", "group_size": 64}
+    config = {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "o_groups": 8,
+            "o_lora_rank": 1024,
+            "moe_intermediate_size": 2304,
+        },
+        "omlx_deepseek_v41": {
+            "quantized_modules": {
+                "language_model.layers.0.attn.wo_b": affine,
+                "language_model.layers.0.ffn.experts.w2": affine,
+                "language_model.layers.1.ffn.experts.w2": {"bits": 4, "mode": "mxfp4"},
+            }
+        },
+    }
+
+    assert _supports_tensor_parallel(config)
+    # 2304 / 64 = 36 expert groups allow four ranks, not eight.
+    assert set(_tensor_parallel_divisors(config)) == {64, 8, 128, 36, 72}
+
+
+def _v41_split_layout():
+    """V4.1-shaped: 8 output groups, 36 expert blocks, 40 layers of 7 GiB."""
+
+    return ModelLayout(
+        source="v41",
+        fixed_weight_bytes=2 * GIB,
+        layer_weight_bytes=(7 * GIB,) * 40,
+        tensor_parallel_heads=64,
+        tensor_parallel_divisors=(64, 8, 36),
+        supports_tensor_parallel=True,
+        tensor_parallel_split_units=(8, 36),
+        tensor_parallel_split_bytes=(10 * GIB, 260 * GIB),
+    )
+
+
+def _studio_and_macbook(*extra):
+    return [
+        NodeBudget("studio", 243 * GIB, reserve_bytes=8 * GIB, rank=0),
+        NodeBudget("macbook", 121 * GIB, reserve_bytes=3 * GIB, rank=1),
+        *extra,
+    ]
+
+
+def test_deepseek_v41_auto_split_is_equal_only_while_equal_fits():
+    model = _v41_split_layout()
+    pair = [NodeBudget(n, 243 * GIB, rank=i) for i, n in enumerate("ab")]
+    auto = plan_hybrid(model, pair, tensor_parallel_size=2)
+    equal = plan_hybrid(model, pair, tensor_parallel_size=2, tensor_split="equal")
+    assert auto.plan_hash == equal.plan_hash
+    assert all("tensor_parallel_split" not in a.to_dict() for a in auto.assignments)
+
+    nodes = _studio_and_macbook()
+    with pytest.raises(PlanningError):
+        plan_hybrid(model, nodes, tensor_parallel_size=2, tensor_split="equal")
+    studio, macbook = plan_hybrid(model, nodes, tensor_parallel_size=2).assignments
+    attention, experts = studio.tensor_parallel_split
+    assert sum(attention) == 8 and sum(experts) == 36 and experts[0] > experts[1]
+    # Each rank holds the replicated part plus its own share of each axis.
+    replicated = sum(model.tensor_parallel_layer_bytes) - 270 * GIB
+    assert studio.layer_weight_bytes == (
+        replicated + 10 * GIB * attention[0] // 8 + 260 * GIB * experts[0] // 36
+    )
+    for item, node in zip((studio, macbook), nodes):
+        assert item.planned_weight_bytes <= node.usable_bytes
+        decoded = _assignment_from_dict(item.to_dict())
+        assert decoded.tensor_parallel_split == studio.tensor_parallel_split
+    assert ModelLayout.from_dict(model.to_dict()) == model
+
+
+@pytest.mark.parametrize(
+    ("split", "error"),
+    [
+        ({"attention": [5, 2], "experts": [25, 11]}, "totalling"),
+        ({"attention": [5, 3], "experts": [36, 0]}, "malformed"),
+        ({"attention": [1, 7], "experts": [6, 30]}, "does not fit"),
+    ],
+)
+def test_deepseek_v41_explicit_split_must_cover_and_fit_every_rank(split, error):
+    with pytest.raises((PlanningError, ValueError), match=error):
+        plan_hybrid(
+            _v41_split_layout(),
+            _studio_and_macbook(),
+            tensor_parallel_size=2,
+            tensor_split=split,
+        )
+
+
+def test_uneven_split_keeps_the_supported_tensor_parallel_degrees():
+    nodes = _studio_and_macbook(NodeBudget("mini", 121 * GIB, rank=2))
+    with pytest.raises(PlanningError, match="not divisible"):
+        plan_hybrid(_v41_split_layout(), nodes, tensor_parallel_size=3)
+
+
+@pytest.mark.parametrize(
+    ("modules", "oqh", "units"),
+    [
+        ({"ffn.shared_experts.w2": {"bits": 8, "mode": "mxfp8"}}, {}, (8, 36)),
+        # The fused decode MoE kernel reads two shared w2 groups per step.
+        ({"ffn.shared_experts.w2": {"bits": 8, "group_size": 64}}, {}, (8, 18)),
+        ({}, {"ffn.experts.w2": {"bits": 4, "block": 128, "group_size": 128}}, (8, 18)),
+        ({}, {"attn.wo_b": {"bits": 4, "block": 256, "group_size": 2048}}, ()),
+    ],
+)
+def test_deepseek_v41_split_blocks_follow_the_checkpoint_format(modules, oqh, units):
+    from omlx.cluster.planner import _tensor_split_units
+
+    def scoped(entries):
+        return {f"language_model.layers.0.{k}": v for k, v in entries.items()}
+
+    config = {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "num_attention_heads": 64,
+            "o_groups": 8,
+            "o_lora_rank": 1024,
+            "moe_intermediate_size": 2304,
+        },
+        "omlx_deepseek_v41": {"quantized_modules": scoped(modules)},
+        **({"omlx_oqh": {"version": 1, "tensors": scoped(oqh)}} if oqh else {}),
+    }
+
+    assert _tensor_split_units(config) == units
+
+
+def test_inspection_measures_deepseek_v41_split_bytes(tmp_path):
+    text = {"num_attention_heads": 64, "o_groups": 8, "o_lora_rank": 1024}
+    text |= {"moe_intermediate_size": 2304, "num_hidden_layers": 2}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v41", "text_config": text})
+    )
+    tensors = [("language_model.embed.weight", 100)]
+    for layer in range(2):
+        prefix = f"language_model.layers.{layer}."
+        tensors += [
+            (prefix + "attn.wq_b.weight", 10),
+            (prefix + "attn.wo_b.scales", 2),
+            (prefix + "attn.attn_sink", 1),
+            (prefix + "attn.wkv.weight", 5),
+            (prefix + "ffn.experts.w1.weight", 40),
+            (prefix + "ffn.shared_experts.w2.weight", 8),
+        ]
+    _write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.tensor_parallel_split_units == (8, 36)
+    assert layout.tensor_parallel_split_bytes == (2 * 13, 2 * 48)
+
+
+def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
+    from omlx.cluster.planner import plan_hybrid
+
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=10,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        tensor_parallel_heads=2,
+        supports_tensor_parallel=True,
+        supports_pipeline=True,
+    )
+    nodes = [
+        NodeBudget(node_id=n, capacity_bytes=1000, rank=i) for i, n in enumerate("ab")
+    ]
+
+    tensor = plan_hybrid(layout, nodes, tensor_parallel_size=2)
+    pipeline = plan_hybrid(layout, nodes, tensor_parallel_size=1)
+
+    assert [item.layer_weight_bytes for item in tensor.assignments] == [150, 150]
+    assert sum(item.layer_weight_bytes for item in pipeline.assignments) == 500
+    assert ModelLayout.from_dict(layout.to_dict()) == layout
+
+
+def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        supports_pipeline=True,
+    )
+    small = [NodeBudget(node_id="mini", capacity_bytes=320, rank=0)]
+
+    for planner in (plan_unequal_pipeline, plan_proportional_pipeline):
+        with pytest.raises(PlanningError):
+            planner(layout, small)
+        (assignment,) = planner(layout, small, engram_ssd_offload=True).assignments
+        assert assignment.layer_weight_bytes == 500
+        assert assignment.ssd_weight_bytes == 200
+        assert assignment.planned_weight_bytes == 300
+        assert _assignment_from_dict(assignment.to_dict()) == assignment
+
+    large = [NodeBudget(node_id="studio", capacity_bytes=1000, rank=0)]
+    assert (
+        plan_unequal_pipeline(layout, large, engram_ssd_offload=True).plan_hash
+        != plan_unequal_pipeline(layout, large).plan_hash
+    )
+
+
+def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
+    tmp_path, monkeypatch
+):
+    """An in-place shard rewrite bumps neither the directory mtime nor
+    config.json's, so the shard stats themselves must be in the cache key."""
+
+    from omlx.cluster import planner
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 100)]
+    )
+
+    calls = []
+    real_inspect = planner.inspect_safetensors_layout
+
+    def counting_inspect(path):
+        calls.append(str(path))
+        return real_inspect(path)
+
+    monkeypatch.setattr(planner, "inspect_safetensors_layout", counting_inspect)
+
+    planner.complete_model_layout(tmp_path)
+    planner.complete_model_layout(tmp_path)
+    assert len(calls) == 1  # second read served from the cache
+
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 200)]
+    )
+    layout = planner.complete_model_layout(tmp_path)
+    assert len(calls) == 2  # overwrite invalidated the cached entry
+    assert layout.layer_weight_bytes == (200,)
+
+
+def test_nemotron_h_per_module_quant_overrides_tighten_the_guard():
+    """oQ mixed checkpoints override group_size per module inside the
+    quantization dict; a coarser override can leave a prime group count the
+    top-level size hides, so its group counts must constrain the degree too."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "backbone.layers.0.mixer.shared_experts.down_proj": {
+                "group_size": 128,
+                "bits": 6,
+            },
+        },
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 58 in divisors  # 3712 / 64 under the top-level size
+    assert 29 in divisors  # 3712 / 128 under the override
+
+
+def test_nemotron_h_head_dim_falls_back_to_hidden_over_heads():
+    """A config without head_dim must not silently drop the attention
+    constraint; the runtime falls back to hidden_size // heads and so must
+    the guard."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "hidden_size": 4096,
+        "n_groups": 8,
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 64 in divisors  # (32 * 128) / 64 via the fallback head_dim
+
+
+def test_vocab_split_heads_constrain_the_degree():
+    """These strategies split an untied lm_head over the vocabulary."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    text = {"num_attention_heads": 8, "num_key_value_heads": 2, "vocab_size": 1001}
+    assert 1001 in _tensor_parallel_divisors(
+        {"model_type": "muse_spark", "text_config": text}
+    )
+    # Qwen3.5 keeps its lm_head whole for the rank-zero Lightning MTP head.
+    assert 1001 not in _tensor_parallel_divisors(
+        {"model_type": "qwen3_5", "text_config": text}
+    )
+    # Ministral 3 ties its embeddings unless the config says otherwise.
+    assert 1001 not in _tensor_parallel_divisors({"model_type": "ministral3", **text})
+
+
+def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
+    # The text backbone declares a pipeline() in mlx-lm source, but the on-disk
+    # checkpoint carries a vision sub-config, so it is served by mlx-vlm and has
+    # no model.model.pipeline (progressive_loading gates on exactly that). The
+    # static flag must mirror the runtime, i.e. report False.
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
+    assert planner._supports_pipeline(config) is False
+
+
+def test_supports_pipeline_true_for_text_model(monkeypatch):
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    assert planner._supports_pipeline({"model_type": "qwen3_moe"}) is True
+
+
+def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
+    # A VLM oMLX explicitly vouches for (ships its own pipeline()) stays True.
+    import sys
+    import types
+
+    from omlx.cluster import planner
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.minimax_m3_vl",
+        types.SimpleNamespace(SUPPORTS_PIPELINE=True),
+    )
+    config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
+    assert planner._supports_pipeline(config) is True

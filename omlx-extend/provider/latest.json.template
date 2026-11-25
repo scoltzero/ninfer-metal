@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "provider_id": "io.ninfer.metal",
+  "name": "ninfer-metal",
+  "channel": "stable",
+  "codename": "miv",
+  "display_version": "${DISPLAY_VERSION}",
+  "semver": "${SEMVER}",
+  "tag": "${RELEASE_TAG}",
+  "core_abi": 1,
+  "protocol_version": 2,
+  "min_omlx_extend_version": "0.8.0-extend",
+  "min_macos_version": "27.0",
+  "published_at_utc": "${PUBLISHED_AT_UTC}",
+  "assets": {
+    "macos-arm64": {
+      "filename": "${TARBALL_FILENAME}",
+      "url": "${TARBALL_URL}",
+      "sha256": "${TARBALL_SHA256}",
+      "size_bytes": 0,
+      "provider_manifest_url": "${PROVIDER_JSON_URL}"
+    }
+  },
+  "kv_formats": [
+    "bf16",
+    "affine4_g128"
+  ],
+  "notes_url": "${RELEASE_NOTES_URL}"
+}

@@ -1,0 +1,124 @@
+{
+  "schema": "ninfer-metal-provider-v1",
+  "provider_id": "io.ninfer.metal",
+  "legacy_provider_ids": [
+    "com.omlx.mseries"
+  ],
+  "engine_id": "m5rt",
+  "display_name": "miv Core Backend (ninfer-metal)",
+  "display_version": "${DISPLAY_VERSION}",
+  "codename": "${CODENAME}",
+  "semver": "${SEMVER}",
+  "core_abi": 1,
+  "protocol_version": 2,
+  "supported_protocols": [
+    1,
+    2
+  ],
+  "engine_contract_version": 1,
+  "min_omlx_extend_version": "0.8.0-extend",
+  "min_macos_version": "27.0",
+  "arch": "arm64",
+  "binary": "bin/mseries_backendd",
+  "entrypoint": "bin/mseries_backendd",
+  "metallib_dir": "metallib",
+  "calibrations_dir": "calibrations",
+  "supported_topologies": [
+    "qwen35_hybrid_dense_v1",
+    "qwen36_hybrid_moe256_k8_shared_v1"
+  ],
+  "supported_model_types": [
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen3_6",
+    "qwen3_6_moe",
+    "qwen3_8",
+    "qwen3_8_moe"
+  ],
+  "artifact_extensions": [
+    ".omlxm5"
+  ],
+  "capabilities": [
+    "ar",
+    "mtp",
+    "dflash2",
+    "kv_affine4_g128",
+    "rolling_prefix_cache",
+    "trim_cache",
+    "memory_budget_bytes",
+    "set_scheduler_hint",
+    "cancel",
+    "stats",
+    "capacity",
+    "subscribe_events"
+  ],
+  "kv_formats": [
+    "bf16",
+    "affine4_g128"
+  ],
+  "supported_standard_settings": [
+    "max_context_window",
+    "mtp_enabled",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
+    "dflash_enabled",
+    "dflash_draft_model",
+    "dflash_block_size",
+    "turboquant_kv_enabled",
+    "turboquant_kv_scheme"
+  ],
+  "options_schema": [
+    {
+      "key": "max_concurrency",
+      "label": "Concurrency (B/C)",
+      "type": "int",
+      "min": 1,
+      "max": 8,
+      "default": 1,
+      "reload_required": true
+    },
+    {
+      "key": "rolling_prefix_cache",
+      "label": "Rolling Prefix Cache",
+      "type": "bool",
+      "default": true,
+      "reload_required": true
+    },
+    {
+      "key": "prefix_cache_gb",
+      "label": "Prefix Cache Budget (GiB)",
+      "type": "bytes_gb",
+      "min": 0,
+      "max": 128,
+      "default": 4,
+      "reload_required": true
+    },
+    {
+      "key": "sampling_contract",
+      "label": "Sampling Contract",
+      "type": "enum",
+      "options": [
+        "position_coupled_v1",
+        "legacy_rejection_v1"
+      ],
+      "default": "legacy_rejection_v1",
+      "reload_required": true
+    },
+    {
+      "key": "artifact_path",
+      "label": "Artifact Path",
+      "type": "string",
+      "default": "",
+      "reload_required": true
+    },
+    {
+      "key": "draft_artifact_path",
+      "label": "Draft Artifact Path",
+      "type": "string",
+      "default": "",
+      "reload_required": true
+    }
+  ],
+  "built_at_utc": "${BUILT_AT_UTC}",
+  "git_commit": "${GIT_COMMIT}"
+}

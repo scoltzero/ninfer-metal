@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="390" viewBox="0 0 840 390" role="img" aria-label="Multi-user concurrency scaling aggregate throughput on Apple M5 Ultra">
+<defs>
+  <clipPath id="cs_card_clip"><rect x="0.5" y="0.5" width="839" height="389" rx="14"/></clipPath>
+  <linearGradient id="cs_accent" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#38bdf8"/><stop offset="55%" stop-color="#10b981"/><stop offset="100%" stop-color="#34d399"/></linearGradient>
+  <linearGradient id="cs_gray" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#6e7681"/><stop offset="100%" stop-color="#484f58"/></linearGradient>
+  <linearGradient id="cs_blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#2563eb"/></linearGradient>
+  <linearGradient id="cs_sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#0284c7"/></linearGradient>
+  <linearGradient id="cs_amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fbbf24"/><stop offset="100%" stop-color="#d97706"/></linearGradient>
+  <linearGradient id="cs_emerald" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#34d399"/><stop offset="100%" stop-color="#059669"/></linearGradient>
+  <linearGradient id="cs_h_gray" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#484f58"/><stop offset="100%" stop-color="#6e7681"/></linearGradient>
+  <linearGradient id="cs_h_sky" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#0284c7"/><stop offset="100%" stop-color="#38bdf8"/></linearGradient>
+  <linearGradient id="cs_h_emerald" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#34d399"/></linearGradient>
+  <linearGradient id="cs_h_amber" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#fbbf24"/></linearGradient>
+  <linearGradient id="cs_area_emerald" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10b981" stop-opacity="0.22"/><stop offset="100%" stop-color="#10b981" stop-opacity="0.0"/></linearGradient>
+  <linearGradient id="cs_area_sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#38bdf8" stop-opacity="0.16"/><stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"/></linearGradient>
+</defs>
+<rect x="0.5" y="0.5" width="839" height="389" rx="14" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<rect x="0" y="0" width="840" height="3.5" fill="url(#cs_accent)" clip-path="url(#cs_card_clip)"/>
+<text x="26" y="32" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f0f6fc">Multi-User Concurrency (B/C) Aggregate Throughput</text>
+<text x="26" y="50" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.2" font-weight="400" fill="#8b949e">Apple M5 Ultra (80-GPU · 256 GiB) · Window Decode (tok/s), temp = 0 · 19/19 Sweep vs Stock oMLX</text>
+<g><rect x="685.6" y="19.0" width="130.4" height="22.0" rx="11.0" fill="#0c2d2a" stroke="#10b981" stroke-width="1"/><text x="750.8" y="33.7" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.2" font-weight="700" fill="#6ee7b7">Dim D · 0-ULP Batch</text></g>
+<line x1="24" y1="63" x2="816" y2="63" stroke="#21262d" stroke-width="1"/>
+<rect x="28.0" y="76" width="11" height="11" rx="3" fill="#3b82f6"/>
+<text x="44.0" y="85.5" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#c9d1d9">B/C = 1</text>
+<rect x="115.6" y="76" width="11" height="11" rx="3" fill="#38bdf8"/>
+<text x="131.6" y="85.5" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#c9d1d9">B/C = 2</text>
+<rect x="203.2" y="76" width="11" height="11" rx="3" fill="#10b981"/>
+<text x="219.2" y="85.5" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#c9d1d9">B/C = 4</text>
+<rect x="290.8" y="76" width="11" height="11" rx="3" fill="#f59e0b"/>
+<text x="306.8" y="85.5" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#c9d1d9">B/C = 8</text>
+<line x1="378.4" y1="81.5" x2="396.4" y2="81.5" stroke="#f0f6fc" stroke-opacity="0.85" stroke-width="2" stroke-dasharray="4,2.5"/>
+<text x="402.4" y="85.5" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="500" fill="#8b949e">Stock oMLX 0.8.0 (same peak B)</text>
+<text x="18" y="211.0" text-anchor="middle" transform="rotate(-90 18 211.0)" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#8b949e">Aggregate Throughput (tok/s)</text>
+<line x1="66.0" y1="310.0" x2="814.0" y2="310.0" stroke="#30363d" stroke-width="1"/>
+<text x="58.0" y="313.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">0</text>
+<line x1="66.0" y1="271.2" x2="814.0" y2="271.2" stroke="#262c36" stroke-width="1" stroke-dasharray="3,4"/>
+<text x="58.0" y="274.7" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">200</text>
+<line x1="66.0" y1="232.4" x2="814.0" y2="232.4" stroke="#262c36" stroke-width="1" stroke-dasharray="3,4"/>
+<text x="58.0" y="235.9" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">400</text>
+<line x1="66.0" y1="193.5" x2="814.0" y2="193.5" stroke="#262c36" stroke-width="1" stroke-dasharray="3,4"/>
+<text x="58.0" y="197.0" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">600</text>
+<line x1="66.0" y1="154.7" x2="814.0" y2="154.7" stroke="#262c36" stroke-width="1" stroke-dasharray="3,4"/>
+<text x="58.0" y="158.2" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#8b949e">800</text>
+<rect x="95.5" y="106.0" width="143.0" height="204.0" rx="8" fill="#161b22" fill-opacity="0.45"/>
+<path d="M 104.5 310.0 L 104.5 287.2 Q 104.5 282.7 109.0 282.7 L 135.0 282.7 Q 139.5 282.7 139.5 287.2 L 139.5 310.0 Z" fill="url(#cs_blue)"/>
+<text x="122.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B1</text>
+<text x="122.0" y="276.7" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#93c5fd">140.48</text>
+<path d="M 149.5 310.0 L 149.5 265.1 Q 149.5 260.6 154.0 260.6 L 180.0 260.6 Q 184.5 260.6 184.5 265.1 L 184.5 310.0 Z" fill="url(#cs_sky)"/>
+<text x="167.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B2</text>
+<text x="167.0" y="254.6" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#7dd3fc">254.43</text>
+<path d="M 194.5 310.0 L 194.5 230.1 Q 194.5 225.6 199.0 225.6 L 225.0 225.6 Q 229.5 225.6 229.5 230.1 L 229.5 310.0 Z" fill="url(#cs_emerald)"/>
+<text x="212.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B4</text>
+<text x="212.0" y="219.6" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="700" fill="#6ee7b7">434.92</text>
+<g><rect x="177.9" y="186.1" width="68.1" height="18.5" rx="9.2" fill="#064e3b" stroke="#10b981" stroke-width="1"/><text x="212.0" y="198.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#6ee7b7">2.93× oMLX</text></g>
+<line x1="190.5" y1="281.2" x2="233.5" y2="281.2" stroke="#f0f6fc" stroke-opacity="0.85" stroke-width="1.8" stroke-dasharray="4,2.5"/>
+<text x="167.0" y="330.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#f0f6fc">27B oQ4e · Native MTP</text>
+<text x="167.0" y="345.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.8" fill="#8b949e">oMLX B=4 MTP: 148.37</text>
+<rect x="262.5" y="106.0" width="143.0" height="204.0" rx="8" fill="#161b22" fill-opacity="0.45"/>
+<path d="M 271.5 310.0 L 271.5 278.3 Q 271.5 273.8 276.0 273.8 L 302.0 273.8 Q 306.5 273.8 306.5 278.3 L 306.5 310.0 Z" fill="url(#cs_blue)"/>
+<text x="289.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B1</text>
+<text x="289.0" y="267.8" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#93c5fd">186.74</text>
+<path d="M 316.5 310.0 L 316.5 247.2 Q 316.5 242.7 321.0 242.7 L 347.0 242.7 Q 351.5 242.7 351.5 247.2 L 351.5 310.0 Z" fill="url(#cs_sky)"/>
+<text x="334.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B2</text>
+<text x="334.0" y="236.7" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#7dd3fc">346.61</text>
+<path d="M 361.5 310.0 L 361.5 218.1 Q 361.5 213.6 366.0 213.6 L 392.0 213.6 Q 396.5 213.6 396.5 218.1 L 396.5 310.0 Z" fill="url(#cs_emerald)"/>
+<text x="379.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B4</text>
+<text x="379.0" y="207.6" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="700" fill="#6ee7b7">496.60</text>
+<g><rect x="344.9" y="174.1" width="68.1" height="18.5" rx="9.2" fill="#064e3b" stroke="#10b981" stroke-width="1"/><text x="379.0" y="186.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#6ee7b7">3.83× oMLX</text></g>
+<line x1="357.5" y1="284.8" x2="400.5" y2="284.8" stroke="#f0f6fc" stroke-opacity="0.85" stroke-width="1.8" stroke-dasharray="4,2.5"/>
+<text x="334.0" y="330.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#f0f6fc">27B MXFP4 · DFlash2</text>
+<text x="334.0" y="345.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.8" fill="#8b949e">oMLX B=4 AR: 129.80*</text>
+<rect x="429.5" y="106.0" width="143.0" height="204.0" rx="8" fill="#161b22" fill-opacity="0.45"/>
+<path d="M 438.5 310.0 L 438.5 278.5 Q 438.5 274.0 443.0 274.0 L 469.0 274.0 Q 473.5 274.0 473.5 278.5 L 473.5 310.0 Z" fill="url(#cs_blue)"/>
+<text x="456.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B1</text>
+<text x="456.0" y="268.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#93c5fd">185.23</text>
+<path d="M 483.5 310.0 L 483.5 250.0 Q 483.5 245.5 488.0 245.5 L 514.0 245.5 Q 518.5 245.5 518.5 250.0 L 518.5 310.0 Z" fill="url(#cs_sky)"/>
+<text x="501.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B2</text>
+<text x="501.0" y="239.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#7dd3fc">332.37</text>
+<path d="M 528.5 310.0 L 528.5 217.3 Q 528.5 212.8 533.0 212.8 L 559.0 212.8 Q 563.5 212.8 563.5 217.3 L 563.5 310.0 Z" fill="url(#cs_emerald)"/>
+<text x="546.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B4</text>
+<text x="546.0" y="206.8" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="700" fill="#6ee7b7">500.57</text>
+<g><rect x="511.9" y="173.3" width="68.1" height="18.5" rx="9.2" fill="#064e3b" stroke="#10b981" stroke-width="1"/><text x="546.0" y="185.7" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#6ee7b7">3.37× oMLX</text></g>
+<line x1="524.5" y1="281.2" x2="567.5" y2="281.2" stroke="#f0f6fc" stroke-opacity="0.85" stroke-width="1.8" stroke-dasharray="4,2.5"/>
+<text x="501.0" y="330.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#f0f6fc">27B oQ4e · DFlash2</text>
+<text x="501.0" y="345.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.8" fill="#8b949e">oMLX B=4 MTP: 148.37</text>
+<rect x="596.5" y="106.0" width="188.0" height="204.0" rx="8" fill="#161b22" fill-opacity="0.45"/>
+<path d="M 605.5 310.0 L 605.5 272.5 Q 605.5 268.0 610.0 268.0 L 636.0 268.0 Q 640.5 268.0 640.5 272.5 L 640.5 310.0 Z" fill="url(#cs_blue)"/>
+<text x="623.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B1</text>
+<text x="623.0" y="262.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#93c5fd">216.44</text>
+<path d="M 650.5 310.0 L 650.5 241.5 Q 650.5 237.0 655.0 237.0 L 681.0 237.0 Q 685.5 237.0 685.5 241.5 L 685.5 310.0 Z" fill="url(#cs_sky)"/>
+<text x="668.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B2</text>
+<text x="668.0" y="231.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#7dd3fc">376.20</text>
+<path d="M 695.5 310.0 L 695.5 206.3 Q 695.5 201.8 700.0 201.8 L 726.0 201.8 Q 730.5 201.8 730.5 206.3 L 730.5 310.0 Z" fill="url(#cs_emerald)"/>
+<text x="713.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B4</text>
+<text x="713.0" y="195.8" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" font-weight="700" fill="#6ee7b7">557.14</text>
+<path d="M 740.5 310.0 L 740.5 150.2 Q 740.5 145.7 745.0 145.7 L 771.0 145.7 Q 775.5 145.7 775.5 150.2 L 775.5 310.0 Z" fill="url(#cs_amber)"/>
+<text x="758.0" y="303.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="700" fill="#0d1117" fill-opacity="0.82">B8</text>
+<text x="758.0" y="139.7" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="700" fill="#fcd34d">846.29</text>
+<g><rect x="721.2" y="106.2" width="73.6" height="18.5" rx="9.2" fill="#451a03" stroke="#f59e0b" stroke-width="1"/><text x="758.0" y="118.6" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#fcd34d">+52.6% oMLX</text></g>
+<line x1="736.5" y1="202.4" x2="779.5" y2="202.4" stroke="#f0f6fc" stroke-opacity="0.85" stroke-width="1.8" stroke-dasharray="4,2.5"/>
+<text x="690.5" y="330.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#f0f6fc">35B-A3B · MoE AR</text>
+<text x="690.5" y="345.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.8" fill="#8b949e">oMLX B=8 AR: 554.42</text>
+<text x="26" y="376" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.6" fill="#8b949e">*oMLX DFlash2 errors on MXFP4 (compared vs oMLX B=4 AR). Dashed tick = Stock oMLX peak-B baseline. Spec modes: 128/128 × B 0-ULP.</text>
+</svg>

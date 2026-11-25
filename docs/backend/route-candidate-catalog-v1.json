@@ -1,0 +1,556 @@
+{
+  "evidence_scope": "implemented/M4-correct candidates; no M5 Ultra route promoted",
+  "m5_ultra_pending_count": 23,
+  "m5_ultra_promoted_count": 0,
+  "route_count": 23,
+  "routes": [
+    {
+      "evidence": [
+        "B2.2"
+      ],
+      "family": "qmv",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1"
+      ],
+      "id": "dense.oq.qmv.t1",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=1"
+    },
+    {
+      "evidence": [
+        "B2.2"
+      ],
+      "family": "qmv",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.mxfp4.qmv.t1",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=1"
+    },
+    {
+      "evidence": [
+        "B2.3"
+      ],
+      "family": "row_split",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1"
+      ],
+      "id": "dense.oq.row_split.t2_8",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=2..8"
+    },
+    {
+      "evidence": [
+        "B2.3"
+      ],
+      "family": "split_k",
+      "formats": [
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1"
+      ],
+      "id": "dense.oq.split_k.t2_6",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=2..6"
+    },
+    {
+      "evidence": [
+        "B2.3"
+      ],
+      "family": "cooperative",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1"
+      ],
+      "id": "dense.oq.cooperative.t9_12",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=9..12"
+    },
+    {
+      "evidence": [
+        "B2.4"
+      ],
+      "family": "mxfp4_simd",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.mxfp4.simd.t2_12",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=2..12"
+    },
+    {
+      "evidence": [
+        "B2.4"
+      ],
+      "family": "tensorops",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.mxfp4.tensorops.t2_12",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h0",
+      "profiles": [
+        "W4A4"
+      ],
+      "promotion_blocker": "target capability and execution-path evidence",
+      "required_route": "native_tensorops",
+      "scope": "linear",
+      "token_domain": "T=2..12"
+    },
+    {
+      "evidence": [
+        "B2.5"
+      ],
+      "family": "cooperative",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1"
+      ],
+      "id": "dense.oq.broad",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=13..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.5"
+      ],
+      "family": "cooperative",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.mxfp4.broad_a16",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "T=13..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.5"
+      ],
+      "family": "tensorops",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.mxfp4.broad_a4",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h0",
+      "profiles": [
+        "W4A4"
+      ],
+      "promotion_blocker": "target capability and execution-path evidence",
+      "required_route": "native_tensorops",
+      "scope": "linear",
+      "token_domain": "T=13..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.1",
+        "B2.2",
+        "B2.5"
+      ],
+      "family": "tail_safe",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "dense.tail_safe",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16",
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "linear",
+      "token_domain": "all T / unaligned N,K"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "router_top8",
+      "formats": [
+        "direct_bf16_v1"
+      ],
+      "id": "moe.router.top8",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "T=1..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "grouped_moe",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1"
+      ],
+      "id": "moe.oq.grouped",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "T=1..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "per_expert_fallback",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1"
+      ],
+      "id": "moe.oq.per_expert",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "all T fallback"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "grouped_moe",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "moe.mxfp4.grouped_a16",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "T=1..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "grouped_moe_a4",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "moe.mxfp4.grouped_a4",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A4"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "T=1..128,512,1024"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "per_expert_fallback",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "moe.mxfp4.per_expert_a16",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A16"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "all T fallback"
+    },
+    {
+      "evidence": [
+        "B2.6"
+      ],
+      "family": "per_expert_fallback_a4",
+      "formats": [
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "moe.mxfp4.per_expert_a4",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h1",
+      "profiles": [
+        "W4A4"
+      ],
+      "promotion_blocker": "target median/p95 route comparison and static-table review",
+      "required_route": "classic_msl",
+      "scope": "moe",
+      "token_domain": "all T fallback"
+    },
+    {
+      "evidence": [
+        "B3.1",
+        "B3.2",
+        "B3.3"
+      ],
+      "family": "fused_parent_split_output",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "program.fused_projection",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h2",
+      "profiles": [
+        "A16",
+        "W4A16",
+        "W4A4"
+      ],
+      "promotion_blocker": "full-model quality, performance, memory, power, and stability",
+      "required_route": "metal4_direct",
+      "scope": "program",
+      "token_domain": "profile capacity"
+    },
+    {
+      "evidence": [
+        "B3.4-B3.10"
+      ],
+      "family": "layer_program",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "program.attention_gdn_mlp_vocab",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h2",
+      "profiles": [
+        "A16",
+        "W4A16",
+        "W4A4"
+      ],
+      "promotion_blocker": "full-model quality, performance, memory, power, and stability",
+      "required_route": "metal4_direct",
+      "scope": "program",
+      "token_domain": "decode/prefill profiles"
+    },
+    {
+      "evidence": [
+        "B4.4",
+        "B4.6"
+      ],
+      "family": "execute_batch",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "program.ar.execute_batch",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h2",
+      "profiles": [
+        "A16",
+        "W4A16",
+        "W4A4"
+      ],
+      "promotion_blocker": "full-model quality, performance, memory, power, and stability",
+      "required_route": "metal4_direct",
+      "scope": "program",
+      "token_domain": "AR decode/prefill"
+    },
+    {
+      "evidence": [
+        "B4.0",
+        "B4.5"
+      ],
+      "family": "record_once_icb",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "program.ar.icb",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h0",
+      "profiles": [
+        "A16",
+        "W4A16",
+        "W4A4"
+      ],
+      "promotion_blocker": "target capability and execution-path evidence",
+      "required_route": "metal4_compute_icb",
+      "scope": "program",
+      "token_domain": "AR decode/prefill"
+    },
+    {
+      "evidence": [
+        "B5",
+        "B6"
+      ],
+      "family": "dflash2",
+      "formats": [
+        "oq_affine_q4_g64_bf16_v1",
+        "oq_affine_q5_g64_bf16_v1",
+        "oq_affine_q5_g128_bf16_v1",
+        "oq_affine_q6_g64_bf16_v1",
+        "oq_affine_q6_g128_bf16_v1",
+        "oq_affine_q8_g64_bf16_v1",
+        "oq_affine_q8_g128_bf16_v1",
+        "mxfp4_e2m1_g32_e8m0_v1"
+      ],
+      "id": "program.dflash2.m8",
+      "implementation_state": "installed",
+      "m4_state": "correctness_qualified",
+      "m5_ultra_state": "pending_h2",
+      "profiles": [
+        "A16",
+        "W4A16",
+        "W4A4"
+      ],
+      "promotion_blocker": "full-model quality, performance, memory, power, and stability",
+      "required_route": "metal4_compute_icb",
+      "scope": "program",
+      "token_domain": "K=1..7,T=1..8,M=8"
+    }
+  ],
+  "schema": "omlx-m5-b7-route-catalog-v1"
+}

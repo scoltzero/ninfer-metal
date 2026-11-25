@@ -1,0 +1,161 @@
+{
+  "schema": "omlx-m5-static-dispatch-table-v1",
+  "profile_id": "apple-m5-ultra-64gpu",
+  "result_namespace": "m5-ultra-64gpu-96g",
+  "reviewed_at_utc": "2026-11-21T08:32:00Z",
+  "hardware_identity": {
+    "chip": "Apple M5 Ultra",
+    "architecture_name": "applegpu_g17d",
+    "agx_io_class": "AGXAcceleratorG17X",
+    "apple_gpu_family": 10,
+    "cpu_total_cores": 30,
+    "gpu_core_count": 64,
+    "system_memory_bytes": 103079215104,
+    "recommended_working_set_bytes": 83494174720,
+    "macos": "27.2.1",
+    "macos_build": "26B131"
+  },
+  "scope_and_isolation": {
+    "qualified_profile": "apple-m5-ultra-64gpu",
+    "does_not_qualify": [
+      "apple-m5-ultra-80gpu",
+      "apple-m5-max-40gpu",
+      "apple-m5-max-32gpu",
+      "apple-m5-pro-20gpu",
+      "apple-m5-pro-16gpu",
+      "apple-m5-10gpu"
+    ],
+    "note": "Stage B (Apple M5 Ultra 80-core 256GB) requires its own m5-ultra-80gpu-256g calibration and static dispatch table upon arrival."
+  },
+  "memory_and_icb_rules": {
+    "max_weight_segment_bytes": 2147483648,
+    "icb_max_buffer_offset_bytes": 4294963200,
+    "icb_execution_route": "metal4_compute_icb",
+    "shared_primary_slots": true,
+    "dflash_cyclic_feature_ring_rows": "min(max_context, max(sliding_window + block_size + 64, 1024))",
+    "reason": "Apple Silicon MTLIndirectComputeCommand truncates offsets >= 4 GiB silently without API validation; capping weight segments at 2 GiB + SharedPrimary per-slot buffer sharing + cyclic feature_history ring + FOSCAR Affine4Group128 KV unlocks B=8@64K (24.5 GiB) and B=4@128K (23.8 GiB) on 96GB UMA."
+  },
+  "dispatch_policies": {
+    "production_sampling_contract": "position_coupled_v1",
+    "linear_row_exact": {
+      "kernel_library": "omlx_m5_row_exact.metallib",
+      "mxfp4_kernel": "omlx_m5_row_exact_mxfp4 (v3: 8-group 128B coalesced uint + bfloat4, zero inner-loop SIMD shuffle)",
+      "oq_affine_kernel": "omlx_m5_row_exact_q{3,4,5,6,8}_g{64,128} (v4: adds QDA q3_g64/q3_g128 + half-register s*c + coalesced bfloat2/bfloat4)",
+      "bf16_kernel": "omlx_m5_row_exact_bf16 (v3: 256B coalesced bfloat4)",
+      "verified_bit_exact_widths": [1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128]
+    },
+    "attention": {
+      "split_kv_min_context": 2048,
+      "split_kv_partitions": 12,
+      "exact_kernel_library": "omlx_m5_attention_exact.metallib",
+      "nax_prefill_library": "omlx_m5_attention_nax_prefill.metallib",
+      "affine4_foscar_library": "omlx_m5_attention_affine4.metallib (omlx_m5_paged_kv_append_affine4_g128 + omlx_m5_paged_attention_affine4_g128)",
+      "exact_optimization": "occupancy-guarded GQA shared K/V tile (active when total_tgs >= 64) + FlashNaxV1 (#4808) prefill (T >= 64, -1994 ms at 8K) + FOSCAR Affine4Group128 zero-mean scale/bias paged KV (4.27x smaller KV with 100% AR==DFlash2==Batch parity)",
+      "evidence_h1_a": [
+        "bench/results/m5-ultra-64gpu-96g/h1/h1-a-27b-p0.json",
+        "bench/results/m5-ultra-64gpu-96g/h1/h1-a-35b-p0.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-prefill-flashnax-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-footprint-and-longctx-m5rt4.json"
+      ]
+    },
+    "gdn_prefill": {
+      "tb8_min_tokens": 8,
+      "conv1d_kernel": "2D coalesced conv1d + TB=8 register-tiled WY chunk scan",
+      "t1024_measured_speedup": 3.08,
+      "evidence_h1_g": [
+        "bench/results/m5-ultra-64gpu-96g/h1/h1_g/qwen38-27b-mxfp4-gdn.json",
+        "bench/results/m5-ultra-64gpu-96g/h1/h1_g/qwen38-27b-oq4e-gdn.json"
+      ]
+    },
+    "bounded_batch": {
+      "batch_mode": "on_for_b_ge_2",
+      "packed_execution": "run_packed_batch (cross-slot single-weight-read B*W NAX forward across shared linear/MLP/MoE weights with per-slot paged attention & GDN state) + replay_icb_batch for Draft & Commit",
+      "contended_prefill_scheduler": "#5164 <=45 ms decode-protect chunk scheduler preserving pos%1024==0 coupled contract (24.53 ms active decode p50 ITL under 2048-tok contending prefill)",
+      "shared_prefix_cache": "global COW SharedPrefixCache across all B slots (100% B=4 hit rate, 633.89 ms warm B=4 TTFT)",
+      "b8_ar_speedup_h1_c": 1.49,
+      "b4_27b_mxfp4_ar_tok_s": 135.49,
+      "b4_27b_mxfp4_dflash2_tok_s": 137.76,
+      "b4_27b_oq4e_ar_tok_s": 132.36,
+      "b4_27b_oq4e_dflash2_tok_s": 168.08,
+      "b8_35b_mxfp4_ar_tok_s": 463.46,
+      "b1_regression": 0.0,
+      "evidence_h1_c": [
+        "bench/results/m5-ultra-64gpu-96g/h1/h1-c-p10-batch.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-b4-32k-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/27b-oq4e-b4-32k-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-b8-64k-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-footprint-and-longctx-m5rt4.json"
+      ]
+    },
+    "moe_routing": {
+      "decode_kernel_library": "omlx_m5_moe.metallib",
+      "decode_swiglu_kernel": "omlx_m5_mxfp4_moe_w4a16_swiglu_grouped & omlx_m5_oq_q{4,5,6,8}_g{64,128}_moe_swiglu_grouped (128B coalesced, zero inner-loop shuffle; fastest at B=1 T=1: 138.24 tok/s)",
+      "decode_down_kernel": "omlx_m5_mxfp4_moe_w4a16_down_reduce & omlx_m5_oq_q{4,5,6,8}_g{64,128}_moe_down_reduce (8-row butterfly register reuse)",
+      "prefill_nax_kernel_library": "omlx_m5_moe_nax.metallib",
+      "prefill_nax_min_tokens": 8,
+      "prefill_nax_kernels": "omlx_m5_moe_mxfp4_nax_prepare_t32 + swiglu_bm8_bn16_sk2 + down_scatter_bm8_bn16_sk2_nsg2 (fused NSG=2 2xBN16 down+scatter, zero weight repack, used for T>=8 prefill & B>=2 packed batch)",
+      "router_projection": "omlx_m5_row_exact_q8_g64",
+      "router_topk": "omlx_m5_forward_router_top8_logits",
+      "grouped_vs_fallback_active_tokens": 8,
+      "measured_35b_b1_tok_s": 138.24,
+      "measured_35b_b8_64k_tok_s": 463.46,
+      "measured_35b_t1024_prefill_ttft_ms": 282.27,
+      "measured_35b_t1024_prefill_speedup": 3.21,
+      "evidence_h1_m": [
+        "bench/results/m5-ultra-64gpu-96g/h1/h1_m/qwen36-35b-a3b-mxfp4-layer0-routes.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-b1-32k-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-b8-64k-m5rt4.json",
+        "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-prefill-moe-nax-m5rt4.json"
+      ]
+    },
+    "nax_native_kernels": {
+      "mxfp4_w4a16_library": "omlx_m5_mxfp4_nax.metallib (BM=8, BN=16/32, BK=128, RF=1 default when SK>1, direct-F16 SwiGLU->down_proj fusion; zero-repack with mx_nax_tiled_bk128_v1)",
+      "mxfp4_w4a4_prefill": "omlx_m5_mxfp4_w4a4_nax_n{16,32}_sk{1,2,4,8} + swiglu (BM=16, T >= 32, explicit gate OMLX_M5_ALLOW_W4A4_PREFILL=1, 1504.30 ms @ 1K, 1471.75 ms with FlashNaxV1)",
+      "affine_oq_library": "omlx_m5_affine_nax.metallib (Q3/Q4/Q5/Q6 G64 & G128 BM=8, BN=16/32, uint4b+uint2b + fused SwiGLU; zero-repack with oq_nax_tiled_g{64,128}_v1 saving 14.4 GiB on 27B-oQ4e)",
+      "bf16_library": "omlx_m5_bf16_nax.metallib (direct_bf16_v1 zero-repack BM=8, BN=16, SK=4 + fused SwiGLU + FP32-output selector_nax_f32)",
+      "t_domain_dispatch": "explicit gate OMLX_M5_T_DOMAIN_DISPATCH=1 routes T=1 pure AR to row_exact v3 SIMD QMV (48.80 tok/s on 27B-MXFP4); default off to preserve 100% AR==DFlash2 coupled parity"
+    },
+    "speculative_dflash2": {
+      "draft_tokens": 7,
+      "adaptive_controller": "AdaptiveSpecController (SpecSearch survival S(1..K) + DraftDepth plain_guard + P12 MoE U(M) goodput allocator; --spec-search auto/on/off)",
+      "draft_optimizations": "single-ICB fused (context_gather + context_kv_append + 5-layer bf16_nax backbone + selector_nax_f32 + 32-SIMDgroup selector_finish) + O(1) feature_epoch + 32B tokens_only readback (draft_gpu 8.98 -> 7.42 ms, verify_gpu 26.54 -> 24.86 ms)",
+      "breakeven_tokens_per_round_27b_mxfp4": 2.3,
+      "measured_peak_tok_s_27b_mxfp4_32k": 161.23,
+      "measured_reasoning_tok_s_27b_mxfp4_32k": 91.96,
+      "measured_b4_tok_s_27b_mxfp4_32k": 137.76,
+      "measured_peak_tok_s_27b_oq4e_32k": 131.98,
+      "measured_reasoning_tok_s_27b_oq4e_32k": 106.41,
+      "measured_b4_tok_s_27b_oq4e_32k": 168.08
+    },
+    "legacy_diagnostic_h1_l_winners": {
+      "note": "Measured on real 27B/35B weights for diagnostic/legacy route reference; production position_coupled_v1 uses native M5 NAX + row_exact v4 above.",
+      "mxfp4_t1_winner": "lane_accum (1.23x-2.56x across 9/9 shapes)",
+      "mxfp4_t8_winner": "simdgroup_matrix_k32 (1.40x-5.89x across 10/10 shapes)",
+      "oq_affine_t8_winner": "simdgroup_matrix_k32 (3.28x down_proj, 4.24x lm_head)"
+    }
+  },
+  "evidence_manifest": {
+    "h0_capability": "bench/results/m5-ultra-64gpu-96g/h0/capability.json",
+    "h0_hw_trace_27b_mxfp4_m5rt4": "bench/results/m5-ultra-64gpu-96g/h0/hw-trace-27b-mxfp4-m5rt4-summary.json",
+    "h0_hw_trace_35b_mxfp4_m5rt4": "bench/results/m5-ultra-64gpu-96g/h0/hw-trace-35b-a3b-mxfp4-m5rt4-summary.json",
+    "h1_tuning": "bench/results/m5-ultra-64gpu-96g/h1/tuning.json",
+    "h2_27b_mxfp4_pretiled_coding_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-pretiled-coding-m5rt4.json",
+    "h2_27b_mxfp4_reasoning_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-reasoning-m5rt4.json",
+    "h2_27b_mxfp4_reasoning_specsearch_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-reasoning-specsearch-m5rt4.json",
+    "h2_27b_mxfp4_t_domain_ar_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-t-domain-ar-m5rt4.json",
+    "h2_27b_mxfp4_b4_32k_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-b4-32k-m5rt4.json",
+    "h2_27b_mxfp4_prefill_a16_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-prefill-a16-m5rt4.json",
+    "h2_27b_mxfp4_prefill_w4a4_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-prefill-w4a4-m5rt4.json",
+    "h2_27b_mxfp4_prefill_flashnax_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-prefill-flashnax-m5rt4.json",
+    "h2_27b_mxfp4_footprint_and_longctx_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-mxfp4-footprint-and-longctx-m5rt4.json",
+    "h2_27b_oq4e_pretiled_footprint_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-oq4e-pretiled-footprint-m5rt4.json",
+    "h2_27b_oq4e_coding_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-oq4e-coding-m5rt4.json",
+    "h2_27b_oq4e_reasoning_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-oq4e-reasoning-m5rt4.json",
+    "h2_27b_oq4e_b4_32k_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/27b-oq4e-b4-32k-m5rt4.json",
+    "h2_35b_mxfp4_b1_32k_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-b1-32k-m5rt4.json",
+    "h2_35b_mxfp4_b8_64k_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-b8-64k-m5rt4.json",
+    "h2_35b_mxfp4_prefill_moe_nax_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/35b-mxfp4-prefill-moe-nax-m5rt4.json",
+    "h2_qda_q3_validation_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/qda-q3-validation-m5rt4.json",
+    "sidecar_provider_smoke_m5rt4": "bench/results/m5-ultra-64gpu-96g/h2/sidecar-provider-smoke-m5rt4.json"
+  }
+}

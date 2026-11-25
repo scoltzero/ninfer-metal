@@ -1,0 +1,62 @@
+/build/
+/dist/
+/.cache/
+/.ruff_cache/
+.DS_Store
+**/__pycache__/
+*.pyc
+*.omlxm5
+
+# Large local checkpoints and independently versioned upstream repositories.
+/models/
+/ninfer/
+/TensorFold/
+
+# Monorepo-tracked omlx/ runtime, virtualenv, cache, and build artifacts.
+omlx/.venv/
+omlx/venv/
+omlx/**/__pycache__/
+omlx/**/*.pyc
+omlx/**/*.pyo
+omlx/.pytest_cache/
+omlx/.mypy_cache/
+omlx/.ruff_cache/
+omlx/.mlx_cache/
+omlx/build/
+omlx/dist/
+omlx/*.egg-info/
+omlx/omlx.egg-info/
+omlx/packaging/_build/
+omlx/packaging/_export/
+omlx/packaging/_wheels/
+omlx/apps/omlx-mac/.build/
+omlx/apps/omlx-mac/.swiftpm/
+omlx/apps/omlx-mac/DerivedData/
+omlx/node_modules/
+omlx/**/.DS_Store
+omlx/**/*.dylib
+omlx/**/*.so
+omlx/**/*.metallib
+omlx/**/*.dmg
+omlx/**/*.pkg
+omlx/**/*.db
+omlx/**/*.sqlite
+omlx/**/*.sqlite3
+omlx/**/*.log
+
+# Generated codebase graph dumps and AST caches.
+/graphify-out/
+
+# Local-only intermediate workspace artifacts, visual dumps, legacy benches/tools,
+# and historical milestone logs (kept intact on local disk, excluded from GitHub).
+/architecture/
+/bench/
+/tools/
+/hardware-software-boundaries-v1.md
+/m5-series-silicon-optimization-guide.md
+/m5-ultra-arrival-runbook.md
+/omlx-m5-backend-nlnfer-项目实施计划书.md
+/docs/versions/
+/docs/p4/
+/docs/docs-reorg-blueprint.md
+/docs/backend/b0-completion-report.md

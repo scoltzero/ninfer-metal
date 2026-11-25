@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 27,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "d0-m4",
+      "displayName": "M4 Xcode 27 / Metal 4 development build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/d0-m4",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "Python_EXECUTABLE": "${sourceDir}/omlx/.venv/bin/python",
+        "OMLX_M5_BUILD_NAX_METALLIB": "ON",
+        "OMLX_M5_BUILD_MLX_LEGACY_SMOKE": "OFF",
+        "OMLX_M5_BUILD_PYTHON": "ON",
+        "OMLX_M5_BUILD_PROBES": "ON"
+      },
+      "environment": {
+        "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "d0-m4",
+      "configurePreset": "d0-m4",
+      "jobs": 8
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "d0-m4",
+      "configurePreset": "d0-m4",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

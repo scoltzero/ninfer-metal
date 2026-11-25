@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The idle GPU keep-warm ticker runs only while a model is loaded and idle."""
+
+import asyncio
+import concurrent.futures
+import sys
+import time
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+
+from omlx import engine_pool as ep
+from omlx.admin import routes as admin_routes
+from omlx.settings import GlobalSettings, ServerSettings
+
+
+def _entry(*, active: bool = False, loaded: bool = True, idle_for: float = 0.0):
+    engine = SimpleNamespace(has_active_requests=lambda: active) if loaded else None
+    return SimpleNamespace(engine=engine, in_use=0, last_access=time.time() - idle_for)
+
+
+@pytest.fixture
+def pool(monkeypatch):
+    ticks = []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(ep, "_touch_gpu", lambda: ticks.append(1))
+    monkeypatch.setattr(ep, "get_mlx_executor", lambda: executor)
+    monkeypatch.setattr(ep, "shutdown_mlx_executor", executor.shutdown)
+    pool = ep.EnginePool()
+    pool.ticks = ticks
+    yield pool
+
+
+async def _settle(pool, seconds=0.08):
+    await asyncio.sleep(seconds)
+    return len(pool.ticks)
+
+
+@pytest.mark.asyncio
+async def test_ticks_only_while_a_loaded_model_is_idle(pool):
+    pool.configure_gpu_keep_warm(0.005)
+    pool._entries["m"] = _entry()
+    pool._ensure_gpu_keep_warm_task()
+    assert await _settle(pool) > 0
+
+    pool._entries["m"] = _entry(active=True)
+    n = await _settle(pool, 0.02)
+    assert await _settle(pool) == n  # generation keeps the GPU busy already
+
+    pool._entries["m"] = _entry(loaded=False)
+    n = await _settle(pool, 0.02)
+    assert await _settle(pool) == n  # nothing resident: let the GPU sleep
+
+    pool._entries["m"] = _entry()
+    assert await _settle(pool) > n
+
+    await pool._stop_gpu_keep_warm()
+    assert pool._gpu_keep_warm_task is None
+    n = len(pool.ticks)
+    assert await _settle(pool) == n
+
+
+@pytest.mark.asyncio
+async def test_ticks_stop_after_the_idle_window(pool):
+    window = ep._GPU_KEEP_WARM_IDLE_WINDOW_S
+    pool.configure_gpu_keep_warm(0.005)
+    pool._entries["m"] = _entry(idle_for=window + 1)
+    pool._ensure_gpu_keep_warm_task()
+    assert await _settle(pool) == 0  # idle too long: let the GPU sleep
+
+    # A request that outlasts the window restarts it when it finishes.
+    pool._entries["m"] = _entry(active=True, idle_for=window + 1)
+    await _settle(pool, 0.02)
+    pool._entries["m"] = _entry(idle_for=window + 1)
+    assert await _settle(pool) > 0
+
+    await pool._stop_gpu_keep_warm()
+
+
+@pytest.mark.asyncio
+async def test_disabled_interval_starts_no_task(pool):
+    pool.configure_gpu_keep_warm(0)
+    pool._entries["m"] = _entry()
+    pool._ensure_gpu_keep_warm_task()
+    assert pool._gpu_keep_warm_task is None
+    assert await _settle(pool, 0.03) == 0
+
+
+@pytest.mark.asyncio
+async def test_reconfiguring_to_zero_cancels_and_shutdown_stops(pool):
+    pool.configure_gpu_keep_warm(0.005)
+    pool._entries["m"] = _entry()
+    pool._ensure_gpu_keep_warm_task()
+    task = pool._gpu_keep_warm_task
+    assert task is not None
+    pool.configure_gpu_keep_warm(0)
+    await asyncio.sleep(0)
+    assert task.cancelled() or task.done()
+    assert pool._gpu_keep_warm_task is None
+
+    pool.configure_gpu_keep_warm(0.005)
+    pool._ensure_gpu_keep_warm_task()
+    await pool.shutdown()
+    assert pool._gpu_keep_warm_task is None
+
+
+def test_settings_default_roundtrip_and_env(monkeypatch):
+    assert ServerSettings().gpu_keep_warm_interval == 0.5
+    assert ServerSettings.from_dict({}).gpu_keep_warm_interval == 0.5
+    s = ServerSettings.from_dict({"gpu_keep_warm_interval": 0})
+    assert s.gpu_keep_warm_interval == 0.0
+    assert ServerSettings.from_dict(s.to_dict()).gpu_keep_warm_interval == 0.0
+
+    settings = GlobalSettings()
+    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_INTERVAL", "2")
+    settings._apply_env_overrides()
+    assert settings.server.gpu_keep_warm_interval == 2.0
+    monkeypatch.setenv("OMLX_GPU_KEEP_WARM_INTERVAL", "nope")
+    settings._apply_env_overrides()
+    assert settings.server.gpu_keep_warm_interval == 2.0
+
+
+@pytest.mark.asyncio
+async def test_idle_window_is_configurable(pool):
+    # A model last used 10 s ago: inside a 60 s window, outside a 5 s one.
+    pool._entries["m"] = _entry(idle_for=10.0)
+    pool.configure_gpu_keep_warm(0.005, 60.0)
+    assert pool._gpu_keep_warm_needed() is True
+    pool.configure_gpu_keep_warm(0.005, 5.0)
+    assert pool._gpu_keep_warm_needed() is False
+    # None keeps the current window; the default stays 5 minutes.
+    pool.configure_gpu_keep_warm(0.005)
+    assert pool._gpu_keep_warm_needed() is False
+    assert ep.EnginePool()._gpu_keep_warm_idle_window == 300.0
+
+
+def test_idle_window_settings_default_roundtrip():
+    assert ServerSettings().gpu_keep_warm_idle_window == 300.0
+    assert ServerSettings.from_dict({}).gpu_keep_warm_idle_window == 300.0
+    s = ServerSettings.from_dict({"gpu_keep_warm_idle_window": 3600})
+    assert s.gpu_keep_warm_idle_window == 3600.0
+    assert (
+        ServerSettings.from_dict(s.to_dict()).gpu_keep_warm_idle_window == 3600.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_finite_idle_window_is_rejected(monkeypatch, tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    request = admin_routes.GlobalSettingsRequest(gpu_keep_warm_idle_window=1e999)
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_global_settings(request, is_admin=True)
+    assert exc_info.value.status_code == 400
+    assert settings.server.gpu_keep_warm_idle_window == 300.0
+
+    settings.server.gpu_keep_warm_idle_window = float("inf")
+    assert "gpu_keep_warm_idle_window must be finite" in settings.validate()
+
+
+@pytest.mark.asyncio
+async def test_admin_update_applies_idle_window(monkeypatch, tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    calls: list[tuple] = []
+
+    class Pool:
+        def configure_gpu_keep_warm(self, interval, window):
+            calls.append(("configure", interval, window))
+
+    fake_server = SimpleNamespace(
+        _server_state=SimpleNamespace(engine_pool=Pool())
+    )
+    monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    async def save(_settings):
+        return None
+
+    monkeypatch.setattr(admin_routes, "_save_global_settings_async", save)
+
+    result = await admin_routes.update_global_settings(
+        admin_routes.GlobalSettingsRequest(gpu_keep_warm_idle_window=3600),
+        is_admin=True,
+    )
+
+    assert settings.server.gpu_keep_warm_idle_window == 3600.0
+    assert calls == [
+        ("configure", settings.server.gpu_keep_warm_interval, 3600.0),
+    ]
+    assert "gpu_keep_warm_idle_window" in result["runtime_applied"]

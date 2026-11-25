@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "model_revision": "04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc",
+  "quantization": {
+    "mode": "affine",
+    "group_size": 64,
+    "bits": [4, 5]
+  },
+  "m_values": [1, 2, 3, 4, 5, 6, 7, 8, 16],
+  "shapes": [
+    {
+      "id": "mlp_gate_up_q4",
+      "out_features": 17408,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 128
+    },
+    {
+      "id": "mlp_down_q4",
+      "out_features": 5120,
+      "in_features": 17408,
+      "bits": 4,
+      "tensor_count": 37
+    },
+    {
+      "id": "mlp_down_q5",
+      "out_features": 5120,
+      "in_features": 17408,
+      "bits": 5,
+      "tensor_count": 27
+    },
+    {
+      "id": "gdn_qkv_q4",
+      "out_features": 10240,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 48
+    },
+    {
+      "id": "gdn_a_q4",
+      "out_features": 48,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 17
+    },
+    {
+      "id": "gdn_a_q5",
+      "out_features": 48,
+      "in_features": 5120,
+      "bits": 5,
+      "tensor_count": 31
+    },
+    {
+      "id": "gdn_b_q4",
+      "out_features": 48,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 18
+    },
+    {
+      "id": "gdn_b_q5",
+      "out_features": 48,
+      "in_features": 5120,
+      "bits": 5,
+      "tensor_count": 30
+    },
+    {
+      "id": "gdn_z_q4",
+      "out_features": 6144,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 27
+    },
+    {
+      "id": "gdn_z_q5",
+      "out_features": 6144,
+      "in_features": 5120,
+      "bits": 5,
+      "tensor_count": 21
+    },
+    {
+      "id": "gdn_out_q5",
+      "out_features": 5120,
+      "in_features": 6144,
+      "bits": 5,
+      "tensor_count": 48
+    },
+    {
+      "id": "attention_q_q4",
+      "out_features": 12288,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 16
+    },
+    {
+      "id": "attention_k_q4",
+      "out_features": 1024,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 14
+    },
+    {
+      "id": "attention_k_q5",
+      "out_features": 1024,
+      "in_features": 5120,
+      "bits": 5,
+      "tensor_count": 2
+    },
+    {
+      "id": "attention_v_q4",
+      "out_features": 1024,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 16
+    },
+    {
+      "id": "attention_o_q4",
+      "out_features": 5120,
+      "in_features": 6144,
+      "bits": 4,
+      "tensor_count": 9
+    },
+    {
+      "id": "attention_o_q5",
+      "out_features": 5120,
+      "in_features": 6144,
+      "bits": 5,
+      "tensor_count": 7
+    },
+    {
+      "id": "lm_head_q4",
+      "out_features": 248320,
+      "in_features": 5120,
+      "bits": 4,
+      "tensor_count": 1
+    }
+  ],
+  "source": "docs/p4/analysis.json and docs/quantization.md"
+}

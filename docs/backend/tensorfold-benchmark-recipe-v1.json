@@ -1,0 +1,103 @@
+{
+  "schema": "omlx-m5-tensorfold-comparison-recipe-v1",
+  "prepared_only": true,
+  "target_device_results": null,
+  "tensorfold_commit": "cb2ebf0540f42604e2759b2ddef497861e928248",
+  "native_recipe": "explicit position_coupled_v1; legacy_rejection_v1 separate",
+  "checkpoint_candidate": "Jundot/Qwen3.8-27B-oQ4e-mtp",
+  "checkpoint_revision": "04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc",
+  "metadata_sha256": {
+    "config.json": "7a063b70e128d238784dce2c594cb7e0f714f44c4387975c99acc8fcf6511eb5",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "REVISION": "84a7d7b05117faf4d043a7f37a9cd0b21b8c1f567a10bb5069e4eb5bdaa08684"
+  },
+  "required_common_recipe_checks": [
+    "identical checkpoint revision and stored weights",
+    "format/group/protected layer compatibility",
+    "activation precision",
+    "rendered template and exact input token IDs",
+    "context and prefill chunk/cache state",
+    "B and actual W/M",
+    "sampling algorithm and seed semantics separately recorded"
+  ],
+  "inputs": [
+    {
+      "id": "explain-kv",
+      "messages": [
+        {
+          "role": "user",
+          "content": "解释分页KV缓存如何减少重复计算，并说明它与完整前缀状态恢复的区别。"
+        }
+      ]
+    },
+    {
+      "id": "replay-state",
+      "messages": [
+        {
+          "role": "user",
+          "content": "用五个要点说明投机解码在拒绝草稿后如何恢复Attention和GDN状态。"
+        }
+      ]
+    }
+  ],
+  "sampling_cases": [
+    {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 0,
+      "seed": 123
+    },
+    {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20,
+      "seed": 123
+    }
+  ],
+  "matrix": {
+    "max_new_tokens": 256,
+    "native_draft_depths": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "request_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "cache": [
+      "miss",
+      "hit"
+    ],
+    "thermal": [
+      "cold",
+      "warm"
+    ],
+    "contexts": [
+      2048,
+      8192,
+      32768
+    ]
+  },
+  "tensorfold_serial_control": "tensorfold serve Jundot/Qwen3.8-27B-oQ4e-mtp --name bench --no-drafts",
+  "tensorfold_spec_control": "tensorfold serve Jundot/Qwen3.8-27B-oQ4e-mtp --name bench; record actual drafter/tree/window/depth policy",
+  "unsupported_rule": "If no common checkpoint/format/capability exists, record unsupported; do not silently substitute weights, quantization or MTP.",
+  "exactness_rule": "Verify serial/spec and solo/shared within each runtime contract. Same named seed across different samplers does not require same token sequence.",
+  "outputs": [
+    "raw paired samples",
+    "TTFT/TPOT and per-stream/aggregate tok/s",
+    "committed tokens/round and acceptance by depth",
+    "full round phases",
+    "actual routes and identity hashes",
+    "memory, energy and thermal conditions"
+  ],
+  "upstream_131_160_tok_s": "upstream report only; never filled as project target measurements"
+}

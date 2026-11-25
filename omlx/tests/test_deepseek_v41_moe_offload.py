@@ -1,0 +1,1175 @@
+"""V4.1 expert residency preserves routing, projection arithmetic and loading."""
+
+import json
+import weakref
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import mlx.core as mx
+import numpy as np
+import pytest
+from test_deepseek_v41 import write_checkpoint
+
+from omlx.engine.vlm import wire_moe_offload_slot_hooks
+from omlx.patches.deepseek_v41.convert import convert
+from omlx.patches.deepseek_v41.loading import load
+from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+
+@pytest.mark.parametrize("converted", [False, True])
+@pytest.mark.parametrize("engram", [False, True])
+def test_checkpoint_offload_matches_prefill_decode_and_closes(
+    tmp_path, converted, engram
+):
+    kwargs = dict(n_routed_experts=8, n_activated_experts=2)
+    if engram:
+        kwargs.update(
+            engram_layer_ids=(1, 3),
+            engram_num_embeddings=(72, 204),
+            engram_vocab_size=5,
+            engram_max_ngram_size=4,
+            engram_n_heads=2,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=64,
+        )
+    source, _ = write_checkpoint(tmp_path, vision=False, **kwargs)
+    if converted:
+        target = tmp_path / "converted"
+        convert(source, target)
+        source = target
+    resident, _ = load(source, engram_ssd_offload=engram)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        disk, _ = executor.submit(
+            load,
+            source,
+            engram_ssd_offload=engram,
+            moe_expert_offload_resident_fraction=0.25,
+        ).result()
+    plan = disk._moe_offload_plan
+    try:
+        assert plan.capacity == 2 and plan.count == 8
+        assert plan.resident_bytes * 4 == plan.full_bytes
+        assert isinstance(disk.language_model.layers[0].ffn.experts, OffloadedExpert)
+        caches = [m.language_model.make_cache() for m in (resident, disk)]
+        # Include the caller's sorted expert path and several eviction rounds.
+        for ids in (mx.array([[3, 4] * 17]), mx.array([[5]]), mx.array([[6, 7]])):
+            out = [m(ids, cache=c) for m, c in zip((resident, disk), caches)]
+            mx.eval(out)
+            np.testing.assert_allclose(out[0], out[1], rtol=2e-4, atol=2e-5)
+        assert disk.language_model.layers[0].ffn.experts.slots.misses >= 2
+    finally:
+        resident.close()
+        disk.close()
+    assert plan._closed and not plan._fds
+    disk.close()
+
+
+def test_missing_expert_is_rejected_before_loading(tmp_path):
+    source, _ = write_checkpoint(tmp_path, vision=False)
+    path = source / "model.safetensors.index.json"
+    mapping = json.loads(path.read_text())
+    del mapping["weight_map"]["layers.0.ffn.experts.3.w2.weight"]
+    path.write_text(json.dumps(mapping))
+    with pytest.raises(KeyError):
+        load(source, moe_expert_offload_resident_fraction=0.25)
+
+
+@pytest.mark.parametrize("source_format", ["affine", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("sorted_routes", [False, True])
+def test_quantized_expert_eviction_preserves_arithmetic(
+    tmp_path, source_format, sorted_routes
+):
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    mx.random.seed(412)
+    config = ModelConfig(
+        dim=64, moe_inter_dim=64, n_layers=1, n_routed_experts=8, n_activated_experts=2
+    )
+    reference = Expert(config, True)
+    specs = {}
+    for proj in ("w1", "w3", "w2"):
+        mode = source_format
+        bits = 8 if mode == "mxfp8" or (mode == "affine" and proj == "w2") else 4
+        arrays = mx.quantize(
+            mx.random.normal((8, 64, 64)).astype(mx.bfloat16) * 0.05,
+            bits=bits,
+            group_size=32,
+            mode=mode,
+        )
+        params = dict(weight=arrays[0], scales=arrays[1], bits=bits, mode=mode)
+        if len(arrays) == 3:
+            params["biases"] = arrays[2]
+        setattr(reference, proj, QuantizedProjection(**params))
+        specs[f"language_model.layers.0.ffn.experts.{proj}"] = dict(
+            bits=bits, mode=mode
+        )
+    prefix = "language_model.layers.0.ffn.experts"
+    tensors = {prefix + "." + k: v for k, v in tree_flatten(reference.parameters())}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    mapping = {k: "model.safetensors" for k in tensors}
+    raw = {"omlx_deepseek_v41": {"version": 1, "quantized_modules": specs}}
+    plan = ExpertOffloadPlan(tmp_path, raw, mapping, config, 0.25)
+    disk = OffloadedExpert(Expert(config, True), plan, prefix)
+    try:
+        for step in range(4):
+            if sorted_routes:
+                idx = mx.array([0, 1, 2, 3, 4, 5, 6, 7])
+                x = mx.random.normal((8, 1, 64)).astype(mx.bfloat16)
+            else:
+                idx = (mx.arange(6).reshape(1, 3, 2) + step * 2) % 8
+                x = mx.random.normal((1, 3, 1, 1, 64)).astype(mx.bfloat16)
+            weights = mx.ones(idx.shape) / 2
+            expected = reference(x, idx, weights, sorted_indices=sorted_routes)
+            actual = disk(x, idx, weights, sorted_indices=sorted_routes)
+            mx.eval(expected, actual)
+            np.testing.assert_allclose(
+                actual.astype(mx.float32),
+                expected.astype(mx.float32),
+                rtol=0.01,
+                atol=0.002,
+            )
+        assert disk.slots.misses > plan.capacity
+    finally:
+        plan.close()
+
+
+@pytest.mark.parametrize("key", ["vlm_mtp_enabled", "dflash_enabled"])
+def test_speculative_offload_conflict(key):
+    from omlx.model_settings import ModelSettings
+
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        ModelSettings(moe_expert_offload_enabled=True, **{key: True})
+
+
+def test_lightning_mtp_offload_conflict_is_family_aware():
+    from omlx.model_settings import validate_moe_expert_offload
+
+    settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
+    validate_moe_expert_offload(settings, model_type="deepseek_v41")
+    validate_moe_expert_offload(settings, model_type="glm5_next")
+    validate_moe_expert_offload(settings, model_type="glm5-next")
+    validate_moe_expert_offload(settings, model_type="qwen4_exp")
+    validate_moe_expert_offload(settings, model_type=None)
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(settings, model_type="qwen3_5")
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(settings, model_type="glm_moe_dsa")
+    # DFlash/VLM MTP stay rejected for every family, V4.1 included.
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        validate_moe_expert_offload(
+            {"moe_expert_offload_enabled": True, "dflash_enabled": True},
+            model_type="deepseek_v41",
+        )
+
+
+def test_mtp_offload_pairing_survives_settings_roundtrip():
+    from omlx.model_settings import ModelSettings
+
+    settings = ModelSettings(moe_expert_offload_enabled=True, mtp_enabled=True)
+    assert settings.moe_expert_offload_enabled and settings.mtp_enabled
+
+
+def test_converted_draft_weights_are_not_loaded_with_offload(tmp_path):
+    from mlx.utils import tree_flatten
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    target = tmp_path / "converted"
+    convert(source, target, preserve_mtp=True)
+    model, _ = load(target, moe_expert_offload_resident_fraction=0.5)
+    try:
+        assert not hasattr(model.language_model, "mtp")
+        assert not model.config.preserve_mtp
+        assert model._moe_offload_plan.draft_bytes > 0
+        assert not any(".mtp." in name for name, _ in tree_flatten(model.parameters()))
+        mx.eval(model(mx.array([[3, 4, 5]])))
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize("fraction", [0, -0.25, 1.01, float("nan")])
+def test_offload_api_rejects_invalid_fraction(fraction):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omlx.admin.routes import _validate_model_settings
+
+    with pytest.raises(HTTPException) as error:
+        _validate_model_settings(
+            SimpleNamespace(config_model_type="deepseek_v41"),
+            {"moe_expert_offload_resident_fraction": fraction},
+        )
+    assert error.value.status_code == 400
+
+
+def test_loader_never_reads_nonresident_stacked_experts(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41 import loading
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.storage import TensorFile
+
+    source, _ = write_checkpoint(tmp_path, vision=False, n_routed_experts=8)
+    target = tmp_path / "converted"
+    convert(source, target)
+    seen = []
+    original_read = ExpertOffloadPlan.read
+
+    def read(slab):
+        assert slab.expert is not None, "Whole expert tensor materialized"
+        seen.append(slab.expert)
+        return original_read(slab)
+
+    monkeypatch.setattr(ExpertOffloadPlan, "read", staticmethod(read))
+    original_gather = TensorFile.read
+
+    def gather(self, key, rows=None, **kwargs):
+        assert ".ffn.experts." not in key, "Expert slab read through the mmap"
+        return original_gather(self, key, rows, **kwargs)
+
+    monkeypatch.setattr(TensorFile, "read", gather)
+
+    def no_whole_shards(*args, **kwargs):
+        raise AssertionError("Shared shard would materialize nonresident experts")
+
+    monkeypatch.setattr(loading, "_load_shard", no_whole_shards)
+    model, _ = load(target, moe_expert_offload_resident_fraction=0.125)
+    try:
+        assert model._moe_offload_plan.capacity == 2  # Routing top-k floor.
+        assert seen and set(seen) == {0}  # Only a one-expert shape/dtype sample.
+        mx.eval(model(mx.array([[3, 4, 5]])))
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_original_quantized_expert_reads_repack_only_selected_experts(tmp_path, bits):
+    from test_deepseek_v41 import raw_safetensors
+
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    mx.random.seed(441)
+    config = ModelConfig(
+        dim=64, moe_inter_dim=64, n_layers=1, n_routed_experts=8, n_activated_experts=2
+    )
+    reference = Expert(config, True)
+    tensors = {}
+    for proj in ("w1", "w3", "w2"):
+        w, scales = mx.quantize(
+            mx.random.normal((8, 64, 64)), bits=bits, group_size=32, mode=f"mxfp{bits}"
+        )
+        if bits == 8:
+            scales = mx.repeat(scales[:, ::32], 32, axis=1)
+        setattr(reference, proj, QuantizedProjection(w, scales, bits, f"mxfp{bits}"))
+        for e in range(8):
+            name = f"layers.0.ffn.experts.{e}.{proj}"
+            tensors[name + ".weight"] = (
+                np.asarray(w[e]).view(np.uint8),
+                "I8" if bits == 4 else "F8_E4M3",
+            )
+            tensors[name + ".scale"] = (
+                np.asarray(scales[e])[:: 32 if bits == 8 else 1],
+                "F8_E8M0",
+            )
+    raw_safetensors(tmp_path / "model.safetensors", tensors)
+    plan = ExpertOffloadPlan(
+        tmp_path, {}, {k: "model.safetensors" for k in tensors}, config, 0.25
+    )
+    disk = OffloadedExpert(
+        Expert(config, True), plan, "language_model.layers.0.ffn.experts"
+    )
+    try:
+        for ids in ([[0, 1]], [[2, 3]], [[0, 7]], [[6, 5]]):
+            x = mx.random.normal((1, 1, 1, 64)).astype(mx.bfloat16)
+            idx = mx.array(ids)
+            scores = mx.ones(idx.shape) / 2
+            a, b = reference(x, idx, scores), disk(x, idx, scores)
+            mx.eval(a, b)
+            np.testing.assert_array_equal(a.astype(mx.float32), b.astype(mx.float32))
+        assert disk.slots.misses > 2
+    finally:
+        plan.close()
+
+
+def test_original_affine_expert_reads_repack_only_selected_experts(tmp_path):
+    """Affine source experts offload with the packed arithmetic intact."""
+    from test_deepseek_v41 import raw_safetensors
+
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    def bf16_bytes(array):
+        # bfloat16 travels as its raw bits, the way safetensors stores it.
+        return np.asarray(array.view(mx.uint16))
+
+    mx.random.seed(517)
+    config = ModelConfig(
+        dim=64, moe_inter_dim=64, n_layers=1, n_routed_experts=8, n_activated_experts=2
+    )
+    reference = Expert(config, True)
+    tensors = {}
+    for proj in ("w1", "w3", "w2"):
+        weight, scales, biases = mx.quantize(
+            mx.random.normal((8, 64, 64)).astype(mx.bfloat16),
+            bits=2,
+            group_size=64,
+            mode="affine",
+        )
+        setattr(
+            reference,
+            proj,
+            QuantizedProjection(
+                weight,
+                scales,
+                2,
+                "affine",
+                biases=biases,
+                group_size=64,
+                quantize_input=False,
+            ),
+        )
+        for expert in range(8):
+            name = f"layers.0.ffn.experts.{expert}.{proj}"
+            tensors[name + ".weight"] = (np.asarray(weight[expert]), "U32")
+            tensors[name + ".scales"] = (bf16_bytes(scales[expert]), "BF16")
+            tensors[name + ".biases"] = (bf16_bytes(biases[expert]), "BF16")
+    raw_safetensors(tmp_path / "model.safetensors", tensors)
+    plan = ExpertOffloadPlan(
+        tmp_path,
+        {"quantization": {"bits": 2, "group_size": 64, "mode": "affine"}},
+        {key: "model.safetensors" for key in tensors},
+        config,
+        0.25,
+    )
+    disk = OffloadedExpert(
+        Expert(config, True), plan, "language_model.layers.0.ffn.experts"
+    )
+    try:
+        for ids in ([[0, 1]], [[2, 3]], [[0, 7]], [[6, 5]]):
+            x = mx.random.normal((1, 1, 1, 64)).astype(mx.bfloat16)
+            idx = mx.array(ids)
+            scores = mx.ones(idx.shape) / 2
+            a, b = reference(x, idx, scores), disk(x, idx, scores)
+            mx.eval(a, b)
+            np.testing.assert_array_equal(a.astype(mx.float32), b.astype(mx.float32))
+        assert disk.slots.misses > 2
+        # Metadata is part of the expert, so it must be part of its byte size.
+        assert plan.full_bytes == plan.expert_bytes * plan.count
+    finally:
+        plan.close()
+
+
+def test_engram_and_expert_estimates_compose(tmp_path):
+    from test_engine_pool import _make_pool
+
+    from omlx.engine_pool import EngineEntry
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.deepseek_v41.moe_offload import estimate_expert_savings
+    from omlx.patches.deepseek_v41.residency import deepseek_v41_residency_estimate
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=8,
+        engram_layer_ids=(1, 3),
+        engram_num_embeddings=(72, 204),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+        engram_compressed_vocab_size=64,
+    )
+    target = tmp_path / "converted"
+    convert(source, target)
+    base = deepseek_v41_residency_estimate(target)
+    pool = _make_pool(ceiling=1024**3)
+    entry = EngineEntry(
+        model_id="v41",
+        model_path=str(target),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="deepseek_v41",
+        estimated_size=base.resident_bytes,
+    )
+    settings = ModelSettings(
+        moe_expert_offload_enabled=True,
+        moe_expert_offload_resident_fraction=0.25,
+        deepseek_v41_engram_ssd_offload=True,
+    )
+    saved = int(estimate_expert_savings(target, 0.25) * 1.05)
+    expected = base.mmap_bytes - saved
+    assert pool._entry_runtime_resident_size(entry, settings) == expected
+    assert (
+        pool._entry_runtime_resident_size(
+            entry, settings, include_ane_reservation=False
+        )
+        == expected
+    )
+
+
+def _synthetic_affine_experts(tmp_path, fraction, seed=412):
+    """A one-layer stacked affine checkpoint with a resident reference Expert."""
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.language import Expert
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+
+    mx.random.seed(seed)
+    config = ModelConfig(
+        dim=64, moe_inter_dim=64, n_layers=1, n_routed_experts=8, n_activated_experts=2
+    )
+    reference = Expert(config, True)
+    specs = {}
+    for proj in ("w1", "w3", "w2"):
+        arrays = mx.quantize(
+            mx.random.normal((8, 64, 64)).astype(mx.bfloat16) * 0.05,
+            bits=4,
+            group_size=32,
+            mode="affine",
+        )
+        setattr(
+            reference,
+            proj,
+            QuantizedProjection(arrays[0], arrays[1], 4, "affine", biases=arrays[2]),
+        )
+        specs[f"language_model.layers.0.ffn.experts.{proj}"] = dict(
+            bits=4, mode="affine"
+        )
+    prefix = "language_model.layers.0.ffn.experts"
+    tensors = {prefix + "." + k: v for k, v in tree_flatten(reference.parameters())}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    mapping = {k: "model.safetensors" for k in tensors}
+    raw = {"omlx_deepseek_v41": {"version": 1, "quantized_modules": specs}}
+    plan = ExpertOffloadPlan(tmp_path, raw, mapping, config, fraction)
+    return reference, OffloadedExpert(Expert(config, True), plan, prefix), plan
+
+
+def test_release_slots_keeps_hot_banks_and_routes(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        idx = mx.array([3, 2, 0, 5]).reshape(1, 2, 2)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        before = np.array(disk(x, idx, weights).view(mx.uint16))
+        # Whole-reference heat, as the eviction policy ranks it. Experts 1 and 4
+        # are the cold tail; 1 and 3 tie, so the more recently used 3 stays.
+        slots._uses = {
+            0: (4.0, 0),
+            1: (1.0, 0),
+            2: (2.0, 0),
+            3: (1.0, 0),
+            4: (0.5, 0),
+            5: (5.0, 0),
+        }
+        assert slots.release_slots(4) == plan.expert_bytes * 2
+        assert slots.capacity == 4 and plan.capacity == 6
+        # Compacted least to most recently used: the probe call above touched
+        # 3, 2, 0, 5 in that order, so _victim keeps its tie-break order.
+        assert list(slots.slot_of) == [3, 2, 0, 5]
+        # The contract that order exists for: the cold tail goes first, and a
+        # tie goes to the least recently used expert.
+        assert slots._victim(set()) == 3
+        assert slots.free == []
+        misses = slots.misses
+        np.testing.assert_array_equal(disk(x, idx, weights).view(mx.uint16), before)
+        assert slots.misses == misses
+    finally:
+        plan.close()
+
+
+def test_restore_slots_grows_back_and_refills_on_misses(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        assert slots.release_slots(3) == plan.expert_bytes * 3
+        assert slots.capacity == 3 and slots.free == []
+        assert set(slots.slot_of) == {3, 4, 5}
+        assert slots.restore_slots() == plan.expert_bytes * 3
+        assert slots.capacity == plan.capacity == 6
+        assert slots.free == [3, 4, 5]
+        assert slots.restore_slots() == 0
+        assert slots.release_slots(6) == 0
+
+        idx = mx.array([0, 1, 2, 3, 4, 5]).reshape(1, 2, 3)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        np.testing.assert_array_equal(
+            disk(x, idx, weights).view(mx.uint16),
+            reference(x, idx, weights).view(mx.uint16),
+        )
+        assert set(slots.slot_of) == {0, 1, 2, 3, 4, 5}
+    finally:
+        plan.close()
+
+
+def test_resize_failure_before_publish_leaves_the_bank_unchanged(
+    tmp_path, monkeypatch
+):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1])
+        bank = slots.expert.w1.weight
+        other = slots.expert.w3.weight
+        before = list(slots.slot_of.items())
+        before_free = list(slots.free)
+        before_views = slots._views
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("replacement allocation failed")
+
+        # Every replacement array is materialized by this one eval before any
+        # of them is published, so a failed allocation is the only failure
+        # point: the setattr loop after it cannot fail.
+        with monkeypatch.context() as patch:
+            patch.setattr(mx, "eval", fail)
+            with pytest.raises(RuntimeError, match="allocation failed"):
+                slots.release_slots(4)
+        assert slots.capacity == 6 and slots.expert.w1.weight is bank
+        assert slots.expert.w3.weight is other
+        assert list(slots.slot_of.items()) == before
+        assert slots.free == before_free
+        assert slots._views is before_views
+    finally:
+        plan.close()
+
+
+def test_slot_hooks_wire_the_banks_into_the_scheduler(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3])
+        scheduler = SimpleNamespace()
+        model = SimpleNamespace(_moe_offload_slots=[slots])
+        assert wire_moe_offload_slot_hooks(scheduler, model)
+        assert scheduler.moe_offload_releasable() == plan.expert_bytes * (
+            slots.capacity - slots.floor
+        )
+        reclaimed = []
+        assert (
+            scheduler.moe_offload_release(
+                plan.expert_bytes, lambda: reclaimed.append(True)
+            )
+            == plan.expert_bytes
+        )
+        assert slots.capacity == 5 and reclaimed == [True]
+        scheduler.moe_offload_restore(lambda: reclaimed.append(True))
+        assert slots.capacity == 6 and reclaimed == [True, True]
+        # A model without banks keeps whatever hooks it already had.
+        plain = SimpleNamespace()
+        assert not wire_moe_offload_slot_hooks(plain, SimpleNamespace())
+        assert not hasattr(plain, "moe_offload_release")
+    finally:
+        plan.close()
+
+
+def _eviction_reference(sequence, capacity, half_life):
+    """The serial residency policy: hits protect, a miss evicts the unprotected
+    resident expert with the lowest decayed use count (ties: least recent)."""
+    slot_of, free, uses, misses = {}, list(range(capacity)), {}, 0
+    for clock, ids in enumerate(sequence, start=1):
+        needed = list(dict.fromkeys(ids))
+        for e in needed:
+            count, then = uses.get(e, (0.0, clock))
+            uses[e] = (count * 0.5 ** ((clock - then) / half_life) + 1.0, clock)
+        for e in needed:
+            if e in slot_of:
+                slot_of[e] = slot_of.pop(e)
+        protected = set(needed)
+        for e in needed:
+            if e not in slot_of:
+                if free:
+                    slot = free.pop()
+                else:
+                    candidates = [k for k in slot_of if k not in protected]
+                    decayed = [
+                        uses[k][0] * 0.5 ** ((clock - uses[k][1]) / half_life)
+                        for k in candidates
+                    ]
+                    victim = candidates[decayed.index(min(decayed))]
+                    slot = slot_of.pop(victim)
+                slot_of[e] = slot
+                misses += 1
+    return list(slot_of.items()), misses
+
+
+@pytest.mark.parametrize("inflight", [1, 1 << 30])
+@pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize("half_life", [32, 1])
+def test_parallel_reads_install_in_serial_eviction_order(
+    tmp_path, monkeypatch, inflight, in_place, half_life
+):
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", inflight)
+    monkeypatch.setattr(moe_offload, "EVICTION_HALF_LIFE", half_life)
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        assert plan.capacity == 3
+        assert disk.slots._views is not None  # affine slabs are slot bytes
+        if not in_place:
+            disk.slots._views = None
+        sequence = [[0, 1, 2], [3, 1], [4, 5, 5], [1, 4], [6, 7, 0], [2]]
+        for ids in sequence:
+            slots = disk.slots.ensure_ids(ids)
+            assert slots == [disk.slots.slot_of[e] for e in ids]
+        expected, expected_misses = _eviction_reference(sequence, 3, half_life)
+        assert list(disk.slots.slot_of.items()) == expected
+        misses = sum(len(dict.fromkeys(ids)) for ids in sequence) - disk.slots.hits
+        assert disk.slots.misses == misses == expected_misses
+        assert disk.slots.fetched_bytes == misses * plan.expert_bytes
+        assert plan.expert_bytes * plan.count == plan.full_bytes
+    finally:
+        plan.close()
+    assert not plan._fds
+    with pytest.raises(RuntimeError, match="closed"):
+        disk(mx.zeros((1, 1, 64), mx.bfloat16), mx.array([0]), sorted_indices=True)
+
+
+def test_in_place_reads_fall_back_when_slot_arrays_are_replaced(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        assert disk.slots._views is not None
+        lin = disk.slots.expert.w1
+        lin["weight"] = mx.array(lin["weight"])  # same values, a new array object
+        disk.slots.ensure_ids([0, 1])
+        assert disk.slots._views is None  # the copying path took over
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        idx = mx.array([[[0, 1]]])
+        w = mx.ones(idx.shape) / 2
+        want, got = reference(x, idx, w), disk(x, idx, w)
+        mx.eval(want, got)
+        np.testing.assert_allclose(
+            got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+        )
+    finally:
+        plan.close()
+
+
+@pytest.mark.parametrize("field", ["weight", "scales"])
+def test_in_place_reads_detect_a_moved_buffer_under_the_same_array(tmp_path, field):
+    """``array[i] = v`` keeps the Python object but can move its buffer."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        disk.slots.ensure_ids([0, 1, 2])
+        lin = disk.slots.expert.w3
+        owner = lin[field]
+        owner[0] = owner[0]  # same values, same object, possibly a new buffer
+        mx.eval(owner)
+        assert lin[field] is owner
+        disk.slots.ensure_ids([3, 4])  # misses: the in-place path re-checks first
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        for idx in ([[[3, 4]]], [[[0, 2]]]):
+            idx = mx.array(idx)
+            w = mx.ones(idx.shape) / 2
+            want, got = reference(x, idx, w), disk(x, idx, w)
+            mx.eval(want, got)
+            np.testing.assert_allclose(
+                got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+            )
+    finally:
+        plan.close()
+
+
+def test_in_place_slot_bytes_match_the_checkpoint(tmp_path):
+    """Every installed slot holds exactly the expert's stored bytes, over many
+    evictions, and matches what the copying path installs."""
+    import random
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    (tmp_path / "copy").mkdir()
+    _, copy, copy_plan = _synthetic_affine_experts(tmp_path / "copy", 0.375)
+    copy.slots._views = None
+    rng = random.Random(7)
+    try:
+        checked = 0
+        for _ in range(60):
+            ids = rng.sample(range(plan.count), rng.randint(1, plan.capacity))
+            disk.slots.ensure_ids(ids)
+            copy.slots.ensure_ids(ids)
+            for e in ids:
+                for proj in ("w1", "w3", "w2"):
+                    for slab in plan.slabs(disk.slots.prefix, proj, e):
+                        field = slab.key.rsplit(".", 1)[1]
+                        stored = bytes(plan.read(slab))
+                        got = getattr(disk.slots.expert, proj)[field][disk.slots.slot_of[e]]
+                        ref = getattr(copy.slots.expert, proj)[field][copy.slots.slot_of[e]]
+                        assert np.array(got.view(mx.uint8)).tobytes() == stored
+                        assert np.array(ref.view(mx.uint8)).tobytes() == stored
+                        checked += 1
+        assert checked > 200
+        assert disk.slots._views is not None  # stayed on the in-place path
+    finally:
+        plan.close()
+        copy_plan.close()
+
+
+def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    original = ExpertOffloadPlan.read
+    original_into = ExpertOffloadPlan.read_into
+    broken = {"expert": None}
+
+    def read(slab):
+        if slab.expert == broken["expert"] and slab.key.endswith("w3.scales"):
+            raise OSError("simulated EIO")
+        return original(slab)
+
+    def read_into(slab, dst):
+        if slab.expert == broken["expert"] and slab.key.endswith("w3.scales"):
+            raise OSError("simulated EIO")
+        return original_into(slab, dst)
+
+    monkeypatch.setattr(ExpertOffloadPlan, "read", staticmethod(read))
+    monkeypatch.setattr(ExpertOffloadPlan, "read_into", staticmethod(read_into))
+    try:
+        assert disk.slots.ensure_ids([0, 1, 2]) == [2, 1, 0]
+        broken["expert"] = 4
+        with pytest.raises(OSError, match="EIO"):
+            disk.slots.ensure_ids([3, 4])
+        # The failing expert and everything queued behind it left no trace:
+        # the slot count is intact and only the completed install counts.
+        assert len(disk.slots.free) + len(disk.slots.slot_of) == plan.capacity
+        assert 4 not in disk.slots.slot_of and 3 in disk.slots.slot_of
+        assert disk.slots.misses == 4
+        broken["expert"] = None
+        assert disk.slots.ensure_ids([4, 5, 6]) == [
+            disk.slots.slot_of[e] for e in (4, 5, 6)
+        ]
+        assert disk.slots.misses == 7
+    finally:
+        plan.close()
+    plan.close()  # Idempotent, and never re-closes a released descriptor.
+    assert not plan._fds
+
+
+def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41.language import Expert
+
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    calls = []
+    original = Expert.__call__
+
+    def counted(self, x, indices=None, *args, **kwargs):
+        if self is disk.slots.expert and kwargs.get("sorted_indices"):
+            calls.append(indices.size)
+        return original(self, x, indices, *args, **kwargs)
+
+    monkeypatch.setattr(Expert, "__call__", counted)
+    try:
+        ids = sorted([0, 0, 0, 1, 2, 2, 3, 4, 4, 4, 4, 5, 6, 7, 7])
+        idx = mx.array(ids)
+        x = mx.random.normal((len(ids), 1, 64)).astype(mx.bfloat16)
+        weights = mx.ones(idx.shape) / 2
+        expected = reference(x, idx, weights, sorted_indices=True)
+        actual = disk(x, idx, weights, sorted_indices=True)
+        mx.eval(expected, actual)
+        np.testing.assert_allclose(
+            actual.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
+        # Eight experts at two resident slots: every route of two experts per
+        # chunk, never a chunk cut inside an expert's run.
+        assert calls == [4, 3, 5, 3]
+        assert disk.slots.misses == 8 and disk.slots.hits == 0
+        # Read-ahead must not outlive the call that started it.
+        assert disk.slots._ahead == {}
+        # A second sweep runs the resident pair (6, 7) first, before any miss
+        # evicts it: six reads instead of eight, same outputs.
+        calls.clear()
+        again = disk(x, idx, weights, sorted_indices=True)
+        mx.eval(again)
+        assert calls == [3, 4, 3, 5]
+        assert disk.slots.misses == 14 and disk.slots.hits == 2
+        assert disk.slots._ahead == {}
+        np.testing.assert_allclose(
+            again.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
+    finally:
+        plan.close()
+
+
+def test_read_ahead_folds_into_the_inflight_window(tmp_path, monkeypatch):
+    """Carried reads count against the same bound ``ensure_ids`` enforces."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    window = 2
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", window * plan.expert_bytes)
+    try:
+        assert disk.slots.read_ahead([0, 1, 2, 3, 4, 5, 6, 7]) == window
+        assert len(disk.slots._ahead) == window
+        # The read-ahead itself installs nothing.
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+        # The chunk that needs them consumes the carried reads instead of
+        # starting a second set.
+        assert len(disk.slots.ensure_ids([0, 1])) == 2
+        assert disk.slots.misses == 2
+        assert disk.slots._ahead == {}
+    finally:
+        disk.slots.release_read_ahead()
+        plan.close()
+
+
+@pytest.mark.parametrize("engram", [False, True])
+def test_admission_and_fit_match_the_engine_pool(tmp_path, engram):
+    from test_engine_pool import _make_pool
+
+    from omlx.engine_pool import EngineEntry
+    from omlx.model_discovery import estimate_model_size
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.deepseek_v41.moe_offload import (
+        admission_bytes,
+        fit_resident_fraction,
+    )
+
+    kwargs = dict(n_routed_experts=8, n_activated_experts=2)
+    if engram:
+        kwargs.update(
+            engram_layer_ids=(1, 3),
+            engram_num_embeddings=(72, 204),
+            engram_vocab_size=5,
+            engram_max_ngram_size=4,
+            engram_n_heads=2,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=64,
+        )
+    source, _ = write_checkpoint(tmp_path, vision=False, **kwargs)
+    target = tmp_path / "converted"
+    convert(source, target)
+    pool = _make_pool(ceiling=1024**3)
+    entry = EngineEntry(
+        model_id="v41",
+        model_path=str(target),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="deepseek_v41",
+        estimated_size=estimate_model_size(target),
+    )
+    assert fit_resident_fraction(target, 1 << 60, engram_ssd_offload=engram) == 1.0
+    assert fit_resident_fraction(target, 0, engram_ssd_offload=engram) is None
+    for capacity in range(2, 9):
+        fraction = capacity / 8
+        settings = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=fraction,
+            deepseek_v41_engram_ssd_offload=engram,
+        )
+        expected = pool._entry_runtime_resident_size(entry, settings)
+        assert expected > 0
+        assert admission_bytes(target, fraction, engram_ssd_offload=engram) == expected
+        assert fit_resident_fraction(target, expected, engram_ssd_offload=engram) == (
+            fraction
+        )
+        assert fit_resident_fraction(
+            target, expected - 1, engram_ssd_offload=engram
+        ) == ((capacity - 1) / 8 if capacity > 2 else None)
+
+
+@pytest.mark.parametrize("window_experts", [1, 2])
+def test_consumed_read_buffers_are_released_within_window(
+    tmp_path, monkeypatch, window_experts
+):
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 1.0)
+    # The window bounds the copying path's host buffers; in-place reads have none.
+    disk.slots._views = None
+    budget = window_experts * plan.expert_bytes
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", budget)
+    refs, samples = [], []
+    original_decode = plan.decode
+
+    class TrackedBuffer(bytearray):
+        pass
+
+    def allocate(size):
+        buffer = TrackedBuffer(size)
+        refs.append((weakref.ref(buffer), size))
+        return buffer
+
+    def decode(slabs, raws):
+        samples.append(sum(size for ref, size in refs if ref() is not None))
+        return original_decode(slabs, raws)
+
+    monkeypatch.setattr(moe_offload, "bytearray", allocate, raising=False)
+    monkeypatch.setattr(plan, "decode", decode)
+    try:
+        disk.slots.ensure_ids(list(range(plan.count)))
+        assert disk.slots.misses == plan.count
+        assert max(samples) <= budget
+        assert all(ref() is None for ref, _ in refs)
+    finally:
+        plan.close()
+
+
+def _mtp_checkpoint(tmp_path, name="converted", experts=8):
+    """A converted -mtp checkpoint: DSpark draft head + offloadable backbone."""
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=experts,
+        n_activated_experts=2,
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    target = tmp_path / name
+    convert(source, target, preserve_mtp=True)
+    return target
+
+
+def test_converted_draft_head_stays_resident_with_offload_and_mtp(
+    tmp_path, monkeypatch
+):
+    from mlx.utils import tree_flatten
+
+    from omlx.patches import mlx_lm_mtp
+
+    target = _mtp_checkpoint(tmp_path)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    model, _ = load(target, moe_expert_offload_resident_fraction=0.5)
+    try:
+        assert model.config.preserve_mtp
+        assert model.language_model.mtp, "The draft head must stay resident"
+        assert model.language_model._omlx_dspark_decode_enabled
+        plan = model._moe_offload_plan
+        assert plan.mtp_resident and plan.draft_bytes > 0
+        assert isinstance(model.language_model.layers[0].ffn.experts, OffloadedExpert)
+        # Draft tensors are loaded normally, never registered for exclusion.
+        assert not any(
+            key.startswith("language_model.mtp.") for key in plan.excluded_keys
+        )
+        draft_names = []
+        for stage in model.language_model.mtp:
+            draft_names.extend(name for name, _ in tree_flatten(stage.parameters()))
+        assert draft_names
+        out = model(mx.array([[3, 4, 5]]))
+        mx.eval(out)
+        assert np.isfinite(np.asarray(out)).all()
+    finally:
+        model.close()
+
+
+def test_offloaded_dspark_verify_matches_resident(tmp_path, monkeypatch):
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41 import dspark
+
+    target = _mtp_checkpoint(tmp_path)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    offloaded, _ = load(target, moe_expert_offload_resident_fraction=0.5)
+    resident, _ = load(target)
+    prompt = [3, 4, 5, 6, 7, 8, 9]
+    try:
+        off_lm, res_lm = offloaded.language_model, resident.language_model
+        assert isinstance(off_lm.layers[0].ffn.experts, OffloadedExpert)
+        assert not isinstance(res_lm.layers[0].ffn.experts, OffloadedExpert)
+        off_lm.configure_mtp(True, 3)
+        res_lm.configure_mtp(True, 3)
+
+        # Resident draft head proposes from backbone-committed context.
+        _, main_hidden = off_lm(
+            mx.array([prompt]), cache=off_lm.make_cache(), return_dspark_hidden=True
+        )
+        mtp_cache = off_lm.make_mtp_cache()
+        assert (
+            dspark.forward_spec(off_lm, mx.array([[prompt[0]]]), main_hidden, mtp_cache)
+            is None
+        )
+        proposals = dspark.forward_spec(
+            off_lm, mx.array([[prompt[-1]]]), main_hidden[:, -1:], mtp_cache
+        )
+        assert proposals is not None and proposals[0].shape == (
+            1,
+            off_lm._config.dspark_block_size + 1,
+        )
+
+        # Backbone verify (T = k + 1 tokens) through the streamed experts.
+        off_cache, res_cache = off_lm.make_cache(), res_lm.make_cache()
+        off_lm(mx.array([prompt]), cache=off_cache)
+        res_lm(mx.array([prompt]), cache=res_cache)
+        block = mx.array([[21, 22, 23, 24]])
+        off_hidden = off_lm(block, cache=off_cache, return_hidden=True, n_confirmed=1)
+        res_hidden = res_lm(block, cache=res_cache, return_hidden=True, n_confirmed=1)
+        off_hidden = off_hidden[0] if isinstance(off_hidden, tuple) else off_hidden
+        res_hidden = res_hidden[0] if isinstance(res_hidden, tuple) else res_hidden
+        mx.eval(off_hidden, res_hidden)
+        np.testing.assert_allclose(
+            np.asarray(off_hidden), np.asarray(res_hidden), rtol=2e-4, atol=2e-5
+        )
+    finally:
+        offloaded.close()
+        resident.close()
+
+
+def test_mtp_resident_savings_excludes_draft_bytes(tmp_path, monkeypatch):
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41.config import ModelConfig
+    from omlx.patches.deepseek_v41.moe_offload import (
+        ExpertOffloadPlan,
+        estimate_expert_savings,
+    )
+
+    target = _mtp_checkpoint(tmp_path)
+    raw = json.loads((target / "config.json").read_text())
+    mapping = json.loads((target / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+
+    def plan(mtp_resident):
+        return ExpertOffloadPlan(
+            target,
+            raw,
+            mapping,
+            ModelConfig.from_dict(raw),
+            0.5,
+            mtp_resident=mtp_resident,
+        )
+
+    streaming = plan(False)
+    resident = plan(True)
+    assert streaming.draft_bytes == resident.draft_bytes > 0
+    assert any(k.startswith("language_model.mtp.") for k in streaming.excluded_keys)
+    assert not any(k.startswith("language_model.mtp.") for k in resident.excluded_keys)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    assert (
+        estimate_expert_savings(target, 0.5, mtp_resident=False)
+        - estimate_expert_savings(target, 0.5, mtp_resident=True)
+        == streaming.draft_bytes
+    )
+
+
+def _stub_checkpoint(tmp_path, model_type):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(tmp_path)
+
+
+def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
+    from omlx.utils.model_loading import (
+        _config_model_type,
+        maybe_apply_pre_load_patches,
+    )
+
+    v41 = _stub_checkpoint(tmp_path / "v41", "deepseek_v41")
+    assert _config_model_type(v41) == "deepseek_v41"
+    other = _stub_checkpoint(tmp_path / "qwen", "qwen3_5_moe")
+
+    class Settings:
+        moe_expert_offload_enabled = True
+        moe_expert_offload_resident_fraction = 0.5
+        mtp_enabled = True
+        vlm_mtp_enabled = False
+        dflash_enabled = False
+
+    from omlx.model_settings import validate_moe_expert_offload
+
+    validate_moe_expert_offload(
+        {
+            "moe_expert_offload_enabled": True,
+            "moe_expert_offload_resident_fraction": 0.5,
+            "mtp_enabled": True,
+        },
+        model_type=_config_model_type(v41),
+    )
+    with pytest.raises(ValueError, match="MoE expert offload cannot"):
+        maybe_apply_pre_load_patches(other, Settings())
+
+
+def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omlx.admin.routes import _validate_model_settings
+
+    # Isolate the family gate from the checkpoint-layout inspection.
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda *_a, **_k: (True, ""),
+    )
+    settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
+    # V4.1: allowed, no HTTPException.
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="deepseek-v41"),
+        settings,
+    )
+    _validate_model_settings(
+        SimpleNamespace(model_path=str(tmp_path), config_model_type="glm5-next"),
+        settings,
+    )
+    # Any other lightning family: rejected at save time.
+    with pytest.raises(HTTPException) as error:
+        _validate_model_settings(
+            SimpleNamespace(model_path=str(tmp_path), config_model_type="qwen3_5_moe"),
+            settings,
+        )
+    assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_resident_first_groups_restore_the_sorted_route_order(tmp_path, seed):
+    """Non-contiguous groups (resident experts first) give every route its own output."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    rng = np.random.default_rng(seed)
+    try:
+        for k in range(4):
+            ids = sorted(rng.integers(0, 8, size=24).tolist())
+            idx = mx.array(ids)
+            mx.random.seed(seed * 10 + k)
+            x = mx.random.normal((len(ids), 1, 64)).astype(mx.bfloat16)
+            weights = mx.array(rng.uniform(0.1, 1.0, size=len(ids)).astype(np.float32))
+            before = set(disk.slots.slot_of)
+            misses = disk.slots.misses
+            actual = disk(x, idx, weights, sorted_indices=True)
+            expected = reference(x, idx, weights, sorted_indices=True)
+            mx.eval(actual, expected)
+            np.testing.assert_allclose(
+                actual.astype(mx.float32),
+                expected.astype(mx.float32),
+                rtol=0.01,
+                atol=0.002,
+            )
+            # Experts resident before the call are never read again by it.
+            assert disk.slots.misses - misses == len(set(ids) - before)
+            assert disk.slots._ahead == {}
+    finally:
+        plan.close()

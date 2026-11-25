@@ -1,0 +1,66 @@
+{
+  "schema": "omlx-microkernel-registry-v1",
+  "providers_dir_default": "~/Library/Application Support/oMLX/Providers",
+  "supported_protocols": [
+    1,
+    2
+  ],
+  "providers": [
+    {
+      "provider_id": "io.ninfer.metal",
+      "engine_id": "m5rt",
+      "display_name": "miv Core Backend (ninfer-metal)",
+      "path": "A",
+      "channel": "stable",
+      "status": "shipped",
+      "codename": "miv",
+      "current_version": "miv-v0.01",
+      "repo": "https://github.com/scoltzero/ninfer-metal",
+      "latest_manifest_url": "https://github.com/scoltzero/ninfer-metal/releases/latest/download/latest.json",
+      "supported_topologies": [
+        "qwen35_hybrid_dense_v1",
+        "qwen36_hybrid_moe256_k8_shared_v1"
+      ],
+      "supported_model_types": [
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen3_8",
+        "qwen3_8_moe"
+      ],
+      "artifact_extensions": [
+        ".omlxm5"
+      ],
+      "core_abi": 1,
+      "protocol_version": 2,
+      "min_omlx_extend_version": "0.8.0-extend",
+      "min_macos_version": "27.0",
+      "certification_tier": "tier1-mainline"
+    }
+  ],
+  "community_provider_schema_example": {
+    "provider_id": "io.community.llama-metal",
+    "engine_id": "llama-metal",
+    "display_name": "Community Llama Metal 4 Microkernel (Path B Example)",
+    "path": "B",
+    "channel": "community",
+    "status": "example-schema",
+    "repo": "https://github.com/<org>/<microkernel-repo>",
+    "latest_manifest_url": "https://github.com/<org>/<microkernel-repo>/releases/latest/download/latest.json",
+    "supported_topologies": [
+      "llama3_gqa_v1"
+    ],
+    "supported_model_types": [
+      "llama"
+    ],
+    "artifact_extensions": [
+      ".omlxm5"
+    ],
+    "core_abi": 1,
+    "protocol_version": 2,
+    "min_omlx_extend_version": "0.8.0-extend",
+    "min_macos_version": "27.0",
+    "certification_tier": "tier2-community"
+  }
+}

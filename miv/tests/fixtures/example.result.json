@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "source_id": "sha256:d0-example",
+  "commit": null,
+  "omlx_commit": "14194fe74bab38b89c144bd89656fbedca641d14",
+  "date": "2026-09-19T00:00:00+08:00",
+  "machine_id": "example",
+  "macos": "15.6",
+  "xcode": "26.3",
+  "model_revision": "04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc",
+  "manifest_hash": null,
+  "prompt_id": null,
+  "prompt_tokens": null,
+  "gen_tokens": null,
+  "mode": "probe",
+  "engine": "probe",
+  "measurement_scope": "M4 correctness and harness only",
+  "context_tokens": null,
+  "m": null,
+  "k": null,
+  "seed": null,
+  "metrics": {
+    "read_plus_write_gbs": 1.0
+  },
+  "environment": {},
+  "error": null,
+  "fallback_reason": null
+}

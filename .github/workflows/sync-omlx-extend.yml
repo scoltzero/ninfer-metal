@@ -1,0 +1,412 @@
+name: Sync & Release oMLX-extend
+
+on:
+  schedule:
+    # Check upstream jundot/omlx every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: "0 */6 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      # When a protected-branch sync PR updates UPSTREAM_VERSION and merges into main,
+      # publish the corresponding omlx-extend-vX.Y.Z release immediately.
+      - "omlx-extend/UPSTREAM_VERSION"
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: "auto = sync latest upstream & publish omlx-extend-vX.Y.Z; mix = publish next omlx-extend-vX.Y.Z-mixN from main; force = republish assets to latest tag"
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - mix
+          - force
+      upstream_tag:
+        description: "Specific upstream jundot/omlx tag (e.g. v0.8.3); leave empty for latest (auto) or current UPSTREAM_VERSION (mix)"
+        required: false
+        default: ""
+      ninfer_metal_tag:
+        description: "ninfer-metal core release tag to embed in bundled release (empty = latest core release e.g. miv-v0.01)"
+        required: false
+        default: ""
+      force_resync:
+        description: "Re-sync monorepo omlx/ from upstream tag even if UPSTREAM_VERSION already matches"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Verify sync/patch + pytest + wheel/bundle build without pushing to main, opening PR, tagging, or releasing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-omlx-extend
+  cancel-in-progress: false
+
+jobs:
+  sync-patch-test-release:
+    runs-on: macos-26
+    env:
+      UPSTREAM_REPO: jundot/omlx
+
+    steps:
+      - name: Checkout monorepo (ninfer-metal + omlx/)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve target upstream jundot/omlx tag and oMLX-extend release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_MODE="${{ inputs.release_mode || 'auto' }}"
+          CURRENT_TAG=""
+          if [[ -f omlx-extend/UPSTREAM_VERSION ]]; then
+            # shellcheck disable=SC1091
+            source omlx-extend/UPSTREAM_VERSION
+            CURRENT_TAG="${UPSTREAM_TAG:-}"
+          fi
+
+          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
+            TARGET_TAG="${{ inputs.upstream_tag }}"
+          elif [[ "${RELEASE_MODE}" == "mix" && -n "${CURRENT_TAG}" ]]; then
+            TARGET_TAG="${CURRENT_TAG}"
+          else
+            TARGET_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
+          fi
+
+          # Combine existing git tags and GitHub Releases so mix numbering never collides.
+          EXISTING_TAGS_FILE="$(mktemp)"
+          {
+            git tag -l "omlx-extend-${TARGET_TAG}*"
+            gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '.[].tagName' || true
+          } | sort -u > "${EXISTING_TAGS_FILE}"
+
+          python3 omlx-extend/scripts/resolve_extend_tag.py \
+            --upstream-tag "${TARGET_TAG}" \
+            --mode "${RELEASE_MODE}" \
+            --existing-tags-file "${EXISTING_TAGS_FILE}" \
+            --format github-output | tee -a "$GITHUB_OUTPUT"
+          rm -f "${EXISTING_TAGS_FILE}"
+
+          NEEDS_SYNC="false"
+          if [[ "${CURRENT_TAG}" != "${TARGET_TAG}" || "${{ inputs.force_resync }}" == "true" ]]; then
+            NEEDS_SYNC="true"
+          fi
+
+          echo "tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "current_tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_mode=${RELEASE_MODE}" >> "$GITHUB_OUTPUT"
+          echo "needs_sync=${NEEDS_SYNC}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if monorepo and release are already up to date
+        if: steps.upstream.outputs.release_mode == 'auto' && steps.upstream.outputs.already_released == 'true' && steps.upstream.outputs.needs_sync == 'false' && inputs.dry_run != true
+        shell: bash
+        run: |
+          echo "Monorepo omlx/ is already at ${{ steps.upstream.outputs.tag }} and ${{ steps.upstream.outputs.extend_tag }} is published. Nothing to do."
+
+      - name: Direct-sync upstream jundot/omlx (3-way merge) or refresh SPI patch
+        id: sync
+        if: steps.upstream.outputs.release_mode != 'auto' || steps.upstream.outputs.already_released != 'true' || steps.upstream.outputs.needs_sync == 'true' || inputs.dry_run == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.upstream.outputs.tag }}"
+
+          if [[ "${{ steps.upstream.outputs.needs_sync }}" == "true" ]]; then
+            set +e
+            ./omlx-extend/scripts/sync_omlx.sh \
+              --tag "${TARGET_TAG}" \
+              --skip-tests \
+              > patch-apply.log 2>&1
+            SYNC_RC=$?
+            set -e
+            cat patch-apply.log
+
+            if [[ "${SYNC_RC}" -ne 0 ]]; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "tree_changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "Monorepo omlx/ already tracks ${TARGET_TAG}; refreshing binary-safe SPI patch from live omlx/ so all mix updates are captured."
+            ./omlx-extend/scripts/sync_omlx.sh \
+              --export-patch \
+              --tag "${TARGET_TAG}"
+          fi
+
+          TREE_CHANGED="false"
+          if [[ -n "$(git status --porcelain -- omlx omlx-extend/UPSTREAM_VERSION omlx-extend/patches)" ]]; then
+            TREE_CHANGED="true"
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "tree_changed=${TREE_CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Fail dry-run on merge/patch conflict
+        if: steps.sync.outputs.conflict == 'true' && inputs.dry_run == true
+        shell: bash
+        run: |
+          echo "::error::Dry-run detected a 3-way merge/patch conflict against ${UPSTREAM_REPO}@${{ steps.upstream.outputs.tag }}."
+          exit 1
+
+      - name: Open automated Conflict PR on merge/patch conflict
+        if: steps.sync.outputs.conflict == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.upstream.outputs.tag }}"
+          EXTEND_TAG="${{ steps.upstream.outputs.extend_tag }}"
+          CONFLICT_BRANCH="chore/omlx-sync-conflict-${UPSTREAM_TAG}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${CONFLICT_BRANCH}"
+
+          mkdir -p omlx-extend/patches
+          cat > "omlx-extend/patches/CONFLICT-${UPSTREAM_TAG}.md" <<EOF
+          # oMLX-extend Monorepo Sync Conflict (${UPSTREAM_TAG})
+
+          Automated monorepo 3-way sync against \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` (target \`${EXTEND_TAG}\`) encountered a merge conflict while carrying forward live \`oMLX-extend\` / \`mix\` changes in \`omlx/\`.
+
+          ## Sync Log
+          \`\`\`text
+          $(cat patch-apply.log)
+          \`\`\`
+
+          ## Resolution Steps (Monorepo Mode)
+          1. Run \`./omlx-extend/scripts/sync_omlx.sh --tag ${UPSTREAM_TAG} --keep-staging\` locally and inspect/resolve conflicts in the preserved staging repo.
+          2. Verify \`(cd omlx && pytest tests/test_microkernel_manager.py tests/test_m5_sidecar_engine.py tests/test_splash_engine.py tests/test_process_memory_enforcer.py -q)\` and \`pytest omlx-extend/tests/test_p1_ext_spi.py -q\`.
+          3. Re-export the binary-safe patch via \`./omlx-extend/scripts/sync_omlx.sh --export-patch --tag ${UPSTREAM_TAG}\`, update \`omlx-extend/UPSTREAM_VERSION\`, and delete this conflict file.
+          EOF
+
+          git add "omlx-extend/patches/CONFLICT-${UPSTREAM_TAG}.md"
+          git commit -m "chore(omlx-extend): record monorepo sync conflict against upstream ${UPSTREAM_TAG}"
+          git push --force-with-lease origin "${CONFLICT_BRANCH}"
+
+          EXISTING_PR="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${CONFLICT_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "${EXISTING_PR}" ]]; then
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --head "${CONFLICT_BRANCH}" \
+              --base main \
+              --title "chore(omlx-extend): resolve sync conflict for upstream ${UPSTREAM_TAG}" \
+              --body "Automated monorepo 3-way sync detected a conflict carrying \`oMLX-extend\` / \`mix\` edits onto \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\`. See \`omlx-extend/patches/CONFLICT-${UPSTREAM_TAG}.md\` for the exact log."
+          else
+            gh pr comment "${EXISTING_PR}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Re-checked against \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\`: merge conflict still present. Updated \`CONFLICT-${UPSTREAM_TAG}.md\`."
+          fi
+          echo "::warning::Merge conflict detected for ${UPSTREAM_TAG}; Conflict PR created/updated on branch ${CONFLICT_BRANCH}."
+
+      - name: Install monorepo omlx/ dependencies and run pytest regression suite
+        if: steps.sync.outputs.conflict == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e "./omlx[dev]" pytest pytest-asyncio httpx build pyyaml
+          (cd omlx && pytest \
+            tests/test_microkernel_manager.py \
+            tests/test_m5_sidecar_engine.py \
+            tests/test_splash_engine.py \
+            tests/test_process_memory_enforcer.py \
+            -q)
+          pytest omlx-extend/tests/test_p1_ext_spi.py omlx-extend/tests/test_sync_and_mix_release.py -q
+
+      - name: Build slim and bundled oMLX-extend release artifacts from monorepo omlx/
+        id: bundle
+        if: steps.sync.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTEND_TAG="${{ steps.upstream.outputs.extend_tag }}"
+          OUT_DIR="${PWD}/dist/omlx-extend"
+          mkdir -p "${OUT_DIR}"
+
+          # 1) Build oMLX-extend Python wheel directly from monorepo omlx/
+          (cd omlx && python -m build --wheel --outdir "${OUT_DIR}")
+
+          # 2) Assemble slim oMLX-extend bundle (wheel + UPSTREAM_VERSION + config template + SPI patch + scripts)
+          SLIM_DIR="${OUT_DIR}/${EXTEND_TAG}-slim"
+          mkdir -p "${SLIM_DIR}/wheels" "${SLIM_DIR}/config" "${SLIM_DIR}/patches" "${SLIM_DIR}/scripts"
+          cp "${OUT_DIR}"/*.whl "${SLIM_DIR}/wheels/"
+          cp omlx-extend/UPSTREAM_VERSION "${SLIM_DIR}/"
+          cp omlx-extend/config/ninfer-metal.toml "${SLIM_DIR}/config/"
+          cp omlx-extend/config/ninfer-metal.toml.example "${SLIM_DIR}/config/"
+          cp omlx-extend/patches/*.patch "${SLIM_DIR}/patches/"
+          cp omlx-extend/scripts/*.sh "${SLIM_DIR}/scripts/"
+          cp omlx-extend/scripts/*.py "${SLIM_DIR}/scripts/"
+          cp omlx-extend/README.md "${SLIM_DIR}/"
+          SLIM_TAR="${OUT_DIR}/${EXTEND_TAG}-slim.tar.gz"
+          tar -czf "${SLIM_TAR}" -C "${OUT_DIR}" "$(basename "${SLIM_DIR}")"
+          (cd "${OUT_DIR}" && shasum -a 256 "$(basename "${SLIM_TAR}")" > "$(basename "${SLIM_TAR}").sha256")
+
+          # 3) Fetch latest ninfer-metal core tarball (strictly excluding omlx-extend-* tags)
+          CORE_TAG="${{ inputs.ninfer_metal_tag }}"
+          if [[ -z "${CORE_TAG}" ]]; then
+            CORE_TAG="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 --json tagName --jq '[.[] | select((.tagName | startswith("omlx-extend-") | not) and (.tagName | test("^[a-z][a-z0-9]*-v[0-9]+\\.[0-9]+")))] | .[0].tagName // empty' || true)"
+          fi
+
+          BUNDLED_TAR=""
+          if [[ -n "${CORE_TAG}" ]]; then
+            CORE_DL="${OUT_DIR}/core-dl"
+            mkdir -p "${CORE_DL}"
+            if gh release download "${CORE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${CORE_DL}" --pattern "*.tar.gz" --pattern "provider.json"; then
+              CORE_ARCHIVE="$(find "${CORE_DL}" -maxdepth 1 -name "*.tar.gz" | head -n 1)"
+              if [[ -n "${CORE_ARCHIVE}" ]]; then
+                BUNDLE_NAME="${EXTEND_TAG}+ninfer-metal-${CORE_TAG}-macos27-arm64"
+                BUNDLE_DIR="${OUT_DIR}/${BUNDLE_NAME}"
+                cp -R "${SLIM_DIR}" "${BUNDLE_DIR}"
+                PROV_VER_DIR="${BUNDLE_DIR}/Providers/io.ninfer.metal/versions/${CORE_TAG}"
+                mkdir -p "${PROV_VER_DIR}"
+                tar -xzf "${CORE_ARCHIVE}" --strip-components=1 -C "${PROV_VER_DIR}"
+                if [[ -f "${CORE_DL}/provider.json" ]]; then
+                  cp "${CORE_DL}/provider.json" "${PROV_VER_DIR}/provider.json"
+                fi
+                ln -sfn "versions/${CORE_TAG}" "${BUNDLE_DIR}/Providers/io.ninfer.metal/current"
+                BUNDLED_TAR="${OUT_DIR}/${BUNDLE_NAME}.tar.gz"
+                tar -czf "${BUNDLED_TAR}" -C "${OUT_DIR}" "${BUNDLE_NAME}"
+                (cd "${OUT_DIR}" && shasum -a 256 "$(basename "${BUNDLED_TAR}")" > "$(basename "${BUNDLED_TAR}").sha256")
+              fi
+            fi
+          else
+            echo "No ninfer-metal core release found yet; skipping bundled offline tarball."
+          fi
+
+          echo "slim_tar=${SLIM_TAR}" >> "$GITHUB_OUTPUT"
+          echo "bundled_tar=${BUNDLED_TAR}" >> "$GITHUB_OUTPUT"
+          echo "core_tag=${CORE_TAG}" >> "$GITHUB_OUTPUT"
+          ls -lh "${OUT_DIR}"
+
+      - name: Upload oMLX-extend workflow artifacts
+        if: steps.sync.outputs.conflict == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.upstream.outputs.extend_tag }}
+          path: |
+            dist/omlx-extend/*.whl
+            dist/omlx-extend/*.tar.gz
+            dist/omlx-extend/*.sha256
+
+      - name: Commit synced monorepo changes to main (or open sync PR if branch-protected)
+        id: commit_sync
+        if: steps.sync.outputs.conflict == 'false' && steps.sync.outputs.tree_changed == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.upstream.outputs.tag }}"
+          EXTEND_TAG="${{ steps.upstream.outputs.extend_tag }}"
+          RELEASE_MODE="${{ steps.upstream.outputs.release_mode }}"
+          SYNC_BRANCH="chore/omlx-sync-${UPSTREAM_TAG}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- omlx omlx-extend/UPSTREAM_VERSION omlx-extend/patches
+
+          if git diff --cached --quiet; then
+            echo "pushed_to_main=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${RELEASE_MODE}" == "mix" ]]; then
+            COMMIT_MSG="chore(omlx-extend): refresh SPI patch for ${EXTEND_TAG}"
+          else
+            COMMIT_MSG="chore(omlx): sync upstream ${UPSTREAM_REPO}@${UPSTREAM_TAG} into monorepo (${EXTEND_TAG})"
+          fi
+          git commit -m "${COMMIT_MSG}"
+
+          # Attempt direct push to main so upstream sync -> release is 100% hands-free.
+          if git push origin HEAD:main; then
+            echo "Pushed verified sync commit directly to main; proceeding to tag & publish ${EXTEND_TAG}."
+            echo "pushed_to_main=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fallback when main is protected: open/update a sync PR and defer tagging until merge.
+          echo "Direct push to main rejected (branch protection enabled); falling back to sync PR ${SYNC_BRANCH}."
+          git checkout -B "${SYNC_BRANCH}"
+          EXISTING_PR="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "${EXISTING_PR}" ]] && git rev-parse --verify "refs/remotes/origin/${SYNC_BRANCH}" >/dev/null 2>&1; then
+            if git diff --quiet "origin/${SYNC_BRANCH}" HEAD -- omlx omlx-extend/UPSTREAM_VERSION omlx-extend/patches; then
+              echo "Sync PR #${EXISTING_PR} on ${SYNC_BRANCH} already matches ${EXTEND_TAG}; deferring release until merge."
+              echo "pushed_to_main=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          git push --force-with-lease origin "${SYNC_BRANCH}"
+          if [[ -z "${EXISTING_PR}" ]]; then
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --head "${SYNC_BRANCH}" \
+              --base main \
+              --title "chore(omlx): sync upstream ${UPSTREAM_REPO}@${UPSTREAM_TAG} (${EXTEND_TAG})" \
+              --body "Automated monorepo 3-way sync updated \`omlx/\`, \`omlx-extend/UPSTREAM_VERSION\`, and \`omlx-extend/patches/\` to \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` with all \`oMLX-extend\` / \`mix\` changes preserved and pytest passing. Merging this PR into \`main\` will immediately trigger the \`${EXTEND_TAG}\` GitHub Release."
+          else
+            gh pr comment "${EXISTING_PR}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Updated monorepo sync branch for \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` (${EXTEND_TAG}); pytest suite passed. Merging into \`main\` will immediately publish \`${EXTEND_TAG}\`."
+          fi
+          echo "pushed_to_main=false" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and publish oMLX-extend GitHub Release
+        if: steps.sync.outputs.conflict == 'false' && (steps.sync.outputs.tree_changed == 'false' || steps.commit_sync.outputs.pushed_to_main == 'true') && (steps.upstream.outputs.already_released != 'true' || steps.upstream.outputs.release_mode == 'mix' || steps.upstream.outputs.release_mode == 'force') && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTEND_TAG="${{ steps.upstream.outputs.extend_tag }}"
+          RELEASE_TITLE="${{ steps.upstream.outputs.release_title }}"
+          UPSTREAM_TAG="${{ steps.upstream.outputs.tag }}"
+          RELEASE_MODE="${{ steps.upstream.outputs.release_mode }}"
+          IS_MIX="${{ steps.upstream.outputs.is_mix }}"
+          CORE_TAG="${{ steps.bundle.outputs.core_tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ "${RELEASE_MODE}" == "force" ]]; then
+            git tag -f "${EXTEND_TAG}" HEAD
+            git push origin "refs/tags/${EXTEND_TAG}" --force
+          else
+            git tag "${EXTEND_TAG}" HEAD
+            git push origin "refs/tags/${EXTEND_TAG}"
+          fi
+
+          ASSETS=(dist/omlx-extend/*.whl dist/omlx-extend/*.tar.gz dist/omlx-extend/*.sha256)
+          if [[ "${IS_MIX}" == "true" ]]; then
+            NOTES="Incremental \`oMLX-extend\` mix update (\`${EXTEND_TAG}\`) built on upstream \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` with refreshed Provider SPI patch; all changes carry forward automatically into future upstream syncs."
+          else
+            NOTES="Monorepo-synced \`oMLX-extend\` release (\`${EXTEND_TAG}\`) based on \`${UPSTREAM_REPO}@${UPSTREAM_TAG}\` (\`omlx/\` + binary-safe Provider SPI patch for \`ninfer-metal\`)."
+          fi
+          if [[ -n "${CORE_TAG}" ]]; then
+            NOTES="${NOTES} Includes bundled offline archive embedding \`ninfer-metal\` \`${CORE_TAG}\`."
+          fi
+
+          if gh release view "${EXTEND_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${EXTEND_TAG}" "${ASSETS[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${EXTEND_TAG}" "${ASSETS[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --latest=false \
+              --title "${RELEASE_TITLE}" \
+              --notes "${NOTES}"
+          fi

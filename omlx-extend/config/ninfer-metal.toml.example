@@ -1,0 +1,131 @@
+# ninfer-metal (codename: miv, miv-v0.01) configuration template
+#
+# Used by BOTH:
+#   1. Standalone server / CLI mode (`ninfer-metal serve --config ninfer-metal.toml`)
+#   2. oMLX-extend sidecar overrides (auto-loaded from lowest to highest precedence):
+#        - ~/Library/Application Support/oMLX/ninfer-metal.toml
+#        - ~/.config/ninfer-metal/ninfer-metal.toml
+#        - <model_dir>/ninfer-metal.toml
+#        - $NINFER_METAL_CONFIG
+#      and overridden by per-model `model_settings.json` -> `external_engine_options["ninfer-metal"]`.
+#
+# Naming disambiguation:
+#   - `max_concurrency` = Multi-user Concurrency / Batch slots (B in miv/m5rt docs, C in upstream ninfer)
+#   - `max_context`     = Context window length (L, e.g. 32768 / 65536 / 131072 / 262144)
+
+[server]
+# Standalone HTTP server settings (ignored in oMLX sidecar mode, which uses AF_UNIX sockets).
+# Default port 8080 is intentionally disjoint from stock oMLX's port 8000 so both can coexist.
+host = "127.0.0.1"
+port = 8080
+api_key = ""
+request_timeout_seconds = 600
+log_level = "info"
+# Optional Path B SPI v2 microkernel providers root (string or array of directories).
+# Scans <dir>/*/current/provider.json (fallback <dir>/*/provider.json); also checks
+# $OMLX_PROVIDERS_DIR and ~/Library/Application Support/oMLX/Providers automatically.
+# providers_dir = "~/Library/Application Support/oMLX/Providers"
+# Optional server-wide UMA memory budget cap in GiB (default: 81% of physical RAM).
+# memory_budget_gb = 48.0
+
+[model]
+# Standalone mode: path to HuggingFace checkpoint directory containing config.json + tokenizer.
+model_dir = ""
+# Optional explicit path to compiled .omlxm5 target artifact (auto-discovered if omitted).
+# artifact_path = "/path/to/model.omlxm5"
+# Optional explicit path to DFlash2 draft model directory and .omlxm5 artifact.
+# draft_dir = "/path/to/draft-model"
+# draft_artifact_path = "/path/to/draft.omlxm5"
+trust_remote_code = false
+
+[engine]
+# Multi-user Concurrency (B/C): concurrent batch slots in [1..8].
+# In oMLX sidecar mode, omit or comment out to inherit Global Settings `max_concurrent_requests`.
+max_concurrency = 4
+
+# Maximum context window (Context L, tokens). Honors up to model native max_position_embeddings (e.g. 262144).
+# In oMLX sidecar mode, stock Model Settings `max_context_window` maps here automatically.
+max_context = 65536
+
+# KV cache storage format implemented in miv-v0.01:
+#   "bf16"         - full-precision BF16 KV cache (2.0 B/val)
+#   "affine4_g128" - 4-bit group-128 affine KV cache (0.5625 B/val, lossless 0-ULP verified on 64K+)
+# Note: "int8_g64" is NOT implemented in miv-v0.01 and must not be used.
+kv_dtype = "affine4_g128"
+
+# Multi-turn UMA rolling prefix cache & checkpoint pool budget (GiB).
+rolling_prefix_cache = true
+prefix_cache_gb = 4.0
+
+# Prefill execution engine: "auto" | "nax" | "nax_ane"
+prefill_engine = "auto"
+
+# Speculative sampling verification contract: "position_coupled_v1" | "legacy_rejection_v1"
+sampling_contract = "position_coupled_v1"
+
+# Explicit Metal 4 / NAX .metallib directory override (auto-discovered from provider bundle if omitted).
+# metallib_dir = "~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/metallib"
+
+# Explicit mseries_backendd binary override (auto-discovered from provider bundle if omitted).
+# m5rt_path = "~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/bin/mseries_backendd"
+
+[speculative]
+# Speculative decoding backend: "none" | "mtp" | "dflash2"
+# In oMLX sidecar mode, stock Acceleration toggles (`mtp_enabled`, `dflash_enabled`,
+# `mtp_fixed_depth`, `mtp_adaptive_max_depth`, `dflash_block_size`) map here automatically.
+backend = "none"
+
+# Speculative draft tokens per verify round (1..7 when backend is "mtp" or "dflash2").
+draft_tokens = 4
+
+# Optional DFlash2 draft model overrides:
+# draft_dir = "/path/to/Qwen3.8-27B-DFlash2"
+# draft_artifact_path = "/path/to/qwen38-dflash2.omlxm5"
+
+[sidecar]
+# Sidecar-specific defaults applied when oMLX-extend spawns mseries_backendd.
+# Set explicit memory budget cap in bytes only when overriding oMLX ProcessMemoryEnforcer coordination (0 = auto).
+# memory_budget_bytes = 0
+
+# Example per-model overrides (keyed by oMLX model_id):
+# [sidecar.models."Qwen3.8-27B-oQ4e-mtp"]
+# max_concurrency = 4
+# kv_dtype = "affine4_g128"
+# rolling_prefix_cache = true
+# prefix_cache_gb = 8.0
+# speculative_backend = "mtp"
+# draft_tokens = 3
+
+# ---------------------------------------------------------------------------
+# Standalone Multi-Microkernel Parallel Serving (ONE HTTP port, ZERO Python)
+# ---------------------------------------------------------------------------
+# Uncomment [[models]] entries below to host multiple models concurrently on
+# a single `ninfer-metal-serve` port. Each entry inherits unset defaults from
+# [engine] and [speculative], and selects either in-process `miv` ("inproc")
+# or a discovered Path B SPI v2 microkernel sidecar ("auto" or explicit id):
+#
+# [[models]]
+# id = "Qwen3.8-27B-oQ4e-mtp"
+# model_dir = "/path/to/Qwen3.8-27B-oQ4e-mtp"
+# provider = "auto"                    # Routes Qwen3.5/3.6/3.8 -> in-process miv (io.ninfer.metal)
+# # artifact_path = "/path/to/qwen38.omlxm5"
+# max_concurrency = 4
+# max_context = 65536
+# kv_dtype = "affine4_g128"
+# spec_backend = "mtp"
+# draft_tokens = 3
+# rolling_prefix_cache = true
+# prefix_cache_gb = 4.0
+# # memory_budget_gb = 28.0
+#
+# [[models]]
+# id = "Llama-3.3-70B-Instruct"
+# model_dir = "/path/to/Llama-3.3-70B-Instruct"
+# provider = "auto"                    # Auto-routes via Providers/*/current/provider.json (or set explicit provider_id)
+# # artifact_path = "/path/to/llama33.mockbin"
+# max_concurrency = 2
+# max_context = 32768
+# kv_dtype = "bf16"
+# rolling_prefix_cache = true
+# prefix_cache_gb = 2.0
+# # memory_budget_gb = 16.0
