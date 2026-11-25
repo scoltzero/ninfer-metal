@@ -5208,3 +5208,174 @@ class M5SidecarEngine(BaseEngine):
                 if req.first_token_at is not None
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# In-App .safetensors -> .omlxm5 Conversion Helpers (oMLX-extend)
+# ---------------------------------------------------------------------------
+
+from contextlib import suppress
+import threading
+
+_CONVERT_LOCKS_GUARD = threading.Lock()
+_CONVERT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
+    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
+    for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
+        raw_env = os.environ.get(env_key, "").strip()
+        if raw_env:
+            p = Path(raw_env).expanduser()
+            if p.is_file():
+                return p
+
+    binary, _ = find_m5rt_binary(configured_binary)
+    if binary is not None:
+        # Provider layout: <provider>/versions/<ver>/bin/mseries_backendd -> ../tools/m5_artifact.py
+        cand = binary.path.resolve().parent.parent / "tools" / "m5_artifact.py"
+        if cand.is_file():
+            return cand
+        # Also check un-resolved symlink parent (`current/tools/m5_artifact.py`)
+        cand_sym = binary.path.parent.parent / "tools" / "m5_artifact.py"
+        if cand_sym.is_file():
+            return cand_sym
+
+    # Monorepo / source checkout fallback: <repo>/miv/tools/m5_artifact.py
+    with suppress(Exception):
+        repo_cand = Path(__file__).resolve().parents[3] / "miv" / "tools" / "m5_artifact.py"
+        if repo_cand.is_file():
+            return repo_cand
+
+    return None
+
+
+def can_convert_to_omlxm5(
+    model_path: str | Path,
+    configured_binary: str | None = None,
+    model_settings: object | None = None,
+) -> tuple[bool, str]:
+    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.omlxm5`."""
+    if not model_path:
+        return False, "model_path is empty"
+    model_dir = Path(model_path).expanduser()
+    if not model_dir.is_dir():
+        return False, f"model directory not found: {model_dir}"
+
+    if detect_adapted(model_dir, model_settings).adapted:
+        return False, "model already has .omlxm5 weights"
+
+    cfg_path = model_dir / "config.json"
+    if not cfg_path.is_file():
+        return False, "config.json not found"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"failed to parse config.json: {exc}"
+    if not isinstance(cfg, dict):
+        return False, "config.json is not a JSON object"
+
+    model_types = _extract_model_type_tokens(cfg)
+    manifest = _builtin_m5rt_manifest()
+    supported_types = {
+        str(m).strip().lower()
+        for m in (manifest.get("supported_model_types") or M5RT_SUPPORTED_MODEL_TYPES)
+        if isinstance(m, str) and m.strip()
+    }
+    if not model_types or not (model_types & supported_types):
+        return False, f"model_type is not in {sorted(supported_types)}"
+
+    try:
+        has_safetensors = any(
+            f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
+        )
+    except OSError:
+        has_safetensors = False
+    if not has_safetensors:
+        return False, "no .safetensors weights found in model directory"
+
+    if not os.access(model_dir, os.W_OK):
+        return False, f"model directory is not writable: {model_dir}"
+
+    binary, bin_reason = find_m5rt_binary(configured_binary)
+    if binary is None:
+        return False, bin_reason
+    tool = find_m5_artifact_tool(configured_binary)
+    if tool is None:
+        return False, "m5_artifact.py converter tool not found in installed miv bundle"
+
+    return True, ""
+
+
+def convert_model_to_omlxm5(
+    model_path: str | Path,
+    *,
+    source_repo: str | None = None,
+    configured_binary: str | None = None,
+    model_settings: object | None = None,
+    nax_pretile: bool = True,
+) -> dict[str, Any]:
+    """Convert `.safetensors` weights in `model_path` to `model.omlxm5` atomically."""
+    model_dir = Path(model_path).expanduser().resolve()
+    lock_key = str(model_dir)
+    with _CONVERT_LOCKS_GUARD:
+        lock = _CONVERT_LOCKS.setdefault(lock_key, threading.Lock())
+
+    with lock:
+        existing_probe = detect_adapted(model_dir, model_settings)
+        out_path = model_dir / "model.omlxm5"
+        if existing_probe.adapted and out_path.is_file():
+            return {
+                "artifact_path": str(out_path),
+                "artifact_bytes": out_path.stat().st_size,
+                "already_existed": True,
+            }
+
+        ok, reason = can_convert_to_omlxm5(model_dir, configured_binary, model_settings)
+        if not ok:
+            raise ValueError(f"Cannot convert model to .omlxm5: {reason}")
+
+        tool = find_m5_artifact_tool(configured_binary)
+        if tool is None:
+            raise ValueError("m5_artifact.py converter tool not found")
+
+        repo_label = (source_repo or "").strip() or model_dir.name
+        tmp_out = model_dir / f".model.omlxm5.tmp.{os.getpid()}"
+        try:
+            cmd = [
+                sys.executable,
+                str(tool),
+                "convert",
+                "--source",
+                str(model_dir),
+                "--output",
+                str(tmp_out),
+                "--source-repo",
+                repo_label,
+            ]
+            if nax_pretile:
+                cmd.append("--nax-pretile")
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                if len(detail) > 600:
+                    detail = detail[-600:]
+                raise ValueError(
+                    f"m5_artifact.py convert failed (exit {proc.returncode}): {detail}"
+                )
+            if not tmp_out.is_file() or tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
+                raise ValueError("Converter finished without producing a valid .omlxm5 file")
+            with tmp_out.open("rb") as fh:
+                if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
+                    raise ValueError("Converted file does not have a valid OMLXM5A1 header")
+            os.replace(tmp_out, out_path)
+        finally:
+            with suppress(OSError):
+                if tmp_out.exists():
+                    tmp_out.unlink()
+
+        return {
+            "artifact_path": str(out_path),
+            "artifact_bytes": out_path.stat().st_size,
+            "already_existed": False,
+        }

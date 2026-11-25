@@ -203,6 +203,11 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.importMtplx(id))
     }
 
+    @discardableResult
+    func convertModelToOMLXM5(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.convertOMLXM5(id), timeout: 1800)
+    }
+
     // MARK: - Prefill Accelerator
 
     func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {

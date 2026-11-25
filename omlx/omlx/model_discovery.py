@@ -1140,6 +1140,20 @@ def detect_reasoning_effort(
     return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
+def _has_omlxm5_weights(model_dir: Path) -> bool:
+    """True when ``model_dir`` contains a primary ``.omlxm5`` microkernel weight file."""
+    try:
+        return any(
+            f.is_file()
+            and f.suffix == ".omlxm5"
+            and not f.name.startswith(".")
+            and f.name.lower() != "mtp.omlxm5"
+            for f in model_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def estimate_model_size(model_path: Path) -> int:
     """
     Estimate model memory usage from safetensors/bin file sizes.
@@ -1172,6 +1186,12 @@ def estimate_model_size(model_path: Path) -> int:
     if total_size == 0:
         for f in model_path.glob("**/*.safetensors"):
             total_size += f.stat().st_size
+
+    # Fallback: pure .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
+    if total_size == 0:
+        for f in model_path.glob("*.omlxm5"):
+            if f.is_file() and not f.name.startswith("."):
+                total_size += f.stat().st_size
 
     if total_size == 0:
         raise ValueError(f"No model weights found in {model_path}")
@@ -1300,6 +1320,16 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
     Returns (missing count, up to 3 example names, manifest description), or
     None when the directory is complete or makes no shard promises.
     """
+    if _has_omlxm5_weights(model_dir):
+        try:
+            has_safetensors = any(
+                f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
+            )
+        except OSError:
+            has_safetensors = False
+        if not has_safetensors:
+            return None
+
     idx_path = model_dir / "model.safetensors.index.json"
     index_missing: tuple[int, list[str]] | None = None
     if idx_path.is_file():
@@ -1674,6 +1704,11 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
         except (OSError, ValueError, TypeError, KeyError) as error:
             logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
             return False
+    if _has_omlxm5_weights(model_dir):
+        logger.info(
+            f"Treating HF cache model with .omlxm5 weights as compatible: {source_repo_id}"
+        )
+        return True
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False
@@ -1827,6 +1862,17 @@ def _register_model(
         reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
         model_context_length = _read_model_context_length(model_dir)
 
+        try:
+            has_mlx_weights = any(
+                f.is_file() and f.suffix in (".safetensors", ".bin")
+                for f in model_dir.iterdir()
+            )
+        except OSError:
+            has_mlx_weights = False
+        model_format = (
+            "omlxm5" if (not has_mlx_weights and _has_omlxm5_weights(model_dir)) else None
+        )
+
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
@@ -1842,6 +1888,7 @@ def _register_model(
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
+            model_format=model_format,
             is_helper=is_helper,
         )
 

@@ -61104,6 +61104,78 @@
           }
         }
       }
+    },
+    "settings.advanced.external_engine.omlxm5_only" : {
+      "comment" : "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pure .omlxm5 models run on a Metal 4 microkernel only."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "纯 .omlxm5 模型仅由 Metal 4 微内核运行。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "純 .omlxm5 模型僅由 Metal 4 微核心執行。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.convert_omlxm5" : {
+      "comment" : "Button that converts .safetensors weights to .omlxm5 for miv Core Backend",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Convert to .omlxm5"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "转换为 .omlxm5"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "轉換為 .omlxm5"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.converting_omlxm5" : {
+      "comment" : "Button label while converting .safetensors weights to .omlxm5",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Converting…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在转换…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在轉換…"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

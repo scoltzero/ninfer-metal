@@ -313,7 +313,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/apps/omlx-mac/Resources/Localizable.xcstrings b/apps/omlx-mac/Resources/Localizable.xcstrings
-index a9c9fb7..bc11117 100644
+index a9c9fb7..17346d4 100644
 --- a/apps/omlx-mac/Resources/Localizable.xcstrings
 +++ b/apps/omlx-mac/Resources/Localizable.xcstrings
 @@ -14660,6 +14660,18 @@
@@ -426,7 +426,7 @@ index a9c9fb7..bc11117 100644
          }
        }
      },
-@@ -60020,6 +60086,1024 @@
+@@ -60020,6 +60086,1096 @@
            }
          }
        }
@@ -1448,6 +1448,78 @@ index a9c9fb7..bc11117 100644
 +          }
 +        }
 +      }
++    },
++    "settings.advanced.external_engine.omlxm5_only" : {
++      "comment" : "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Pure .omlxm5 models run on a Metal 4 microkernel only."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "纯 .omlxm5 模型仅由 Metal 4 微内核运行。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "純 .omlxm5 模型僅由 Metal 4 微核心執行。"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.convert_omlxm5" : {
++      "comment" : "Button that converts .safetensors weights to .omlxm5 for miv Core Backend",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Convert to .omlxm5"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "转换为 .omlxm5"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "轉換為 .omlxm5"
++          }
++        }
++      }
++    },
++    "settings.advanced.external_engine.converting_omlxm5" : {
++      "comment" : "Button label while converting .safetensors weights to .omlxm5",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Converting…"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正在转换…"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正在轉換…"
++          }
++        }
++      }
      }
    },
    "version" : "1.0"
@@ -1941,7 +2013,7 @@ index 2291b42..db09ba1 100644
  
  private struct MarkItDownSection: View {
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
-index 2cc8864..9bdbc07 100644
+index 2cc8864..8fa6150 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
 +++ b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
 @@ -54,7 +54,12 @@ struct ModelSettingsScreen: View {
@@ -2117,7 +2189,15 @@ index 2cc8864..9bdbc07 100644
          }
      }
  
-@@ -1902,12 +1945,57 @@ private struct ExternalEngineRow: View {
+@@ -1895,6 +1938,7 @@ private struct ExternalEngineRow: View {
+     }
+ 
+     private var isGGUF: Bool { vm.model?.isGGUF == true }
++    private var isOMLXM5Only: Bool { vm.model?.isOMLXM5Only == true }
+ 
+     private var draftRepo: String? {
+         let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
+@@ -1902,12 +1946,62 @@ private struct ExternalEngineRow: View {
          return engine.draftRepo
      }
  
@@ -2166,6 +2246,11 @@ index 2cc8864..9bdbc07 100644
 +                          defaultValue: "Using Stock MLX (auto-route overridden)",
 +                          comment: "Hint shown when an adapted model is overridden back to Stock MLX")
 +        }
++        if isOMLXM5Only {
++            return String(localized: "settings.advanced.external_engine.omlxm5_only",
++                          defaultValue: "Pure .omlxm5 models run on a Metal 4 microkernel only.",
++                          comment: "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights")
++        }
 +        if vm.isAutoRoutedExternalEngine {
 +            let autoName = vm.externalEngineDisplayName(for: vm.autoExternalEngine)
 +            return String(localized: "settings.advanced.external_engine.auto_routed",
@@ -2175,7 +2260,7 @@ index 2cc8864..9bdbc07 100644
          if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
              return reason
          }
-@@ -1941,21 +2029,19 @@ private struct ExternalEngineRow: View {
+@@ -1941,21 +2035,39 @@ private struct ExternalEngineRow: View {
                      .disabled(draftStarted)
                      .help(draftError ?? "")
                  }
@@ -2185,6 +2270,26 @@ index 2cc8864..9bdbc07 100644
 -                          options: engines
 -                              .filter { $0.compatible || $0.id == vm.externalEngine }
 -                              .map { ($0.id, $0.label) })
++                if vm.canConvertOMLXM5 || vm.isConvertingOMLXM5 {
++                    Button {
++                        Task { await vm.convertModelToOMLXM5(client: client) }
++                    } label: {
++                        HStack(spacing: 5) {
++                            if vm.isConvertingOMLXM5 {
++                                ProgressView().controlSize(.mini)
++                                Text(String(localized: "settings.advanced.external_engine.converting_omlxm5",
++                                            defaultValue: "Converting…",
++                                            comment: "Button label while converting .safetensors weights to .omlxm5"))
++                            } else {
++                                Text(String(localized: "settings.advanced.external_engine.convert_omlxm5",
++                                            defaultValue: "Convert to .omlxm5",
++                                            comment: "Button that converts .safetensors weights to .omlxm5 for miv Core Backend"))
++                            }
++                        }
++                    }
++                    .buttonStyle(.omlx(.normal, size: .small))
++                    .disabled(vm.isConvertingOMLXM5)
++                }
 +                if !vm.effectiveExternalEngine.isEmpty {
 +                    Popup(selection: popupSelection,
 +                          width: .controlMedium,
@@ -2199,11 +2304,11 @@ index 2cc8864..9bdbc07 100644
                      }
                  ))
 -                .disabled(isGGUF || (vm.externalEngine.isEmpty && usableEngine == nil))
-+                .disabled(isGGUF || (vm.effectiveExternalEngine.isEmpty && vm.autoExternalEngine.isEmpty && usableEngine == nil))
++                .disabled(isGGUF || isOMLXM5Only || (vm.effectiveExternalEngine.isEmpty && vm.autoExternalEngine.isEmpty && usableEngine == nil))
              }
          }
      }
-@@ -2230,9 +2316,10 @@ private struct AccelerationSection: View {
+@@ -2230,9 +2342,10 @@ private struct AccelerationSection: View {
                                comment: "Row label for the Lightning MTP toggle"),
                  sublabel: mtpSublabel) {
                  RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
@@ -2215,7 +2320,7 @@ index 2cc8864..9bdbc07 100644
              if vm.mtpEnabled {
                  Row(label: String(localized: "settings.acceleration.mtp.depth.label",
                                    defaultValue: "Adaptive max depth",
-@@ -2246,6 +2333,8 @@ private struct AccelerationSection: View {
+@@ -2246,6 +2359,8 @@ private struct AccelerationSection: View {
                          options: ModelSettingsScreenVM.mtpDepthOptions
                      )
                  }
@@ -2224,7 +2329,7 @@ index 2cc8864..9bdbc07 100644
              }
  
              if vm.canImportMtplxSidecar {
-@@ -2277,9 +2366,10 @@ private struct AccelerationSection: View {
+@@ -2277,9 +2392,10 @@ private struct AccelerationSection: View {
                                comment: "Row label for the DFlash toggle"),
                  sublabel: dflashSublabel) {
                  RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
@@ -2236,7 +2341,7 @@ index 2cc8864..9bdbc07 100644
              if vm.dflashEnabled {
                  Row(label: String(localized: "settings.experimental.dflash.draft.label",
                                    defaultValue: "DFlash Draft Model",
-@@ -2290,6 +2380,8 @@ private struct AccelerationSection: View {
+@@ -2290,6 +2406,8 @@ private struct AccelerationSection: View {
                          options: vm.draftModelOptions()
                      )
                  }
@@ -2245,7 +2350,7 @@ index 2cc8864..9bdbc07 100644
                  Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
                                    defaultValue: "Draft Quantization",
                                    comment: "Row label for the DFlash draft quantization toggle"),
-@@ -2298,6 +2390,8 @@ private struct AccelerationSection: View {
+@@ -2298,6 +2416,8 @@ private struct AccelerationSection: View {
                                       comment: "Sublabel for the DFlash draft quantization toggle")) {
                      RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                  }
@@ -2254,7 +2359,7 @@ index 2cc8864..9bdbc07 100644
                  if vm.dflashDraftQuantEnabled {
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
                                        defaultValue: "Weight Bits",
-@@ -2308,6 +2402,8 @@ private struct AccelerationSection: View {
+@@ -2308,6 +2428,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
                          )
                      }
@@ -2263,7 +2368,7 @@ index 2cc8864..9bdbc07 100644
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
                                        defaultValue: "Group Size",
                                        comment: "Row label for the DFlash draft quantization group size picker")) {
-@@ -2317,6 +2413,8 @@ private struct AccelerationSection: View {
+@@ -2317,6 +2439,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
                          )
                      }
@@ -2272,7 +2377,7 @@ index 2cc8864..9bdbc07 100644
                  }
                  Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                    defaultValue: "Verify Mode",
-@@ -2330,6 +2428,8 @@ private struct AccelerationSection: View {
+@@ -2330,6 +2454,8 @@ private struct AccelerationSection: View {
                          options: ModelSettingsScreenVM.dflashVerifyModeOptions
                      )
                  }
@@ -2281,7 +2386,7 @@ index 2cc8864..9bdbc07 100644
                  Row(label: String(localized: "settings.experimental.dflash.window_size.label",
                                    defaultValue: "Draft Window Size",
                                    comment: "Row label for the DFlash draft sliding-attention window size field"),
-@@ -2339,6 +2439,8 @@ private struct AccelerationSection: View {
+@@ -2339,6 +2465,8 @@ private struct AccelerationSection: View {
                      TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
                                placeholder: "2048", mono: true, width: .controlCompact)
                  }
@@ -2290,7 +2395,7 @@ index 2cc8864..9bdbc07 100644
                  Row(label: String(localized: "settings.experimental.dflash.block_size.label",
                                    defaultValue: "Runtime Block Size",
                                    comment: "Row label for the DFlash runtime block size field"),
-@@ -2348,6 +2450,8 @@ private struct AccelerationSection: View {
+@@ -2348,6 +2476,8 @@ private struct AccelerationSection: View {
                      TextInput(text: vm.bindProfile($vm.dflashBlockSize),
                                placeholder: "checkpoint", mono: true, width: .controlCompact)
                  }
@@ -2299,7 +2404,7 @@ index 2cc8864..9bdbc07 100644
              }
  
              // VLM MTP reveals the draft-model picker and block-size field
-@@ -2358,9 +2462,10 @@ private struct AccelerationSection: View {
+@@ -2358,9 +2488,10 @@ private struct AccelerationSection: View {
                  sublabel: vlmMtpSublabel,
                  isLast: !vm.vlmMtpEnabled && !hasFamilyRows) {
                  RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
@@ -2311,7 +2416,7 @@ index 2cc8864..9bdbc07 100644
              if vm.vlmMtpEnabled {
                  Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
                                    defaultValue: "VLM Draft Model",
-@@ -2400,6 +2505,8 @@ private struct AccelerationSection: View {
+@@ -2400,6 +2531,8 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                      }))
                  }
@@ -2320,7 +2425,7 @@ index 2cc8864..9bdbc07 100644
              }
              if vm.isQwen4Exp {
                  Row(label: String(localized: "settings.acceleration.qwen4_wide_decode.label",
-@@ -2413,6 +2520,8 @@ private struct AccelerationSection: View {
+@@ -2413,6 +2546,8 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                      }))
                  }
@@ -2329,7 +2434,7 @@ index 2cc8864..9bdbc07 100644
              }
              // The A8 rows do not depend on an ANE backend, which several A8 families lack.
              if vm.showsA8Prefill {
-@@ -2425,9 +2534,10 @@ private struct AccelerationSection: View {
+@@ -2425,9 +2560,10 @@ private struct AccelerationSection: View {
                                      comment: "Warning on the INT8 prefill row: INT8 activations can lower output quality"),
                      isLast: !vm.a8PrefillEnabled) {
                      RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
@@ -2646,10 +2751,18 @@ index 0f7a2eb..5011218 100644
          let models = try await client.listModels().models
          availableModels = models.map { $0.id }
 diff --git a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
-index 0fd23d0..c2aea3b 100644
+index 0fd23d0..e620480 100644
 --- a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
 +++ b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
-@@ -297,17 +297,107 @@ final class ModelSettingsScreenVM {
+@@ -243,6 +243,7 @@ final class ModelSettingsScreenVM {
+     var modelID: String = ""
+     var lastError: String?
+     var isImportingMtplxSidecar: Bool = false
++    var isConvertingOMLXM5: Bool = false
+ 
+     // Basic
+     var alias: String = ""
+@@ -297,17 +298,107 @@ final class ModelSettingsScreenVM {
      // Security
      var trustRemoteCode: Bool = false
  
@@ -2761,7 +2874,31 @@ index 0fd23d0..c2aea3b 100644
      // Embedding audio tower. Empty seconds keeps the 30 s processor default.
      var embeddingAudioEnabled: Bool = false
      var embeddingAudioMaxSeconds: String = ""
-@@ -1632,7 +1722,17 @@ final class ModelSettingsScreenVM {
+@@ -1542,6 +1633,23 @@ final class ModelSettingsScreenVM {
+         }
+     }
+ 
++    var canConvertOMLXM5: Bool {
++        model?.externalEngines?.contains(where: { !$0.compatible && $0.canConvert == true }) == true
++    }
++
++    func convertModelToOMLXM5(client: OMLXClient) async {
++        guard !isConvertingOMLXM5, canConvertOMLXM5 else { return }
++        isConvertingOMLXM5 = true
++        defer { isConvertingOMLXM5 = false }
++
++        do {
++            _ = try await client.convertModelToOMLXM5(id: modelID)
++            await load(modelID: modelID, client: client, preservingEdits: false)
++        } catch {
++            lastError = error.omlxDescription
++        }
++    }
++
+     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
+     /// other speculative-decoding / KV-quant features. Mirrors the HTML
+     /// editor's gating so the toggle disables itself and surfaces why.
+@@ -1632,7 +1740,17 @@ final class ModelSettingsScreenVM {
                                comment: "Profile banner title when the model uses server defaults")
              }
              return profileDisplayName(scope: activeProfileScope, name: name)
@@ -2780,7 +2917,7 @@ index 0fd23d0..c2aea3b 100644
              if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
              return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
          case .advanced:
-@@ -1696,9 +1796,11 @@ final class ModelSettingsScreenVM {
+@@ -1696,9 +1814,11 @@ final class ModelSettingsScreenVM {
              }
          case .advanced:
              if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
@@ -3035,7 +3172,7 @@ index 3092c54..8e83021 100644
      /// an MCP config file consumed by every integration launcher (Claude
      /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
 diff --git a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
-index b7902d2..aa2a667 100644
+index b7902d2..c619e89 100644
 --- a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 +++ b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 @@ -54,6 +54,14 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
@@ -3053,10 +3190,11 @@ index b7902d2..aa2a667 100644
      /// True when the model is structurally compatible with DFlash (block
      /// diffusion speculative decoding). The toggle stays disabled when false.
      let dflashCompatible: Bool?
-@@ -108,6 +116,114 @@ extension ModelDTO {
+@@ -108,6 +116,115 @@ extension ModelDTO {
  
      var isInHFCache: Bool { sourceType == "hf_cache" }
      var isGGUF: Bool { modelFormat == "gguf" }
++    var isOMLXM5Only: Bool { modelFormat == "omlxm5" }
 +
 +    /// Localized display name for a given engine ID, translating built-in `m5rt`
 +    /// while preserving manifest display names for Path B providers and Splash.
@@ -3168,20 +3306,30 @@ index b7902d2..aa2a667 100644
  }
  
  /// One entry of `external_engines` in GET /admin/api/models.
-@@ -118,6 +234,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
+@@ -118,6 +235,10 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
      let reason: String?
      /// Hugging Face repo of the draft the engine lacks, when one provides it.
      var draftRepo: String? = nil
++    /// True when `.safetensors` weights can be converted in-place to `.omlxm5` for this engine.
++    var canConvert: Bool? = nil
 +    /// Standard `ModelSettings` keys honored when this engine serves the model.
 +    var supportedStandardSettings: [String]? = nil
  }
  
  struct ModelSettingsDTO: Codable, Equatable, Sendable {
 diff --git a/apps/omlx-mac/Sources/Net/Endpoints.swift b/apps/omlx-mac/Sources/Net/Endpoints.swift
-index a38dc54..9efe5a1 100644
+index a38dc54..0351176 100644
 --- a/apps/omlx-mac/Sources/Net/Endpoints.swift
 +++ b/apps/omlx-mac/Sources/Net/Endpoints.swift
-@@ -132,4 +132,20 @@ enum AdminAPI {
+@@ -31,6 +31,7 @@ enum AdminAPI {
+     static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
+     static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
+     static func importMtplx(_ id: String) -> String { "\(models)/\(id)/import-mtplx" }
++    static func convertOMLXM5(_ id: String) -> String { "\(models)/\(id)/convert-omlxm5" }
+     // Prefill Accelerator (needs the server's cluster setting on).
+     static let prefillHelper = "\(prefix)/prefill-helper"
+     static let prefillHelperCandidates = "\(prefillHelper)/candidates"
+@@ -132,4 +133,20 @@ enum AdminAPI {
      static let contextBenchStart   = "\(prefix)/bench/context/start"
      static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
      static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
@@ -3203,10 +3351,22 @@ index a38dc54..9efe5a1 100644
 +    }
  }
 diff --git a/apps/omlx-mac/Sources/Net/OMLXClient.swift b/apps/omlx-mac/Sources/Net/OMLXClient.swift
-index 50ec8e7..68441df 100644
+index 50ec8e7..0bbd319 100644
 --- a/apps/omlx-mac/Sources/Net/OMLXClient.swift
 +++ b/apps/omlx-mac/Sources/Net/OMLXClient.swift
-@@ -601,6 +601,38 @@ final class OMLXClient: ObservableObject {
+@@ -203,6 +203,11 @@ final class OMLXClient: ObservableObject {
+         try await postEmpty(AdminAPI.importMtplx(id))
+     }
+ 
++    @discardableResult
++    func convertModelToOMLXM5(id: String) async throws -> SimpleStatusResponse {
++        try await postEmpty(AdminAPI.convertOMLXM5(id), timeout: 1800)
++    }
++
+     // MARK: - Prefill Accelerator
+ 
+     func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {
+@@ -601,6 +606,38 @@ final class OMLXClient: ObservableObject {
          try await postEmpty(AdminAPI.contextBenchCancel(benchId))
      }
  
@@ -3245,7 +3405,7 @@ index 50ec8e7..68441df 100644
      // MARK: - Core request
  
      private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
-@@ -619,12 +651,12 @@ final class OMLXClient: ObservableObject {
+@@ -619,12 +656,12 @@ final class OMLXClient: ObservableObject {
          return try await request("PUT", path: path, body: data)
      }
  
@@ -3803,10 +3963,10 @@ index 0039ee7..25eefaa 100644
          // Direct file-level parse so a catalog corruption (extra trailing
          // comma, bad nesting) shows up here rather than as a missing-string
 diff --git a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
-index 2e40221..7e8ebcc 100644
+index 2e40221..6614306 100644
 --- a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
 +++ b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
-@@ -983,6 +983,58 @@ final class ModelSettingsScreenVMTests: XCTestCase {
+@@ -983,6 +983,103 @@ final class ModelSettingsScreenVMTests: XCTestCase {
          model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
          return model
      }
@@ -3861,6 +4021,51 @@ index 2e40221..7e8ebcc 100644
 +        XCTAssertEqual(vm.effectiveExternalEngine, "llama-metal")
 +        XCTAssertFalse(vm.isAutoRoutedExternalEngine)
 +        XCTAssertEqual(vm.headerEngineId, "llama-metal")
++    }
++
++    func testCanConvertOMLXM5AndPureOMLXM5Detection() throws {
++        let decoder = JSONDecoder()
++        decoder.keyDecodingStrategy = .convertFromSnakeCase
++
++        let convertibleJSON = Data(#"""
++        {
++          "id": "Qwen3.5-9B",
++          "loaded": false,
++          "is_loading": false,
++          "estimated_size": 1000,
++          "config_model_type": "qwen3_5",
++          "external_engines": [
++            {
++              "id": "m5rt",
++              "label": "miv Core Backend",
++              "compatible": false,
++              "can_convert": true,
++              "reason": "Convert weights to .omlxm5 to run this model on miv Core Backend."
++            }
++          ]
++        }
++        """#.utf8)
++        let convertibleModel = try decoder.decode(ModelDTO.self, from: convertibleJSON)
++        let vm = ModelSettingsScreenVM()
++        vm.model = convertibleModel
++        vm.modelID = convertibleModel.id
++        XCTAssertTrue(vm.canConvertOMLXM5)
++        XCTAssertFalse(convertibleModel.isOMLXM5Only)
++
++        let pureJSON = Data(#"""
++        {
++          "id": "Qwen3.8-PureMiv",
++          "loaded": false,
++          "is_loading": false,
++          "estimated_size": 2000,
++          "config_model_type": "qwen3_8",
++          "model_format": "omlxm5",
++          "auto_external_engine": "m5rt"
++        }
++        """#.utf8)
++        let pureModel = try decoder.decode(ModelDTO.self, from: pureJSON)
++        XCTAssertTrue(pureModel.isOMLXM5Only)
++        XCTAssertEqual(pureModel.resolvedEngineId, "m5rt")
 +    }
  }
  
@@ -3943,10 +4148,18 @@ index 75fd00b..3917edd 100644
    "modal.model_settings.trust_remote_code": "信任远程代码",
    "modal.model_settings.trust_remote_code_hint": "允许模型仓库在加载时运行任意 Python 代码。请仅对可信的发布者启用。",
 diff --git a/apps/omlx-web/omlx_web/static/js/dashboard.js b/apps/omlx-web/omlx_web/static/js/dashboard.js
-index 62235bb..68c992f 100644
+index 62235bb..dd5ec9a 100644
 --- a/apps/omlx-web/omlx_web/static/js/dashboard.js
 +++ b/apps/omlx-web/omlx_web/static/js/dashboard.js
-@@ -2362,6 +2362,8 @@
+@@ -332,6 +332,7 @@
+             savingModelSettings: false,
+             settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
+             importingMtplx: false,
++            convertingOmlxm5: false,
+             loadingGenDefaults: false,
+             reasoningParsers: [],
+             loraAdapters: [],
+@@ -2362,6 +2363,8 @@
                      is_diffusion_model: isDiffusion,
                      external_engine: s.external_engine || '',
                      external_engines: model?.external_engines || [],
@@ -3955,11 +4168,41 @@ index 62235bb..68c992f 100644
                      model_format: model?.model_format || null,
                      trust_remote_code: s.trust_remote_code || false,
                      embedding_audio_enabled: s.embedding_audio_enabled || false,
-@@ -4848,13 +4850,39 @@
+@@ -4848,13 +4851,69 @@
                  return this.modelSettings.model_format === 'gguf';
              },
  
 -            // A GGUF runs on an external engine even when its settings pick none.
++            isOmlxm5OnlyModel() {
++                return this.modelSettings.model_format === 'omlxm5';
++            },
++
++            canConvertOmlxm5() {
++                const engines = this.modelSettings.external_engines || [];
++                return engines.some(e => !e.compatible && e.can_convert);
++            },
++
++            async convertModelOmlxm5() {
++                if (!this.selectedModel || this.convertingOmlxm5) return;
++                this.convertingOmlxm5 = true;
++                try {
++                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-omlxm5`, {
++                        method: 'POST',
++                    });
++                    const data = await response.json().catch(() => ({}));
++                    if (!response.ok) {
++                        alert(data.detail || 'Failed to convert model to .omlxm5');
++                        return;
++                    }
++                    if (data.message) alert(data.message);
++                    await this.loadModels();
++                    const updated = (this.models || []).find(m => m.id === this.selectedModel.id);
++                    if (updated) this.openModelSettings(updated);
++                } finally {
++                    this.convertingOmlxm5 = false;
++                }
++            },
++
 +            // A GGUF (or auto-routed adapted model) runs on an external engine even when settings pick none.
              effectiveExternalEngine() {
 +                if (this.modelSettings.external_engine === 'stock') return '';
@@ -3997,7 +4240,7 @@ index 62235bb..68c992f 100644
                  const engines = this.modelSettings.external_engines || [];
                  const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
 diff --git a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
-index 2e9a43b..6601fb0 100644
+index 2e9a43b..4d7e904 100644
 --- a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 +++ b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 @@ -521,10 +521,10 @@
@@ -4098,11 +4341,34 @@ index 2e9a43b..6601fb0 100644
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
                                      <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.kv_compression') }}</span>
+@@ -1034,13 +1037,20 @@
+                                         <i data-lucide="download" class="w-3 h-3"></i>
+                                         <span x-text="window.t('modal.model_settings.external_engine_get_draft').replace('{repo_id}', externalEngineDraftRepo())"></span>
+                                     </button>
++                                    <button type="button" x-show="canConvertOmlxm5() || convertingOmlxm5" x-cloak
++                                            @click="convertModelOmlxm5()"
++                                            :disabled="convertingOmlxm5"
++                                            :class="convertingOmlxm5 ? 'opacity-50 cursor-not-allowed' : ''"
++                                            class="mt-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all inline-flex items-center gap-1.5">
++                                        <span x-text="convertingOmlxm5 ? 'Converting…' : 'Convert to .omlxm5'"></span>
++                                    </button>
+                                 </div>
+                                 <button type="button"
+                                         @click="modelSettings.external_engine = modelSettings.external_engine ? '' : firstUsableExternalEngine()"
+-                                        :disabled="isGgufModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())"
++                                        :disabled="isGgufModel() || isOmlxm5OnlyModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())"
+                                         :class="[
+                                             effectiveExternalEngine() ? 'bg-black' : 'bg-neutral-200',
+-                                            (isGgufModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())) ? 'opacity-40 cursor-not-allowed' : ''
++                                            (isGgufModel() || isOmlxm5OnlyModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())) ? 'opacity-40 cursor-not-allowed' : ''
+                                         ]"
+                                         role="switch"
+                                         :aria-checked="effectiveExternalEngine() ? 'true' : 'false'"
 diff --git a/omlx/admin/routes.py b/omlx/admin/routes.py
-index 39132d8..7c84e2e 100644
+index 39132d8..d274708 100644
 --- a/omlx/admin/routes.py
 +++ b/omlx/admin/routes.py
-@@ -45,6 +45,31 @@ from .._version import __version__ as _omlx_version
+@@ -45,6 +45,33 @@ from .._version import __version__ as _omlx_version
  from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
  from ..api.openai_models import _coerce_tool_call_arguments
  from ..api.utils import _try_parse_json
@@ -4112,6 +4378,8 @@ index 39132d8..7c84e2e 100644
 +    M5RT_ENGINE_LABEL,
 +    M5RT_PROVIDER_ID,
 +    apply_m5rt_model_settings_update,
++    can_convert_to_omlxm5,
++    convert_model_to_omlxm5,
 +    discover_external_engine_plugins,
 +    external_engine_dflash_compatibility,
 +    external_engine_mtp_compatibility,
@@ -4134,7 +4402,7 @@ index 39132d8..7c84e2e 100644
  from ..engine.splash import (
      EXTERNAL_ENGINES,
      SPLASH_INSTALL_HINT,
-@@ -499,8 +524,12 @@ class ModelSettingsRequest(BaseModel):
+@@ -499,8 +526,12 @@ class ModelSettingsRequest(BaseModel):
      specprefill_draft_model: str | None = None
      specprefill_keep_pct: float | None = None
      specprefill_threshold: int | None = None
@@ -4148,7 +4416,7 @@ index 39132d8..7c84e2e 100644
      # DFlash (block diffusion speculative decoding)
      dflash_enabled: bool | None = None
      dflash_draft_model: str | None = None
-@@ -908,6 +937,8 @@ class GlobalSettingsRequest(BaseModel):
+@@ -908,6 +939,8 @@ class GlobalSettingsRequest(BaseModel):
      splash_max_memory_gb: float | None = None
      splash_ssd_cache_gb: float | None = None
      splash_ane_prefill: bool | None = None
@@ -4157,7 +4425,7 @@ index 39132d8..7c84e2e 100644
  
      # UI settings
      ui_language: str | None = None
-@@ -1084,8 +1115,12 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
+@@ -1084,8 +1117,12 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
  _PAROQUANT_DFLASH_MODEL_TYPES = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
  
  
@@ -4171,7 +4439,7 @@ index 39132d8..7c84e2e 100644
      model_type = model_info.get("config_model_type")
      is_paro, paro_reason = _paroquant_compat_for_model(model_info)
      if is_paro and model_type not in _PAROQUANT_DFLASH_MODEL_TYPES:
-@@ -1099,23 +1134,59 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
+@@ -1099,23 +1136,71 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
          return []
      if model_info.get("is_helper"):
          return []
@@ -4235,6 +4503,18 @@ index 39132d8..7c84e2e 100644
          }
 -        for engine_id, label in EXTERNAL_ENGINES.items()
 -    ]
++        if engine_id == M5RT_ENGINE_ID and not compatible:
++            m5rt_cfg_path = (
++                global_settings.integrations.m5rt_path if global_settings else None
++            )
++            can_conv, _ = can_convert_to_omlxm5(
++                model_info.get("model_path") or "", m5rt_cfg_path, settings
++            )
++            if can_conv:
++                row["can_convert"] = True
++                row["reason"] = (
++                    "Convert weights to .omlxm5 to run this model on miv Core Backend."
++                )
 +        supported = list(get_external_engine_supported_settings(engine_id))
 +        if supported:
 +            row["supported_standard_settings"] = supported
@@ -4243,7 +4523,7 @@ index 39132d8..7c84e2e 100644
  
  
  def _entry_is_diffusion_model(entry) -> bool:
-@@ -1170,6 +1241,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
+@@ -1170,6 +1255,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
      settings["moe_expert_offload_resident_fraction"] = 0.25
      settings["specprefill_enabled"] = False
      settings["external_engine"] = None
@@ -4254,7 +4534,7 @@ index 39132d8..7c84e2e 100644
      settings["dflash_enabled"] = False
      settings["mtp_enabled"] = False
      settings["vlm_mtp_enabled"] = False
-@@ -1266,7 +1341,9 @@ _MTP_EXTERNAL_ENGINE_REASON = (
+@@ -1266,7 +1355,9 @@ _MTP_EXTERNAL_ENGINE_REASON = (
  
  
  def _mtp_compat_for_model(
@@ -4265,7 +4545,7 @@ index 39132d8..7c84e2e 100644
  ) -> tuple[bool, str]:
      """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
  
-@@ -1295,8 +1372,10 @@ def _mtp_compat_for_model(
+@@ -1295,8 +1386,10 @@ def _mtp_compat_for_model(
          _is_mtp_compatible,
      )
  
@@ -4278,7 +4558,7 @@ index 39132d8..7c84e2e 100644
  
      is_paro, paro_reason = _paroquant_compat_for_model(model_info)
      if is_paro:
-@@ -2523,6 +2602,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2523,6 +2616,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
          await asyncio.to_thread(
              find_splash_binary, global_settings.integrations.splash_path
          )
@@ -4288,7 +4568,7 @@ index 39132d8..7c84e2e 100644
  
      # Get engine pool status
      status = engine_pool.get_status()
-@@ -2556,14 +2638,88 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2556,14 +2652,88 @@ async def list_models(is_admin: bool = Depends(require_admin)):
      models = []
      # M1/M2 GPUs (families 13/14) have no native bf16 ALU path.
      fp16_recast_gpu = get_apple_gpu_generation() in (13, 14)
@@ -4380,7 +4660,7 @@ index 39132d8..7c84e2e 100644
          )
          external_engines = _external_engines_for_model(
              engine_pool, model_info, settings
-@@ -2709,6 +2865,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
+@@ -2709,6 +2879,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
              "cluster": model_info.get("cluster"),
              "last_access": model_info.get("last_access"),
              "external_engines": external_engines,
@@ -4391,7 +4671,63 @@ index 39132d8..7c84e2e 100644
              "dflash_compatible": compat_ok,
              "dflash_compatibility_reason": compat_reason,
              "mtp_compatible": mtp_compat_ok,
-@@ -3479,33 +3639,72 @@ async def update_model_settings(
+@@ -3042,6 +3216,55 @@ async def import_mtplx(
+     return {"status": "ok", "model_id": model_id, **result}
+ 
+ 
++@router.post("/api/models/{model_id}/convert-omlxm5")
++async def convert_model_omlxm5(
++    model_id: str,
++    is_admin: bool = Depends(_require_admin_or_bearer),
++):
++    """Convert a supported Qwen `.safetensors` checkpoint to `model.omlxm5` for `miv`."""
++    engine_pool = _get_engine_pool()
++    if engine_pool is None:
++        raise HTTPException(status_code=503, detail="Engine pool not initialized")
++    entry = engine_pool.get_entry(model_id)
++    if entry is None:
++        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
++
++    global_settings = _get_global_settings() if _get_global_settings else None
++    m5rt_cfg_path = global_settings.integrations.m5rt_path if global_settings else None
++    settings_mgr = _get_model_settings_manager() if _get_model_settings_manager else None
++    model_settings = (
++        settings_mgr.get_settings(model_id) if settings_mgr is not None else None
++    )
++
++    try:
++        result = await asyncio.to_thread(
++            convert_model_to_omlxm5,
++            entry.model_path,
++            source_repo=getattr(entry, "source_repo_id", None) or model_id,
++            configured_binary=m5rt_cfg_path,
++            model_settings=model_settings,
++            nax_pretile=True,
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++
++    # Clear any prior Stock MLX override so auto-routing to miv Core Backend activates immediately.
++    if (
++        settings_mgr is not None
++        and model_settings is not None
++        and getattr(model_settings, "external_engine", None) == "stock"
++    ):
++        model_settings.external_engine = None
++        save_fn = getattr(settings_mgr, "save_settings", None)
++        if callable(save_fn):
++            save_fn(model_id, model_settings)
++
++    logger.info("Converted model '%s' to .omlxm5 (%s)", model_id, result.get("artifact_path"))
++    if getattr(entry, "engine", None) is not None:
++        result["message"] = "Converted to .omlxm5. Reload the model to switch to miv Core Backend."
++    return {"status": "ok", "model_id": model_id, **result}
++
++
+ @router.post("/api/reload")
+ async def reload_models(is_admin: bool = Depends(require_admin)):
+     """Reload models: re-read model settings, re-discover models, preload pinned."""
+@@ -3479,33 +3702,77 @@ async def update_model_settings(
          current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
      if "specprefill_threshold" in sent:
          current_settings.specprefill_threshold = request.specprefill_threshold or None
@@ -4403,6 +4739,11 @@ index 39132d8..7c84e2e 100644
 +        raise HTTPException(status_code=400, detail=str(exc)) from exc
      if "external_engine" in sent:
          engine_id = None if is_diffusion_model else request.external_engine or None
++        if engine_id == "stock" and getattr(entry, "model_format", None) == "omlxm5":
++            raise HTTPException(
++                status_code=400,
++                detail="Pure .omlxm5 models have no Stock MLX .safetensors weights on disk.",
++            )
          # Check only a change: a client may resend the stored value, and a
          # launcher or draft removed later must not block other fields.
 -        if engine_id is not None and engine_id != current_settings.external_engine:
@@ -4476,7 +4817,7 @@ index 39132d8..7c84e2e 100644
              )
              if not compat_ok:
                  raise HTTPException(status_code=400, detail=compat_reason)
-@@ -3550,12 +3749,19 @@ async def update_model_settings(
+@@ -3550,12 +3817,19 @@ async def update_model_settings(
          if new_mtp_enabled:
              # Same gate as the toggle status in the model list, which also
              # accepts MiniMax M3.1 through its bundled dspark/ draft.
@@ -4502,7 +4843,7 @@ index 39132d8..7c84e2e 100644
              )
              if not compat_ok:
                  raise HTTPException(status_code=400, detail=compat_reason)
-@@ -4887,6 +5093,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
+@@ -4887,6 +5161,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
      await asyncio.to_thread(
          find_splash_binary, global_settings.integrations.splash_path
      )
@@ -4512,7 +4853,7 @@ index 39132d8..7c84e2e 100644
      return _global_settings_response(global_settings)
  
  
-@@ -4938,6 +5147,97 @@ def _splash_status(global_settings) -> dict:
+@@ -4938,6 +5215,97 @@ def _splash_status(global_settings) -> dict:
      }
  
  
@@ -4610,7 +4951,7 @@ index 39132d8..7c84e2e 100644
  def _global_settings_response(global_settings):
      from ..settings import get_auto_ssd_cache_size
  
-@@ -5113,8 +5413,12 @@ def _global_settings_response(global_settings):
+@@ -5113,8 +5481,12 @@ def _global_settings_response(global_settings):
              "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
              "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
              "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -4624,7 +4965,7 @@ index 39132d8..7c84e2e 100644
          "system": {
              "total_memory_bytes": memory_info["total_bytes"],
              "total_memory": memory_info["total_formatted"],
-@@ -6071,6 +6375,25 @@ async def update_global_settings(
+@@ -6071,6 +6443,25 @@ async def update_global_settings(
              request.splash_ane_prefill
          )
          integrations_changed = True
@@ -4650,7 +4991,7 @@ index 39132d8..7c84e2e 100644
      if "markitdown_enabled" in request.model_fields_set:
          global_settings.integrations.markitdown_enabled = bool(
              request.markitdown_enabled
-@@ -10290,3 +10613,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
+@@ -10290,3 +10681,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
      if not success:
          raise HTTPException(status_code=404, detail="Task not found or still active")
      return {"success": True}
@@ -4768,10 +5109,10 @@ index 39132d8..7c84e2e 100644
 +        )
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..440c7c2
+index 0000000..4091c56
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,5210 @@
+@@ -0,0 +1,5381 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -9982,6 +10323,177 @@ index 0000000..440c7c2
 +                if req.first_token_at is not None
 +            ],
 +        }
++
++
++# ---------------------------------------------------------------------------
++# In-App .safetensors -> .omlxm5 Conversion Helpers (oMLX-extend)
++# ---------------------------------------------------------------------------
++
++from contextlib import suppress
++import threading
++
++_CONVERT_LOCKS_GUARD = threading.Lock()
++_CONVERT_LOCKS: dict[str, threading.Lock] = {}
++
++
++def find_m5_artifact_tool(configured_binary: str | None = None) -> Path | None:
++    """Locate `m5_artifact.py` shipped inside the installed `miv` provider or monorepo."""
++    for env_key in ("NINFER_METAL_ARTIFACT_TOOL", "OMLX_M5_ARTIFACT_TOOL"):
++        raw_env = os.environ.get(env_key, "").strip()
++        if raw_env:
++            p = Path(raw_env).expanduser()
++            if p.is_file():
++                return p
++
++    binary, _ = find_m5rt_binary(configured_binary)
++    if binary is not None:
++        # Provider layout: <provider>/versions/<ver>/bin/mseries_backendd -> ../tools/m5_artifact.py
++        cand = binary.path.resolve().parent.parent / "tools" / "m5_artifact.py"
++        if cand.is_file():
++            return cand
++        # Also check un-resolved symlink parent (`current/tools/m5_artifact.py`)
++        cand_sym = binary.path.parent.parent / "tools" / "m5_artifact.py"
++        if cand_sym.is_file():
++            return cand_sym
++
++    # Monorepo / source checkout fallback: <repo>/miv/tools/m5_artifact.py
++    with suppress(Exception):
++        repo_cand = Path(__file__).resolve().parents[3] / "miv" / "tools" / "m5_artifact.py"
++        if repo_cand.is_file():
++            return repo_cand
++
++    return None
++
++
++def can_convert_to_omlxm5(
++    model_path: str | Path,
++    configured_binary: str | None = None,
++    model_settings: object | None = None,
++) -> tuple[bool, str]:
++    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.omlxm5`."""
++    if not model_path:
++        return False, "model_path is empty"
++    model_dir = Path(model_path).expanduser()
++    if not model_dir.is_dir():
++        return False, f"model directory not found: {model_dir}"
++
++    if detect_adapted(model_dir, model_settings).adapted:
++        return False, "model already has .omlxm5 weights"
++
++    cfg_path = model_dir / "config.json"
++    if not cfg_path.is_file():
++        return False, "config.json not found"
++    try:
++        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
++    except Exception as exc:
++        return False, f"failed to parse config.json: {exc}"
++    if not isinstance(cfg, dict):
++        return False, "config.json is not a JSON object"
++
++    model_types = _extract_model_type_tokens(cfg)
++    manifest = _builtin_m5rt_manifest()
++    supported_types = {
++        str(m).strip().lower()
++        for m in (manifest.get("supported_model_types") or M5RT_SUPPORTED_MODEL_TYPES)
++        if isinstance(m, str) and m.strip()
++    }
++    if not model_types or not (model_types & supported_types):
++        return False, f"model_type is not in {sorted(supported_types)}"
++
++    try:
++        has_safetensors = any(
++            f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
++        )
++    except OSError:
++        has_safetensors = False
++    if not has_safetensors:
++        return False, "no .safetensors weights found in model directory"
++
++    if not os.access(model_dir, os.W_OK):
++        return False, f"model directory is not writable: {model_dir}"
++
++    binary, bin_reason = find_m5rt_binary(configured_binary)
++    if binary is None:
++        return False, bin_reason
++    tool = find_m5_artifact_tool(configured_binary)
++    if tool is None:
++        return False, "m5_artifact.py converter tool not found in installed miv bundle"
++
++    return True, ""
++
++
++def convert_model_to_omlxm5(
++    model_path: str | Path,
++    *,
++    source_repo: str | None = None,
++    configured_binary: str | None = None,
++    model_settings: object | None = None,
++    nax_pretile: bool = True,
++) -> dict[str, Any]:
++    """Convert `.safetensors` weights in `model_path` to `model.omlxm5` atomically."""
++    model_dir = Path(model_path).expanduser().resolve()
++    lock_key = str(model_dir)
++    with _CONVERT_LOCKS_GUARD:
++        lock = _CONVERT_LOCKS.setdefault(lock_key, threading.Lock())
++
++    with lock:
++        existing_probe = detect_adapted(model_dir, model_settings)
++        out_path = model_dir / "model.omlxm5"
++        if existing_probe.adapted and out_path.is_file():
++            return {
++                "artifact_path": str(out_path),
++                "artifact_bytes": out_path.stat().st_size,
++                "already_existed": True,
++            }
++
++        ok, reason = can_convert_to_omlxm5(model_dir, configured_binary, model_settings)
++        if not ok:
++            raise ValueError(f"Cannot convert model to .omlxm5: {reason}")
++
++        tool = find_m5_artifact_tool(configured_binary)
++        if tool is None:
++            raise ValueError("m5_artifact.py converter tool not found")
++
++        repo_label = (source_repo or "").strip() or model_dir.name
++        tmp_out = model_dir / f".model.omlxm5.tmp.{os.getpid()}"
++        try:
++            cmd = [
++                sys.executable,
++                str(tool),
++                "convert",
++                "--source",
++                str(model_dir),
++                "--output",
++                str(tmp_out),
++                "--source-repo",
++                repo_label,
++            ]
++            if nax_pretile:
++                cmd.append("--nax-pretile")
++            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
++            if proc.returncode != 0:
++                detail = (proc.stderr or proc.stdout or "").strip()
++                if len(detail) > 600:
++                    detail = detail[-600:]
++                raise ValueError(
++                    f"m5_artifact.py convert failed (exit {proc.returncode}): {detail}"
++                )
++            if not tmp_out.is_file() or tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
++                raise ValueError("Converter finished without producing a valid .omlxm5 file")
++            with tmp_out.open("rb") as fh:
++                if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
++                    raise ValueError("Converted file does not have a valid OMLXM5A1 header")
++            os.replace(tmp_out, out_path)
++        finally:
++            with suppress(OSError):
++                if tmp_out.exists():
++                    tmp_out.unlink()
++
++        return {
++            "artifact_path": str(out_path),
++            "artifact_bytes": out_path.stat().st_size,
++            "already_existed": False,
++        }
 diff --git a/omlx/engine/microkernel_manager.py b/omlx/engine/microkernel_manager.py
 new file mode 100644
 index 0000000..6dd9d31
@@ -11978,6 +12490,99 @@ index 65312ce..bf7838f 100644
              models.append(
                  {
                      "id": mid,
+diff --git a/omlx/model_discovery.py b/omlx/model_discovery.py
+index 4d68ffe..0ef5682 100644
+--- a/omlx/model_discovery.py
++++ b/omlx/model_discovery.py
+@@ -1140,6 +1140,20 @@ def detect_reasoning_effort(
+     return [level for level in REASONING_EFFORT_LEVELS if level in named]
+ 
+ 
++def _has_omlxm5_weights(model_dir: Path) -> bool:
++    """True when ``model_dir`` contains a primary ``.omlxm5`` microkernel weight file."""
++    try:
++        return any(
++            f.is_file()
++            and f.suffix == ".omlxm5"
++            and not f.name.startswith(".")
++            and f.name.lower() != "mtp.omlxm5"
++            for f in model_dir.iterdir()
++        )
++    except OSError:
++        return False
++
++
+ def estimate_model_size(model_path: Path) -> int:
+     """
+     Estimate model memory usage from safetensors/bin file sizes.
+@@ -1173,6 +1187,12 @@ def estimate_model_size(model_path: Path) -> int:
+         for f in model_path.glob("**/*.safetensors"):
+             total_size += f.stat().st_size
+ 
++    # Fallback: pure .omlxm5 Metal 4 microkernel weight artifacts (oMLX-extend)
++    if total_size == 0:
++        for f in model_path.glob("*.omlxm5"):
++            if f.is_file() and not f.name.startswith("."):
++                total_size += f.stat().st_size
++
+     if total_size == 0:
+         raise ValueError(f"No model weights found in {model_path}")
+ 
+@@ -1300,6 +1320,16 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
+     Returns (missing count, up to 3 example names, manifest description), or
+     None when the directory is complete or makes no shard promises.
+     """
++    if _has_omlxm5_weights(model_dir):
++        try:
++            has_safetensors = any(
++                f.is_file() and f.suffix == ".safetensors" for f in model_dir.iterdir()
++            )
++        except OSError:
++            has_safetensors = False
++        if not has_safetensors:
++            return None
++
+     idx_path = model_dir / "model.safetensors.index.json"
+     index_missing: tuple[int, list[str]] | None = None
+     if idx_path.is_file():
+@@ -1674,6 +1704,11 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+         except (OSError, ValueError, TypeError, KeyError) as error:
+             logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+             return False
++    if _has_omlxm5_weights(model_dir):
++        logger.info(
++            f"Treating HF cache model with .omlxm5 weights as compatible: {source_repo_id}"
++        )
++        return True
+     if not list(model_dir.glob("model*.safetensors")):
+         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+         return False
+@@ -1827,6 +1862,17 @@ def _register_model(
+         reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
+         model_context_length = _read_model_context_length(model_dir)
+ 
++        try:
++            has_mlx_weights = any(
++                f.is_file() and f.suffix in (".safetensors", ".bin")
++                for f in model_dir.iterdir()
++            )
++        except OSError:
++            has_mlx_weights = False
++        model_format = (
++            "omlxm5" if (not has_mlx_weights and _has_omlxm5_weights(model_dir)) else None
++        )
++
+         models[model_id] = DiscoveredModel(
+             model_id=model_id,
+             model_path=str(model_dir),
+@@ -1842,6 +1888,7 @@ def _register_model(
+             model_context_length=model_context_length,
+             source_type=source_type,
+             source_repo_id=source_repo_id,
++            model_format=model_format,
+             is_helper=is_helper,
+         )
+ 
 diff --git a/omlx/model_profiles.py b/omlx/model_profiles.py
 index 702278c..8f70580 100644
 --- a/omlx/model_profiles.py
@@ -12149,10 +12754,10 @@ index 8bbdd65..c7f2239 100644
  
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..c4d1e56
+index 0000000..e36f556
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,2656 @@
+@@ -0,0 +1,2757 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -14806,6 +15411,107 @@ index 0000000..c4d1e56
 +
 +        monkeypatch.setenv("NINFER_METAL_CONFIG", str(custom_toml))
 +        assert m5_mod.discover_ninfer_metal_toml_path() == custom_toml
++
++
++class TestMix1PureOmlxm5DiscoveryAndConversion:
++    def test_pure_omlxm5_discovery_with_stale_index_and_hf_cache(self, tmp_path: Path):
++        from omlx.model_discovery import discover_models
++
++        models_root = tmp_path / "models"
++        models_root.mkdir()
++
++        # 1) Pure .omlxm5 local folder that still retains model.safetensors.index.json
++        #    after user deleted the redundant .safetensors shards to save disk space.
++        pure_dir = models_root / "Qwen3.8-27B-PureMiv"
++        pure_dir.mkdir()
++        (pure_dir / "config.json").write_text(
++            json.dumps({"model_type": "qwen3_8", "hidden_size": 4096}),
++            encoding="utf-8",
++        )
++        (pure_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
++        (pure_dir / "model.safetensors.index.json").write_text(
++            json.dumps(
++                {
++                    "weight_map": {
++                        "model.embed_tokens.weight": "model-00001-of-00004.safetensors",
++                        "lm_head.weight": "model-00004-of-00004.safetensors",
++                    }
++                }
++            ),
++            encoding="utf-8",
++        )
++        omlxm5_payload = b"OMLXM5A1" + (b"\x00" * 4096)
++        (pure_dir / "model.omlxm5").write_bytes(omlxm5_payload)
++
++        # 2) Pure .omlxm5 HF Hub cache snapshot
++        hf_snap = (
++            models_root
++            / "models--scoltzero--Qwen3.5-9B-miv"
++            / "snapshots"
++            / "abc123456789"
++        )
++        hf_snap.mkdir(parents=True)
++        (models_root / "models--scoltzero--Qwen3.5-9B-miv" / "refs").mkdir()
++        (models_root / "models--scoltzero--Qwen3.5-9B-miv" / "refs" / "main").write_text(
++            "abc123456789\n", encoding="utf-8"
++        )
++        (hf_snap / "config.json").write_text(
++            json.dumps({"model_type": "qwen3_5", "hidden_size": 2048}),
++            encoding="utf-8",
++        )
++        (hf_snap / "model.omlxm5").write_bytes(omlxm5_payload)
++
++        discovered = discover_models(models_root)
++        assert "Qwen3.8-27B-PureMiv" in discovered
++        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "omlxm5"
++        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(omlxm5_payload)
++
++        assert "scoltzero--Qwen3.5-9B-miv" in discovered
++        assert discovered["scoltzero--Qwen3.5-9B-miv"].model_format == "omlxm5"
++
++    def test_can_convert_and_convert_model_to_omlxm5_atomic(
++        self, tmp_path: Path, monkeypatch
++    ):
++        # Fake provider layout with bin/mseries_backendd and tools/m5_artifact.py
++        prov_root = tmp_path / "provider"
++        (prov_root / "bin").mkdir(parents=True)
++        (prov_root / "tools").mkdir(parents=True)
++        fake_bin = prov_root / "bin" / "mseries_backendd"
++        fake_bin.write_text(
++            '#!/bin/sh\necho "mseries-backendd miv-v0.01 (codename=miv semver=0.0.1 core_abi=1) protocol=2"\n',
++            encoding="utf-8",
++        )
++        fake_bin.chmod(0o755)
++        fake_tool = prov_root / "tools" / "m5_artifact.py"
++        fake_tool.write_text(
++            "import pathlib, sys\n"
++            "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
++            "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 128)\n",
++            encoding="utf-8",
++        )
++        monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
++
++        qwen_dir = tmp_path / "Qwen3.5-Unconverted"
++        qwen_dir.mkdir()
++        (qwen_dir / "config.json").write_text(
++            json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
++        )
++        (qwen_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
++
++        ok, reason = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
++        assert ok is True and reason == ""
++
++        res = m5_mod.convert_model_to_omlxm5(
++            qwen_dir, source_repo="Qwen/Qwen3.5-9B", configured_binary=str(fake_bin)
++        )
++        assert res["already_existed"] is False
++        assert (qwen_dir / "model.omlxm5").is_file()
++        assert m5_mod.detect_adapted(qwen_dir).adapted is True
++
++        # Subsequent check reports already adapted (not convertible again)
++        ok_after, _ = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
++        assert ok_after is False
++
 +
 +
 +

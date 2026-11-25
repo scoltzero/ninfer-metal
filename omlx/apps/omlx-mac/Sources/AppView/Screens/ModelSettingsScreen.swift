@@ -1938,6 +1938,7 @@ private struct ExternalEngineRow: View {
     }
 
     private var isGGUF: Bool { vm.model?.isGGUF == true }
+    private var isOMLXM5Only: Bool { vm.model?.isOMLXM5Only == true }
 
     private var draftRepo: String? {
         let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
@@ -1990,6 +1991,11 @@ private struct ExternalEngineRow: View {
                           defaultValue: "Using Stock MLX (auto-route overridden)",
                           comment: "Hint shown when an adapted model is overridden back to Stock MLX")
         }
+        if isOMLXM5Only {
+            return String(localized: "settings.advanced.external_engine.omlxm5_only",
+                          defaultValue: "Pure .omlxm5 models run on a Metal 4 microkernel only.",
+                          comment: "Sublabel for the external engine toggle of a pure .omlxm5 model without Stock MLX .safetensors weights")
+        }
         if vm.isAutoRoutedExternalEngine {
             let autoName = vm.externalEngineDisplayName(for: vm.autoExternalEngine)
             return String(localized: "settings.advanced.external_engine.auto_routed",
@@ -2029,6 +2035,26 @@ private struct ExternalEngineRow: View {
                     .disabled(draftStarted)
                     .help(draftError ?? "")
                 }
+                if vm.canConvertOMLXM5 || vm.isConvertingOMLXM5 {
+                    Button {
+                        Task { await vm.convertModelToOMLXM5(client: client) }
+                    } label: {
+                        HStack(spacing: 5) {
+                            if vm.isConvertingOMLXM5 {
+                                ProgressView().controlSize(.mini)
+                                Text(String(localized: "settings.advanced.external_engine.converting_omlxm5",
+                                            defaultValue: "Converting…",
+                                            comment: "Button label while converting .safetensors weights to .omlxm5"))
+                            } else {
+                                Text(String(localized: "settings.advanced.external_engine.convert_omlxm5",
+                                            defaultValue: "Convert to .omlxm5",
+                                            comment: "Button that converts .safetensors weights to .omlxm5 for miv Core Backend"))
+                            }
+                        }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(vm.isConvertingOMLXM5)
+                }
                 if !vm.effectiveExternalEngine.isEmpty {
                     Popup(selection: popupSelection,
                           width: .controlMedium,
@@ -2041,7 +2067,7 @@ private struct ExternalEngineRow: View {
                         save()
                     }
                 ))
-                .disabled(isGGUF || (vm.effectiveExternalEngine.isEmpty && vm.autoExternalEngine.isEmpty && usableEngine == nil))
+                .disabled(isGGUF || isOMLXM5Only || (vm.effectiveExternalEngine.isEmpty && vm.autoExternalEngine.isEmpty && usableEngine == nil))
             }
         }
     }

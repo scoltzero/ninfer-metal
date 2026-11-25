@@ -243,6 +243,7 @@ final class ModelSettingsScreenVM {
     var modelID: String = ""
     var lastError: String?
     var isImportingMtplxSidecar: Bool = false
+    var isConvertingOMLXM5: Bool = false
 
     // Basic
     var alias: String = ""
@@ -1627,6 +1628,23 @@ final class ModelSettingsScreenVM {
         do {
             _ = try await client.importMtplxSidecar(id: modelID)
             await load(modelID: modelID, client: client, preservingEdits: true)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    var canConvertOMLXM5: Bool {
+        model?.externalEngines?.contains(where: { !$0.compatible && $0.canConvert == true }) == true
+    }
+
+    func convertModelToOMLXM5(client: OMLXClient) async {
+        guard !isConvertingOMLXM5, canConvertOMLXM5 else { return }
+        isConvertingOMLXM5 = true
+        defer { isConvertingOMLXM5 = false }
+
+        do {
+            _ = try await client.convertModelToOMLXM5(id: modelID)
+            await load(modelID: modelID, client: client, preservingEdits: false)
         } catch {
             lastError = error.omlxDescription
         }

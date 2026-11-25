@@ -51,6 +51,8 @@ from ..engine.m5_sidecar import (
     M5RT_ENGINE_LABEL,
     M5RT_PROVIDER_ID,
     apply_m5rt_model_settings_update,
+    can_convert_to_omlxm5,
+    convert_model_to_omlxm5,
     discover_external_engine_plugins,
     external_engine_dflash_compatibility,
     external_engine_mtp_compatibility,
@@ -1182,6 +1184,18 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
             "reason": reason,
             "draft_repo": draft_repo,
         }
+        if engine_id == M5RT_ENGINE_ID and not compatible:
+            m5rt_cfg_path = (
+                global_settings.integrations.m5rt_path if global_settings else None
+            )
+            can_conv, _ = can_convert_to_omlxm5(
+                model_info.get("model_path") or "", m5rt_cfg_path, settings
+            )
+            if can_conv:
+                row["can_convert"] = True
+                row["reason"] = (
+                    "Convert weights to .omlxm5 to run this model on miv Core Backend."
+                )
         supported = list(get_external_engine_supported_settings(engine_id))
         if supported:
             row["supported_standard_settings"] = supported
@@ -3202,6 +3216,55 @@ async def import_mtplx(
     return {"status": "ok", "model_id": model_id, **result}
 
 
+@router.post("/api/models/{model_id}/convert-omlxm5")
+async def convert_model_omlxm5(
+    model_id: str,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Convert a supported Qwen `.safetensors` checkpoint to `model.omlxm5` for `miv`."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    global_settings = _get_global_settings() if _get_global_settings else None
+    m5rt_cfg_path = global_settings.integrations.m5rt_path if global_settings else None
+    settings_mgr = _get_model_settings_manager() if _get_model_settings_manager else None
+    model_settings = (
+        settings_mgr.get_settings(model_id) if settings_mgr is not None else None
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            convert_model_to_omlxm5,
+            entry.model_path,
+            source_repo=getattr(entry, "source_repo_id", None) or model_id,
+            configured_binary=m5rt_cfg_path,
+            model_settings=model_settings,
+            nax_pretile=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Clear any prior Stock MLX override so auto-routing to miv Core Backend activates immediately.
+    if (
+        settings_mgr is not None
+        and model_settings is not None
+        and getattr(model_settings, "external_engine", None) == "stock"
+    ):
+        model_settings.external_engine = None
+        save_fn = getattr(settings_mgr, "save_settings", None)
+        if callable(save_fn):
+            save_fn(model_id, model_settings)
+
+    logger.info("Converted model '%s' to .omlxm5 (%s)", model_id, result.get("artifact_path"))
+    if getattr(entry, "engine", None) is not None:
+        result["message"] = "Converted to .omlxm5. Reload the model to switch to miv Core Backend."
+    return {"status": "ok", "model_id": model_id, **result}
+
+
 @router.post("/api/reload")
 async def reload_models(is_admin: bool = Depends(require_admin)):
     """Reload models: re-read model settings, re-discover models, preload pinned."""
@@ -3647,6 +3710,11 @@ async def update_model_settings(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "external_engine" in sent:
         engine_id = None if is_diffusion_model else request.external_engine or None
+        if engine_id == "stock" and getattr(entry, "model_format", None) == "omlxm5":
+            raise HTTPException(
+                status_code=400,
+                detail="Pure .omlxm5 models have no Stock MLX .safetensors weights on disk.",
+            )
         # Check only a change: a client may resend the stored value, and a
         # launcher or draft removed later must not block other fields.
         if (

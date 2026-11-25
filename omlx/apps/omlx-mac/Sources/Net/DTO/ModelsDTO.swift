@@ -116,6 +116,7 @@ extension ModelDTO {
 
     var isInHFCache: Bool { sourceType == "hf_cache" }
     var isGGUF: Bool { modelFormat == "gguf" }
+    var isOMLXM5Only: Bool { modelFormat == "omlxm5" }
 
     /// Localized display name for a given engine ID, translating built-in `m5rt`
     /// while preserving manifest display names for Path B providers and Splash.
@@ -234,6 +235,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let reason: String?
     /// Hugging Face repo of the draft the engine lacks, when one provides it.
     var draftRepo: String? = nil
+    /// True when `.safetensors` weights can be converted in-place to `.omlxm5` for this engine.
+    var canConvert: Bool? = nil
     /// Standard `ModelSettings` keys honored when this engine serves the model.
     var supportedStandardSettings: [String]? = nil
 }

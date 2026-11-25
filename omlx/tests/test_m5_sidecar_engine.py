@@ -2653,4 +2653,105 @@ class TestPathBMultiMicrokernelSidecars:
         assert m5_mod.discover_ninfer_metal_toml_path() == custom_toml
 
 
+class TestMix1PureOmlxm5DiscoveryAndConversion:
+    def test_pure_omlxm5_discovery_with_stale_index_and_hf_cache(self, tmp_path: Path):
+        from omlx.model_discovery import discover_models
+
+        models_root = tmp_path / "models"
+        models_root.mkdir()
+
+        # 1) Pure .omlxm5 local folder that still retains model.safetensors.index.json
+        #    after user deleted the redundant .safetensors shards to save disk space.
+        pure_dir = models_root / "Qwen3.8-27B-PureMiv"
+        pure_dir.mkdir()
+        (pure_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_8", "hidden_size": 4096}),
+            encoding="utf-8",
+        )
+        (pure_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        (pure_dir / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "model.embed_tokens.weight": "model-00001-of-00004.safetensors",
+                        "lm_head.weight": "model-00004-of-00004.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        omlxm5_payload = b"OMLXM5A1" + (b"\x00" * 4096)
+        (pure_dir / "model.omlxm5").write_bytes(omlxm5_payload)
+
+        # 2) Pure .omlxm5 HF Hub cache snapshot
+        hf_snap = (
+            models_root
+            / "models--scoltzero--Qwen3.5-9B-miv"
+            / "snapshots"
+            / "abc123456789"
+        )
+        hf_snap.mkdir(parents=True)
+        (models_root / "models--scoltzero--Qwen3.5-9B-miv" / "refs").mkdir()
+        (models_root / "models--scoltzero--Qwen3.5-9B-miv" / "refs" / "main").write_text(
+            "abc123456789\n", encoding="utf-8"
+        )
+        (hf_snap / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5", "hidden_size": 2048}),
+            encoding="utf-8",
+        )
+        (hf_snap / "model.omlxm5").write_bytes(omlxm5_payload)
+
+        discovered = discover_models(models_root)
+        assert "Qwen3.8-27B-PureMiv" in discovered
+        assert discovered["Qwen3.8-27B-PureMiv"].model_format == "omlxm5"
+        assert discovered["Qwen3.8-27B-PureMiv"].estimated_size >= len(omlxm5_payload)
+
+        assert "scoltzero--Qwen3.5-9B-miv" in discovered
+        assert discovered["scoltzero--Qwen3.5-9B-miv"].model_format == "omlxm5"
+
+    def test_can_convert_and_convert_model_to_omlxm5_atomic(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # Fake provider layout with bin/mseries_backendd and tools/m5_artifact.py
+        prov_root = tmp_path / "provider"
+        (prov_root / "bin").mkdir(parents=True)
+        (prov_root / "tools").mkdir(parents=True)
+        fake_bin = prov_root / "bin" / "mseries_backendd"
+        fake_bin.write_text(
+            '#!/bin/sh\necho "mseries-backendd miv-v0.01 (codename=miv semver=0.0.1 core_abi=1) protocol=2"\n',
+            encoding="utf-8",
+        )
+        fake_bin.chmod(0o755)
+        fake_tool = prov_root / "tools" / "m5_artifact.py"
+        fake_tool.write_text(
+            "import pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 128)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
+
+        qwen_dir = tmp_path / "Qwen3.5-Unconverted"
+        qwen_dir.mkdir()
+        (qwen_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
+        )
+        (qwen_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+
+        ok, reason = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
+        assert ok is True and reason == ""
+
+        res = m5_mod.convert_model_to_omlxm5(
+            qwen_dir, source_repo="Qwen/Qwen3.5-9B", configured_binary=str(fake_bin)
+        )
+        assert res["already_existed"] is False
+        assert (qwen_dir / "model.omlxm5").is_file()
+        assert m5_mod.detect_adapted(qwen_dir).adapted is True
+
+        # Subsequent check reports already adapted (not convertible again)
+        ok_after, _ = m5_mod.can_convert_to_omlxm5(qwen_dir, str(fake_bin))
+        assert ok_after is False
+
+
+
 

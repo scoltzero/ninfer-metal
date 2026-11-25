@@ -332,6 +332,7 @@
             savingModelSettings: false,
             settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
+            convertingOmlxm5: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
             loraAdapters: [],
@@ -4848,6 +4849,36 @@
 
             isGgufModel() {
                 return this.modelSettings.model_format === 'gguf';
+            },
+
+            isOmlxm5OnlyModel() {
+                return this.modelSettings.model_format === 'omlxm5';
+            },
+
+            canConvertOmlxm5() {
+                const engines = this.modelSettings.external_engines || [];
+                return engines.some(e => !e.compatible && e.can_convert);
+            },
+
+            async convertModelOmlxm5() {
+                if (!this.selectedModel || this.convertingOmlxm5) return;
+                this.convertingOmlxm5 = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/convert-omlxm5`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || 'Failed to convert model to .omlxm5');
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    await this.loadModels();
+                    const updated = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (updated) this.openModelSettings(updated);
+                } finally {
+                    this.convertingOmlxm5 = false;
+                }
             },
 
             // A GGUF (or auto-routed adapted model) runs on an external engine even when settings pick none.

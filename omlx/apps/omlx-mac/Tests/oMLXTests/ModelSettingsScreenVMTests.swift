@@ -1035,6 +1035,51 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(vm.isAutoRoutedExternalEngine)
         XCTAssertEqual(vm.headerEngineId, "llama-metal")
     }
+
+    func testCanConvertOMLXM5AndPureOMLXM5Detection() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let convertibleJSON = Data(#"""
+        {
+          "id": "Qwen3.5-9B",
+          "loaded": false,
+          "is_loading": false,
+          "estimated_size": 1000,
+          "config_model_type": "qwen3_5",
+          "external_engines": [
+            {
+              "id": "m5rt",
+              "label": "miv Core Backend",
+              "compatible": false,
+              "can_convert": true,
+              "reason": "Convert weights to .omlxm5 to run this model on miv Core Backend."
+            }
+          ]
+        }
+        """#.utf8)
+        let convertibleModel = try decoder.decode(ModelDTO.self, from: convertibleJSON)
+        let vm = ModelSettingsScreenVM()
+        vm.model = convertibleModel
+        vm.modelID = convertibleModel.id
+        XCTAssertTrue(vm.canConvertOMLXM5)
+        XCTAssertFalse(convertibleModel.isOMLXM5Only)
+
+        let pureJSON = Data(#"""
+        {
+          "id": "Qwen3.8-PureMiv",
+          "loaded": false,
+          "is_loading": false,
+          "estimated_size": 2000,
+          "config_model_type": "qwen3_8",
+          "model_format": "omlxm5",
+          "auto_external_engine": "m5rt"
+        }
+        """#.utf8)
+        let pureModel = try decoder.decode(ModelDTO.self, from: pureJSON)
+        XCTAssertTrue(pureModel.isOMLXM5Only)
+        XCTAssertEqual(pureModel.resolvedEngineId, "m5rt")
+    }
 }
 
 /// Serves one model with Lightning MTP on and rejects its settings writes
