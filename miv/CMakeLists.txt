@@ -2809,6 +2809,16 @@ target_include_directories(
 target_compile_features(omlx_m5_ane_dual_offload PUBLIC cxx_std_20)
 target_compile_options(
   omlx_m5_ane_dual_offload
+# Module 5: Full-Matrix Prefill / PPL / Logits Benchmark Helper
+add_executable(
+  omlx_m5_prefill_matrix_bench
+  apps/prefill_matrix_bench.cpp)
+target_include_directories(
+  omlx_m5_prefill_matrix_bench
+  SYSTEM PRIVATE
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(
+  omlx_m5_prefill_matrix_bench
   PRIVATE
   -Wall
   -Wextra
@@ -2816,6 +2826,7 @@ target_compile_options(
   -Werror)
 target_link_libraries(
   omlx_m5_prefill_switches_spi_tests
+  omlx_m5_prefill_matrix_bench
   PRIVATE
   omlx_m5_serve_lib
   omlx_m5_core_runtime)
@@ -2962,3 +2973,5 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       $<TARGET_FILE:omlx_m5_cache_blend_hybrid_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
 endif()
+  omlx_m5_prefill_matrix_bench
+  omlx_m5_qwen_forward_resources)
