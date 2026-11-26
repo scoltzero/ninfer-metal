@@ -2789,6 +2789,26 @@ target_include_directories(
   ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
 target_compile_options(
   omlx_m5_prefill_switches_spi_tests
+# Module 4b: Native Dual-ANE Fixed-Chunk Output-Channel-Split Co-Execution Engine
+omlx_m5_compile_metallib(
+  omlx_m5_ane_pack_unpack_metallib
+  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ane_pack_unpack.metal"
+  "omlx_m5_ane_pack_unpack.metallib"
+  "15.0")
+
+add_library(
+  omlx_m5_ane_dual_offload
+  STATIC
+  src/ane/ane_dual_offload.mm)
+target_include_directories(
+  omlx_m5_ane_dual_offload
+  PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  PRIVATE
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_features(omlx_m5_ane_dual_offload PUBLIC cxx_std_20)
+target_compile_options(
+  omlx_m5_ane_dual_offload
   PRIVATE
   -Wall
   -Wextra
@@ -2849,3 +2869,48 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       "${OMLX_M5_METAL_OUTPUT_DIR}")
   endif()
 endif()
+  -Werror
+  "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+target_link_libraries(
+  omlx_m5_ane_dual_offload
+  PUBLIC
+  omlx_m5_core_runtime
+  "-framework IOSurface"
+  "-framework CoreFoundation"
+  "-framework Foundation"
+  "-framework IOKit"
+  "-framework Metal")
+add_dependencies(
+  omlx_m5_ane_dual_offload
+  omlx_m5_ane_pack_unpack_metallib)
+
+add_executable(
+  omlx_m5_ane_dual_offload_tests
+  tests/ane_dual_offload_tests.mm)
+target_include_directories(
+  omlx_m5_ane_dual_offload_tests
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_features(omlx_m5_ane_dual_offload_tests PRIVATE cxx_std_20)
+target_compile_options(
+  omlx_m5_ane_dual_offload_tests
+  PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror
+  "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+target_link_libraries(
+  omlx_m5_ane_dual_offload_tests
+  PRIVATE
+  omlx_m5_ane_dual_offload
+  omlx_m5_core_runtime)
+add_dependencies(
+  omlx_m5_ane_dual_offload_tests
+  omlx_m5_ane_pack_unpack_metallib)
+add_test(
+  NAME omlx_m5_ane_dual_offload
+  COMMAND
+    $<TARGET_FILE:omlx_m5_ane_dual_offload_tests>
+    "${OMLX_M5_METAL_OUTPUT_DIR}")
