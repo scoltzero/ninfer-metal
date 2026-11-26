@@ -16,6 +16,7 @@ import json
 import shutil
 import stat
 import subprocess
+import tomllib
 import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,23 +73,6 @@ FORBIDDEN_DYLIB_PREFIXES = (
     "/Applications/Xcode",
     "/Users/",
 )
-
-PROVIDER_CAPABILITIES = [
-    "ar",
-    "mtp",
-    "dflash2",
-    "kv_affine4_g128",
-    "rolling_prefix_cache",
-    "trim_cache",
-    "memory_budget_bytes",
-    "set_scheduler_hint",
-    "cancel",
-    "stats",
-    "capacity",
-    "subscribe_events",
-]
-
-PROVIDER_KV_FORMATS = ["bf16", "affine4_g128"]
 
 PROVIDER_SUPPORTED_TOPOLOGIES = [
     "qwen35_hybrid_dense_v1",
@@ -163,69 +147,6 @@ PROVIDER_CONVERTER = {
     "default_args": ["--nax-pretile"],
     "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
 }
-
-SUPPORTED_STANDARD_SETTINGS = [
-    "max_context_window",
-    "mtp_enabled",
-    "mtp_adaptive_max_depth",
-    "mtp_fixed_depth",
-    "dflash_enabled",
-    "dflash_draft_model",
-    "dflash_block_size",
-    "turboquant_kv_enabled",
-    "turboquant_kv_scheme",
-]
-
-PROVIDER_OPTIONS_SCHEMA = [
-    {
-        "key": "max_concurrency",
-        "label": "Concurrency (B/C)",
-        "type": "int",
-        "min": 1,
-        "max": 8,
-        "default": 1,
-        "reload_required": True,
-    },
-    {
-        "key": "rolling_prefix_cache",
-        "label": "Rolling Prefix Cache",
-        "type": "bool",
-        "default": True,
-        "reload_required": True,
-    },
-    {
-        "key": "prefix_cache_gb",
-        "label": "Prefix Cache Budget (GiB)",
-        "type": "bytes_gb",
-        "min": 0,
-        "max": 128,
-        "default": 4,
-        "reload_required": True,
-    },
-    {
-        "key": "sampling_contract",
-        "label": "Sampling Contract",
-        "type": "enum",
-        "options": ["position_coupled_v1", "legacy_rejection_v1"],
-        "default": "legacy_rejection_v1",
-        "reload_required": True,
-    },
-    {
-        "key": "artifact_path",
-        "label": "Artifact Path",
-        "type": "string",
-        "default": "",
-        "reload_required": True,
-    },
-    {
-        "key": "draft_artifact_path",
-        "label": "Draft Artifact Path",
-        "type": "string",
-        "default": "",
-        "reload_required": True,
-    },
-]
-
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -673,6 +594,17 @@ def main() -> int:
             args.evidence_summary.read_text(encoding="utf-8")
         )
 
+    try:
+        contract = json.loads(run_text([str(stage_dir / "bin" / "mseries_backendd"), "--describe"]))
+    except (subprocess.SubprocessError, ValueError) as exc:
+        raise SystemExit(f"Unable to read the packaged miv daemon's provider contract: {exc}")
+    default_config = tomllib.loads(default_cfg_src.read_text(encoding="utf-8"))
+    for key in ("max_concurrency", "kv_dtype", "sampling_contract"):
+        if default_config["engine"].get(key) != contract["load_defaults"][key]:
+            raise SystemExit(f"Default TOML and miv daemon disagree on {key}")
+    if default_config["speculative"].get("draft_tokens") != contract["load_defaults"]["draft_tokens"]:
+        raise SystemExit("Default TOML and miv daemon disagree on draft_tokens")
+
     provider_manifest: dict[str, Any] = {
         "schema": "ninfer-metal-provider-v1",
         "provider_id": "io.ninfer.metal",
@@ -701,10 +633,10 @@ def main() -> int:
         "supported_dflash2_models": PROVIDER_SUPPORTED_DFLASH2_MODELS,
         "artifact_extensions": PROVIDER_ARTIFACT_EXTENSIONS,
         "converter": PROVIDER_CONVERTER,
-        "capabilities": PROVIDER_CAPABILITIES,
-        "kv_formats": PROVIDER_KV_FORMATS,
-        "supported_standard_settings": SUPPORTED_STANDARD_SETTINGS,
-        "options_schema": PROVIDER_OPTIONS_SCHEMA,
+        **{key: contract[key] for key in (
+            "capabilities", "kv_formats", "supported_standard_settings", "options_schema",
+            "speculative_limits", "load_defaults",
+        )},
         "built_at_utc": built_at_utc,
         "git_commit": git_commit,
     }

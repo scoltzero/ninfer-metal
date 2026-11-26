@@ -95,7 +95,7 @@ python3 miv/tools/m5_artifact.py convert \
 
 ### 1-Click Launch (Shared Zero-Edit Config)
 
-Start `ninfer-metal-serve` right away without hand-writing a config file. The launcher script auto-discovers `ninfer-metal-serve` and loads [`omlx-extend/config/ninfer-metal.toml`](../omlx-extend/config/ninfer-metal.toml) — the exact same default file reused by `oMLX-extend` (`max_concurrency = 4`, `max_context = 65536`, `kv_dtype = "affine4_g128"`, `rolling_prefix_cache = true`, `prefix_cache_gb = 4.0`, `speculative.backend = "auto"`, `providers_dir = ["~/Library/Application Support/oMLX/Providers"]`):
+Start `ninfer-metal-serve` right away without hand-writing a config file. The launcher script auto-discovers `ninfer-metal-serve` and loads [`omlx-extend/config/ninfer-metal.toml`](../omlx-extend/config/ninfer-metal.toml) — the exact same default file reused by `oMLX-extend` (`max_concurrency = 1`, `max_context = 65536`, `kv_dtype = "bf16"`, `rolling_prefix_cache = true`, `prefix_cache_gb = 4.0`, `speculative.backend = "auto"`, `providers_dir = ["~/Library/Application Support/oMLX/Providers"]`):
 
 ```bash
 # 1-click launch with a specific model directory (default port 8080, separate from oMLX port 8000)
@@ -200,7 +200,7 @@ Optional Bearer auth (`--api-key`) returns `401` on mismatch; CORS preflight (`O
 
 ### `ninfer-metal-serve` CLI Flags
 
-When `--config` is omitted, `ninfer-metal-serve` auto-loads [`omlx-extend/config/ninfer-metal.toml`](../omlx-extend/config/ninfer-metal.toml) (`max_concurrency = 4`, `max_context = 65536`, `kv_dtype = "affine4_g128"`, `rolling_prefix_cache = true`, `prefix_cache_gb = 4.0`, `speculative.backend = "auto"`). Pass `--no-default-config` to start from the bare compiled defaults listed below; see [`ninfer-metal.toml.example`](../omlx-extend/config/ninfer-metal.toml.example) for the full commented reference.
+When `--config` is omitted, `ninfer-metal-serve` auto-loads [`omlx-extend/config/ninfer-metal.toml`](../omlx-extend/config/ninfer-metal.toml) (`max_concurrency = 1`, `max_context = 65536`, `kv_dtype = "bf16"`, `rolling_prefix_cache = true`, `prefix_cache_gb = 4.0`, `speculative.backend = "auto"`). Pass `--no-default-config` to start from the bare compiled defaults listed below; see [`ninfer-metal.toml.example`](../omlx-extend/config/ninfer-metal.toml.example) for the full commented reference.
 
 | Flag | Bare CLI Default / Values | Description |
 |---|---|---|
@@ -225,7 +225,7 @@ When `--config` is omitted, `ninfer-metal-serve` auto-loads [`omlx-extend/config
 | `--draft-tokens N` | `0` (auto; `1..7` explicit) | Draft tokens per verify round |
 | `--rolling-prefix-cache on\|off` | unset (engine default) | Enable/disable multi-turn rolling UMA prefix reuse with `1×` ancestor supersede |
 | `--prefix-cache-gb FLOAT` | unset (`0..128`) | Prefix cache and UMA checkpoint pool budget (GiB) |
-| `--sampling-contract NAME` | `legacy_rejection_v1` | Speculative verification sampling contract (`legacy_rejection_v1` \| `position_coupled_v1`) |
+| `--sampling-contract NAME` | `position_coupled_v1` | Speculative verification sampling contract (`legacy_rejection_v1` \| `position_coupled_v1`) |
 | `--version`, `--help` (`-h`) | — | Print structured version string or usage summary |
 
 ---

@@ -1416,17 +1416,24 @@ class EnginePool:
                 resolved_ext_engine = live_ext_id
         if resolved_ext_engine == M5RT_ENGINE_ID:
             gs = _safe_global_settings()
-            add(
-                "m5rt_signature",
-                m5rt_runtime_signature(
-                    settings,
-                    gs.integrations.m5rt_path,
-                    global_settings=gs,
-                    lora_adapters=self._lora_adapters,
-                    model_path=entry.model_path if entry else None,
-                    model_dirs=self._model_dirs,
-                ),
-            )
+            try:
+                target, reason = self.m5rt_target(model_id, settings) if entry else (None, "")
+                if target is None and reason:
+                    add("m5rt_plan_error", reason)
+                add(
+                    "m5rt_signature",
+                    m5rt_runtime_signature(
+                        settings, gs.integrations.m5rt_path, global_settings=gs,
+                        lora_adapters=self._lora_adapters,
+                        model_path=entry.model_path if entry else None,
+                        model_dirs=self._model_dirs, model_id=model_id, target=target,
+                        default_context=self._splash_sizing_context(entry, settings) if entry else None,
+                    ),
+                )
+            except (ValueError, OSError) as exc:
+                # Invalid stored options must still be editable in the admin UI.
+                add("m5rt_plan_error", str(exc))
+            return tuple(signature)
         elif resolved_ext_engine and resolved_ext_engine != "splash":
             plugin = get_external_engine_plugin(str(resolved_ext_engine))
             if plugin is not None and callable(plugin.runtime_signature):
@@ -2392,6 +2399,7 @@ class EnginePool:
             gs.integrations.m5rt_path,
             model_settings,
             self._splash_draft_candidates(model_settings),
+            model_id=model_id,
         )
 
     def external_engine_compatibility(

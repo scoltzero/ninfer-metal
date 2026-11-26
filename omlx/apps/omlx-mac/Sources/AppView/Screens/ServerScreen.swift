@@ -505,7 +505,8 @@ private struct ServerDefaultProfileEditor: View {
                                   comment: "Row label for the max tokens field"),
                     sublabel: String(localized: "server.profile.max_tokens.sub",
                                      defaultValue: "Server-wide cap on generated tokens.",
-                                     comment: "Sublabel for the max tokens field")) {
+                                     comment: "Sublabel for the max tokens field"),
+                    mivSetting: true) {
                     TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.temperature",
@@ -513,7 +514,8 @@ private struct ServerDefaultProfileEditor: View {
                                   comment: "Row label for the temperature field"),
                     sublabel: String(localized: "server.profile.temperature.sub",
                                      defaultValue: "Sampling randomness (0–2).",
-                                     comment: "Sublabel for the temperature field")) {
+                                     comment: "Sublabel for the temperature field"),
+                    mivSetting: true) {
                     TextInput(text: $vm.samplingTemperatureText, placeholder: "0.7", mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.top_p",
@@ -521,7 +523,8 @@ private struct ServerDefaultProfileEditor: View {
                                   comment: "Row label for the Top P field"),
                     sublabel: String(localized: "server.profile.top_p.sub",
                                      defaultValue: "Nucleus sampling cutoff (0–1).",
-                                     comment: "Sublabel for the Top P field")) {
+                                     comment: "Sublabel for the Top P field"),
+                    mivSetting: true) {
                     TextInput(text: $vm.samplingTopPText, mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.top_k",
@@ -529,7 +532,8 @@ private struct ServerDefaultProfileEditor: View {
                                   comment: "Row label for the Top K field"),
                     sublabel: String(localized: "server.profile.top_k.sub",
                                      defaultValue: "Limit candidates to top K. 0 = disabled.",
-                                     comment: "Sublabel for the Top K field")) {
+                                     comment: "Sublabel for the Top K field"),
+                    mivSetting: true) {
                     TextInput(text: $vm.samplingTopKText, mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.repetition_penalty",

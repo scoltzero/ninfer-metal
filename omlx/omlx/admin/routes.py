@@ -64,6 +64,8 @@ from ..engine.m5_sidecar import (
     external_engine_mtp_compatibility,
     find_m5rt_binary,
     get_external_engine_options_schema,
+    M5RT_MAX_DRAFT_TOKENS,
+    M5RT_REQUEST_SETTINGS,
     get_external_engine_plugin,
     get_external_engine_supported_settings,
     get_external_engines,
@@ -560,6 +562,7 @@ class ModelSettingsRequest(BaseModel):
     # External engine (omlx/engine/splash.py, omlx/engine/m5_sidecar.py); null runs in-process
     external_engine: str | None = None
     external_engine_options: dict[str, Any] | None = None
+    external_engine_options_patch: dict[str, dict[str, Any]] | None = None
     m5rt_artifact_path: str | None = None
     m5rt_draft_artifact_path: str | None = None
     m5rt_options: dict[str, Any] | None = None
@@ -1258,6 +1261,9 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
             row["options_schema"] = schema
         if engine_id == M5RT_ENGINE_ID:
             row["provider_id"] = M5RT_PROVIDER_ID
+            row["request_settings"] = list(M5RT_REQUEST_SETTINGS)
+            row["kv_formats"] = ["bf16", "affine4_g128"]
+            row["speculative_limits"] = M5RT_MAX_DRAFT_TOKENS
         elif engine_id in plugins and getattr(plugins[engine_id], "provider_id", None):
             row["provider_id"] = plugins[engine_id].provider_id
         rows.append(row)
@@ -1742,8 +1748,7 @@ async def _apply_cache_settings_runtime(
     """
     Apply cache settings at runtime.
 
-    Updates the scheduler_config and unloads all models so they
-    will use the new cache settings when reloaded.
+    Update the scheduler template and drain the engines that use it.
 
     Returns:
         Tuple of (success, message)
@@ -1814,15 +1819,23 @@ async def _apply_cache_settings_runtime(
     if hasattr(pool, "configure_hot_cache_budget"):
         pool.configure_hot_cache_budget()
 
-    # Unload all loaded models so they use new config when reloaded
-    loaded_models = pool.get_loaded_model_ids()
-    for model_id in loaded_models:
+    unloaded = deferred = 0
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool.get_entry(model_id)
+        engine = entry.engine if entry is not None else None
+        if engine is None or not getattr(
+            type(engine), "consumes_stock_cache", not is_external_process_engine(engine)
+        ):
+            continue
         try:
-            await pool._unload_engine(model_id)
+            if await pool.request_unload(model_id, reason="cache settings changed", abort_active=False):
+                unloaded += 1
+            else:
+                deferred += 1
         except Exception as e:
-            logger.warning(f"Error unloading {model_id}: {e}")
+            logger.warning("Error updating cache settings for %s: %s", model_id, e)
 
-    return True, f"Cache settings updated. Unloaded {len(loaded_models)} models."
+    return True, f"Cache settings updated. Unloaded {unloaded} models. Waiting for {deferred} busy models."
 
 
 def _apply_sampling_settings_runtime(
@@ -2901,8 +2914,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             configured_m5rt_binary=_configured_m5rt_path(global_settings),
         )
 
+        engine_entry = engine_pool.get_entry(model_id)
+        effective_miv = getattr(getattr(engine_entry, "engine", None), "effective_load_settings", None)
         model_data = {
             "id": model_id,
+            "miv_effective_settings": effective_miv() if callable(effective_miv) else None,
             "model_path": model_info.get("model_path", ""),
             "display_name": _model_display_name(
                 model_id,
@@ -3473,6 +3489,7 @@ async def update_model_settings(
         model_id, current_settings
     )
     prev_lora_adapter = current_settings.lora_adapter
+    prev_spec_toggles = (current_settings.mtp_enabled, current_settings.dflash_enabled)
     prev_ext_options = copy.deepcopy(current_settings.external_engine_options)
     prev_m5rt_options = copy.deepcopy(current_settings.m5rt_options)
     is_diffusion_model = _entry_is_diffusion_model(entry)
@@ -3637,14 +3654,11 @@ async def update_model_settings(
         if name not in sent:
             continue
         value = getattr(request, name)
-        if value is not None and not 1 <= value <= MAX_LIGHTNING_MTP_DRAFT_TOKENS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{name} must be between 1 and "
-                    f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS} (or null)."
-                ),
-            )
+        maximum = MAX_LIGHTNING_MTP_DRAFT_TOKENS
+        if engine_pool.external_engine_id(model_id, current_settings) == M5RT_ENGINE_ID:
+            maximum = M5RT_MAX_DRAFT_TOKENS["mtp"]
+        if value is not None and not 1 <= value <= maximum:
+            raise HTTPException(status_code=400, detail=f"{name} must be between 1 and {maximum} (or null).")
         setattr(current_settings, name, value)
     if "preserve_thinking" in sent:
         current_settings.preserve_thinking = request.preserve_thinking
@@ -3945,6 +3959,10 @@ async def update_model_settings(
         )
     if "dflash_block_size" in sent:
         value = request.dflash_block_size
+        if active_ext_engine == M5RT_ENGINE_ID and value not in (None, 0):
+            maximum = M5RT_MAX_DRAFT_TOKENS["dflash2"] + 1
+            if not 2 <= value <= maximum:
+                raise HTTPException(status_code=400, detail=f"miv DFlash2 block size must be in [2, {maximum}]")
         current_settings.dflash_block_size = (
             int(value) if value is not None and value > 0 else None
         )
@@ -3986,6 +4004,28 @@ async def update_model_settings(
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+    if active_ext_engine == M5RT_ENGINE_ID:
+        selected = (current_settings.mtp_enabled, current_settings.dflash_enabled)
+        if selected != prev_spec_toggles:
+            explicit_policy = False
+            for field_name in ("m5rt_options", "external_engine_options", "external_engine_options_patch"):
+                data = getattr(request, field_name, None)
+                if field_name not in sent or not isinstance(data, dict):
+                    continue
+                candidates = [data] if field_name == "m5rt_options" else [
+                    value for key, value in data.items()
+                    if canonical_external_engine_id(key) == M5RT_ENGINE_ID and isinstance(value, dict)
+                ]
+                if any({"speculative_backend", "spec_backend"} & opts.keys() for opts in candidates):
+                    explicit_policy = True
+                    break
+            if not explicit_policy:
+                policy = "mtp" if selected[0] else "dflash2" if selected[1] else "none"
+                opts = dict(current_settings.m5rt_options or {})
+                opts.pop("spec_backend", None)
+                opts["speculative_backend"] = policy
+                current_settings.m5rt_options = opts
+
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -4174,28 +4214,20 @@ async def update_model_settings(
     )
     lora_changed = prev_lora_adapter != current_settings.lora_adapter
 
-    # Auto-unload (and re-load if pinned) when a setting that only takes
-    # effect at engine construction time is changed on a loaded model.
+    # For miv, only changes to the resolved load plan make the process stale.
+    stock_load_fields = {
+        "index_cache_freq", "dflash_enabled", "dflash_draft_model",
+        "dflash_draft_quant_enabled", "dflash_draft_quant_weight_bits",
+        "dflash_draft_quant_group_size", "dflash_draft_window_size",
+        "dflash_block_size", "dflash_verify_mode", "trust_remote_code",
+    }
     requires_reload = entry.engine is not None and (
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
-        # Runtime-signature fields are engine-construction settings. This
-        # catches Qwen ANE controls (and future signature additions) without
-        # requiring a second hand-maintained field list here.
         or prev_load_signature != current_load_signature
-        or lora_changed
-        or ext_options_changed
-        or "index_cache_freq" in sent
-        or "dflash_enabled" in sent
-        or "dflash_draft_model" in sent
-        or "dflash_draft_quant_enabled" in sent
-        or "dflash_draft_quant_weight_bits" in sent
-        or "dflash_draft_quant_group_size" in sent
-        or "dflash_draft_window_size" in sent
-        or "dflash_block_size" in sent
-        or "dflash_verify_mode" in sent
-        # trust_remote_code is plumbed at model load time; toggling it on
-        # an already-loaded engine has no effect until reload.
-        or "trust_remote_code" in sent
+        or (
+            active_ext_engine != M5RT_ENGINE_ID
+            and (lora_changed or ext_options_changed or bool(stock_load_fields & sent))
+        )
     )
     auto_unloaded = False
     auto_reloaded = False

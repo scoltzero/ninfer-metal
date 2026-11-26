@@ -74,7 +74,9 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
     assert.equal(app.modelSettings.mtp_adaptive_max_depth, '');
     await app.saveModelSettings();
     assert.equal(payload.mtp_adaptive_max_depth, null);
+    assert.equal('mtp_fixed_depth' in payload, false);
     for (const depth of [3, 4, 5, 6, 7, 8]) {
+        app._modelSettingsBaseline = JSON.stringify(app.modelSettings);
         app.modelSettings.mtp_adaptive_max_depth = String(depth);
         await app.saveModelSettings();
         assert.equal(payload.mtp_adaptive_max_depth, depth);

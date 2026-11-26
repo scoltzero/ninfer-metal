@@ -25,7 +25,8 @@ import uuid
 import zlib
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -216,6 +217,14 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "reload_required": True,
     },
     {
+        "key": "speculative_backend",
+        "label": "Speculative Backend",
+        "type": "enum",
+        "options": ["auto", "none", "mtp", "dflash2"],
+        "default": "auto",
+        "reload_required": True,
+    },
+    {
         "key": "sampling_contract",
         "label": "Sampling Contract",
         "type": "enum",
@@ -279,7 +288,10 @@ LOG_TAIL_LINES = 8
 
 SUPPORTED_PROTOCOLS = frozenset({1, 2})
 VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
-VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane"})
+VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
+M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
+M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
+M5RT_REQUEST_SETTINGS = ("max_tokens", "temperature", "top_p", "top_k")
 VALID_SAMPLING_CONTRACTS = frozenset({"legacy_rejection_v1", "position_coupled_v1"})
 VALID_SPEC_BACKENDS = frozenset({"auto", "none", "dflash2", "mtp"})
 VALID_LORA_MODES = frozenset({"merge", "bypass"})
@@ -613,7 +625,7 @@ class M5Target:
 
 @dataclass(frozen=True)
 class M5Options:
-    """Runtime options passed to `M5SidecarEngine`."""
+    """Resolved load plan used for admission, reloads and the sidecar RPC."""
 
     max_context: int = 32768
     max_concurrency: int = 1
@@ -621,7 +633,10 @@ class M5Options:
     prefill_engine: str = "auto"
     sampling_contract: str = "legacy_rejection_v1"
     speculative_backend: str = "none"
+    speculative_policy: str = "auto"
+    spec_search: str | None = None
     draft_tokens: int = 0
+    concurrency_source: str = "default"
     prefix_cache_bytes: int = 0
     rolling_prefix_cache: bool | None = None
     batch_mode: bool | None = None
@@ -1055,6 +1070,7 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
         return None
     if not isinstance(options, dict):
         raise ValueError("m5rt_options must be an object")
+    options = _normalize_m5_aliases(options)
 
     kv_dtype = options.get("kv_dtype")
     if kv_dtype is not None and kv_dtype not in VALID_KV_DTYPES:
@@ -1086,8 +1102,9 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
 
     draft_tokens = options.get("draft_tokens")
     if draft_tokens is not None:
-        if isinstance(draft_tokens, bool) or not isinstance(draft_tokens, int) or not 0 <= draft_tokens <= 7:
-            raise ValueError("m5rt_options.draft_tokens must be an integer in [0, 7]")
+        maximum = M5RT_MAX_DRAFT_TOKENS.get(spec_backend, M5RT_MAX_DRAFT_TOKENS["dflash2"])
+        if isinstance(draft_tokens, bool) or not isinstance(draft_tokens, int) or not 0 <= draft_tokens <= maximum:
+            raise ValueError(f"m5rt_options.draft_tokens must be an integer in [0, {maximum}]")
 
     prefix_cache_bytes = options.get("prefix_cache_bytes")
     if prefix_cache_bytes is not None:
@@ -1107,6 +1124,9 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
         _parse_optional_toggle(
             options.get("rolling_prefix_cache"), "m5rt_options.rolling_prefix_cache"
         )
+
+    if options.get("spec_search") not in (None, "auto", "off", "on"):
+        raise ValueError("m5rt_options.spec_search must be auto, off, or on")
 
     if "batch_mode" in options:
         _parse_optional_toggle(
@@ -1153,14 +1173,14 @@ def sync_m5rt_ui_kv_setting(
     if "m5rt_options" in sent and isinstance(getattr(request, "m5rt_options", None), dict):
         if request.m5rt_options.get("kv_dtype") is not None:
             req_explicit_kv = True
-    if "external_engine_options" in sent and isinstance(
-        getattr(request, "external_engine_options", None), dict
-    ):
-        for eng_key in M5RT_OPTION_KEYS:
-            nested = request.external_engine_options.get(eng_key)
-            if isinstance(nested, dict) and nested.get("kv_dtype") is not None:
-                req_explicit_kv = True
-                break
+    for field_name in ("external_engine_options", "external_engine_options_patch"):
+        updates = getattr(request, field_name, None)
+        if field_name in sent and isinstance(updates, dict):
+            for eng_key in M5RT_OPTION_KEYS:
+                nested = updates.get(eng_key)
+                if isinstance(nested, dict) and nested.get("kv_dtype") is not None:
+                    req_explicit_kv = True
+                    break
     if req_explicit_kv:
         return
 
@@ -1205,6 +1225,26 @@ def sync_m5rt_ui_kv_setting(
                 current_settings.external_engine_options = ext_copy or None
 
 
+def _validate_external_engine_option_fields(engine_key: str, fields: Any) -> dict[str, Any]:
+    if not isinstance(fields, dict):
+        raise ValueError(f"external_engine_options.{engine_key} must be an object")
+    if engine_key in M5RT_OPTION_KEYS:
+        return validate_m5rt_options(fields) or {}
+    cleaned = dict(fields)
+    for item in get_external_engine_options_schema(engine_key):
+        key = item.get("key")
+        value = cleaned.get(key)
+        if value is None or item.get("type") != "enum" or not isinstance(item.get("options"), list):
+            continue
+        allowed = [str(option) for option in item["options"]]
+        if not isinstance(value, str) or value.strip() not in allowed:
+            raise ValueError(
+                f"external_engine_options.{engine_key}.{key} must be one of {sorted(allowed)}"
+            )
+        cleaned[key] = value.strip()
+    return cleaned
+
+
 def apply_m5rt_model_settings_update(
     current_settings: Any,
     request: Any,
@@ -1240,51 +1280,41 @@ def apply_m5rt_model_settings_update(
             if is_diffusion_model or not request.m5rt_options
             else validate_m5rt_options(request.m5rt_options)
         )
-    if "external_engine_options" in sent:
-        raw_ext_opts = getattr(request, "external_engine_options", None)
-        if is_diffusion_model or not raw_ext_opts:
-            current_settings.external_engine_options = None
-        else:
-            if not isinstance(raw_ext_opts, dict):
-                raise ValueError("external_engine_options must be an object")
-            validated_ext: dict[str, dict[str, Any]] = {}
-            for eng_key, eng_val in raw_ext_opts.items():
-                if not isinstance(eng_val, dict):
-                    raise ValueError(
-                        f"external_engine_options.{eng_key} must be an object"
-                    )
-                if eng_key in M5RT_OPTION_KEYS:
-                    validated_ext[eng_key] = validate_m5rt_options(eng_val) or {}
-                else:
-                    schema = get_external_engine_options_schema(str(eng_key))
-                    cleaned_provider_opts = dict(eng_val)
-                    for item in schema:
-                        opt_key = item.get("key")
-                        if not opt_key or opt_key not in cleaned_provider_opts:
-                            continue
-                        val = cleaned_provider_opts[opt_key]
-                        if val is None:
-                            continue
-                        if item.get("type") == "enum" and isinstance(item.get("options"), list):
-                            allowed_vals = [str(x) for x in item["options"]]
-                            if not isinstance(val, str) or val.strip() not in allowed_vals:
-                                raise ValueError(
-                                    f"external_engine_options.{eng_key}.{opt_key} must be one of "
-                                    f"{sorted(allowed_vals)}"
-                                )
-                            cleaned_provider_opts[opt_key] = val.strip()
-                    validated_ext[str(eng_key)] = cleaned_provider_opts
-            current_settings.external_engine_options = validated_ext
-            if "m5rt_options" not in sent and isinstance(
-                getattr(current_settings, "m5rt_options", None), dict
-            ):
-                synced_m5 = dict(current_settings.m5rt_options)
-                for eng_key in M5RT_OPTION_KEYS:
-                    if eng_key in validated_ext:
-                        for opt_k, opt_v in validated_ext[eng_key].items():
-                            if opt_k in synced_m5:
-                                synced_m5[opt_k] = opt_v
-                current_settings.m5rt_options = synced_m5
+    if "external_engine_options" in sent and "external_engine_options_patch" in sent:
+        raise ValueError("Send either external_engine_options or external_engine_options_patch")
+    if "external_engine_options" in sent or "external_engine_options_patch" in sent:
+        partial = "external_engine_options_patch" in sent
+        field_name = "external_engine_options_patch" if partial else "external_engine_options"
+        updates = getattr(request, field_name, None) or {}
+        merged = {
+            key: _normalize_m5_aliases(value) if key in M5RT_OPTION_KEYS else dict(value)
+            for key, value in (current_settings.external_engine_options or {}).items()
+            if isinstance(value, dict)
+        } if partial and not is_diffusion_model else {}
+        legacy = _normalize_m5_aliases(getattr(current_settings, "m5rt_options", None) or {})
+        if not isinstance(updates, dict):
+            raise ValueError(f"{field_name} must be an object")
+        if not is_diffusion_model:
+            for engine_key, fields in updates.items():
+                cleaned = _validate_external_engine_option_fields(str(engine_key), fields)
+                if not partial:
+                    merged[engine_key] = cleaned
+                for key, value in cleaned.items():
+                    if engine_key in M5RT_OPTION_KEYS and "m5rt_options" not in sent:
+                        if value is None and partial:
+                            legacy.pop(key, None)
+                        elif key in legacy:
+                            legacy[key] = value
+                    if partial and value is None:
+                        aliases = M5RT_OPTION_KEYS if engine_key in M5RT_OPTION_KEYS else (engine_key,)
+                        for alias in aliases:
+                            if alias in merged:
+                                merged[alias].pop(key, None)
+                    elif partial:
+                        merged.setdefault(engine_key, {})[key] = value
+        current_settings.external_engine_options = {k: v for k, v in merged.items() if v} or None
+        if "m5rt_options" not in sent and not is_diffusion_model:
+            current_settings.m5rt_options = legacy or None
 
     eff_ext = external_engine
     if eff_ext is None:
@@ -1316,6 +1346,21 @@ def _normalize_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
+def _normalize_m5_aliases(options: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(options)
+    # Match the standalone reader's precedence when both spellings are present.
+    for legacy, canonical in (
+        ("spec_backend", "speculative_backend"),
+        ("artifact", "artifact_path"),
+        ("draft_artifact", "draft_artifact_path"),
+        ("kernel_dir", "metallib_dir"),
+    ):
+        value = normalized.pop(legacy, None)
+        if value is not None and (legacy != "kernel_dir" or canonical not in normalized):
+            normalized[canonical] = value
+    return normalized
+
+
 def _extract_toml_layered_options(
     doc: dict[str, Any], *, model_id: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1323,6 +1368,7 @@ def _extract_toml_layered_options(
     shared: dict[str, Any] = {}
     model_sec = doc.get("model")
     if isinstance(model_sec, dict):
+        model_sec = _normalize_m5_aliases(model_sec)
         for key in (
             "artifact_path",
             "draft_artifact_path",
@@ -1337,11 +1383,14 @@ def _extract_toml_layered_options(
 
     engine_sec = doc.get("engine")
     if isinstance(engine_sec, dict):
+        engine_sec = _normalize_m5_aliases(engine_sec)
         for key in (
             "max_concurrency",
             "max_context",
             "kv_dtype",
             "prefill_engine",
+            "spec_search",
+            "speculative_backend",
             "sampling_contract",
             "rolling_prefix_cache",
             "prefix_cache_bytes",
@@ -1376,13 +1425,13 @@ def _extract_toml_layered_options(
             item_id = str(item.get("id") or "").strip()
             item_dir = str(item.get("model_dir") or "").strip()
             if item_id == model_id or (item_dir and Path(item_dir).name == model_id):
-                for key, val in item.items():
+                for key, val in _normalize_m5_aliases(item).items():
                     if key not in ("id", "model_dir") and val is not None:
                         per_model[key] = val
 
     sidecar_sec = doc.get("sidecar")
     if isinstance(sidecar_sec, dict):
-        for key, val in sidecar_sec.items():
+        for key, val in _normalize_m5_aliases(sidecar_sec).items():
             if key == "models" or val is None:
                 continue
             shared[key] = val
@@ -1390,7 +1439,7 @@ def _extract_toml_layered_options(
         if model_id and isinstance(models_sec, dict):
             model_entry = models_sec.get(model_id)
             if isinstance(model_entry, dict):
-                for key, val in model_entry.items():
+                for key, val in _normalize_m5_aliases(model_entry).items():
                     if val is not None:
                         per_model[key] = val
     return shared, per_model
@@ -1601,10 +1650,10 @@ def _explicit_m5rt_model_options(model_settings: object | None) -> dict[str, Any
         for key in M5RT_OPTION_KEYS:
             nested = ext_opts.get(key)
             if isinstance(nested, dict):
-                explicit.update(nested)
+                explicit.update(_normalize_m5_aliases(nested))
     legacy_opts = getattr(model_settings, "m5rt_options", None)
     if isinstance(legacy_opts, dict):
-        explicit.update(legacy_opts)
+        explicit.update(_normalize_m5_aliases(legacy_opts))
     return explicit
 
 
@@ -1974,6 +2023,7 @@ def _resolve_target_artifact(
     manifest: dict[str, Any] | None = None,
     engine_id: str = M5RT_ENGINE_ID,
     provider_id: str = M5RT_PROVIDER_ID,
+    model_id: str | None = None,
 ) -> tuple[Path | None, str]:
     is_builtin = (engine_id == M5RT_ENGINE_ID) and (provider_id in M5RT_BUILTIN_PROVIDER_IDS)
     eff_manifest = manifest if manifest is not None else _builtin_m5rt_manifest()
@@ -1984,6 +2034,7 @@ def _resolve_target_artifact(
         engine_id=engine_id,
         provider_id=provider_id,
         manifest=eff_manifest,
+        model_id=model_id,
     )
     explicit = (
         getattr(model_settings, "m5rt_artifact_path", None) if is_builtin else None
@@ -2047,6 +2098,7 @@ def _resolve_metallib_dir(
     *,
     engine_id: str | None = None,
     provider_id: str | None = None,
+    model_id: str | None = None,
 ) -> tuple[Path | None, str]:
     eff_provider_id = provider_id or binary.provider_id
     eff_engine_id = engine_id or binary.engine_id
@@ -2057,6 +2109,7 @@ def _resolve_metallib_dir(
         engine_id=eff_engine_id,
         provider_id=eff_provider_id,
         manifest=binary.provider_manifest,
+        model_id=model_id,
     )
     explicit = opts.get("metallib_dir") or (
         os.environ.get("OMLX_M5RT_METALLIB_DIR", "").strip() if is_builtin else ""
@@ -2221,6 +2274,27 @@ def _dflash2_draft_matches_target(
     return True
 
 
+def _requested_speculative_backend(
+    model_settings: object | None,
+    explicit: dict[str, Any] | None,
+    per_model: dict[str, Any] | None = None,
+    shared: dict[str, Any] | None = None,
+) -> str:
+    raw = (explicit or {}).get("speculative_backend")
+    if raw is None and getattr(model_settings, "mtp_enabled", False):
+        raw = "mtp"
+    if raw is None and getattr(model_settings, "dflash_enabled", False):
+        raw = "dflash2"
+    if raw is None:
+        raw = (per_model or {}).get("speculative_backend")
+    if raw is None:
+        raw = (shared or {}).get("speculative_backend")
+    backend = str(raw or "auto").strip().lower()
+    if backend not in VALID_SPEC_BACKENDS:
+        raise ValueError(f"Unsupported speculative backend: {backend!r}")
+    return backend
+
+
 def _resolve_draft_target(
     model_dir: Path,
     model_settings: object | None,
@@ -2230,6 +2304,7 @@ def _resolve_draft_target(
     engine_id: str = M5RT_ENGINE_ID,
     provider_id: str = M5RT_PROVIDER_ID,
     allow_missing_artifact: bool = False,
+    model_id: str | None = None,
 ) -> tuple[Path | None, Path | None, str]:
     is_builtin = (engine_id == M5RT_ENGINE_ID) and (provider_id in M5RT_BUILTIN_PROVIDER_IDS)
     extensions = _normalize_extensions(manifest.get("artifact_extensions") if manifest else None)
@@ -2239,50 +2314,21 @@ def _resolve_draft_target(
         engine_id=engine_id,
         provider_id=provider_id,
         manifest=manifest,
+        model_id=model_id,
     )
     opts = {**shared_toml, **model_toml, **explicit_opts}
 
-    explicit_spec = explicit_opts.get("speculative_backend")
-    if explicit_spec is not None and str(explicit_spec).strip():
-        spec_backend = str(explicit_spec).strip()
-    elif bool(getattr(model_settings, "mtp_enabled", False)):
-        spec_backend = "mtp"
-    elif bool(getattr(model_settings, "dflash_enabled", False)):
-        spec_backend = "dflash2"
-    elif model_toml.get("speculative_backend") is not None and str(model_toml["speculative_backend"]).strip():
-        spec_backend = str(model_toml["speculative_backend"]).strip()
-    elif shared_toml.get("speculative_backend") is not None and str(shared_toml["speculative_backend"]).strip():
-        spec_backend = str(shared_toml["speculative_backend"]).strip()
-    else:
-        spec_backend = "none"
+    spec_backend = _requested_speculative_backend(
+        model_settings, explicit_opts, model_toml, shared_toml
+    )
+    if spec_backend not in ("auto", "dflash2"):
+        return None, None, ""
 
     explicit_draft_art = (
         (getattr(model_settings, "m5rt_draft_artifact_path", None) if is_builtin else None)
         or opts.get("draft_artifact_path")
         or (os.environ.get("OMLX_M5RT_DRAFT_ARTIFACT", "").strip() if is_builtin else "")
     )
-    if spec_backend == "auto" and not explicit_draft_art:
-        # Opportunistically detect companion `dflash2/` without failing when absent.
-        companion_dir = model_dir / "dflash2"
-        if companion_dir.is_dir():
-            cfg_dir: Path | None = None
-            for cdir in (companion_dir, companion_dir / "source"):
-                if (cdir / "config.json").is_file():
-                    cfg_dir = cdir.resolve()
-                    break
-            comp_art = _find_draft_artifact_in_dir(
-                cfg_dir or companion_dir,
-                extensions,
-                model_dir=model_dir,
-                is_builtin=is_builtin,
-            )
-            if cfg_dir is not None and comp_art is not None:
-                return cfg_dir, comp_art, ""
-        return None, None, ""
-
-    if spec_backend != "dflash2" and not explicit_draft_art:
-        return None, None, ""
-
     draft_art: Path | None = None
     if explicit_draft_art:
         try:
@@ -2307,7 +2353,10 @@ def _resolve_draft_target(
     companion_dir = model_dir / "dflash2"
     if companion_dir.is_dir():
         discovered_dirs.extend([companion_dir / "source", companion_dir])
-    discovered_dirs.extend(Path(c).expanduser() for c in draft_candidates)
+    # Auto looks at explicitly selected or colocated drafts; explicit DFlash2
+    # can also search the model library's helpers.
+    if spec_backend == "dflash2" or draft_dir_raw:
+        discovered_dirs.extend(Path(c).expanduser() for c in draft_candidates)
 
     resolved_dir: Path | None = None
     for cdir in explicit_dirs:
@@ -2325,10 +2374,13 @@ def _resolve_draft_target(
             cand_resolved = cdir.resolve()
             if fallback_dir is None:
                 fallback_dir = cand_resolved
-            if _dflash2_draft_matches_target(_read_json(cfg_file), target_cfg):
+            if _dflash2_draft_matches_target(_read_json(cfg_file), target_cfg) or (
+                cand_resolved.is_relative_to(companion_dir.resolve())
+                and _find_draft_artifact_in_dir(cand_resolved, extensions, model_dir=model_dir, is_builtin=is_builtin)
+            ):
                 resolved_dir = cand_resolved
                 break
-        if resolved_dir is None:
+        if resolved_dir is None and spec_backend == "dflash2":
             resolved_dir = fallback_dir
 
     if draft_art is None and resolved_dir is not None:
@@ -2485,10 +2537,12 @@ def resolve_m5rt_target(
     draft_candidates: Iterable[str] = (),
     *,
     allow_auto_convert: bool = True,
+    model_id: str | None = None,
 ) -> tuple[M5Target | None, str]:
     """Check whether `m5rt` can serve `model_path`, returning `(M5Target, reason)`."""
     model_dir = Path(model_path).expanduser()
-    opts = _merged_m5rt_options(model_dir, model_settings)
+    shared, per_model, explicit = _layered_provider_options(model_dir, model_settings, model_id=model_id)
+    opts = {**shared, **per_model, **explicit}
     binary_override = opts.get("m5rt_path") or configured_binary
     binary, reason = find_m5rt_binary(binary_override)
     if binary is None:
@@ -2509,7 +2563,7 @@ def resolve_m5rt_target(
             "",
         )
 
-    metallib_dir, reason = _resolve_metallib_dir(model_dir, binary, model_settings)
+    metallib_dir, reason = _resolve_metallib_dir(model_dir, binary, model_settings, model_id=model_id)
     if metallib_dir is None:
         return None, reason
 
@@ -2520,6 +2574,7 @@ def resolve_m5rt_target(
         model_settings,
         draft_candidates,
         allow_missing_artifact=allow_auto_convert,
+        model_id=model_id,
     )
     if reason:
         return None, reason
@@ -2539,12 +2594,14 @@ def resolve_m5rt_target(
                     draft_dir, manifest, is_builtin=True
                 )
         if auto_convert_draft_output is None:
-            base_msg = f"DFlash2 speculative backend requires a draft {'/'.join(extensions)} artifact"
-            if draft_conv_reason and _has_valid_safetensors_header(draft_dir):
-                return None, f"{base_msg} ({draft_conv_reason})"
-            return None, base_msg
+            if _requested_speculative_backend(model_settings, explicit, per_model, shared) == "dflash2":
+                base_msg = f"DFlash2 speculative backend requires a draft {'/'.join(extensions)} artifact"
+                if draft_conv_reason and _has_valid_safetensors_header(draft_dir):
+                    return None, f"{base_msg} ({draft_conv_reason})"
+                return None, base_msg
+            draft_dir = None
 
-    artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings)
+    artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings, model_id=model_id)
     auto_convert_output: Path | None = None
     if artifact_path is None:
         if allow_auto_convert:
@@ -2599,9 +2656,15 @@ def inspect_omlxm5_has_mtp_weights(artifact_path: Path | None) -> bool | None:
     if artifact_path is None:
         return None
     try:
-        if not artifact_path.is_file():
-            return None
-        file_size = artifact_path.stat().st_size
+        stat = artifact_path.stat()
+    except OSError:
+        return None
+    return _inspect_mtp_manifest(artifact_path, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=64)
+def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, file_size: int) -> bool | None:
+    try:
         if file_size < _OMLXM5_HEADER_BYTES:
             return None
         with artifact_path.open("rb") as fh:
@@ -2757,36 +2820,12 @@ def _resolve_effective_speculative(
     explicit_opts: dict[str, Any] | None = None,
     model_dir: Path | None = None,
 ) -> tuple[str, int]:
-    def _nonempty_str(d: dict[str, Any] | None, key: str) -> str | None:
-        if d is None:
-            return None
-        val = d.get(key)
-        if val is None:
-            return None
-        s = str(val).strip()
-        return s or None
-
-    layered = explicit_opts is not None or model_toml is not None or shared_toml is not None
-    explicit_spec = (
-        _nonempty_str(explicit_opts, "speculative_backend")
-        if layered
-        else _nonempty_str(opts, "speculative_backend")
+    layered = any(layer is not None for layer in (explicit_opts, model_toml, shared_toml))
+    explicit_opts = explicit_opts if layered else opts
+    spec_backend = _requested_speculative_backend(
+        model_settings, explicit_opts, model_toml, shared_toml
     )
-    model_toml_spec = _nonempty_str(model_toml, "speculative_backend")
-    shared_toml_spec = _nonempty_str(shared_toml, "speculative_backend")
-
-    # Precedence: explicit per-model options > oMLX UI toggles > [sidecar.models] > shared TOML > auto/fallback
-    if explicit_spec is not None and explicit_spec != "auto":
-        spec_backend = explicit_spec
-    elif bool(getattr(model_settings, "mtp_enabled", False)):
-        spec_backend = "mtp"
-    elif bool(getattr(model_settings, "dflash_enabled", False)):
-        spec_backend = "dflash2"
-    elif model_toml_spec is not None and model_toml_spec != "auto":
-        spec_backend = model_toml_spec
-    elif shared_toml_spec is not None and shared_toml_spec != "auto":
-        spec_backend = shared_toml_spec
-    else:
+    if spec_backend == "auto":
         # "auto" (or unset): detect companion or embedded speculative weights
         # matching standalone `ninfer-metal-serve` (`resolve_auto_speculative`).
         raw_mtp_art = (
@@ -2845,68 +2884,26 @@ def _resolve_effective_speculative(
             else:
                 spec_backend = "none"
 
-    def _positive_int(d: dict[str, Any] | None, key: str) -> int | None:
-        if d is None or d.get(key) is None:
-            return None
-        val = int(d[key])
-        return val if val > 0 else None
+    if spec_backend == "none":
+        return "none", 0
 
-    explicit_dt = (
-        _positive_int(explicit_opts, "draft_tokens")
-        if layered
-        else _positive_int(opts, "draft_tokens")
-    )
-    if explicit_dt is not None:
-        draft_tokens = explicit_dt
-    elif spec_backend == "mtp":
-        fixed = getattr(model_settings, "mtp_fixed_depth", None)
-        adaptive = getattr(model_settings, "mtp_adaptive_max_depth", None)
-        chosen = fixed if fixed is not None else adaptive
-        if chosen is not None:
-            draft_tokens = int(chosen)
-        else:
-            toml_dt = _positive_int(model_toml, "draft_tokens") or _positive_int(
-                shared_toml, "draft_tokens"
-            )
-            draft_tokens = toml_dt if toml_dt is not None else 3
-    elif spec_backend == "dflash2":
-        block_size = getattr(model_settings, "dflash_block_size", None)
-        if isinstance(block_size, int) and block_size >= 2:
-            draft_tokens = block_size - 1
-        else:
-            toml_dt = _positive_int(model_toml, "draft_tokens") or _positive_int(
-                shared_toml, "draft_tokens"
-            )
-            if toml_dt is not None:
-                draft_tokens = toml_dt
-            else:
-                draft_bs = _dflash2_draft_block_size(
-                    target.draft_dir if target is not None else None
-                )
-                draft_tokens = (draft_bs - 1) if draft_bs is not None else 4
-    else:
-        draft_tokens = 0
-
-    if spec_backend in ("mtp", "dflash2"):
-        draft_tokens = max(1, min(7, draft_tokens))
-    else:
-        draft_tokens = 0
-    return spec_backend, draft_tokens
-
-
-def _dflash2_draft_block_size(draft_dir: Path | None) -> int | None:
-    if draft_dir is None:
-        return None
-    cfg = _read_json(draft_dir / "config.json")
-    if not isinstance(cfg, dict):
-        return None
-    df_cfg = cfg.get("dflash_config")
-    raw_bs = df_cfg.get("block_size") if isinstance(df_cfg, dict) else None
-    if raw_bs is None:
-        raw_bs = cfg.get("block_size")
-    if isinstance(raw_bs, int) and not isinstance(raw_bs, bool) and raw_bs >= 2:
-        return raw_bs
-    return None
+    raw_depth = (explicit_opts or {}).get("draft_tokens")
+    if raw_depth is None and spec_backend == "mtp":
+        raw_depth = getattr(model_settings, "mtp_fixed_depth", None)
+        if raw_depth is None:
+            raw_depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
+    if raw_depth is None and spec_backend == "dflash2":
+        block = getattr(model_settings, "dflash_block_size", None)
+        raw_depth = int(block) - 1 if block is not None else None
+    if raw_depth is None:
+        raw_depth = (model_toml or {}).get("draft_tokens")
+    if raw_depth is None:
+        raw_depth = (shared_toml or {}).get("draft_tokens", 0)
+    depth = int(raw_depth)
+    maximum = M5RT_MAX_DRAFT_TOKENS[spec_backend]
+    if not 0 <= depth <= maximum:
+        raise ValueError(f"{spec_backend} draft_tokens must be in [0, {maximum}] (0 = auto)")
+    return spec_backend, depth
 
 
 def _resolve_effective_concurrency(
@@ -3057,67 +3054,24 @@ def m5rt_memory_estimate(
     lora_adapters: dict[str, str] | None = None,
     model_dirs: Iterable[str | Path] = (),
     model_id: str | None = None,
+    plan: M5Options | None = None,
 ) -> int:
     """Estimate unified memory footprint for `M5SidecarEngine`."""
     mdir = Path(model_path)
-    eff_manifest = manifest if manifest is not None else target.binary.provider_manifest
-    eff_provider_id = provider_id or target.binary.provider_id
-    eff_engine_id = engine_id or target.binary.engine_id
-    shared_toml, model_toml, explicit_opts = _layered_provider_options(
-        mdir,
-        model_settings,
-        engine_id=eff_engine_id,
-        provider_id=eff_provider_id,
-        manifest=eff_manifest,
-        model_id=model_id,
-    )
-    lora_path, lora_mode = resolve_sidecar_lora_settings(
-        mdir,
-        model_settings,
-        shared_toml=shared_toml,
-        model_toml=model_toml,
-        explicit_opts=explicit_opts,
-        lora_adapters=lora_adapters,
-        model_dirs=model_dirs,
-        engine_id=eff_engine_id,
-        provider_id=eff_provider_id,
-        manifest=eff_manifest,
-    )
+    if plan is None:
+        plan = build_m5rt_options(
+            mdir, target, model_settings, default_context=max_context,
+            memory_budget_bytes=0, global_settings=global_settings,
+            engine_id=engine_id, provider_id=provider_id, manifest=manifest,
+            lora_adapters=lora_adapters, model_dirs=model_dirs, model_id=model_id,
+        )
     lora_bytes = (
-        estimate_sidecar_lora_bytes(lora_path, lora_mode=lora_mode) if lora_path else 0
+        estimate_sidecar_lora_bytes(plan.lora_adapter, lora_mode=plan.lora_mode)
+        if plan.lora_adapter else 0
     )
     if target.fake:
         return 64 * 1024**2 + lora_bytes
-    opts = {**shared_toml, **model_toml, **explicit_opts}
-    allowed_kv = (
-        None
-        if eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
-        else _manifest_allowed_kv_dtypes(eff_manifest)
-    )
-    kv_dtype = _resolve_effective_kv_dtype(
-        opts,
-        model_settings,
-        allowed_kv_dtypes=allowed_kv,
-        shared_toml=shared_toml,
-        model_toml=model_toml,
-        explicit_opts=explicit_opts,
-    )
-    max_concurrency = _resolve_effective_concurrency(opts, global_settings)
-    config = _read_json(mdir / "config.json") or {}
-    text_cfg = _text_config(config)
-    native_ctx_raw = text_cfg.get("max_position_embeddings")
-    configured_ctx = (
-        explicit_opts.get("max_context")
-        or getattr(model_settings, "max_context_window", None)
-        or max_context
-        or model_toml.get("max_context")
-        or shared_toml.get("max_context")
-    )
-    if native_ctx_raw:
-        native_ctx = max(1024, int(native_ctx_raw))
-    else:
-        native_ctx = max(32768, int(configured_ctx or 32768))
-    context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
+    text_cfg = _text_config(_read_json(mdir / "config.json") or {})
     vocab_size = max(256, int(text_cfg.get("vocab_size") or 248320))
 
     if target.artifact_path is not None:
@@ -3144,15 +3098,9 @@ def m5rt_memory_estimate(
         draft = int(draft_st * 1.01) if draft_st > 0 else 0
     else:
         draft = 0
-    kv = _kv_bytes_per_token(text_cfg, kv_dtype) * context * max_concurrency
-    workspace = max(64 * 1024**2, 1024 * vocab_size * 2 * max_concurrency)
-    prefix_cache = _resolve_prefix_cache_bytes(
-        opts,
-        shared_toml=shared_toml,
-        model_toml=model_toml,
-        explicit_opts=explicit_opts,
-    )
-    return weights + draft + kv + workspace + prefix_cache + lora_bytes
+    kv = _kv_bytes_per_token(text_cfg, plan.kv_dtype) * plan.max_context * plan.max_concurrency
+    workspace = max(64 * 1024**2, 1024 * vocab_size * 2 * plan.max_concurrency)
+    return weights + draft + kv + workspace + plan.prefix_cache_bytes + lora_bytes
 
 
 def _safe_lora_fingerprint(
@@ -3184,8 +3132,25 @@ def m5rt_runtime_signature(
     lora_adapters: dict[str, str] | None = None,
     model_path: str | Path | None = None,
     model_dirs: Iterable[str | Path] = (),
+    model_id: str | None = None,
+    target: M5Target | None = None,
+    default_context: int | None = None,
 ) -> tuple[Any, ...]:
     """Canonical tuple of load-time M5 settings that require engine reload."""
+    if model_path is not None and target is not None:
+        plan = build_m5rt_options(
+            model_path, target, model_settings,
+            default_context=default_context, memory_budget_bytes=0,
+            global_settings=global_settings, model_id=model_id,
+            lora_adapters=lora_adapters, model_dirs=model_dirs,
+        )
+        return (
+            str(target.binary.path), target.binary.version,
+            str(target.artifact_path), str(target.metallib_dir),
+            str(target.draft_dir), str(target.draft_artifact_path),
+            asdict(replace(plan, concurrency_source="")),
+            _safe_lora_fingerprint(plan.lora_adapter),
+        )
     global_conc = (
         getattr(getattr(global_settings, "scheduler", None), "max_concurrent_requests", None)
         if global_settings is not None
@@ -3351,21 +3316,31 @@ def build_m5rt_options(
     text_cfg = _text_config(config)
     native_ctx_raw = text_cfg.get("max_position_embeddings")
 
-    # Precedence: explicit per-model options > oMLX UI max_context_window >
-    # [sidecar.models."<name>"] > shared ninfer-metal.toml > default_context
-    configured_ctx = (
+    per_model_context = (
         explicit_opts.get("max_context")
         or getattr(model_settings, "max_context_window", None)
         or model_toml.get("max_context")
-        or shared_toml.get("max_context")
-        or default_context
     )
-    if native_ctx_raw:
-        native_ctx = max(1024, int(native_ctx_raw))
-    else:
-        native_ctx = max(32768, int(configured_ctx or 32768))
+    configured_ctx = per_model_context or shared_toml.get("max_context") or default_context
+    if not configured_ctx and not native_ctx_raw:
+        configured_ctx = getattr(getattr(global_settings, "sampling", None), "max_context_window", None)
+    native_ctx = int(native_ctx_raw) if native_ctx_raw else max(32768, int(configured_ctx or 32768))
     max_context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
+    policy = getattr(getattr(global_settings, "sampling", None), "max_context_window_policy", None)
+    if not getattr(model_settings, "max_context_window", None) and policy:
+        max_context = max(1024, min(max_context, int(policy)))
+
     max_concurrency = _resolve_effective_concurrency(opts, global_settings)
+    if explicit_opts.get("max_concurrency") is not None:
+        concurrency_source = "model_options"
+    elif model_toml.get("max_concurrency") is not None:
+        concurrency_source = "model_toml"
+    elif shared_toml.get("max_concurrency") is not None:
+        concurrency_source = "shared_toml"
+    elif getattr(getattr(global_settings, "scheduler", None), "max_concurrent_requests", None):
+        concurrency_source = "global"
+    else:
+        concurrency_source = "default"
     allowed_kv = (
         None
         if eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
@@ -3403,10 +3378,29 @@ def build_m5rt_options(
 
     raw_overrides = opts.get("path_overrides")
     overrides = (
-        {str(k): str(v) for k, v in raw_overrides.items()}
+        {
+            str(k): ("on" if v else "off") if isinstance(v, bool) else str(v)
+            for k, v in raw_overrides.items() if v is not None
+        }
         if isinstance(raw_overrides, dict)
         else {}
     )
+    is_miv = eff_engine_id == M5RT_ENGINE_ID and eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
+    if is_miv:
+        if spec_backend == "none":
+            overrides["enable_mtp"] = "off"
+        elif spec_backend == "mtp" and explicit_opts.get("draft_tokens") is None:
+            if getattr(model_settings, "mtp_fixed_depth", None) is not None:
+                overrides["mtp_fixed_depth"] = "on"
+            elif getattr(model_settings, "mtp_adaptive_max_depth", None) is not None:
+                overrides["mtp_fixed_depth"] = "off"
+    prefix_layers = (explicit_opts, model_toml, shared_toml)
+    prefix_bytes = _resolve_prefix_cache_bytes(
+        opts, shared_toml=shared_toml, model_toml=model_toml, explicit_opts=explicit_opts
+    )
+    if not any(layer.get(key) is not None for layer in prefix_layers
+               for key in ("prefix_cache_bytes", "prefix_cache_gb")):
+        prefix_bytes = max(0, int(overrides.get("prefix_cache_bytes", "0")))
     mtp_art_raw = opts.get("mtp_artifact_path") or opts.get("mtp_artifact")
     if mtp_art_raw and "mtp_artifact" not in overrides:
         overrides["mtp_artifact"] = str(Path(str(mtp_art_raw)).expanduser())
@@ -3431,17 +3425,19 @@ def build_m5rt_options(
         max_concurrency=max_concurrency,
         kv_dtype=kv_dtype,
         prefill_engine=str(opts.get("prefill_engine") or "auto"),
-        sampling_contract=str(opts.get("sampling_contract") or "legacy_rejection_v1"),
+        sampling_contract=str(opts.get("sampling_contract") or (
+            M5RT_DEFAULT_SAMPLING_CONTRACT if is_miv else "legacy_rejection_v1"
+        )),
         speculative_backend=spec_backend,
+        speculative_policy=_requested_speculative_backend(
+            model_settings, explicit_opts, model_toml, shared_toml
+        ),
+        spec_search=str(opts["spec_search"]) if opts.get("spec_search") is not None else None,
         draft_tokens=draft_tokens,
+        concurrency_source=concurrency_source,
         lora_adapter=lora_adapter,
         lora_mode=lora_mode,
-        prefix_cache_bytes=_resolve_prefix_cache_bytes(
-            opts,
-            shared_toml=shared_toml,
-            model_toml=model_toml,
-            explicit_opts=explicit_opts,
-        ),
+        prefix_cache_bytes=prefix_bytes,
         rolling_prefix_cache=rolling_prefix_cache,
         batch_mode=batch_mode,
         batch_projection_prototype=bool(opts.get("batch_projection_prototype", False)),
@@ -3471,18 +3467,22 @@ def create_m5rt_pool_engine(
     eff_manifest = manifest if manifest is not None else m5_target.binary.provider_manifest
     eff_provider_id = provider_id or m5_target.binary.provider_id
     eff_engine_id = engine_id or m5_target.binary.engine_id
-    wanted = m5rt_memory_estimate(
+    m5_options = build_m5rt_options(
         entry.model_path,
         m5_target,
-        sizing_context,
         model_settings,
+        default_context=sizing_context,
+        memory_budget_bytes=0,
         global_settings=global_settings,
+        model_id=entry.model_id,
         engine_id=eff_engine_id,
         provider_id=eff_provider_id,
         manifest=eff_manifest,
         lora_adapters=lora_adapters,
         model_dirs=model_dirs,
-        model_id=entry.model_id,
+    )
+    wanted = m5rt_memory_estimate(
+        entry.model_path, m5_target, sizing_context, plan=m5_options
     )
     if admission_limit > 0:
         room = admission_limit - current_model_memory
@@ -3491,20 +3491,7 @@ def create_m5rt_pool_engine(
         budget = min(room, wanted)
     else:
         budget = wanted
-    m5_options = build_m5rt_options(
-        entry.model_path,
-        m5_target,
-        model_settings,
-        default_context=sizing_context,
-        memory_budget_bytes=budget,
-        global_settings=global_settings,
-        model_id=entry.model_id,
-        engine_id=eff_engine_id,
-        provider_id=eff_provider_id,
-        manifest=eff_manifest,
-        lora_adapters=lora_adapters,
-        model_dirs=model_dirs,
-    )
+    m5_options = replace(m5_options, memory_budget_bytes=budget)
     logger.info(
         "Serving %s through %s %s (%s)",
         entry.model_id,
@@ -4349,7 +4336,14 @@ class _StopMatcher:
         self,
         stop_token_seqs: list[list[int]],
         stop_strings: list[str],
+        *,
+        skip_reasoning: bool = False,
+        prompt_opens_think: bool = False,
     ) -> None:
+        self._think_state = "answer"
+        if skip_reasoning:
+            self._think_state = "thinking" if prompt_opens_think else "leading"
+        self._think_pending = ""
         self._token_seqs = [list(s) for s in stop_token_seqs if s]
         self._max_tok_seq = max((len(s) for s in self._token_seqs), default=0)
         self._recent_tokens: list[int] = []
@@ -4383,11 +4377,42 @@ class _StopMatcher:
 
     def push_text(self, piece: str) -> str:
         """Feed decoded text, holding back partial stop prefixes in O(1) time."""
-        if not piece and not self._pending_text:
-            return ""
         if not self._stop_strings:
             return piece
+        if self._think_state == "answer":
+            return self._push_answer(piece)
 
+        buf = self._think_pending + piece
+        self._think_pending = ""
+        opened, closed = "<think>", "</think>"
+        prefix = ""
+        if self._think_state == "leading":
+            start = buf.lstrip()
+            if not start:
+                return buf
+            if start.startswith(opened):
+                self._think_state = "thinking"
+                opening_end = len(buf) - len(start) + len(opened)
+                prefix, buf = buf[:opening_end], buf[opening_end:]
+            elif opened.startswith(start):
+                self._think_pending = start
+                return buf[:len(buf) - len(start)]
+            else:
+                self._think_state = "answer"
+                return self._push_answer(buf)
+
+        closing = buf.find(closed)
+        if closing >= 0:
+            end = closing + len(closed)
+            self._think_state = "answer"
+            return prefix + buf[:end] + self._push_answer(buf[end:])
+        for n in range(min(len(closed) - 1, len(buf)), 0, -1):
+            if closed.startswith(buf[-n:]):
+                self._think_pending = buf[-n:]
+                return prefix + buf[:-n]
+        return prefix + buf
+
+    def _push_answer(self, piece: str) -> str:
         buf = self._pending_text + piece
         earliest_idx: int | None = None
         for s in self._stop_strings:
@@ -4415,11 +4440,8 @@ class _StopMatcher:
         return buf
 
     def flush(self) -> str:
-        if self.stopped or not self._pending_text:
-            self._pending_text = ""
-            return ""
-        rem = self._pending_text
-        self._pending_text = ""
+        rem = "" if self.stopped else self._think_pending + self._pending_text
+        self._think_pending = self._pending_text = ""
         return rem
 
 
@@ -4497,6 +4519,7 @@ class _SidecarEvent:
     tokens: tuple[int, ...] = ()
     finish_reason: str = ""
     error: str = ""
+    request_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -4559,6 +4582,7 @@ class M5SidecarEngine(BaseEngine):
     """Serves a model through an out-of-process `mseries_backendd` UDS sidecar."""
 
     _prefill_memory_guard_managed_externally = True
+    consumes_stock_cache = False
     external_engine_id = M5RT_ENGINE_ID
     supports_request_scoped_abort = True
     supports_native_response_format = False
@@ -4643,6 +4667,7 @@ class M5SidecarEngine(BaseEngine):
 
         self._hello_info: dict[str, Any] = {}
         self._last_stats: dict[str, Any] | None = None
+        self._warned_request_controls: set[str] = set()
         self._last_capacity: dict[str, Any] | None = None
         self._reported_footprint_bytes: int = 0
         self._reported_lora_buffer_bytes: int | None = None
@@ -4861,8 +4886,7 @@ class M5SidecarEngine(BaseEngine):
                 overrides["batch_mode"] = "on"
         if opts.batch_projection_prototype:
             overrides["batch_projection_prototype"] = "on"
-        if opts.prefix_cache_bytes > 0:
-            overrides["prefix_cache_bytes"] = str(opts.prefix_cache_bytes)
+        overrides["prefix_cache_bytes"] = str(opts.prefix_cache_bytes)
         if opts.rolling_prefix_cache is not None:
             overrides["rolling_prefix_cache"] = (
                 "on" if opts.rolling_prefix_cache else "off"
@@ -4888,9 +4912,7 @@ class M5SidecarEngine(BaseEngine):
                 )
                 if dflash_lib.is_file():
                     overrides.setdefault("dflash2_metallib", str(dflash_lib))
-        elif spec_backend == "mtp":
-            draft_tokens = max(1, min(7, int(draft_tokens or 3)))
-        else:
+        elif spec_backend != "mtp":
             draft_tokens = 0
 
         payload: dict[str, Any] = {
@@ -4909,6 +4931,8 @@ class M5SidecarEngine(BaseEngine):
             },
             "path_overrides": overrides,
         }
+        if opts.spec_search is not None:
+            payload["spec_search"] = opts.spec_search
         if opts.memory_budget_bytes > 0:
             payload["memory_budget_bytes"] = int(opts.memory_budget_bytes)
         if "rolling_prefix_cache" in overrides:
@@ -5076,6 +5100,10 @@ class M5SidecarEngine(BaseEngine):
             tokens=tuple(int(t) for t in tokens_raw),
             finish_reason=str(raw_event.get("finish_reason") or ""),
             error=str(raw_event.get("error") or ""),
+            request_stats=(
+                raw_event["request_stats"]
+                if isinstance(raw_event.get("request_stats"), dict) else None
+            ),
         )
         queue = self._request_queues.setdefault(req_id, asyncio.Queue())
         queue.put_nowait(event)
@@ -5241,8 +5269,14 @@ class M5SidecarEngine(BaseEngine):
                 and not (self._path / "mtp.omlxm5").is_file()
                 and inspect_omlxm5_has_mtp_weights(built_art) is False
             ):
+                if self._options.speculative_policy != "auto":
+                    raise ValueError("MTP was requested but the converted model has no MTP weights")
+                logger.warning("%s: converted model has no MTP weights; auto selected AR", self._model_id)
                 self._options = replace(
-                    self._options, speculative_backend="none", draft_tokens=0
+                    self._options,
+                    speculative_backend="none",
+                    draft_tokens=0,
+                    path_overrides={**self._options.path_overrides, "enable_mtp": "off"},
                 )
 
         if (
@@ -5823,7 +5857,18 @@ class M5SidecarEngine(BaseEngine):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
-        del repetition_penalty, presence_penalty
+        unsupported = {
+            "repetition_penalty": repetition_penalty not in (None, 1.0),
+            "presence_penalty": bool(presence_penalty),
+            "frequency_penalty": bool(kwargs.get("frequency_penalty")),
+            "thinking_budget": bool(kwargs.get("thinking_budget")),
+            "no_repeat_ngram_size": bool(kwargs.get("no_repeat_ngram_size")),
+            "xtc_probability": bool(kwargs.get("xtc_probability")),
+        }
+        for key, requested in unsupported.items():
+            if requested and key not in self._warned_request_controls:
+                self._warned_request_controls.add(key)
+                logger.warning("%s does not support %s for %s", self._target.binary.label, key, self._model_id)
         if self._process is None:
             await self.start()
         if self.runtime_failed_reason is not None:
@@ -5865,7 +5910,11 @@ class M5SidecarEngine(BaseEngine):
             ignore_eos=ignore_eos,
             extra_token_seqs=kwargs.get("stop_token_seqs"),
         )
-        stop_matcher = _StopMatcher(stop_token_seqs, stop_strings)
+        stop_matcher = _StopMatcher(
+            stop_token_seqs, stop_strings,
+            skip_reasoning=bool(kwargs.get("stop_skips_reasoning")),
+            prompt_opens_think=bool(kwargs.get("_prompt_opens_think")),
+        )
         special_ids = set() if ignore_eos else set(self._eos_token_ids)
         detok = _IncrementalDetokenizer(self._tokenizer, self._path, special_ids)
 
@@ -5885,6 +5934,7 @@ class M5SidecarEngine(BaseEngine):
         accumulated_text = ""
         first_token_at: float | None = None
         finish_reason = "stop"
+        request_stats: dict[str, Any] = {}
 
         try:
             submit_params: dict[str, Any] = {
@@ -5958,6 +6008,7 @@ class M5SidecarEngine(BaseEngine):
                     return
 
                 # `finished`
+                request_stats = event.request_stats or {}
                 if stop_matcher.stopped or event.finish_reason == "stop":
                     finish_reason = "stop"
                 elif len(all_tokens) >= budget or event.finish_reason == "length":
@@ -5980,8 +6031,24 @@ class M5SidecarEngine(BaseEngine):
             now_perf = time.perf_counter()
             if all_tokens and first_token_at is None:
                 first_token_at = now_perf
+            if not terminal_seen and backend_id is not None:
+                await self._cancel_backend_request(backend_id)
+                terminal_seen = True
+                while not queue.empty():
+                    event = queue.get_nowait()
+                    if event.kind != "tokens":
+                        request_stats = event.request_stats or {}
+                        break
+            cached_tokens = max(0, min(num_prompt, int(request_stats.get("prefix_restored_tokens") or 0)))
+            mode = request_stats.get("decode_mode")
+            if mode:
+                logger.info(
+                    "miv request %s model=%s mode=%s cached_tokens=%d spec_rounds=%s ar_steps=%s fallback=%s",
+                    backend_id, self._model_id, mode, cached_tokens, request_stats.get("spec_rounds"),
+                    request_stats.get("ar_steps"), request_stats.get("fallback_reason") or "-",
+                )
             p_tps, g_tps = self._compute_tps(
-                prompt_tokens=num_prompt,
+                prompt_tokens=num_prompt - cached_tokens,
                 completion_tokens=len(all_tokens),
                 started_at=started_perf,
                 first_token_at=first_token_at,
@@ -5995,15 +6062,12 @@ class M5SidecarEngine(BaseEngine):
                 completion_tokens=len(all_tokens),
                 finished=True,
                 finish_reason=finish_reason,
+                cached_tokens=cached_tokens,
                 first_token_at=first_token_at,
                 generated_until=now_perf,
                 prompt_tps=p_tps,
                 generation_tps=g_tps,
             )
-            if not terminal_seen and backend_id is not None:
-                # Client-side stop matched before daemon finished; cancel remaining steps.
-                await self._cancel_backend_request(backend_id)
-                terminal_seen = True
             yield final_output
         finally:
             if backend_id is not None:
@@ -6087,15 +6151,17 @@ class M5SidecarEngine(BaseEngine):
         is_partial = kwargs.pop("is_partial", None)
         prepared = kwargs.pop("_prepared_prompt", None)
         if prepared is not None:
-            token_ids = list(prepared[1])
+            prompt_text, token_ids = prepared[0], list(prepared[1])
         else:
-            _, token_ids = await asyncio.to_thread(
+            prompt_text, token_ids = await asyncio.to_thread(
                 self.prepare_chat_prompt,
                 messages,
                 tools,
                 ct_kwargs,
                 is_partial,
             )
+        if kwargs.get("stop_skips_reasoning") and isinstance(prompt_text, str):
+            kwargs["_prompt_opens_think"] = prompt_text.rfind("<think>") > prompt_text.rfind("</think>")
         async for output in self.stream_generate(
             prompt=token_ids,
             max_tokens=max_tokens,
@@ -6192,6 +6258,20 @@ class M5SidecarEngine(BaseEngine):
         )
         return max(group_footprint, floor)
 
+    def effective_load_settings(self) -> dict[str, Any] | None:
+        """Return live daemon values only when it reports the load contract."""
+        last = self._last_stats or {}
+        if not last.get("max_context") or not last.get("speculative_backend"):
+            return None
+        keys = (
+            "max_context", "max_concurrency", "kv_dtype", "sampling_contract_id",
+            "speculative_backend", "max_draft_tokens",
+        )
+        return {
+            **{k: last[k] for k in keys if k in last},
+            "concurrency_source": self._options.concurrency_source,
+        }
+
     def get_stats(self) -> dict[str, Any]:
         running = self._process is not None and self._process.poll() is None
         last = self._last_stats or {}
@@ -6232,6 +6312,8 @@ class M5SidecarEngine(BaseEngine):
         }
         if self._last_stats:
             stats["backend_stats"] = dict(self._last_stats)
+        if (settings := self.effective_load_settings()) is not None:
+            stats["effective_load_settings"] = settings
         if self._last_capacity:
             stats["capacity"] = dict(self._last_capacity)
         return stats
@@ -6243,7 +6325,7 @@ class M5SidecarEngine(BaseEngine):
         if self._last_stats is None:
             return None
         s = self._last_stats
-        hits = int(s.get("prefix_hits", 0)) + int(s.get("prefix_partial_hits", 0))
+        hits = int(s.get("prefix_hits", 0))
         misses = int(s.get("prefix_misses", 0))
         evictions = int(s.get("prefix_evictions", 0))
         restored = int(s.get("prefix_restored_tokens", 0))

@@ -333,13 +333,24 @@ std::string_view to_string(omlx::m5::EventKind value) {
 }
 
 Json event_json(const omlx::m5::TokenEvent &event) {
-  return {
+  Json result = {
       {"request_id", event.request_id},
       {"tokens", event.tokens},
       {"kind", to_string(event.kind)},
       {"finish_reason", event.finish_reason},
       {"error", event.error},
   };
+  if (event.request_stats) {
+    const auto &stats = *event.request_stats;
+    result["request_stats"] = {
+        {"prefix_restored_tokens", stats.prefix_restored_tokens},
+        {"spec_rounds", stats.spec_rounds},
+        {"ar_steps", stats.ar_steps},
+        {"decode_mode", stats.decode_mode},
+        {"fallback_reason", stats.fallback_reason},
+    };
+  }
+  return result;
 }
 
 omlx::m5::SpeculativeBackend speculative_backend(std::string_view value) {
@@ -405,6 +416,7 @@ std::string parse_lora_mode_strict(std::string_view value,
 
 struct CliOptions {
   bool show_version = false;
+  bool describe = false;
   bool show_help = false;
   bool exit_on_disconnect = false;
   std::filesystem::path socket_path;
@@ -422,8 +434,10 @@ omlx::m5::LoadOptions load_options(const Json &value,
   result.kv_dtype = value.value("kv_dtype", "bf16");
   result.prefill_engine = value.value("prefill_engine", "auto");
   result.spec_search = value.value("spec_search", "auto");
-  result.sampling_contract =
-      value.value("sampling_contract", "legacy_rejection_v1");
+  result.sampling_contract = value.value(
+      "sampling_contract", value.value("fake", false)
+                               ? "legacy_rejection_v1"
+                               : omlx::m5::kDefaultServingSamplingContract);
   if (value.contains("memory_budget_bytes") &&
       !value.at("memory_budget_bytes").is_null()) {
     const auto &mb = value.at("memory_budget_bytes");
@@ -561,6 +575,11 @@ omlx::m5::LoadOptions load_options(const Json &value,
     result.lora_mode = fallback_mode;
   }
 
+  const bool explicit_backend =
+      value.contains("speculative_backend") ||
+      (value.contains("speculative") && value.at("speculative").contains("backend"));
+  if (explicit_backend && result.speculative.backend == omlx::m5::SpeculativeBackend::none)
+    result.path_overrides["enable_mtp"] = "off";
   return result;
 }
 
@@ -618,6 +637,11 @@ Json stats_json(const omlx::m5::StatsReport &value) {
       {"failed", value.failed},
       {"emitted_tokens", value.emitted_tokens},
       {"backend_kind", value.backend_kind},
+      {"max_context", value.max_context},
+      {"max_concurrency", value.max_concurrency},
+      {"kv_dtype", value.kv_dtype},
+      {"speculative_backend", value.speculative_backend},
+      {"max_draft_tokens", value.max_draft_tokens},
       {"model_execution_kind", value.model_execution_kind},
       {"sampling_contract_id", value.sampling_contract_id},
       {"numeric_contract_id", value.numeric_contract_id},
@@ -701,6 +725,85 @@ Json stats_json(const omlx::m5::StatsReport &value) {
   };
 }
 
+Json provider_contract() {
+  return {
+      {"provider_id", "io.ninfer.metal"},
+      {"provider_version", NINFER_METAL_DISPLAY_VERSION},
+      {"codename", NINFER_METAL_CODENAME},
+      {"semver", NINFER_METAL_SEMVER},
+      {"core_abi", NINFER_METAL_CORE_ABI},
+      {"protocol_version", kProtocolVersion},
+      {"engine_contract_version", 1},
+      {"capabilities",
+       {"ar", "mtp", "dflash2", "lora", "reload_lora", "kv_affine4_g128",
+        "rolling_prefix_cache", "trim_cache", "memory_budget_bytes",
+        "set_scheduler_hint", "cancel", "stats", "capacity",
+        "subscribe_events"}},
+      {"kv_formats", {"bf16", "affine4_g128"}},
+      {"speculative_limits", {{"mtp", omlx::m5::kMaxMtpDraftTokens},
+                              {"dflash2", omlx::m5::kMaxDFlash2DraftTokens}}},
+      {"load_defaults", {{"max_concurrency", 1}, {"kv_dtype", "bf16"},
+                         {"sampling_contract", omlx::m5::kDefaultServingSamplingContract},
+                         {"draft_tokens", 0}}},
+      {"supported_standard_settings",
+       {"max_context_window", "lora_adapter", "mtp_enabled",
+        "mtp_adaptive_max_depth", "mtp_fixed_depth", "dflash_enabled",
+        "dflash_draft_model", "dflash_block_size", "turboquant_kv_enabled",
+        "turboquant_kv_scheme"}},
+      {"options_schema",
+       Json::array({
+           {{"key", "max_concurrency"},
+            {"label", "Concurrency (B/C)"},
+            {"type", "int"},
+            {"min", 1},
+            {"max", 8},
+            {"default", 1},
+            {"reload_required", true}},
+           {{"key", "rolling_prefix_cache"},
+            {"label", "Rolling Prefix Cache"},
+            {"type", "bool"},
+            {"default", true},
+            {"reload_required", true}},
+           {{"key", "prefix_cache_gb"},
+            {"label", "Prefix Cache Budget (GiB)"},
+            {"type", "bytes_gb"},
+            {"min", 0},
+            {"max", 128},
+            {"default", 4},
+            {"reload_required", true}},
+           {{"key", "speculative_backend"},
+            {"label", "Speculative Backend"},
+            {"type", "enum"},
+            {"options", Json::array({"auto", "none", "mtp", "dflash2"})},
+            {"default", "auto"},
+            {"reload_required", true}},
+           {{"key", "sampling_contract"},
+            {"label", "Sampling Contract"},
+            {"type", "enum"},
+            {"options",
+             Json::array({"position_coupled_v1", "legacy_rejection_v1"})},
+            {"default", omlx::m5::kDefaultServingSamplingContract},
+            {"reload_required", true}},
+           {{"key", "lora_mode"},
+            {"label", "LoRA Mode"},
+            {"type", "enum"},
+            {"options", Json::array({"merge", "bypass"})},
+            {"default", "merge"},
+            {"reload_required", true}},
+           {{"key", "artifact_path"},
+            {"label", "Artifact Path"},
+            {"type", "string"},
+            {"default", ""},
+            {"reload_required", true}},
+           {{"key", "draft_artifact_path"},
+            {"label", "Draft Artifact Path"},
+            {"type", "string"},
+            {"default", ""},
+            {"reload_required", true}},
+       })},
+  };
+}
+
 bool base_load_options_equal(const omlx::m5::LoadOptions &a,
                              const omlx::m5::LoadOptions &b, bool fake_a,
                              bool fake_b,
@@ -737,73 +840,10 @@ public:
 
   Json execute(std::string_view method, const Json &params) {
     if (method == "hello") {
-      return {
-          {"provider_id", "io.ninfer.metal"},
-          {"provider_version", NINFER_METAL_DISPLAY_VERSION},
-          {"codename", NINFER_METAL_CODENAME},
-          {"semver", NINFER_METAL_SEMVER},
-          {"core_abi", NINFER_METAL_CORE_ABI},
-          {"protocol_version", kProtocolVersion},
-          {"engine_contract_version", 1},
-          {"pid", static_cast<std::int64_t>(::getpid())},
-          {"phys_footprint_bytes", current_phys_footprint_bytes()},
-          {"capabilities",
-           {"ar", "mtp", "dflash2", "lora", "reload_lora", "kv_affine4_g128",
-            "rolling_prefix_cache", "trim_cache", "memory_budget_bytes",
-            "set_scheduler_hint", "cancel", "stats", "capacity",
-            "subscribe_events"}},
-          {"kv_formats", {"bf16", "affine4_g128"}},
-          {"supported_standard_settings",
-           {"max_context_window", "lora_adapter", "mtp_enabled",
-            "mtp_adaptive_max_depth", "mtp_fixed_depth", "dflash_enabled",
-            "dflash_draft_model", "dflash_block_size", "turboquant_kv_enabled",
-            "turboquant_kv_scheme"}},
-          {"options_schema",
-           Json::array({
-               {{"key", "max_concurrency"},
-                {"label", "Concurrency (B/C)"},
-                {"type", "int"},
-                {"min", 1},
-                {"max", 8},
-                {"default", 1},
-                {"reload_required", true}},
-               {{"key", "rolling_prefix_cache"},
-                {"label", "Rolling Prefix Cache"},
-                {"type", "bool"},
-                {"default", true},
-                {"reload_required", true}},
-               {{"key", "prefix_cache_gb"},
-                {"label", "Prefix Cache Budget (GiB)"},
-                {"type", "bytes_gb"},
-                {"min", 0},
-                {"max", 128},
-                {"default", 4},
-                {"reload_required", true}},
-               {{"key", "sampling_contract"},
-                {"label", "Sampling Contract"},
-                {"type", "enum"},
-                {"options",
-                 Json::array({"position_coupled_v1", "legacy_rejection_v1"})},
-                {"default", "legacy_rejection_v1"},
-                {"reload_required", true}},
-               {{"key", "lora_mode"},
-                {"label", "LoRA Mode"},
-                {"type", "enum"},
-                {"options", Json::array({"merge", "bypass"})},
-                {"default", "merge"},
-                {"reload_required", true}},
-               {{"key", "artifact_path"},
-                {"label", "Artifact Path"},
-                {"type", "string"},
-                {"default", ""},
-                {"reload_required", true}},
-               {{"key", "draft_artifact_path"},
-                {"label", "Draft Artifact Path"},
-                {"type", "string"},
-                {"default", ""},
-                {"reload_required", true}},
-           })},
-      };
+      auto result = provider_contract();
+      result["pid"] = static_cast<std::int64_t>(::getpid());
+      result["phys_footprint_bytes"] = current_phys_footprint_bytes();
+      return result;
     }
     if (method == "load") {
       // Validate parameters before acquiring or replacing any loaded engine.
@@ -1366,13 +1406,14 @@ std::string format_daemon_help() {
   return "Usage: mseries-backendd [--exit-on-disconnect] "
          "[--lora|--lora-adapter PATH] [--lora-mode merge|bypass] "
          "--socket PATH\n"
-         "       mseries-backendd --version | --help\n\n"
+         "       mseries-backendd --version | --describe | --help\n\n"
          "Options:\n"
          "  --socket PATH                AF_UNIX socket path (or positional PATH)\n"
          "  --exit-on-disconnect         Exit when all active clients disconnect\n"
          "  --lora, --lora-adapter PATH  Default LoRA adapter directory for load RPC\n"
          "  --lora-mode merge|bypass     Default LoRA execution mode (default: merge)\n"
          "  --version                    Print daemon & protocol version and exit\n"
+         "  --describe                   Print the provider contract as JSON and exit\n"
          "  --help, -h                   Show this help message and exit\n";
 }
 
@@ -1380,6 +1421,10 @@ CliOptions parse_cli(int argc, char **argv) {
   CliOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg(argv[i]);
+    if (arg == "--describe") {
+      options.describe = true;
+      return options;
+    }
     if (arg == "--version") {
       options.show_version = true;
       return options;
@@ -1575,6 +1620,10 @@ int run(const CliOptions &options) {
 int main(int argc, char **argv) {
   try {
     const auto options = parse_cli(argc, argv);
+    if (options.describe) {
+      std::cout << provider_contract().dump() << '\n';
+      return 0;
+    }
     if (options.show_version) {
       std::cout << "mseries-backendd " << NINFER_METAL_DISPLAY_VERSION
                 << " (codename=" << NINFER_METAL_CODENAME

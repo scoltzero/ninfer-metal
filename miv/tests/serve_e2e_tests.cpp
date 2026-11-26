@@ -398,6 +398,26 @@ void test_toml_and_cli_config() {
         "to_load_options prefix_cache_bytes missing");
 }
 
+void test_shared_provider_contract() {
+  const std::string path =
+      (std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() /
+       "omlx" / "tests" / "fixtures" / "ninfer_shared_serve_contract.toml").string();
+  std::vector<std::string> args = {"ninfer-metal-serve", "--config", path};
+  std::vector<char *> argv;
+  for (auto &arg : args) argv.push_back(arg.data());
+  const auto cfg = parse_serve_config(static_cast<int>(argv.size()), argv.data());
+  check(cfg.models.size() == 1, "shared TOML should resolve one model");
+  const auto load = to_load_options(cfg.models.front());
+  check(load.max_context == 65536 && load.max_concurrency == 4 &&
+            load.kv_dtype == "affine4_g128", "shared sizing contract drift");
+  check(load.speculative.backend == SpeculativeBackend::dflash2 &&
+            load.speculative.draft_tokens == 0 && load.spec_search == "on",
+        "shared speculative policy contract drift");
+  check(load.path_overrides.at("batch_mode") == "off" &&
+            load.path_overrides.at("prefix_cache_bytes") == "0",
+        "shared boolean or zero override was lost");
+}
+
 void test_http_server_e2e() {
   auto assets = build_synthetic_assets();
 
@@ -1047,7 +1067,8 @@ void test_multi_model_config_and_aliases(
     ServeConfig example_cfg;
     load_serve_toml_file(example_toml.string(), example_cfg);
     check(example_cfg.host == "127.0.0.1" && example_cfg.port == 8080 &&
-              example_cfg.kv_dtype == "affine4_g128",
+              example_cfg.max_concurrency == 1 && example_cfg.kv_dtype == "bf16" &&
+              example_cfg.spec_backend_auto && example_cfg.draft_tokens == 0,
           "ninfer-metal.toml.example failed validation");
   }
 
@@ -4583,6 +4604,7 @@ int main(int argc, char **argv) {
     std::cout << "[serve_e2e] PASS: OutputParser UTF-8 & thinking states\n";
 
     test_toml_and_cli_config();
+    test_shared_provider_contract();
     std::cout << "[serve_e2e] PASS: TOML config & CLI overrides\n";
 
     test_default_config_auto_discovery_tilde_and_auto_spec();

@@ -9,6 +9,7 @@ struct Row<Trailing: View>: View {
     let label: String?
     let sublabel: String?
     let warning: String?
+    let mivSetting: Bool
     let isLast: Bool
     let trailing: Trailing
 
@@ -18,12 +19,14 @@ struct Row<Trailing: View>: View {
         label: String? = nil,
         sublabel: String? = nil,
         warning: String? = nil,
+        mivSetting: Bool = false,
         isLast: Bool = false,
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.label = label
         self.sublabel = sublabel
         self.warning = warning
+        self.mivSetting = mivSetting
         self.isLast = isLast
         self.trailing = trailing()
     }
@@ -32,9 +35,19 @@ struct Row<Trailing: View>: View {
         HStack(alignment: .center, spacing: 12) {
             if let label {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(label)
-                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                        .foregroundStyle(theme.text)
+                    HStack(spacing: 5) {
+                        Text(label)
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        if mivSetting {
+                            Circle()
+                                .fill(theme.text)
+                                .frame(width: 5, height: 5)
+                                .help(String(localized: "settings.miv.forwarded",
+                                             defaultValue: "Used by miv when selected or inherited"))
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .foregroundStyle(theme.text)
                     if let sublabel, !sublabel.isEmpty {
                         Text(sublabel)
                             .font(.omlxText(11.5))
@@ -92,6 +105,7 @@ extension Row where Trailing == EmptyView {
         self.label = label
         self.sublabel = sublabel
         self.warning = nil
+        self.mivSetting = false
         self.isLast = isLast
         self.trailing = EmptyView()
     }

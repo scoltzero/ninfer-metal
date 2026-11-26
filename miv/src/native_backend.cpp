@@ -2206,6 +2206,7 @@ public:
       auto *ctrl = mtp_controller();
       pending_k_ = ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
       if (pending_k_ == 0U && max_allowed_k > 0U) {
+        note_fallback("adaptive_gate");
         std::scoped_lock lock(backend_.stats_mutex_);
         ++backend_.backend_stats_.spec_search_gated_rounds;
       }
@@ -2241,6 +2242,8 @@ public:
               ? *assigned_spec
               : owner_.spec_controller.select_single_depth(make_spec_query());
       pending_k_ = decision.k;
+      if (decision.gated && pending_k_ == 0)
+        note_fallback("adaptive_gate");
       if (decision.gated || decision.probe) {
         std::scoped_lock lock(backend_.stats_mutex_);
         if (decision.gated)
@@ -2312,6 +2315,8 @@ public:
     step_ = std::move(res);
     if (pending_prefill_)
       offset_ += pending_input_.size();
+    else
+      record_ar_step();
     committed_tokens_.insert(committed_tokens_.end(), pending_input_.begin(),
                              pending_input_.end());
     std::scoped_lock lock(backend_.stats_mutex_);
@@ -2343,6 +2348,7 @@ public:
   record_batch_verify_result(QwenForwardResult &&res,
                              double verify_gpu_share_ms) {
     step_ = std::move(res);
+    record_spec_step(pending_k_);
     {
       std::scoped_lock lock(backend_.stats_mutex_);
       auto &stats = backend_.backend_stats_;
@@ -2663,7 +2669,37 @@ public:
     return advance_contended(cap, ext_contended);
   }
 
+  std::optional<RequestStats> request_stats() const override {
+    RequestStats result = request_stats_;
+    result.prefix_restored_tokens = matched_tokens_;
+    if (result.spec_rounds == 0)
+      result.decode_mode = "ar";
+    else if (result.ar_steps > 0)
+      result.decode_mode = "mixed";
+    else
+      result.decode_mode = draft() ? "dflash2" : "mtp";
+    return result;
+  }
+
 private:
+  void note_fallback(const char *reason) {
+    if (request_stats_.fallback_reason.empty())
+      request_stats_.fallback_reason = reason;
+  }
+
+  void record_ar_step() {
+    ++request_stats_.ar_steps;
+    if (mtp() != nullptr && !mtp_primed_ && matched_tokens_ > 0)
+      note_fallback("mtp_prefix_not_restored");
+  }
+
+  void record_spec_step(std::uint32_t depth) {
+    if (depth > 0)
+      ++request_stats_.spec_rounds;
+    else
+      record_ar_step();
+  }
+
   QwenForward &program() { return owner_.program_at(slot_); }
   const QwenForward &program() const { return owner_.program_at(slot_); }
   DFlashForward *draft() { return owner_.draft_at(slot_); }
@@ -2864,6 +2900,7 @@ private:
       step_ = with_page_pressure([&] { return program().run(input, sampling_); });
       committed_tokens_.push_back(std::uint32_t(token));
     }
+    record_ar_step();
     const double ar_wall = RoundCostRecorder::milliseconds(ar_begin);
     owner_.spec_controller.observe_ar_step(
         step_.submission.timing.gpu_ms > 0 ? step_.submission.timing.gpu_ms
@@ -2899,6 +2936,8 @@ private:
     const auto decision =
         owner_.spec_controller.select_single_depth(make_spec_query());
     const auto k = decision.k;
+    if (decision.gated && k == 0)
+      note_fallback("adaptive_gate");
     if (decision.gated || decision.probe) {
       std::scoped_lock lock(backend_.stats_mutex_);
       if (decision.gated)
@@ -2930,6 +2969,7 @@ private:
     TargetGpuVerifyDecision preselected{};
     const bool pipelined_vs = try_pipelined_verify_and_select(
         program(), input, proposal.selection.steps, cost, preselected);
+    record_spec_step(k);
     if (!pipelined_vs) {
       step_ = cost.measure(RoundCostRecorder::verify, [&] {
         return with_page_pressure(
@@ -3128,6 +3168,8 @@ private:
     auto *ctrl = mtp_controller();
     if (ctrl && ctrl->should_exit()) {
       mtp_exited_ = true;
+      note_fallback("mtp_adaptive_exit");
+      record_ar_step();
       step_.token = anchor_;
       // Step anchor_ in AR and resume standard AR stream cleanly.
       const std::array<std::uint32_t, 1> input{anchor_};
@@ -3161,7 +3203,9 @@ private:
         ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
 
     if (k == 0U) {
+      record_ar_step();
       if (max_allowed_k > 0U) {
+        note_fallback("adaptive_gate");
         std::scoped_lock lock(backend_.stats_mutex_);
         ++backend_.backend_stats_.spec_search_gated_rounds;
       }
@@ -3233,6 +3277,7 @@ private:
     TargetGpuVerifyDecision preselected{};
     const bool pipelined_vs = try_pipelined_verify_and_select(
         program(), input, proposal.selection.steps, cost, preselected);
+    record_spec_step(k);
     if (!pipelined_vs) {
       step_ = cost.measure(RoundCostRecorder::verify, [&] {
         return with_page_pressure(
@@ -3443,6 +3488,7 @@ private:
   std::uint32_t pending_k_ = 0;
   DFlash2DraftResult pending_proposal_;
   std::unique_ptr<RoundCostRecorder> pending_cost_;
+  RequestStats request_stats_;
   std::size_t offset_ = 0, matched_tokens_ = 0;
   std::uint64_t matched_entry_id_ = 0, saved_think_anchor_id_ = 0;
   std::uint32_t produced_ = 0, anchor_ = 0, in_flight_ar_token_ = 0;
@@ -3579,8 +3625,10 @@ ExecutionResult NativeBackend::execute(std::uint64_t /*request_id*/,
                   emit_tokens, sampling);
   slot0_guard.armed = false;
   for (;;) {
-    if (auto out = task.advance())
+    if (auto out = task.advance()) {
+      out->request_stats = task.request_stats();
       return *out;
+    }
   }
 }
 
@@ -4949,6 +4997,15 @@ NativeBackend::advance_batch(std::span<BackendTask *const> tasks) {
 void NativeBackend::populate_stats(StatsReport &stats) const {
   std::scoped_lock lock(stats_mutex_);
   stats.backend_kind = backend_stats_.backend_kind;
+  if (ar_program_->slot_speculative) {
+    stats.speculative_backend = "dflash2";
+    stats.max_draft_tokens = ar_program_->slot_dflash_draft_tokens;
+  } else if (ar_program_->slot_mtp_enabled) {
+    stats.speculative_backend = "mtp";
+    stats.max_draft_tokens = ar_program_->slot_mtp_draft_tokens;
+  } else {
+    stats.speculative_backend = "none";
+  }
   stats.model_execution_kind = backend_stats_.model_execution_kind;
   stats.batch_submissions = backend_stats_.batch_submissions;
   stats.batch_rows = backend_stats_.batch_rows;

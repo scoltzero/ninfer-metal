@@ -419,7 +419,10 @@ def run_session(
             assert schema_by_key["prefix_cache_gb"]["type"] == "bytes_gb"
             assert schema_by_key["prefix_cache_gb"]["min"] == 0
             assert schema_by_key["prefix_cache_gb"]["max"] == 128
-            assert schema_by_key["sampling_contract"]["default"] == "legacy_rejection_v1"
+            assert schema_by_key["sampling_contract"]["default"] == "position_coupled_v1"
+            described = json.loads(subprocess.check_output([str(daemon), "--describe"], text=True))
+            assert hello["load_defaults"] == described["load_defaults"]
+            assert hello["speculative_limits"] == described["speculative_limits"] == {"mtp": 4, "dflash2": 7}
             assert schema_by_key["lora_mode"]["type"] == "enum"
             assert schema_by_key["lora_mode"]["options"] == ["merge", "bypass"]
             assert schema_by_key["lora_mode"]["default"] == "merge"
@@ -444,6 +447,8 @@ def run_session(
             load_result = client.call("load", load)
             assert load_result["pid"] == process.pid
             assert load_result["phys_footprint_bytes"] > 0
+            assert load_result["max_context"] == load.get("max_context", 32768)
+            assert load_result["kv_dtype"] == load.get("kv_dtype", "bf16")
             request = {
                 "prompt_tokens": [1, 7, 3, 9, 2],
                 "max_new_tokens": 8,
@@ -458,6 +463,12 @@ def run_session(
             assert stats["phys_footprint_bytes"] > 0
             for key, value in expected.items():
                 assert stats[key] == value, (key, stats[key], value)
+            if stats["backend_kind"] == "native":
+                request_stats = terminal["request_stats"]
+                assert request_stats["decode_mode"] in {"ar", "mixed", "mtp", "dflash2"}
+                assert request_stats["prefix_restored_tokens"] == 0
+                if stats["speculative_backend"] == "dflash2":
+                    assert request_stats["spec_rounds"] > 0
             capacity = client.call("capacity")
             assert capacity["max_concurrency"] == 1
             assert capacity["pid"] == process.pid

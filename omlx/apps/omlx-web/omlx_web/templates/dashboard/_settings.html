@@ -622,7 +622,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <div class="flex items-center gap-2">
-                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
+                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                             <!-- Applied live, except to distributed (cluster) engines -->
                                             <span x-show="globalSettings.server.distributed_inference_active" x-cloak
                                                   class="badge bg-amber-50 text-amber-700 border-amber-200">
@@ -795,7 +795,7 @@
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
@@ -810,13 +810,13 @@
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <label class="text-sm text-neutral-700">{{ t('settings.generation.max_tokens') }}</label>
+                                    <label class="text-sm text-neutral-700">{{ t('settings.generation.max_tokens') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                     <input type="number" x-model.number="globalSettings.sampling.max_tokens" min="1" max="131072"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.temperature') }}</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.temperature') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.temperature_hint') }}</p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -831,7 +831,7 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_p') }}</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_p') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_p_hint') }}</p>
                                     </div>
                                     <div class="flex items-center gap-3">
@@ -846,7 +846,7 @@
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_k') }}</label>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.top_k') }}<span class="ml-1 text-neutral-900" title="{{ t('modal.model_settings.miv_inherited') }}" aria-label="{{ t('modal.model_settings.miv_inherited') }}">●</span></label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.top_k_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.sampling.top_k" min="0"

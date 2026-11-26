@@ -391,6 +391,19 @@ final class ModelSettingsScreenVM {
         return Set(model?.supportedStandardSettings ?? [])
     }
 
+    var usesMiv: Bool { effectiveExternalEngine == "m5rt" }
+
+    var mivSpeculativeLimits: [String: Int] {
+        guard usesMiv else { return [:] }
+        return model?.externalEngines?.first(where: { $0.id == "m5rt" })?.speculativeLimits ?? [:]
+    }
+
+    func isMivSetting(_ key: String) -> Bool {
+        guard usesMiv else { return false }
+        let requests = model?.externalEngines?.first(where: { $0.id == "m5rt" })?.requestSettings ?? []
+        return externalEngineSupportedSettings.contains(key) || requests.contains(key)
+    }
+
     func externalEngineSupports(_ key: String) -> Bool {
         effectiveExternalEngine.isEmpty || externalEngineSupportedSettings.contains(key)
     }
@@ -837,7 +850,7 @@ final class ModelSettingsScreenVM {
                 self.repetitionPenalty = s?.repetitionPenalty.map { String($0) } ?? ""
                 self.presencePenalty = s?.presencePenalty.map { String($0) } ?? ""
                 self.ttlSeconds = s?.ttlSeconds.map(String.init) ?? ""
-                self.enableThinking = s?.enableThinking ?? true
+                self.enableThinking = s?.enableThinking ?? m.thinkingDefault ?? true
                 self.qwen4PleSsdOffloadForced =
                     m.qwen4PleSsdOffloadForced ?? false
                 self.qwen4PleSsdOffloadSupported =
@@ -972,7 +985,7 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    func save(_ field: Field, client: OMLXClient) async {
+    func save(_ field: Field, client: OMLXClient, externalOptionKey: String? = nil) async {
         if isDiffusionModel && isDiffusionUnsupportedField(field) {
             return
         }
@@ -1018,7 +1031,7 @@ final class ModelSettingsScreenVM {
             case .success(let v): patch.presencePenalty = v
             case .failure(let e): self.lastError = e.message; return
             }
-        case .ttl:                     patch.ttlSeconds = Int(ttlSeconds)
+        case .ttl:                     patch.ttlSeconds = .some(Int(ttlSeconds))
         case .enableThinking:          patch.enableThinking = enableThinking
         case .ssdNgramOffload:
             // A forced offload is a runtime decision, so sending nothing
@@ -1197,8 +1210,9 @@ final class ModelSettingsScreenVM {
         case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
         case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
         case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
-        case .mtpEnabled, .mtpAdaptiveMaxDepth:
+        case .mtpEnabled:
             patch.mtpEnabled = mtpEnabled
+        case .mtpAdaptiveMaxDepth:
             patch.mtpAdaptiveMaxDepth = .some(Int(mtpAdaptiveMaxDepth))
             patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
@@ -1206,7 +1220,10 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         case .loraAdapter:             patch.loraAdapter = loraAdapter
         case .externalEngineLoraMode, .externalEngineOptions:
-            patch.externalEngineOptions = externalEngineOptions
+            let active = effectiveExternalEngine
+            guard let key = field == .externalEngineLoraMode ? "lora_mode" : externalOptionKey,
+                  let value = externalEngineOptions[active]?[key] else { return }
+            patch.externalEngineOptionsPatch = [active: [key: value]]
         }
         if thinkingForced { patch.enableThinking = .some(nil) }
         let targetModelID = modelID
@@ -2548,7 +2565,9 @@ final class ModelSettingsScreenVM {
         guard validateWorkingSettings() else { return }
         let saved = currentSettingsDict()
         do {
-            _ = try await client.updateModelSettings(id: targetModelID, settings: workingSettingsBody())
+            _ = try await client.updateModelSettings(
+                id: targetModelID, settings: workingSettingsBody(changesSince: loadedSettings)
+            )
             guard modelID == targetModelID else { return }
             // Edits made during the request stay unsaved for the next write.
             loadedSettings = saved
@@ -2574,7 +2593,7 @@ final class ModelSettingsScreenVM {
 
     /// PUT body for `saveWorkingToModel`. A profile omits empty fields,
     /// but a settings write must send null to clear them.
-    func workingSettingsBody() -> [String: AnyCodable] {
+    func workingSettingsBody(changesSince baseline: [String: AnyCodable]? = nil) -> [String: AnyCodable] {
         var body = currentSettingsDict()
         let clearable = [
             ProfileSettingsKey.maxContextWindow, ProfileSettingsKey.maxTokens,
@@ -2596,7 +2615,17 @@ final class ModelSettingsScreenVM {
             if !indexCacheEnabled {
                 body[ProfileSettingsKey.indexCacheFreq] = AnyCodable(0)
             }
-            body["mtp_fixed_depth"] = AnyCodable(NSNull())
+        }
+        if let baseline {
+            let current = currentSettingsDict()
+            let changed = Set(current.keys).union(baseline.keys).filter { current[$0] != baseline[$0] }
+            body = body.filter { changed.contains($0.key) }
+            if changed.contains(ProfileSettingsKey.mtpAdaptiveMaxDepth), mtpEnabled {
+                if body[ProfileSettingsKey.mtpAdaptiveMaxDepth] == nil {
+                    body[ProfileSettingsKey.mtpAdaptiveMaxDepth] = AnyCodable(NSNull())
+                }
+                body["mtp_fixed_depth"] = AnyCodable(NSNull())
+            }
         }
         return body
     }

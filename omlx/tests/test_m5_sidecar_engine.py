@@ -921,7 +921,7 @@ class TestDualUdsTransportAndShowstoppers:
 
             cache_stats = engine.get_runtime_cache_stats()
             assert cache_stats is not None
-            assert cache_stats["cache_rates"]["cumulative"]["prefix_hits"] == 4
+            assert cache_stats["cache_rates"]["cumulative"]["prefix_hits"] == 3
         finally:
             engine._process = None
             await engine.stop()
@@ -1512,9 +1512,13 @@ class TestMivV001SettingsCoexistenceAndUI:
         )
         assert opts_aff8.kv_dtype == "bf16"  # Never "int8_g64"!
 
-        # Stale 32768 cap removed in m5rt_memory_estimate()
-        est_32k = m5rt_memory_estimate(model_dir, target, 32768, ModelSettings())
-        est_256k = m5rt_memory_estimate(model_dir, target, 262144, ModelSettings())
+        # Explicit model windows are used by both the planner and the estimator.
+        est_32k = m5rt_memory_estimate(
+            model_dir, target, 262144, ModelSettings(max_context_window=32768)
+        )
+        est_256k = m5rt_memory_estimate(
+            model_dir, target, 32768, ModelSettings(max_context_window=262144)
+        )
         assert est_256k > est_32k
 
     def test_standard_settings_toml_and_global_concurrency_sync(self, tmp_path, monkeypatch):
@@ -1541,7 +1545,7 @@ class TestMivV001SettingsCoexistenceAndUI:
         ms_mtp = ModelSettings(
             external_engine=M5RT_ENGINE_ID,
             mtp_enabled=True,
-            mtp_fixed_depth=5,
+            mtp_fixed_depth=4,
         )
         opts_mtp = m5_mod.build_m5rt_options(
             model_dir,
@@ -1552,7 +1556,7 @@ class TestMivV001SettingsCoexistenceAndUI:
             global_settings=gs,
         )
         assert opts_mtp.speculative_backend == "mtp"
-        assert opts_mtp.draft_tokens == 5
+        assert opts_mtp.draft_tokens == 4
         assert opts_mtp.max_concurrency == 4
 
         eng_mtp = M5SidecarEngine(
@@ -1563,7 +1567,14 @@ class TestMivV001SettingsCoexistenceAndUI:
             options=opts_mtp,
         )
         load_payload = eng_mtp._build_load_params()
-        assert load_payload["speculative"] == {"backend": "mtp", "draft_tokens": 5}
+        assert load_payload["speculative"] == {"backend": "mtp", "draft_tokens": 4}
+        assert load_payload["path_overrides"]["mtp_fixed_depth"] == "on"
+        adaptive = m5_mod.build_m5rt_options(
+            model_dir, target, ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=4),
+            default_context=4096, memory_budget_bytes=0, global_settings=gs,
+        )
+        assert adaptive.draft_tokens == 4
+        assert adaptive.path_overrides["mtp_fixed_depth"] == "off"
         assert load_payload["memory_budget_bytes"] == (4 << 30)
 
         # 2) Stock DFlash settings sync (block_size=6 -> draft_tokens=5)
@@ -2606,7 +2617,7 @@ class TestPathBMultiMicrokernelSidecars:
             memory_budget_bytes=0,
         )
         assert opts_mtp_auto.speculative_backend == "mtp"
-        assert opts_mtp_auto.draft_tokens == 3
+        assert opts_mtp_auto.draft_tokens == 0
         assert opts_mtp_auto.path_overrides["mtp_artifact"] == str(
             (mtp_model / "mtp.omlxm5").resolve()
         )
@@ -2632,7 +2643,7 @@ class TestPathBMultiMicrokernelSidecars:
             memory_budget_bytes=0,
         )
         assert opts_df_auto.speculative_backend == "dflash2"
-        assert opts_df_auto.draft_tokens == 4
+        assert opts_df_auto.draft_tokens == 0
 
         # 3) Precedence: explicit UI settings > [sidecar.models."<name>"] > [engine] in shared TOML
         custom_toml = tmp_path / "layered.toml"
@@ -2676,7 +2687,7 @@ class TestPathBMultiMicrokernelSidecars:
             turboquant_kv_scheme="affine4",
             turboquant_kv_bits=4,
             mtp_enabled=True,
-            mtp_fixed_depth=5,
+            mtp_fixed_depth=4,
         )
         opts_ui = m5_mod.build_m5rt_options(
             model_dir,
@@ -2689,7 +2700,7 @@ class TestPathBMultiMicrokernelSidecars:
         assert opts_ui.max_context == 131072
         assert opts_ui.kv_dtype == "affine4_g128"
         assert opts_ui.speculative_backend == "mtp"
-        assert opts_ui.draft_tokens == 5
+        assert opts_ui.draft_tokens == 4
         assert opts_ui.max_concurrency == 2  # still inherited from [sidecar.models]
 
         # 4) Auto-discovery precedence chain:
@@ -3565,7 +3576,7 @@ class TestDFlash2WhitelistAndAutoRepack:
                 assert (df_27b / "model.miv").is_file()
                 lp = miv_sock_srv.load_params[-1]
                 assert lp["kv_dtype"] == "affine4_g128"
-                assert lp["speculative"] == {"backend": "dflash2", "draft_tokens": 7}
+                assert lp["speculative"] == {"backend": "dflash2", "draft_tokens": 0}
                 assert Path(lp["path_overrides"]["artifact"]) == (qwen_27b / "model.miv").resolve()
                 assert Path(lp["path_overrides"]["draft_artifact"]) == (df_27b / "model.miv").resolve()
             finally:
@@ -3641,3 +3652,85 @@ class TestDFlash2WhitelistAndAutoRepack:
 
 
 
+
+
+def test_miv_launch_plan_uses_same_window_for_load_estimate_and_signature(tmp_path, monkeypatch):
+    fixture = Path(__file__).with_name("fixtures") / "ninfer_shared_serve_contract.toml"
+    monkeypatch.setenv("NINFER_METAL_CONFIG", str(fixture))
+    model_dir = _write_test_model(tmp_path / "source-dir")
+    config_file = model_dir / "config.json"
+    config = json.loads(config_file.read_text())
+    config["text_config"]["max_position_embeddings"] = 262144
+    config_file.write_text(json.dumps(config))
+    binary = m5_mod.M5Binary(path=tmp_path / "daemon", version="miv-v0.02", protocol_version=2, auto_detected=False)
+    target = M5Target(binary=binary, artifact_path=model_dir / "model.omlxm5", metallib_dir=None)
+    gs = GlobalSettings(base_path=tmp_path / "base")
+    gs.sampling.max_context_window_policy = 8192
+    settings = ModelSettings()
+
+    def plan():
+        return m5_mod.build_m5rt_options(
+            model_dir, target, settings, default_context=8192, memory_budget_bytes=0,
+            global_settings=gs, model_id="shared-fixture",
+        )
+
+    first = plan()
+    assert (first.max_context, first.max_concurrency, first.kv_dtype) == (8192, 4, "affine4_g128")
+    assert (first.speculative_backend, first.draft_tokens, first.spec_search) == ("dflash2", 0, "on")
+    assert first.batch_mode is False
+    assert first.prefix_cache_bytes == 0
+
+    engine = M5SidecarEngine(str(model_dir), "shared-fixture", target, tmp_path / "logs", first)
+    params = engine._build_load_params()
+    assert (params["max_context"], params["max_concurrency"], params["kv_dtype"]) == (
+        first.max_context, first.max_concurrency, first.kv_dtype,
+    )
+    assert params["path_overrides"]["prefix_cache_bytes"] == "0"
+
+    def estimate():
+        return m5rt_memory_estimate(
+            model_dir, target, 8192, settings, global_settings=gs, model_id="shared-fixture",
+        )
+
+    def signature():
+        return m5_mod.m5rt_runtime_signature(
+            settings, None, model_path=model_dir, target=target, default_context=8192,
+            model_id="shared-fixture", global_settings=gs,
+        )
+
+    before, old_size = signature(), estimate()
+    gs.scheduler.max_concurrent_requests = 2
+    assert signature() == before
+    gs.sampling.max_context_window_policy = None
+    assert plan().max_context == 65536
+    assert signature() != before
+    assert estimate() > old_size
+
+
+def test_miv_provider_field_patch_and_kv_button_preserve_unedited_options():
+    from omlx.admin.routes import ModelSettingsRequest
+
+    settings = ModelSettings(
+        external_engine="m5rt", mtp_fixed_depth=4,
+        external_engine_options={"m5rt": {"kv_dtype": "bf16", "max_concurrency": 1}},
+        m5rt_options={"kv_dtype": "bf16"},
+    )
+    req = ModelSettingsRequest(
+        turboquant_kv_enabled=True,
+        external_engine_options_patch={"m5rt": {"max_concurrency": 4}},
+    )
+    m5_mod.apply_m5rt_model_settings_update(
+        settings, req, req.model_fields_set, is_diffusion_model=False,
+    )
+    assert settings.mtp_fixed_depth == 4
+    assert settings.m5rt_options is None
+    assert settings.external_engine_options == {"m5rt": {"max_concurrency": 4}}
+
+
+@pytest.mark.parametrize("opened", [False, True])
+def test_sidecar_stop_ignores_streamed_think_text(opened):
+    matcher = m5_mod._StopMatcher([], ["STOP"], skip_reasoning=True, prompt_opens_think=opened)
+    prefix = [] if opened else ["<th", "ink>"]
+    emitted = "".join(matcher.push_text(x) for x in prefix + ["STOP ex", "ample</th", "ink>visible ST", "OP hidden"])
+    assert emitted == ("<think>" if not opened else "") + "STOP example</think>visible "
+    assert matcher.stopped

@@ -735,7 +735,7 @@ class TestExt5SpeculativeAutoMtp:
             emb_dir, emb_target, ModelSettings(), default_context=4096, memory_budget_bytes=0
         )
         assert opts_emb.speculative_backend == "mtp"
-        assert opts_emb.draft_tokens == 3
+        assert opts_emb.draft_tokens == 0
 
         # 2) Valid OMLXM5A1 WITHOUT MTP objects stays "none" even if config.json declares mtp layers
         stripped_dir = _make_model_dir(
@@ -771,7 +771,7 @@ class TestExt5SpeculativeAutoMtp:
             stripped_dir, stripped_target, ms_ext_mtp, default_context=4096, memory_budget_bytes=0
         )
         assert opts_ext.speculative_backend == "mtp"
-        assert opts_ext.draft_tokens == 3
+        assert opts_ext.draft_tokens == 0
         assert opts_ext.path_overrides["mtp_artifact"] == str(ext_mtp_file)
 
         # 4) Synthetic placeholder artifact falls back to config.json mtp_num_hidden_layers
@@ -992,7 +992,7 @@ class TestExt6AdminCompatAndAutoRoute:
             )
         )
         assert res_kv["success"] is True
-        assert stored_settings["AutoM5"].m5rt_options == {"kv_dtype": "bf16"}
+        assert stored_settings["AutoM5"].m5rt_options == {"kv_dtype": "bf16", "speculative_backend": "dflash2"}
 
 
 # ---------------------------------------------------------------------------

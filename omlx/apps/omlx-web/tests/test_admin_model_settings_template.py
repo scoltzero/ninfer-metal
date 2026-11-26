@@ -702,8 +702,37 @@ test('Save sends only fields edited since the modal opened', async () => {
     state.modelSettings.ctKwargEntries = [];
     await state.saveModelSettings();
     assert.deepEqual(body, {
-        temperature: 0.9, chat_template_kwargs: null, forced_ct_kwargs: null, mtp_fixed_depth: null,
+        temperature: 0.9, chat_template_kwargs: null, forced_ct_kwargs: null,
     });
+});
+
+test('miv KV and concurrency save only the edited provider field', async () => {
+    let body;
+    const state = setup(async (_url, options) => {
+        body = JSON.parse(options.body);
+        return {ok: true, json: async () => ({})};
+    });
+    state.loadModels = async () => {};
+    const model = {id: 'miv-lane', auto_external_engine: 'm5rt', external_engines: [{
+        id: 'm5rt',
+        supported_standard_settings: ['turboquant_kv_enabled'],
+        request_settings: ['temperature'],
+    }]};
+    state.selectedModel = model;
+    state.modelSettings = state.buildModelSettingsState(model, {
+        mtp_enabled: true, mtp_fixed_depth: 4,
+        external_engine_options: {m5rt: {kv_dtype: 'bf16', max_concurrency: 1}},
+    });
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    assert.equal(state.mivSettingIsForwarded('temperature'), true);
+    assert.equal(state.mivSettingIsForwarded('repetition_penalty'), false);
+    state.toggleKvCompression();
+    state.setExternalEngineOption({key: 'max_concurrency', type: 'int'}, 4);
+    await state.saveModelSettings();
+    assert.equal(body.turboquant_kv_enabled, true);
+    assert.equal(body.turboquant_kv_scheme, 'affine4');
+    assert.deepEqual(body.external_engine_options_patch, {m5rt: {max_concurrency: 4}});
+    assert.equal('mtp_fixed_depth' in body, false);
 });
 
 test('Apply response cannot replace another model editor', async () => {

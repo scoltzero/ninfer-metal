@@ -60,6 +60,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var activeEngineId: String? = nil
     /// Human-readable display label for the active/resolved engine.
     var activeEngineLabel: String? = nil
+    var mivEffectiveSettings: MivEffectiveSettings? = nil
     /// Standard `ModelSettings` keys honored by the active external engine.
     var supportedStandardSettings: [String]? = nil
     /// True when the model is structurally compatible with DFlash (block
@@ -314,6 +315,16 @@ extension ModelDTO {
     }
 }
 
+struct MivEffectiveSettings: Codable, Equatable, Sendable {
+    let maxContext: Int
+    let maxConcurrency: Int
+    let kvDtype: String
+    let samplingContractId: String
+    let speculativeBackend: String
+    let maxDraftTokens: Int
+    let concurrencySource: String
+}
+
 /// One entry of `external_engines` in GET /admin/api/models.
 struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let id: String
@@ -326,6 +337,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     var canConvert: Bool? = nil
     /// Standard `ModelSettings` keys honored when this engine serves the model.
     var supportedStandardSettings: [String]? = nil
+    var requestSettings: [String]? = nil
+    var speculativeLimits: [String: Int]? = nil
     /// Canonical SPI provider ID when backed by an out-of-process provider.
     var providerId: String? = nil
     /// Provider-specific per-model options schema.
@@ -448,7 +461,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var minP: Double? = nil
     var presencePenalty: Double? = nil
     var repetitionPenalty: Double? = nil
-    var ttlSeconds: Int? = nil
+    var ttlSeconds: Int?? = nil  // Explicit null clears the model override.
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     var qwen4GdnDecodeWideProj: Bool? = nil
@@ -524,6 +537,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpDraftBlockSize: Int? = nil
     var loraAdapter: String? = nil // "" clears the adapter.
     var externalEngineOptions: [String: [String: AnyCodable]]? = nil
+    var externalEngineOptionsPatch: [String: [String: AnyCodable]]? = nil
 }
 
 /// GET /admin/api/models/{id}/generation_config: the sampling values a new

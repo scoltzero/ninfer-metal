@@ -226,6 +226,8 @@ jobs:
             tests/test_process_memory_enforcer.py \
             -q)
           pytest omlx-extend/tests/test_p1_ext_spi.py omlx-extend/tests/test_sync_and_mix_release.py -q
+          (cd omlx && pytest tests/test_admin_server_aliases.py -k 'cache_settings_runtime or host_cache' -q)
+          pytest omlx/apps/omlx-web/tests/test_admin_model_settings_template.py -q
 
       - name: Build macOS oMLX-extend DMG installer
         id: bundle

@@ -84,8 +84,8 @@ private struct SchedulerSection: View {
                               comment: "Row label for max concurrent requests"),
                 sublabel: String(localized: "performance.scheduler.max_concurrent.sub",
                                  defaultValue: "Cap on simultaneous /v1 requests.",
-                                 comment: "Sublabel for max concurrent requests")
-            ) {
+                                 comment: "Sublabel for max concurrent requests"),
+                mivSetting: true) {
                 TextInput(text: $vm.maxConcurrentText, mono: true, width: .controlNarrow)
             }
             Row(

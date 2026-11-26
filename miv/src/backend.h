@@ -19,6 +19,7 @@ struct ExecutionResult {
   EventKind kind = EventKind::finished;
   std::string finish_reason = "length";
   std::string error;
+  std::optional<RequestStats> request_stats;
 };
 
 using EmitTokens = std::function<void(std::vector<std::int32_t>)>;
@@ -29,6 +30,9 @@ class BackendTask {
 public:
   virtual ~BackendTask() = default;
   [[nodiscard]] virtual std::optional<ExecutionResult> advance() = 0;
+  [[nodiscard]] virtual std::optional<RequestStats> request_stats() const {
+    return std::nullopt;
+  }
 };
 
 class Backend {

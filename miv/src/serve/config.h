@@ -29,7 +29,7 @@ struct ModelServeConfig {
   std::string kv_dtype = "bf16";
   std::string prefill_engine = "auto";
   std::string spec_search = "auto";
-  std::string sampling_contract = "legacy_rejection_v1";
+  std::string sampling_contract = kDefaultServingSamplingContract;
   std::optional<bool> rolling_prefix_cache;
   std::optional<double> prefix_cache_gb;
   std::optional<std::string> batch_mode;
@@ -120,7 +120,7 @@ struct ServeConfig {
   std::string kv_dtype = "bf16";
   std::string prefill_engine = "auto";
   std::string spec_search = "auto";
-  std::string sampling_contract = "legacy_rejection_v1";
+  std::string sampling_contract = kDefaultServingSamplingContract;
   std::optional<bool> rolling_prefix_cache;
   std::optional<double> prefix_cache_gb;
   std::optional<std::string> batch_mode;

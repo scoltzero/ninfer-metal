@@ -179,6 +179,18 @@ bool parse_stream_flag(const Json &body) {
   return body.at("stream").get<bool>();
 }
 
+Json completion_usage(std::size_t prompt_tokens, std::size_t completion_tokens,
+                      const std::optional<RequestStats> &stats) {
+  Json usage = {
+      {"prompt_tokens", prompt_tokens},
+      {"completion_tokens", completion_tokens},
+      {"total_tokens", prompt_tokens + completion_tokens},
+  };
+  if (stats)
+    usage["prompt_tokens_details"] = {{"cached_tokens", stats->prefix_restored_tokens}};
+  return usage;
+}
+
 bool parse_include_usage(const Json &body) {
   if (!body.contains("stream_options") || body.at("stream_options").is_null()) {
     return false;
@@ -1068,6 +1080,7 @@ struct ServeHttpServer::Impl {
       std::vector<ParsedToolCall> tool_calls_acc;
       std::size_t completion_tokens = 0;
       std::string backend_finish_reason;
+      std::optional<RequestStats> request_stats;
       std::string error_msg;
       bool failed = false;
       bool saw_first_token = false;
@@ -1102,6 +1115,7 @@ struct ServeHttpServer::Impl {
           }
         } else {
           backend_finish_reason = ev->finish_reason;
+          request_stats = std::move(ev->request_stats);
           if (ev->kind == EventKind::failed) {
             failed = true;
             error_msg = ev->error.empty() ? "engine generation failed"
@@ -1176,12 +1190,7 @@ struct ServeHttpServer::Impl {
                {"message", std::move(message)},
                {"finish_reason", finish_reason},
            }})},
-          {"usage",
-           {
-               {"prompt_tokens", prompt_token_count},
-               {"completion_tokens", completion_tokens},
-               {"total_tokens", prompt_token_count + completion_tokens},
-           }},
+          {"usage", completion_usage(prompt_token_count, completion_tokens, request_stats)},
           {"timings",
            {
                {"prompt_ms", prompt_ms},
@@ -1211,6 +1220,7 @@ struct ServeHttpServer::Impl {
           OutputParser parser(parser_opts);
           std::size_t completion_tokens = 0;
           std::string backend_finish_reason;
+          std::optional<RequestStats> request_stats;
           std::string error_msg;
           bool failed = false;
           bool client_disconnected = false;
@@ -1323,6 +1333,7 @@ struct ServeHttpServer::Impl {
               }
             } else {
               backend_finish_reason = ev->finish_reason;
+              request_stats = std::move(ev->request_stats);
               if (ev->kind == EventKind::failed) {
                 failed = true;
                 error_msg = ev->error.empty() ? "engine generation failed"
@@ -1365,12 +1376,7 @@ struct ServeHttpServer::Impl {
                   {"created", created},
                   {"model", model_name},
                   {"choices", Json::array()},
-                  {"usage",
-                   {
-                       {"prompt_tokens", prompt_token_count},
-                       {"completion_tokens", completion_tokens},
-                       {"total_tokens", prompt_token_count + completion_tokens},
-                   }},
+                  {"usage", completion_usage(prompt_token_count, completion_tokens, request_stats)},
               };
               (void)send_sse_json(sink, usage_chunk);
             }
@@ -1513,6 +1519,7 @@ struct ServeHttpServer::Impl {
       std::string text_acc = echo ? prompt_text : std::string{};
       std::size_t completion_tokens = 0;
       std::string backend_finish_reason;
+      std::optional<RequestStats> request_stats;
       bool failed = false;
       std::string error_msg;
 
@@ -1537,6 +1544,7 @@ struct ServeHttpServer::Impl {
           }
         } else {
           backend_finish_reason = ev->finish_reason;
+          request_stats = std::move(ev->request_stats);
           if (ev->kind == EventKind::failed) {
             failed = true;
             error_msg = ev->error.empty() ? "engine generation failed"
@@ -1567,12 +1575,7 @@ struct ServeHttpServer::Impl {
                {"logprobs", nullptr},
                {"finish_reason", finish_reason},
            }})},
-          {"usage",
-           {
-               {"prompt_tokens", prompt_token_count},
-               {"completion_tokens", completion_tokens},
-               {"total_tokens", prompt_token_count + completion_tokens},
-           }},
+          {"usage", completion_usage(prompt_token_count, completion_tokens, request_stats)},
       };
       write_json_response(res, 200, response);
       return;
@@ -1595,6 +1598,7 @@ struct ServeHttpServer::Impl {
           OutputParser parser(parser_opts);
           std::size_t completion_tokens = 0;
           std::string backend_finish_reason;
+          std::optional<RequestStats> request_stats;
           std::string error_msg;
           bool failed = false;
           bool client_disconnected = false;
@@ -1653,6 +1657,7 @@ struct ServeHttpServer::Impl {
               }
             } else {
               backend_finish_reason = ev->finish_reason;
+              request_stats = std::move(ev->request_stats);
               if (ev->kind == EventKind::failed) {
                 failed = true;
                 error_msg = ev->error.empty() ? "engine generation failed"
@@ -1693,12 +1698,7 @@ struct ServeHttpServer::Impl {
                   {"created", created},
                   {"model", model_name},
                   {"choices", Json::array()},
-                  {"usage",
-                   {
-                       {"prompt_tokens", prompt_token_count},
-                       {"completion_tokens", completion_tokens},
-                       {"total_tokens", prompt_token_count + completion_tokens},
-                   }},
+                  {"usage", completion_usage(prompt_token_count, completion_tokens, request_stats)},
               };
               (void)send_sse_json(sink, usage_chunk);
             }

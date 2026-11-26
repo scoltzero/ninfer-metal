@@ -214,6 +214,16 @@ TokenEvent parse_token_event(const Json &ev) {
   if (ev.contains("error") && ev.at("error").is_string()) {
     out.error = ev.at("error").get<std::string>();
   }
+  const auto stats = ev.find("request_stats");
+  if (stats != ev.end() && stats->is_object()) {
+    out.request_stats = RequestStats{
+        .prefix_restored_tokens = stats->value("prefix_restored_tokens", 0ULL),
+        .spec_rounds = stats->value("spec_rounds", 0ULL),
+        .ar_steps = stats->value("ar_steps", 0ULL),
+        .decode_mode = stats->value("decode_mode", ""),
+        .fallback_reason = stats->value("fallback_reason", ""),
+    };
+  }
   return out;
 }
 

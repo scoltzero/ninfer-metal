@@ -47,13 +47,13 @@ public:
       }
       break;
     case SpeculativeBackend::dflash2:
-      if (load_options_.speculative.draft_tokens > 7) {
+      if (load_options_.speculative.draft_tokens > kMaxDFlash2DraftTokens) {
         throw std::invalid_argument(
             "DFlash2 requires draft_tokens in [0, 7] (0 = auto)");
       }
       break;
     case SpeculativeBackend::mtp:
-      if (load_options_.speculative.draft_tokens > 4) {
+      if (load_options_.speculative.draft_tokens > kMaxMtpDraftTokens) {
         throw std::invalid_argument(
             "MTP requires draft_tokens in [0, 4] (0 = auto)");
       }
@@ -188,6 +188,10 @@ public:
         .failed = failed_.load(std::memory_order_relaxed),
         .emitted_tokens = emitted_tokens_.load(std::memory_order_relaxed),
     };
+    result.max_context = load_options_.max_context;
+    result.max_concurrency = load_options_.max_concurrency;
+    result.kv_dtype = load_options_.kv_dtype;
+    result.sampling_contract_id = load_options_.sampling_contract;
     backend_->populate_stats(result);
     return result;
   }
@@ -360,6 +364,7 @@ private:
         .kind = result.kind,
         .finish_reason = result.finish_reason,
         .error = result.error,
+        .request_stats = result.request_stats,
     });
   }
 
@@ -513,6 +518,7 @@ private:
           auto current = std::move(ready.front());
           ready.pop_front();
           if (outcomes[index]) {
+            outcomes[index]->request_stats = current.task->request_stats();
             current.task.reset();
             finish_request(current.item, *outcomes[index]);
           } else {
@@ -540,6 +546,7 @@ private:
                                          .error = "unknown backend failure"};
       }
       if (result) {
+        result->request_stats = current.task->request_stats();
         current.task.reset(); // release slot before a new request starts
         finish_request(current.item, *result);
       } else {

@@ -1,0 +1,16 @@
+[engine]
+max_context = 65536
+max_concurrency = 4
+kv_dtype = "affine4_g128"
+batch_mode = false
+prefix_cache_gb = 0.0
+spec_search = "on"
+
+[speculative]
+backend = "none"
+
+[[models]]
+id = "shared-fixture"
+model_dir = "/tmp/omlx-contract-fixture"
+spec_backend = "dflash2"
+draft_tokens = 0

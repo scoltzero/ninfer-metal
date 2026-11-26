@@ -2291,7 +2291,7 @@
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
                     hy4_engram_ssd_offload: s.hy4_engram_ssd_offload === true,
                     hy4_engram_ssd_offload_supported: model?.hy4_engram_ssd_offload_supported === true,
-                    enableThinkingBudget: !!(s.thinking_budget_tokens),
+                    enableThinkingBudget: !!s.thinking_budget_enabled,
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     enableGpuPowerLimit: !!(s.gpu_power_limit_w),
                     gpu_power_limit_w: s.gpu_power_limit_w || null,
@@ -2348,7 +2348,7 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     mtp_enabled: s.mtp_enabled || false,
-                    mtp_adaptive_max_depth: [3, 4, 5, 6, 7, 8].includes(s.mtp_adaptive_max_depth)
+                    mtp_adaptive_max_depth: [1, 2, 3, 4, 5, 6, 7, 8].includes(s.mtp_adaptive_max_depth)
                         ? String(s.mtp_adaptive_max_depth) : '',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
@@ -3739,7 +3739,6 @@
                     mtp_adaptive_max_depth: ms.mtp_enabled && ms.mtp_adaptive_max_depth
                         ? parseInt(ms.mtp_adaptive_max_depth)
                         : null,
-                    mtp_fixed_depth: null,
                     qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
                     vlm_mtp_enabled: !!ms.vlm_mtp_enabled,
                     vlm_mtp_draft_model: ms.vlm_mtp_enabled
@@ -3832,6 +3831,22 @@
                 return payload;
             },
 
+            diffExternalEngineOptions(before, after) {
+                before ??= {};
+                after ??= {};
+                const patch = Object.create(null);
+                for (const engine of new Set([...Object.keys(before), ...Object.keys(after)])) {
+                    const earlier = before[engine] || {};
+                    const latest = after[engine] || {};
+                    for (const key of new Set([...Object.keys(earlier), ...Object.keys(latest)])) {
+                        if (JSON.stringify(earlier[key]) !== JSON.stringify(latest[key])) {
+                            (patch[engine] ??= Object.create(null))[key] = latest[key] ?? null;
+                        }
+                    }
+                }
+                return patch;
+            },
+
             async saveModelSettings() {
                 if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
@@ -3858,16 +3873,23 @@
                 try {
                     const payload = this.buildModelSettingsPayload(this.modelSettings);
                     if (this._modelSettingsBaseline) {
-                        // Send only edited fields so a stale form does not overwrite other changes.
-                        // Always send mtp_fixed_depth: null to clear a legacy fixed depth.
                         const initial = this.buildModelSettingsPayload(
                             JSON.parse(this._modelSettingsBaseline),
                         );
+                        const optionsPatch = this.diffExternalEngineOptions(
+                            initial.external_engine_options, payload.external_engine_options,
+                        );
+                        delete payload.external_engine_options;
                         for (const key of Object.keys(payload)) {
-                            if (key !== 'mtp_fixed_depth'
-                                && JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
+                            if (JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
                                 delete payload[key];
                             }
+                        }
+                        if (Object.hasOwn(payload, 'mtp_adaptive_max_depth') && this.modelSettings.mtp_enabled) {
+                            payload.mtp_fixed_depth = null;
+                        }
+                        if (Object.keys(optionsPatch).length && !this.modelSettings.is_diffusion_model) {
+                            payload.external_engine_options_patch = optionsPatch;
                         }
                     }
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
@@ -4917,6 +4939,28 @@
                 if (this.modelSettings.auto_external_engine) return this.modelSettings.auto_external_engine;
                 if (!this.isGgufModel()) return '';
                 return this.firstUsableExternalEngine() || this.modelSettings.external_engines?.[0]?.id || '';
+            },
+
+            mivSettingIsForwarded(key) {
+                if (this.effectiveExternalEngine() !== 'm5rt') return false;
+                if (key === undefined) return true;
+                const requests = this.activeExternalEngineEntry()?.request_settings || [];
+                return this.externalEngineSupportedSettings().includes(key) || requests.includes(key);
+            },
+
+            mivDraftLimit(backend) {
+                if (!this.mivSettingIsForwarded()) return null;
+                return this.activeExternalEngineEntry()?.speculative_limits?.[backend] ?? null;
+            },
+
+            toggleKvCompression() {
+                const settings = this.modelSettings;
+                if (settings.is_paroquant || settings.vlm_mtp_enabled) return;
+                settings.turboquant_kv_enabled = !settings.turboquant_kv_enabled;
+                if (settings.turboquant_kv_enabled && this.mivSettingIsForwarded('turboquant_kv_enabled')) {
+                    settings.turboquant_kv_scheme = 'affine4';
+                    settings.turboquant_kv_bits = 4;
+                }
             },
 
             externalEngineSupportedSettings() {

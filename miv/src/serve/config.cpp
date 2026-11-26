@@ -1070,8 +1070,10 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
                               config.prefix_cache_gb);
     read_toml_optional_double(*engine, "memory_budget_gb",
                               config.engine_memory_budget_gb);
-    if (const auto v = (*engine)["batch_mode"].value<std::string>()) {
-      config.batch_mode = *v;
+    std::optional<bool> batch_mode;
+    read_toml_optional_bool_or_on_off(*engine, "batch_mode", batch_mode);
+    if (batch_mode.has_value()) {
+      config.batch_mode = *batch_mode ? "on" : "off";
     }
     if (const auto v = (*engine)["memory_budget_bytes"].value<std::int64_t>()) {
       if (*v < 0) {
@@ -1288,8 +1290,10 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
       read_toml_optional_bool_or_on_off(*entry, "rolling_prefix_cache",
                                         m.rolling_prefix_cache);
       read_toml_optional_double(*entry, "prefix_cache_gb", m.prefix_cache_gb);
-      if (const auto v = (*entry)["batch_mode"].value<std::string>()) {
-        m.batch_mode = *v;
+      std::optional<bool> batch_mode;
+      read_toml_optional_bool_or_on_off(*entry, "batch_mode", batch_mode);
+      if (batch_mode.has_value()) {
+        m.batch_mode = *batch_mode ? "on" : "off";
       }
       if (entry->get("memory_budget_gb") != nullptr) {
         read_toml_optional_double(*entry, "memory_budget_gb",
@@ -1715,6 +1719,9 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   }
   opts.speculative.backend = resolved.spec_backend;
   opts.speculative.draft_tokens = resolved.draft_tokens;
+  if (resolved.spec_backend == SpeculativeBackend::none) {
+    opts.path_overrides["enable_mtp"] = "off";
+  }
   opts.lora_adapter = resolved.lora_adapter;
   opts.lora_mode = resolved.lora_mode.empty()
                        ? std::string("merge")

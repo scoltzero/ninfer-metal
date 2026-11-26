@@ -25,6 +25,9 @@ struct ModelSettingsScreen: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
+                if vm.usesMiv {
+                    mivSettingsStatus
+                }
                 page
                 FooterBar(error: vm.lastError)
             }
@@ -47,6 +50,36 @@ struct ModelSettingsScreen: View {
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await vm.load(modelID: modelID, client: services.client, preservingEdits: true) }
+        }
+    }
+
+    @ViewBuilder
+    private var mivSettingsStatus: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(String(localized: "settings.miv.legend", defaultValue: "● Sent to the miv core"))
+            if let config = vm.model?.mivEffectiveSettings {
+                let backend = config.speculativeBackend == "none"
+                    ? "AR" : "\(config.speculativeBackend.uppercased()) K=\(config.maxDraftTokens)"
+                Text(String(localized: "settings.miv.loaded", defaultValue: "Loaded by miv")
+                     + ": \(backend) · \(config.kvDtype) · \(config.maxContext) tokens"
+                     + " · B=\(config.maxConcurrency) (\(mivConcurrencySource(config.concurrencySource)))"
+                     + " · \(config.samplingContractId)")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+    }
+
+    private func mivConcurrencySource(_ source: String) -> String {
+        switch source {
+        case "model_options": String(localized: "settings.miv.source.model", defaultValue: "model")
+        case "model_toml": String(localized: "settings.miv.source.model_toml", defaultValue: "model TOML")
+        case "shared_toml": String(localized: "settings.miv.source.shared_toml", defaultValue: "shared TOML")
+        case "global": String(localized: "settings.miv.source.global", defaultValue: "global setting")
+        default: String(localized: "settings.miv.source.default", defaultValue: "default")
         }
     }
 
@@ -1087,7 +1120,8 @@ private struct BasicSection: View {
                                  comment: "Sublabel for the context window field of a reranker model")
                         : String(localized: "settings.basic.embedding_context_window.sub",
                                  defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
-                                 comment: "Sublabel for the context window field of an embedding model")) {
+                                 comment: "Sublabel for the context window field of an embedding model"),
+                    mivSetting: vm.isMivSetting("max_context_window")) {
                     TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
                 }
             }
@@ -1180,7 +1214,8 @@ private struct GenerationSection: View {
                               comment: "Row label for the context window field"),
                 sublabel: String(localized: "settings.basic.context_window.sub",
                                  defaultValue: "Sets the total context size the model can handle. Longer prompts are rejected.",
-                                 comment: "Sublabel for the context window field")) {
+                                 comment: "Sublabel for the context window field"),
+                mivSetting: vm.isMivSetting("max_context_window")) {
                 TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
             }
             Row(label: String(localized: "settings.basic.max_tokens.label",
@@ -1188,7 +1223,8 @@ private struct GenerationSection: View {
                               comment: "Row label for the max generated tokens field"),
                 sublabel: String(localized: "settings.basic.max_tokens.sub",
                                  defaultValue: "Limits how many tokens the model generates in one turn when the request does not set max_tokens.",
-                                 comment: "Sublabel for the max generated tokens field")) {
+                                 comment: "Sublabel for the max generated tokens field"),
+                mivSetting: vm.isMivSetting("max_tokens")) {
                 TextInput(text: vm.bindProfile($vm.maxTokens),
                           placeholder: String(localized: "settings.basic.max_tokens.placeholder",
                                               defaultValue: "Default",
@@ -1201,6 +1237,7 @@ private struct GenerationSection: View {
                 sublabel: String(localized: "settings.basic.temperature.sub",
                                  defaultValue: "Sampling randomness (≥ 0). 0 = deterministic.",
                                  comment: "Sublabel describing the temperature field range"),
+                mivSetting: vm.isMivSetting("temperature"),
                 isLast: vm.isDiffusionModel) {
                 TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: .controlNarrow)
             }
@@ -1211,7 +1248,8 @@ private struct GenerationSection: View {
                                   comment: "Row label for the top-p nucleus sampling field"),
                     sublabel: String(localized: "settings.basic.top_p.sub",
                                      defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
-                                     comment: "Sublabel describing the top-p valid range")) {
+                                     comment: "Sublabel describing the top-p valid range"),
+                    mivSetting: vm.isMivSetting("top_p")) {
                     TextInput(text: vm.bindProfile($vm.topP), mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "settings.basic.top_k.label",
@@ -1219,7 +1257,8 @@ private struct GenerationSection: View {
                                   comment: "Row label for the top-k sampling field"),
                     sublabel: String(localized: "settings.basic.top_k.sub",
                                      defaultValue: "Limit candidates to top K (0 turns it off).",
-                                     comment: "Sublabel describing the top-k field")) {
+                                     comment: "Sublabel describing the top-k field"),
+                    mivSetting: vm.isMivSetting("top_k")) {
                     TextInput(text: vm.bindProfile($vm.topK), mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "settings.basic.min_p.label",
@@ -1443,6 +1482,7 @@ private struct AdvancedPage: View {
                                   defaultValue: "Adapter",
                                   comment: "Row label for the LoRA adapter picker"),
                     sublabel: vm.loraAdapterDetail,
+                    mivSetting: vm.isMivSetting("lora_adapter"),
                     isLast: !vm.showsExternalEngineLoraMode) {
                     Popup(
                         selection: vm.bindProfile($vm.loraAdapter),
@@ -1459,6 +1499,7 @@ private struct AdvancedPage: View {
                         sublabel: String(localized: "settings.advanced.lora_mode.sub",
                                          defaultValue: "Merge fuses LoRA into 8-bit NAX tiles at load time; Bypass injects BF16 low-rank projections at runtime.",
                                          comment: "Sublabel for external engine LoRA mode picker"),
+                        mivSetting: vm.isMivSetting("lora_adapter"),
                         isLast: true) {
                         Popup(
                             selection: Binding(
@@ -1934,9 +1975,10 @@ private struct MemorySavingSection: View {
                               defaultValue: "TurboQuant KV Cache",
                               comment: "Row label for the TurboQuant KV cache toggle"),
                 sublabel: turboquantSublabel,
+                mivSetting: vm.isMivSetting("turboquant_kv_enabled"),
                 isLast: true) {
                 HStack(spacing: 8) {
-                    if vm.turboquantKvEnabled {
+                    if vm.turboquantKvEnabled && !vm.usesMiv {
                         Popup(
                             selection: vm.bindProfile($vm.turboquantKvScheme),
                             width: .controlMedium,
@@ -1950,7 +1992,17 @@ private struct MemorySavingSection: View {
                             )
                         }
                     }
-                    RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
+                    RowSwitch(isOn: Binding(
+                        get: { vm.turboquantKvEnabled },
+                        set: { enabled in
+                            if enabled && vm.usesMiv {
+                                vm.turboquantKvScheme = "affine4"
+                                vm.turboquantKvBits = "4"
+                            }
+                            vm.turboquantKvEnabled = enabled
+                            vm.refreshProfileDirty()
+                        }
+                    ))
                         .disabled(vm.vlmMtpEnabled || !vm.externalEngineSupports("turboquant_kv_enabled"))
                         .help(vm.vlmMtpEnabled ? ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason : "")
                 }
@@ -1978,6 +2030,10 @@ private struct MemorySavingSection: View {
     }
 
     private var turboquantSublabel: String {
+        if vm.usesMiv {
+            return String(localized: "settings.miv.kv",
+                          defaultValue: "Use BF16 when off and 4-bit affine KV when on.")
+        }
         if vm.vlmMtpEnabled { return ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.turboquant.sub",
                       defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
@@ -2164,7 +2220,8 @@ private struct ExternalEngineOptionsRows: View {
     var body: some View {
         ForEach(vm.externalEngineGeneralOptions) { opt in
             Row(label: vm.externalEngineOptionDisplayLabel(opt),
-                sublabel: opt.description ?? "") {
+                sublabel: opt.description ?? "",
+                mivSetting: vm.usesMiv) {
                 control(for: opt)
             }
         }
@@ -2178,7 +2235,7 @@ private struct ExternalEngineOptionsRows: View {
                 get: { vm.externalEngineBoolOption(opt) },
                 set: { newValue in
                     vm.setExternalEngineBoolOption(opt, newValue)
-                    Task { await vm.save(.externalEngineOptions, client: client) }
+                    Task { await vm.save(.externalEngineOptions, client: client, externalOptionKey: opt.key) }
                 }
             ))
         case "enum":
@@ -2187,7 +2244,7 @@ private struct ExternalEngineOptionsRows: View {
                     get: { vm.externalEngineEnumOption(opt) },
                     set: { newValue in
                         vm.setExternalEngineEnumOption(opt, newValue)
-                        Task { await vm.save(.externalEngineOptions, client: client) }
+                        Task { await vm.save(.externalEngineOptions, client: client, externalOptionKey: opt.key) }
                     }
                 ),
                 width: .controlWide,
@@ -2202,7 +2259,7 @@ private struct ExternalEngineOptionsRows: View {
                     set: { newValue in
                         if let iv = Int(newValue) {
                             vm.setExternalEngineIntOption(opt, iv)
-                            Task { await vm.save(.externalEngineOptions, client: client) }
+                            Task { await vm.save(.externalEngineOptions, client: client, externalOptionKey: opt.key) }
                         }
                     }
                 ),
@@ -2224,7 +2281,7 @@ private struct ExternalEngineOptionsRows: View {
                 let text = draftTexts[opt.key] ?? vm.externalEngineNumberText(opt)
                 if vm.setExternalEngineNumberText(opt, text) {
                     draftTexts[opt.key] = vm.externalEngineNumberText(opt)
-                    Task { await vm.save(.externalEngineOptions, client: client) }
+                    Task { await vm.save(.externalEngineOptions, client: client, externalOptionKey: opt.key) }
                 }
             }
         default:
@@ -2240,7 +2297,7 @@ private struct ExternalEngineOptionsRows: View {
             .onSubmit {
                 let text = draftTexts[opt.key] ?? vm.externalEngineStringOption(opt)
                 vm.setExternalEngineStringOption(opt, text)
-                Task { await vm.save(.externalEngineOptions, client: client) }
+                Task { await vm.save(.externalEngineOptions, client: client, externalOptionKey: opt.key) }
             }
         }
     }
@@ -2499,7 +2556,8 @@ private struct AccelerationSection: View {
             Row(label: String(localized: "settings.acceleration.mtp.label",
                               defaultValue: "Lightning MTP",
                               comment: "Row label for the Lightning MTP toggle"),
-                sublabel: mtpSublabel) {
+                sublabel: mtpSublabel,
+                mivSetting: vm.isMivSetting("mtp_enabled")) {
                 RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled || !vm.externalEngineSupports("mtp_enabled"))
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
@@ -2511,11 +2569,14 @@ private struct AccelerationSection: View {
                                   comment: "Row label for the Lightning MTP draft depth picker"),
                     sublabel: String(localized: "settings.acceleration.mtp.depth.sub",
                                      defaultValue: "Automatically adjusts the draft depth up to the selected maximum.",
-                                     comment: "Sublabel for the Lightning MTP draft depth picker")) {
+                                     comment: "Sublabel for the Lightning MTP draft depth picker"),
+                    mivSetting: vm.isMivSetting("mtp_adaptive_max_depth")) {
                     Popup(
                         selection: vm.bindProfile($vm.mtpAdaptiveMaxDepth),
                         width: .controlWide,
-                        options: ModelSettingsScreenVM.mtpDepthOptions
+                        options: ModelSettingsScreenVM.mtpDepthOptions.filter {
+                            (Int($0.0) ?? 0) <= (vm.mivSpeculativeLimits["mtp"] ?? Int.max)
+                        }
                     )
                 }
                 .disabled(!vm.externalEngineSupports("mtp_adaptive_max_depth"))
@@ -2549,7 +2610,8 @@ private struct AccelerationSection: View {
             Row(label: String(localized: "settings.experimental.dflash.label",
                               defaultValue: "DFlash",
                               comment: "Row label for the DFlash toggle"),
-                sublabel: dflashSublabel) {
+                sublabel: dflashSublabel,
+                mivSetting: vm.isMivSetting("dflash_enabled")) {
                 RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
                     .disabled(dflashToggleDisabled || !vm.externalEngineSupports("dflash_enabled"))
                     .help(dflashHelp)
@@ -2558,7 +2620,8 @@ private struct AccelerationSection: View {
             if vm.dflashEnabled {
                 Row(label: String(localized: "settings.experimental.dflash.draft.label",
                                   defaultValue: "DFlash Draft Model",
-                                  comment: "Row label for the DFlash draft-model picker")) {
+                                  comment: "Row label for the DFlash draft-model picker"),
+                    mivSetting: vm.isMivSetting("dflash_draft_model")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashDraftModel),
                         width: .controlWide,
@@ -2631,7 +2694,8 @@ private struct AccelerationSection: View {
                                   comment: "Row label for the DFlash runtime block size field"),
                     sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
                                      defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
-                                     comment: "Sublabel for the DFlash runtime block size field")) {
+                                     comment: "Sublabel for the DFlash runtime block size field"),
+                    mivSetting: vm.isMivSetting("dflash_block_size")) {
                     TextInput(text: vm.bindProfile($vm.dflashBlockSize),
                               placeholder: "checkpoint", mono: true, width: .controlCompact)
                 }

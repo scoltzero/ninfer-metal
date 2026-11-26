@@ -844,8 +844,25 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         let object = try JSONSerialization.jsonObject(with: encoder.encode(body)) as? [String: Any]
         XCTAssertTrue(object?["top_p"] is NSNull)
         XCTAssertTrue(object?["reasoning_parser"] is NSNull)
-        XCTAssertTrue(object?["mtp_fixed_depth"] is NSNull)
+        XCTAssertNil(object?["mtp_fixed_depth"])
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
+    }
+
+    func testMivProfileEditPreservesFixedDepthUntilAdaptiveDepthChanges() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "qwen3_5")
+        vm.mtpEnabled = true
+        let baseline = vm.currentSettingsDict()
+
+        vm.temperature = "0.6"
+        let unrelatedEdit = vm.workingSettingsBody(changesSince: baseline)
+        XCTAssertEqual(unrelatedEdit.keys.sorted(), [ProfileSettingsKey.temperature])
+        XCTAssertNil(unrelatedEdit["mtp_fixed_depth"])
+
+        vm.mtpAdaptiveMaxDepth = "4"
+        let adaptiveEdit = vm.workingSettingsBody(changesSince: baseline)
+        XCTAssertTrue(adaptiveEdit["mtp_fixed_depth"]?.value is NSNull)
+        XCTAssertEqual(adaptiveEdit[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, 4)
     }
 
     func testLoRAAdapterPickerAndWorkingBody() throws {

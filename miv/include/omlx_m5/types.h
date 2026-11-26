@@ -2,10 +2,15 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace omlx::m5 {
+
+inline constexpr char kDefaultServingSamplingContract[] = "position_coupled_v1";
+inline constexpr std::uint32_t kMaxMtpDraftTokens = 4;
+inline constexpr std::uint32_t kMaxDFlash2DraftTokens = 7;
 
 enum class SpeculativeBackend {
   none,
@@ -68,12 +73,21 @@ struct SubmitRequest {
   bool pin_prefix = false;
 };
 
+struct RequestStats {
+  std::uint64_t prefix_restored_tokens = 0;
+  std::uint64_t spec_rounds = 0;
+  std::uint64_t ar_steps = 0;
+  std::string decode_mode;
+  std::string fallback_reason;
+};
+
 struct TokenEvent {
   std::uint64_t request_id = 0;
   std::vector<std::int32_t> tokens;
   EventKind kind = EventKind::tokens;
   std::string finish_reason;
   std::string error;
+  std::optional<RequestStats> request_stats;
 };
 
 struct CapacityReport {
@@ -90,6 +104,11 @@ struct StatsReport {
   std::uint64_t failed = 0;
   std::uint64_t emitted_tokens = 0;
   std::string backend_kind;
+  std::int32_t max_context = 0;
+  std::int32_t max_concurrency = 0;
+  std::string kv_dtype;
+  std::string speculative_backend;
+  std::uint32_t max_draft_tokens = 0;
   // Execution identity is independent of native transport and artifact size.
   // "control_fixture" never qualifies as Qwen model execution.
   std::string model_execution_kind = "unverified";

@@ -848,6 +848,32 @@ class TestApplyCacheSettingsRuntimeGdn:
         assert pool._scheduler_config.initial_cache_blocks == 1024
 
 
+    def test_host_cache_changes_drain_stock_and_skip_miv(self):
+        from types import SimpleNamespace
+
+        from omlx.scheduler import SchedulerConfig
+        from omlx.server import _server_state
+
+        gs = GlobalSettings()
+        gs.cache.ssd_cache_max_size = "2GB"
+        pool = MagicMock()
+        pool._scheduler_config = SchedulerConfig()
+        pool.get_loaded_model_ids.return_value = ["miv", "stock"]
+        class Miv:
+            external_engine_id = "m5rt"
+
+        entries = {
+            "miv": SimpleNamespace(engine=Miv()),
+            "stock": SimpleNamespace(engine=SimpleNamespace()),
+        }
+        pool.get_entry.side_effect = entries.__getitem__
+        pool.request_unload = AsyncMock(return_value=False)
+        with patch.object(_server_state, "engine_pool", pool):
+            success, message = asyncio.run(admin_routes._apply_cache_settings_runtime(None, gs))
+        assert success and "Waiting for 1 busy models" in message
+        pool.request_unload.assert_awaited_once_with("stock", reason="cache settings changed", abort_active=False)
+
+
 class TestUpdateGlobalSettingsMidSystemCache:
     """update_global_settings: save the mid-system prefix-cache fallback toggle."""
 
@@ -1299,7 +1325,7 @@ def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
     pool = MagicMock()
     pool._scheduler_config = SchedulerConfig()
     pool.get_loaded_model_ids.return_value = ["loaded-model"]
-    pool._unload_engine = AsyncMock()
+    pool.request_unload = AsyncMock(return_value=True)
 
     with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
         data = asyncio.run(admin_routes.get_global_settings(is_admin=True))
@@ -1313,7 +1339,7 @@ def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
             )
         )
         assert "cache" not in result["runtime_applied"]
-        pool._unload_engine.assert_not_awaited()
+        pool.request_unload.assert_not_awaited()
         assert gs.cache.ssd_cache_dir is None
         assert gs.cache.ssd_cache_max_size == cache_size
 
@@ -1324,7 +1350,7 @@ def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
             )
         )
         assert "cache" in result["runtime_applied"]
-        pool._unload_engine.assert_awaited_once_with("loaded-model")
+        pool.request_unload.assert_awaited_once_with("loaded-model", reason="cache settings changed", abort_active=False)
         assert pool._scheduler_config.paged_ssd_cache_auto_size == (
             cache_size == "auto"
         )

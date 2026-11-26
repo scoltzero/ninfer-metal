@@ -44,7 +44,7 @@ trust_remote_code = false
 [engine]
 # Multi-user Concurrency (B/C): concurrent batch slots in [1..8].
 # In oMLX sidecar mode, omit or comment out to inherit Global Settings `max_concurrent_requests`.
-max_concurrency = 4
+max_concurrency = 1
 
 # Maximum context window (Context L, tokens). Honors up to model native max_position_embeddings (e.g. 262144).
 # In oMLX sidecar mode, stock Model Settings `max_context_window` maps here automatically.
@@ -54,7 +54,7 @@ max_context = 65536
 #   "bf16"         - full-precision BF16 KV cache (2.0 B/val)
 #   "affine4_g128" - 4-bit group-128 affine KV cache (0.5625 B/val, lossless 0-ULP verified on 64K+)
 # Note: "int8_g64" is NOT implemented in miv-v0.01 and must not be used.
-kv_dtype = "affine4_g128"
+kv_dtype = "bf16"
 
 # Multi-turn UMA rolling prefix cache & checkpoint pool budget (GiB).
 rolling_prefix_cache = true
@@ -78,13 +78,13 @@ lora_mode = "merge"
 # m5rt_path = "~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/bin/mseries_backendd"
 
 [speculative]
-# Speculative decoding backend: "none" | "mtp" | "dflash2"
+# Speculative decoding backend: "auto" | "none" | "mtp" | "dflash2"
 # In oMLX sidecar mode, stock Acceleration toggles (`mtp_enabled`, `dflash_enabled`,
 # `mtp_fixed_depth`, `mtp_adaptive_max_depth`, `dflash_block_size`) map here automatically.
-backend = "none"
+backend = "auto"
 
-# Speculative draft tokens per verify round (1..7 when backend is "mtp" or "dflash2").
-draft_tokens = 4
+# 0 lets miv choose. MTP accepts 0–4 and DFlash2 accepts 0–7.
+draft_tokens = 0
 
 # Optional DFlash2 draft model overrides:
 # draft_dir = "/path/to/Qwen3.8-27B-DFlash2"

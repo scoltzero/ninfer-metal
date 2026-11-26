@@ -9970,6 +9970,9 @@ async def stream_responses_api(
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
+    if store_response:
+        _store_response_state(final_response, input_messages=input_messages or [])
+
     seq = stream_state.next_sequence()
     yield format_sse_event(
         terminal_event,
@@ -9979,11 +9982,6 @@ async def stream_responses_api(
             "sequence_number": seq,
         },
     )
-
-    # Store for future previous_response_id usage
-    if store_response:
-        _store_response_state(final_response, input_messages=input_messages or [])
-
 
 @app.get("/v1/responses/{response_id}")
 async def get_response(

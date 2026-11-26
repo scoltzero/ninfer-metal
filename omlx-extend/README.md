@@ -20,8 +20,8 @@ Stock oMLX UI stays clean — **zero extra settings forms are added**:
 |---|---|---|
 | Context Window | Stock oMLX Model Settings (`max_context_window`) | `max_context` (Context `L`, up to `262144`+, no 32K cap) |
 | Multi-user Concurrency | Stock oMLX Global Settings (`max_concurrent_requests`) | `max_concurrency` (Concurrency `B`/`C`, clamped `1..8`) |
-| Lightning MTP | Stock oMLX Acceleration (`mtp_enabled`, `mtp_fixed_depth`, `mtp_adaptive_max_depth`) | `speculative.backend = "mtp"`, `draft_tokens` (`1..7`) |
-| DFlash2 | Stock oMLX Acceleration (`dflash_enabled`, `dflash_draft_model`, `dflash_block_size`) | `speculative.backend = "dflash2"`, `draft_tokens = block_size - 1` |
+| Lightning MTP | Stock oMLX Acceleration (`mtp_enabled`, `mtp_fixed_depth`, `mtp_adaptive_max_depth`) | `speculative.backend = "mtp"`, `draft_tokens` (`0..4`, with `0` for automatic depth) |
+| DFlash2 | Stock oMLX Acceleration (`dflash_enabled`, `dflash_draft_model`, `dflash_block_size`) | `speculative.backend = "dflash2"`, `draft_tokens = block_size - 1`, up to `7` |
 | KV Cache Quantization | Stock oMLX Memory Saving (`turboquant_kv_enabled`, `turboquant_kv_scheme == "affine4"`) | `kv_dtype = "affine4_g128"` (`0.5625 B/val`); disabled -> `"bf16"` *(note: KV cache `int8_g64` is intentionally NOT mapped in `miv-v0.01`, whereas linear weight `affine8` `oq_affine_q8_g64/g128_bf16_v1` IS supported via `--nax-pretile`)* |
 | LoRA Adapter | Stock oMLX Model Settings (`lora_adapter`) | `lora_adapter` (resolved local directory path forwarded in SPI v2 `load` RPC; unlocked via `"lora"` in `capabilities` and `"lora_adapter"` in `supported_standard_settings`) |
 | LoRA Execution Mode | Admin UI `options_schema` (`external_engine_options["ninfer-metal"]["lora_mode"]`) or `ninfer-metal.toml` | `lora_mode = "merge"` (default) \| `"bypass"` (`reload_required: true`) |
@@ -36,6 +36,23 @@ Standard **HuggingFace PEFT** (`adapter_config.json` + `adapter_model.safetensor
 - **Mode A — `"merge"` (default)**: At load time, unpacks only LoRA-hit base projections on GPU, fuses $W_{\text{eff}} = W_{\text{base}} + \text{scale} \cdot (B A)$ in `FP32`, and quantizes + NAX-pretiles into resident UMA buffers as `oq_nax_tiled_g64_v1` `q8` in `AffineNaxCache` — keeping the on-disk `.miv` file completely read-only and adding **0 runtime kernel overhead**.
 - **Mode B — `"bypass"`**: Keeps base `Mxfp4NaxCache` / `AffineNaxCache` untouched and injects `BF16` low-rank residuals `y += scale * ((x @ A^T) @ B^T)` at runtime with **zero re-quantization drift** and fast `reload_lora` hot-swapping without reloading base weights.
 - **Observability & Memory Accounting**: `mseries_backendd` reports `lora_adapter`, `lora_mode`, `lora_buffer_bytes`, and `lora_adapted_layers` in `load` and `stats` RPCs, feeding directly into `ProcessMemoryEnforcer` / `memory_budget_bytes` UMA admission accounting.
+
+### Settings that reach miv
+
+The black dot marks a field that reaches miv when that model uses the miv provider. Global defaults apply when the model inherits them. The model settings panel shows the daemon's loaded values after Load, including the source of its concurrency limit.
+
+| Setting | Effective behavior |
+|---|---|
+| Global concurrency and model provider concurrency | The model provider option wins, followed by model TOML and shared TOML. An omitted value inherits oMLX global concurrency. miv supports 1–8 slots. The shipped preset is B=1. |
+| Model context window and global context policy | Admission, load and the loaded model use the same window, bounded by the model. Only the explicit oMLX model window can exceed the global context policy. |
+| MTP, DFlash2, draft selection and depth | An explicit backend takes effect, including `none` for AR. Auto discovers a matching DFlash2 draft, then MTP, then AR. The core selects the depth when it receives 0. MTP supports depths up to 4 and DFlash2 up to 7. DFlash2 block size is depth plus one, subject to the checkpoint's limit. |
+| KV compression, prefix reuse, sampling contract | Use `bf16` or `affine4_g128` for miv KV. The miv prefix cache uses its own rolling switch and budget. The shipped verification contract is `position_coupled_v1`. |
+| Artifact paths and LoRA | Model and draft paths are resolved on load. The selected LoRA adapter and its merge or bypass mode are also load settings. |
+| Generation defaults | Max output tokens, temperature, top-p and top-k affect the submit RPC when inherited. The request can supply these values, and the available context limits output tokens. Seed and stop also affect individual requests. |
+
+Stock SSD and hot cache parameters, GDN storage, and the Stock prefill scheduling controls belong to the oMLX scheduler. The host still applies memory pressure and model idle policy to miv. miv logs unsupported thinking budgets and sampling penalties without applying them. String stops can skip the leading think block when the API asks for that behavior.
+
+The default is a single-client preset. For a deliberate throughput comparison on a measured model, use a per-model `max_concurrency = 4` with representative concurrent requests. Compare cold prefill, warm continuation, actual speculative rounds and memory usage as well as generated tokens per second.
 
 ## 3. Config File Discovery & Precedence (`ninfer-metal.toml`)
 

@@ -4,6 +4,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -19,6 +20,7 @@ NB_MODULE(omlx_m5_native, module) {
   using omlx::m5::EventKind;
   using omlx::m5::FakeBackendOptions;
   using omlx::m5::LoadOptions;
+  using omlx::m5::RequestStats;
   using omlx::m5::SamplingSpec;
   using omlx::m5::SpeculativeBackend;
   using omlx::m5::SpeculativeOptions;
@@ -74,12 +76,20 @@ NB_MODULE(omlx_m5_native, module) {
       .def_rw("stop_token_seqs", &SubmitRequest::stop_token_seqs)
       .def_rw("pin_prefix", &SubmitRequest::pin_prefix);
 
+  nb::class_<RequestStats>(module, "RequestStats")
+      .def_ro("prefix_restored_tokens", &RequestStats::prefix_restored_tokens)
+      .def_ro("spec_rounds", &RequestStats::spec_rounds)
+      .def_ro("ar_steps", &RequestStats::ar_steps)
+      .def_ro("decode_mode", &RequestStats::decode_mode)
+      .def_ro("fallback_reason", &RequestStats::fallback_reason);
+
   nb::class_<TokenEvent>(module, "TokenEvent")
       .def_ro("request_id", &TokenEvent::request_id)
       .def_ro("tokens", &TokenEvent::tokens)
       .def_ro("kind", &TokenEvent::kind)
       .def_ro("finish_reason", &TokenEvent::finish_reason)
-      .def_ro("error", &TokenEvent::error);
+      .def_ro("error", &TokenEvent::error)
+      .def_ro("request_stats", &TokenEvent::request_stats);
 
   nb::class_<CapacityReport>(module, "CapacityReport")
       .def_ro("max_concurrency", &CapacityReport::max_concurrency)
@@ -94,6 +104,11 @@ NB_MODULE(omlx_m5_native, module) {
       .def_ro("failed", &StatsReport::failed)
       .def_ro("emitted_tokens", &StatsReport::emitted_tokens)
       .def_ro("backend_kind", &StatsReport::backend_kind)
+      .def_ro("max_context", &StatsReport::max_context)
+      .def_ro("max_concurrency", &StatsReport::max_concurrency)
+      .def_ro("kv_dtype", &StatsReport::kv_dtype)
+      .def_ro("speculative_backend", &StatsReport::speculative_backend)
+      .def_ro("max_draft_tokens", &StatsReport::max_draft_tokens)
       .def_ro("model_execution_kind", &StatsReport::model_execution_kind)
       .def_ro("sampling_contract_id", &StatsReport::sampling_contract_id)
       .def_ro("numeric_contract_id", &StatsReport::numeric_contract_id)
