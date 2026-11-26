@@ -1443,6 +1443,13 @@ public:
       lc_caps.erase(std::unique(lc_caps.begin(), lc_caps.end()), lc_caps.end());
       for (const U32 env : lc_envs) {
         for (const U32 cap : lc_caps) {
+          if (!minference_enabled_ &&
+              !gqa_flash_prefill_tail_needs_split_kv(
+                  cap, U32(config.num_attention_heads),
+                  U32(config.num_key_value_heads), env,
+                  silicon_tuning.gpu_cores)) {
+            continue;
+          }
           const LongCtxProfileKey fk{cap, env, false, false};
           auto prof = compile(cap, false, false, env, false);
           ensure_profile_icb(context, prof);
@@ -4167,9 +4174,12 @@ public:
                            bool *out_fused_add_sq = nullptr,
                            bool out_w4a8 = false,
                            bool out_w4a8_write_bf16 = false,
-                           bool emit_gdn_out_linear = true) {
+                           bool emit_gdn_out_linear = true,
+                           bool *out_wrote_a8 = nullptr) {
     if (out_fused_add_sq)
       *out_fused_add_sq = false;
+    if (out_wrote_a8)
+      *out_wrote_a8 = false;
     const auto &c = config;
     auto params =
         words({U32(c.linear_num_key_heads), U32(c.linear_num_value_heads),
@@ -4252,6 +4262,8 @@ public:
               eff_out_w4a8 && (out_w4a8_write_bf16 || has_bypass_lora(out_w)),
               float(c.rms_norm_eps))) {
         if (eff_out_w4a8) {
+          if (out_wrote_a8)
+            *out_wrote_a8 = true;
           e.set_a8_quant(make_a8_key(
               e, mix_ref, gv,
               dynamic_tokens ? std::nullopt : std::optional<U32>(t)));
@@ -8413,7 +8425,8 @@ public:
   void record_prefill_telemetry(U32 count, U32 start_pos, bool used_w4a8,
                                 bool used_sage2, bool used_minf, U32 minf_cap,
                                 U32 minf_env, bool used_ane,
-                                QwenPrefillTelemetry *out_delta) {
+                                QwenPrefillTelemetry *out_delta,
+                                std::optional<U32> ane_offload_override = {}) {
     QwenPrefillTelemetry delta;
     delta.prefill_ane_active = ane_active_;
     delta.prefill_ane_split_alpha = ane_split_alpha_;
@@ -8463,7 +8476,16 @@ public:
       }
     }
     if (ane_active_) {
-      if (used_ane) {
+      if (ane_offload_override.has_value()) {
+        const U32 off_tok = std::min<U32>(*ane_offload_override, count);
+        const U32 fb_tok = count - off_tok;
+        prefill_telemetry_.prefill_ane_offload_tokens += off_tok;
+        delta.prefill_ane_offload_tokens += off_tok;
+        if (fb_tok > 8U) {
+          prefill_telemetry_.prefill_ane_fallback_tokens += fb_tok;
+          delta.prefill_ane_fallback_tokens += fb_tok;
+        }
+      } else if (used_ane) {
         prefill_telemetry_.prefill_ane_offload_tokens += count;
         delta.prefill_ane_offload_tokens += count;
       } else if (count > 8U) {
@@ -8662,10 +8684,11 @@ public:
           lp.gdn_z_gpu = e.finish();
         }
         // GDN Conv1D + Recurrence + NormGate (writes BF16 mixer + A8 if W4A8).
-        const bool stage3_writes_a8 =
+        const bool stage3_req_a8 =
             use_w4a8 && gdn_chunk_nax_enabled_ &&
             chunk_t >= gdn_chunk_nax_min_tokens() &&
             can_w4a8_weight(block.get("gdn_out"), h, gv);
+        bool stage3_wrote_a8 = false;
         {
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_rec" + ltag);
           e.begin_stage("gdn_rec");
@@ -8673,8 +8696,9 @@ public:
               e, block, block, qkv, z, a, b, convolved, recurrent, mixer,
               chunk_t, /*verify=*/false, /*dynamic_tokens=*/true,
               /*allow_f16_out=*/false, 0U, std::nullopt, nullptr,
-              /*out_w4a8=*/stage3_writes_a8,
-              /*out_w4a8_write_bf16=*/true, /*emit_gdn_out_linear=*/false);
+              /*out_w4a8=*/stage3_req_a8,
+              /*out_w4a8_write_bf16=*/true, /*emit_gdn_out_linear=*/false,
+              &stage3_wrote_a8);
           lp.gdn_rec = e.finish();
         }
         // GDN out_proj: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h).
@@ -8687,7 +8711,7 @@ public:
                can_gpu_suffix_linear(out_w, h, gv, use_w4a8));
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_out" + ltag);
           e.begin_stage("gdn_out");
-          if (stage3_writes_a8) {
+          if (stage3_wrote_a8) {
             e.set_a8_quant(make_a8_key(e, mixer, gv));
           }
           if (offload_out) {
@@ -9603,14 +9627,28 @@ public:
         [&](U32 start_pos, U32 end_pos, bool sample_last,
             QwenPrefillTelemetry &accum) -> QwenForwardResult {
       QwenForwardResult last_res{};
+      const U32 chunk_cap =
+          (ane_active_ && ane_chunk_tokens_ > 0U)
+              ? std::min<U32>(workspace_rows_, ane_chunk_tokens_)
+              : workspace_rows_;
       U32 cur = start_pos;
       while (cur < end_pos) {
         const U32 rem = end_pos - cur;
-        const U32 chunk = std::min<U32>(rem, workspace_rows_);
+        const U32 chunk = std::min<U32>(rem, chunk_cap);
         const bool is_final = (cur + chunk == end_pos);
         if (is_final && sample_last) {
           last_res = owner.run(prompt.subspan(cur, chunk), sampling,
                                inspect_tensors, /*use_icb=*/true);
+          if (inspect_tensors && last_res.logits.size() > v) {
+            last_res.logits.assign(
+                last_res.logits.end() - static_cast<std::ptrdiff_t>(v),
+                last_res.logits.end());
+          }
+          if (inspect_tensors && last_res.hidden.size() > h) {
+            last_res.hidden.assign(
+                last_res.hidden.end() - static_cast<std::ptrdiff_t>(h),
+                last_res.hidden.end());
+          }
         } else {
           last_res = owner.run_trunk(prompt.subspan(cur, chunk), true);
         }
@@ -9640,43 +9678,20 @@ public:
       return res;
     }
 
-    const detail::BlendSegmentConfig eff_cfg =
+    detail::BlendSegmentConfig eff_cfg =
         seg_cfg ? *seg_cfg : detail::BlendSegmentConfig{};
+    // Clamp chunk upper bound to workspace_rows_ so every cacheable segment can
+    // be captured and replayed across multi-window 16K-256K prompts without drop.
+    eff_cfg.l_max = std::min<U32>(eff_cfg.l_max, workspace_rows_);
+    if (eff_cfg.l_min > eff_cfg.l_max) {
+      eff_cfg.l_min = eff_cfg.l_max;
+    }
+    if (eff_cfg.gear_min_len > eff_cfg.l_max) {
+      eff_cfg.gear_min_len = eff_cfg.l_max;
+    }
     const auto plan =
         blend_cache.plan_prompt(model_exec_hash, prompt, prefix_tokens, eff_cfg);
 
-    // ======================================================================
-    // Case 1: Cold miss (populate cacheable segments while advancing state!)
-    // ======================================================================
-    if (plan.hit_tokens == 0U || suffix_len > workspace_rows_) {
-      QwenPrefillTelemetry accum;
-      accum.prefill_ane_active = ane_active_;
-      accum.prefill_ane_split_alpha = ane_split_alpha_;
-      QwenForwardResult final_res{};
-      for (std::size_t si = 0; si < plan.segments.size(); ++si) {
-        const auto &ps = plan.segments[si];
-        const bool is_last_seg = (si + 1U == plan.segments.size());
-        if (!is_last_seg && !ps.is_cache_hit() &&
-            ps.segment.kind == detail::BlendSegmentKind::CacheableChunk &&
-            ps.segment.length <= workspace_rows_) {
-          capture_and_insert_blend_chunk(
-              prompt.subspan(ps.segment.start, ps.segment.length),
-              ps.segment.start, eff_cfg.boundary_window, blend_cache,
-              model_exec_hash, accum);
-        } else {
-          final_res = run_standard_chunked(
-              ps.segment.start, ps.segment.start + ps.segment.length,
-              is_last_seg, accum);
-        }
-      }
-      final_res.tokens = suffix_len;
-      final_res.prefill_delta = accum;
-      return final_res;
-    }
-
-    // ======================================================================
-    // Case 2: Warm Stitched CacheBlend Hit (suffix_len <= workspace_rows_)!
-    // ======================================================================
     const U32 probe_idx = blend_probe_layer_index();
     const U32 kvh = U32(config.num_key_value_heads);
     const U32 qh = U32(config.num_attention_heads);
@@ -9684,98 +9699,8 @@ public:
         U32(std::llround(config.head_dim * config.partial_rotary_factor));
     const U32 kh = U32(config.linear_num_key_heads);
     const U32 hv = U32(config.linear_num_value_heads);
-    const U32 ctx_env =
-        (minference_enabled_ && total_tokens >= kMInferenceMinContextTokens)
-            ? select_long_ctx_envelope(total_tokens)
-            : total_tokens;
-
-    const auto page_copies = page_pool->begin_append(suffix_len);
-    struct PageGuard {
-      KvPagePool *pool;
-      bool active;
-      ~PageGuard() {
-        if (active)
-          try {
-            pool->abort();
-          } catch (...) {
-          }
-      }
-    } page_guard{page_pool.get(), true};
-    execute_cow_copies(page_copies);
-
-    // Scratch buffers for stitched hidden/mixer and HKVD selection.
-    MetalBuffer full_hidden_buf =
-        context.make_private_buffer(mul(suffix_len, mul(h, 2ULL)));
-    MetalBuffer full_mixer_buf =
-        context.make_private_buffer(mul(suffix_len, mul(q, 2ULL)));
-    MetalBuffer mix3_cached_i8_buf =
-        context.make_private_buffer(mul(suffix_len, U64(q)));
-    MetalBuffer mix3_cached_sc_buf =
-        context.make_private_buffer(mul(suffix_len, mul(q / 128U, 2ULL)));
-    MetalBuffer flags_buf = context.make_buffer(mul(suffix_len, 4ULL));
-    MetalBuffer prompt_pos_buf = context.make_buffer(mul(suffix_len, 4ULL));
-    MetalBuffer l2_scores_buf = context.make_buffer(mul(suffix_len, 4ULL));
-    MetalBuffer active_idx_buf = context.make_buffer(mul(suffix_len, 4ULL));
-    MetalBuffer active_pos_buf = context.make_buffer(mul(suffix_len, 4ULL));
-    MetalBuffer active_cnt_buf = context.make_buffer(16ULL);
-    flags_buf.write(std::as_bytes(std::span(plan.suffix_token_flags)));
-    prompt_pos_buf.write(std::as_bytes(std::span(plan.suffix_prompt_positions)));
-
-    std::vector<U32> mand_idx;
-    std::vector<U32> mand_pos;
-    mand_idx.reserve(suffix_len);
-    mand_pos.reserve(suffix_len);
-    for (U32 i = 0; i < suffix_len; ++i) {
-      if (plan.suffix_token_flags[i] == detail::kBlendTokenMandatory) {
-        mand_idx.push_back(i);
-        mand_pos.push_back(plan.suffix_prompt_positions[i]);
-      }
-    }
-    const U32 m_mand = U32(mand_idx.size());
-    MetalBuffer mand_idx_buf =
-        context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
-    MetalBuffer mand_pos_buf =
-        context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
-    if (m_mand > 0U) {
-      mand_idx_buf.write(std::as_bytes(std::span(mand_idx)));
-      mand_pos_buf.write(std::as_bytes(std::span(mand_pos)));
-    }
-
-    const Ref full_hidden_ref{&full_hidden_buf, 0, full_hidden_buf.size()};
-    const Ref full_mixer_ref{&full_mixer_buf, 0, full_mixer_buf.size()};
-    const Ref mix3_i8_ref{&mix3_cached_i8_buf, 0, mix3_cached_i8_buf.size()};
-    const Ref mix3_sc_ref{&mix3_cached_sc_buf, 0, mix3_cached_sc_buf.size()};
-    const Ref flags_ref{&flags_buf, 0, flags_buf.size()};
-    const Ref prompt_pos_ref{&prompt_pos_buf, 0, prompt_pos_buf.size()};
-    const Ref l2_ref{&l2_scores_buf, 0, l2_scores_buf.size()};
-    const Ref act_idx_ref{&active_idx_buf, 0, active_idx_buf.size()};
-    const Ref act_pos_ref{&active_pos_buf, 0, active_pos_buf.size()};
-    const Ref act_cnt_ref{&active_cnt_buf, 0, active_cnt_buf.size()};
-    const Ref mand_idx_ref{&mand_idx_buf, 0, mand_idx_buf.size()};
-    const Ref mand_pos_ref{&mand_pos_buf, 0, mand_pos_buf.size()};
-    const Ref table_ref{&page_pool->table_buffer(), 0,
-                        page_pool->table_buffer().size()};
-
-    const U32 first_page = prefix_tokens / 64U;
-    const U32 last_page = (total_tokens - 1U) / 64U;
-    const U32 num_touched_pages = last_page - first_page + 1U;
     const U64 gdn_tail_bytes =
         U64(config.linear_conv_kernel_dim - 1) * U64(conv) * 2ULL;
-
-    const auto emit_refresh_pages = [&](Encoder &e, const Block &blk) {
-      detail::BlendRefreshPageSummaryParams rp{};
-      rp.key_value_heads = kvh;
-      rp.head_dim = U32(config.head_dim);
-      rp.page_tokens = 64U;
-      rp.first_logical_page = first_page;
-      rp.num_logical_pages = num_touched_pages;
-      rp.total_valid_tokens = total_tokens;
-      auto &rf = e.emit(
-          "cache_blend", "omlx_m5_blend_refresh_kv_page_summary_affine4_g128",
-          {.width = 32U, .height = U64(num_touched_pages) * kvh},
-          {.width = 32U}, {blk.state0, blk.state1, table_ref});
-      e.dynamic(rf, 3, pod_bytes(rp));
-    };
 
     const auto emit_gdn_jump = [&](Encoder &e, const Block &blk, U32 gdn_idx,
                                    const detail::BlendChunkEntry &he) {
@@ -9813,772 +9738,1426 @@ public:
            blk.state1, gdn_tail_bytes);
     };
 
-    // Upload all suffix tokens once to token_ids.
-    std::fill_n(token_staging.begin(), suffix_len, 0U);
-    std::copy(prompt.begin() + prefix_tokens, prompt.end(),
-              token_staging.begin());
-    const_cast<MetalBuffer *>(token_ids.buffer)
-        ->write(std::as_bytes(std::span(token_staging).first(suffix_len)));
-    const_cast<MetalBuffer *>(attention_positions.buffer)
-        ->write(std::as_bytes(std::span(plan.suffix_prompt_positions)));
-
-    // ======================================================================
-    // Stage 1: KV Instantiation + Pre-Probe Layers + Layer-3 Cross-Chunk Probe + HKVD Select
-    // ======================================================================
-    const bool use_w4a8_suffix = use_w4a8_for_t(suffix_len, false);
-    const U64 seq1 = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
-    Encoder e1(context, libraries, suffix_len,
-               "qwen.blend.warm1." + std::to_string(seq1) + plan_key_suffix());
-    if (use_w4a8_suffix) {
-      e1.profile.used_w4a8 = true;
-    }
-
-    // 1A. Instantiate cached KV for all hit segments across all full-attention layers.
-    e1.begin_stage("blend_instantiate_kv");
-    {
-      U32 attn_idx = 0U;
-      for (const auto &blk : blocks) {
-        if (blk.type != LayerType::full_attention)
-          continue;
-        for (const auto &ps : plan.segments) {
-          if (!ps.is_cache_hit())
-            continue;
-          const auto &he = *ps.hit_entry;
-          const U64 lkv = U64(he.geometry.token_length) * U64(kvh) *
-                          he.geometry.attn_vec_bytes();
-          const U64 lrot =
-              U64(he.geometry.token_length) * U64(kvh) * U64(rot_dim) * 2ULL;
-          detail::BlendInstantiateKvParams ip{};
-          ip.key_value_heads = kvh;
-          ip.head_dim = U32(config.head_dim);
-          ip.rotary_dim = rot_dim;
-          ip.chunk_tokens = ps.segment.length;
-          ip.dst_start_pos = ps.segment.start;
-          ip.page_tokens = 64U;
-          ip.theta = float(config.rope_theta);
-          ip.src_token_offset = 0U;
-          ip.use_rotary_bf16 = 1U;
-          auto &inst = e1.emit(
-              "cache_blend", "omlx_m5_blend_instantiate_kv_affine4_g128",
-              {.width = 32U, .height = U64(ps.segment.length) * kvh},
-              {.width = 32U},
-              {Ref{&he.payload.attn_k_pre, U64(attn_idx) * lkv, lkv},
-               Ref{&he.payload.attn_k_rotary_bf16, U64(attn_idx) * lrot, lrot},
-               Ref{&he.payload.attn_v, U64(attn_idx) * lkv, lkv}, blk.state0,
-               blk.state1, table_ref});
-          e1.dynamic(inst, 6, pod_bytes(ip));
+    auto execute_warm_blend_window =
+        [&](std::size_t seg_begin, std::size_t seg_end, bool is_final_window,
+            QwenPrefillTelemetry &accum) -> QwenForwardResult {
+      const U32 win_prefix = plan.segments[seg_begin].segment.start;
+      U32 win_len = 0U;
+      U32 win_hit_tokens = 0U;
+      for (std::size_t si = seg_begin; si < seg_end; ++si) {
+        win_len += plan.segments[si].segment.length;
+        if (plan.segments[si].is_cache_hit()) {
+          win_hit_tokens += plan.segments[si].segment.length;
         }
-        emit_refresh_pages(e1, blk);
-        ++attn_idx;
       }
-    }
+      const U32 win_end = win_prefix + win_len;
+      const U32 win_rel_base = win_prefix - prefix_tokens;
+      const U32 ctx_env =
+          (minference_enabled_ && win_end >= kMInferenceMinContextTokens)
+              ? select_long_ctx_envelope(win_end)
+              : win_end;
 
-    // 1B. Populate full_hidden from cached H3_res for hit segments, and assemble mix3_cached.
-    e1.begin_stage("blend_dequant_h3");
-    for (const auto &ps : plan.segments) {
-      if (!ps.is_cache_hit())
-        continue;
-      const auto &he = *ps.hit_entry;
-      const U32 rel_start = ps.segment.start - prefix_tokens;
-      const U32 lm = ps.segment.length;
-      detail::BlendInt8QuantParams dq{.tokens = lm, .width = h};
-      const Ref dst_h3{full_hidden_ref.buffer,
-                       full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
-                       mul(lm, mul(h, 2ULL))};
-      auto &dh = e1.emit(
-          "cache_blend", "omlx_m5_blend_dequantize_int8_g128_bf16",
-          {.width = 32U, .height = U64(lm) * (h / 128U)}, {.width = 32U},
-          {Ref{&he.payload.h3_res_i8, 0, he.geometry.h3_res_i8_bytes()},
-           Ref{&he.payload.h3_res_scales, 0, he.geometry.h3_res_scale_bytes()},
-           dst_h3});
-      e1.dynamic(dh, 3, pod_bytes(dq));
-      copy(e1,
-           Ref{&he.payload.mix3_cached_i8, 0, he.geometry.mix3_cached_i8_bytes()},
-           Ref{mix3_i8_ref.buffer, mix3_i8_ref.offset + mul(rel_start, U64(q)),
-               he.geometry.mix3_cached_i8_bytes()},
-           he.geometry.mix3_cached_i8_bytes());
-      copy(e1,
-           Ref{&he.payload.mix3_cached_scales, 0,
-               he.geometry.mix3_cached_scale_bytes()},
-           Ref{mix3_sc_ref.buffer,
-               mix3_sc_ref.offset + mul(rel_start, mul(q / 128U, 2ULL)),
-               he.geometry.mix3_cached_scale_bytes()},
-           he.geometry.mix3_cached_scale_bytes());
-    }
+      const auto page_copies = page_pool->begin_append(win_len);
+      struct PageGuard {
+        KvPagePool *pool;
+        bool active;
+        ~PageGuard() {
+          if (active)
+            try {
+              pool->abort();
+            } catch (...) {
+            }
+        }
+      } page_guard{page_pool.get(), true};
+      execute_cow_copies(page_copies);
 
-    // 1C. Pre-probe layers (0 .. probe_idx - 1): dense on boundary/miss + GDN state jump on hit interior!
-    for (const auto &ps : plan.segments) {
-      const U32 rel_start = ps.segment.start - prefix_tokens;
-      const U32 run_len = ps.is_cache_hit()
-                              ? std::min<U32>(ps.segment.boundary_window,
-                                              ps.segment.length)
-                              : ps.segment.length;
-      if (run_len > 0U) {
-        e1.begin_stage("blend_pre_probe.seg" + std::to_string(rel_start));
-        e1.delegated_prefill = (run_len >= 16U);
-        const Ref seg_tok{token_ids.buffer,
-                          token_ids.offset + mul(rel_start, 4ULL),
-                          mul(run_len, 4ULL)};
-        // Embed segment tokens into hidden[0..run_len).
-        embedding_lookup(e1, embedding, seg_tok, hidden, zero, v, h, run_len);
-        const bool seg_w4a8 = use_w4a8_for_t(run_len, false);
-        for (U32 li = 0; li < probe_idx; ++li) {
+      // Scratch buffers for stitched hidden/mixer and HKVD selection in this window.
+      MetalBuffer full_hidden_buf =
+          context.make_private_buffer(mul(win_len, mul(h, 2ULL)));
+      MetalBuffer full_mixer_buf =
+          context.make_private_buffer(mul(win_len, mul(q, 2ULL)));
+      MetalBuffer mix3_cached_i8_buf =
+          context.make_private_buffer(mul(win_len, U64(q)));
+      MetalBuffer mix3_cached_sc_buf =
+          context.make_private_buffer(mul(win_len, mul(q / 128U, 2ULL)));
+      MetalBuffer flags_buf = context.make_buffer(mul(win_len, 4ULL));
+      MetalBuffer prompt_pos_buf = context.make_buffer(mul(win_len, 4ULL));
+      MetalBuffer l2_scores_buf = context.make_buffer(mul(win_len, 4ULL));
+      MetalBuffer active_idx_buf = context.make_buffer(mul(win_len, 4ULL));
+      MetalBuffer active_pos_buf = context.make_buffer(mul(win_len, 4ULL));
+      MetalBuffer active_cnt_buf = context.make_buffer(16ULL);
+      const std::span<const U32> win_flags(
+          plan.suffix_token_flags.data() + win_rel_base, win_len);
+      const std::span<const U32> win_pos(
+          plan.suffix_prompt_positions.data() + win_rel_base, win_len);
+      flags_buf.write(std::as_bytes(win_flags));
+      prompt_pos_buf.write(std::as_bytes(win_pos));
+
+      std::vector<U32> mand_idx;
+      std::vector<U32> mand_pos;
+      mand_idx.reserve(win_len);
+      mand_pos.reserve(win_len);
+      for (U32 i = 0; i < win_len; ++i) {
+        if (win_flags[i] == detail::kBlendTokenMandatory) {
+          mand_idx.push_back(i);
+          mand_pos.push_back(win_pos[i]);
+        }
+      }
+      const U32 m_mand = U32(mand_idx.size());
+      MetalBuffer mand_idx_buf =
+          context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
+      MetalBuffer mand_pos_buf =
+          context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
+      if (m_mand > 0U) {
+        mand_idx_buf.write(std::as_bytes(std::span(mand_idx)));
+        mand_pos_buf.write(std::as_bytes(std::span(mand_pos)));
+      }
+
+      const Ref full_hidden_ref{&full_hidden_buf, 0, full_hidden_buf.size()};
+      const Ref full_mixer_ref{&full_mixer_buf, 0, full_mixer_buf.size()};
+      const Ref mix3_i8_ref{&mix3_cached_i8_buf, 0, mix3_cached_i8_buf.size()};
+      const Ref mix3_sc_ref{&mix3_cached_sc_buf, 0, mix3_cached_sc_buf.size()};
+      const Ref flags_ref{&flags_buf, 0, flags_buf.size()};
+      const Ref prompt_pos_ref{&prompt_pos_buf, 0, prompt_pos_buf.size()};
+      const Ref l2_ref{&l2_scores_buf, 0, l2_scores_buf.size()};
+      const Ref act_idx_ref{&active_idx_buf, 0, active_idx_buf.size()};
+      const Ref act_pos_ref{&active_pos_buf, 0, active_pos_buf.size()};
+      const Ref act_cnt_ref{&active_cnt_buf, 0, active_cnt_buf.size()};
+      const Ref mand_idx_ref{&mand_idx_buf, 0, mand_idx_buf.size()};
+      const Ref mand_pos_ref{&mand_pos_buf, 0, mand_pos_buf.size()};
+      const Ref table_ref{&page_pool->table_buffer(), 0,
+                          page_pool->table_buffer().size()};
+
+      const U32 first_page = win_prefix / 64U;
+      const U32 last_page = (win_end - 1U) / 64U;
+      const U32 num_touched_pages = last_page - first_page + 1U;
+
+      const auto emit_refresh_pages = [&](Encoder &e, const Block &blk) {
+        detail::BlendRefreshPageSummaryParams rp{};
+        rp.key_value_heads = kvh;
+        rp.head_dim = U32(config.head_dim);
+        rp.page_tokens = 64U;
+        rp.first_logical_page = first_page;
+        rp.num_logical_pages = num_touched_pages;
+        rp.total_valid_tokens = win_end;
+        auto &rf = e.emit(
+            "cache_blend", "omlx_m5_blend_refresh_kv_page_summary_affine4_g128",
+            {.width = 32U, .height = U64(num_touched_pages) * kvh},
+            {.width = 32U}, {blk.state0, blk.state1, table_ref});
+        e.dynamic(rf, 3, pod_bytes(rp));
+      };
+
+      // Upload window tokens once to token_ids.
+      std::fill_n(token_staging.begin(), win_len, 0U);
+      std::copy(prompt.begin() + win_prefix, prompt.begin() + win_end,
+                token_staging.begin());
+      const_cast<MetalBuffer *>(token_ids.buffer)
+          ->write(std::as_bytes(std::span(token_staging).first(win_len)));
+      const_cast<MetalBuffer *>(attention_positions.buffer)
+          ->write(std::as_bytes(win_pos));
+
+      // ====================================================================
+      // Stage 1: KV Instantiation + Pre-Probe + Layer-3 Probe + HKVD Select
+      // ====================================================================
+      const bool use_w4a8_win = use_w4a8_for_t(win_len, false);
+      const U64 seq1 =
+          blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+      Encoder e1(context, libraries, win_len,
+                 "qwen.blend.warm1." + std::to_string(seq1) + plan_key_suffix());
+      if (use_w4a8_win) {
+        e1.profile.used_w4a8 = true;
+      }
+
+      // 1A. Instantiate cached KV for all hit segments across all full-attn layers.
+      e1.begin_stage("blend_instantiate_kv");
+      {
+        U32 attn_idx = 0U;
+        for (const auto &blk : blocks) {
+          if (blk.type != LayerType::full_attention)
+            continue;
+          for (std::size_t si = seg_begin; si < seg_end; ++si) {
+            const auto &ps = plan.segments[si];
+            if (!ps.is_cache_hit())
+              continue;
+            const auto &he = *ps.hit_entry;
+            const U64 lkv = U64(he.geometry.token_length) * U64(kvh) *
+                            he.geometry.attn_vec_bytes();
+            const U64 lrot =
+                U64(he.geometry.token_length) * U64(kvh) * U64(rot_dim) * 2ULL;
+            detail::BlendInstantiateKvParams ip{};
+            ip.key_value_heads = kvh;
+            ip.head_dim = U32(config.head_dim);
+            ip.rotary_dim = rot_dim;
+            ip.chunk_tokens = ps.segment.length;
+            ip.dst_start_pos = ps.segment.start;
+            ip.page_tokens = 64U;
+            ip.theta = float(config.rope_theta);
+            ip.src_token_offset = 0U;
+            ip.use_rotary_bf16 = 1U;
+            auto &inst = e1.emit(
+                "cache_blend", "omlx_m5_blend_instantiate_kv_affine4_g128",
+                {.width = 32U, .height = U64(ps.segment.length) * kvh},
+                {.width = 32U},
+                {Ref{&he.payload.attn_k_pre, U64(attn_idx) * lkv, lkv},
+                 Ref{&he.payload.attn_k_rotary_bf16, U64(attn_idx) * lrot, lrot},
+                 Ref{&he.payload.attn_v, U64(attn_idx) * lkv, lkv}, blk.state0,
+                 blk.state1, table_ref});
+            e1.dynamic(inst, 6, pod_bytes(ip));
+          }
+          emit_refresh_pages(e1, blk);
+          ++attn_idx;
+        }
+      }
+
+      // 1B. Populate full_hidden from cached H3_res for hit segments & mix3_cached.
+      e1.begin_stage("blend_dequant_h3");
+      for (std::size_t si = seg_begin; si < seg_end; ++si) {
+        const auto &ps = plan.segments[si];
+        if (!ps.is_cache_hit())
+          continue;
+        const auto &he = *ps.hit_entry;
+        const U32 rel_start = ps.segment.start - win_prefix;
+        const U32 lm = ps.segment.length;
+        detail::BlendInt8QuantParams dq{.tokens = lm, .width = h};
+        const Ref dst_h3{full_hidden_ref.buffer,
+                         full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
+                         mul(lm, mul(h, 2ULL))};
+        auto &dh = e1.emit(
+            "cache_blend", "omlx_m5_blend_dequantize_int8_g128_bf16",
+            {.width = 32U, .height = U64(lm) * (h / 128U)}, {.width = 32U},
+            {Ref{&he.payload.h3_res_i8, 0, he.geometry.h3_res_i8_bytes()},
+             Ref{&he.payload.h3_res_scales, 0, he.geometry.h3_res_scale_bytes()},
+             dst_h3});
+        e1.dynamic(dh, 3, pod_bytes(dq));
+        copy(e1,
+             Ref{&he.payload.mix3_cached_i8, 0,
+                 he.geometry.mix3_cached_i8_bytes()},
+             Ref{mix3_i8_ref.buffer, mix3_i8_ref.offset + mul(rel_start, U64(q)),
+                 he.geometry.mix3_cached_i8_bytes()},
+             he.geometry.mix3_cached_i8_bytes());
+        copy(e1,
+             Ref{&he.payload.mix3_cached_scales, 0,
+                 he.geometry.mix3_cached_scale_bytes()},
+             Ref{mix3_sc_ref.buffer,
+                 mix3_sc_ref.offset + mul(rel_start, mul(q / 128U, 2ULL)),
+                 he.geometry.mix3_cached_scale_bytes()},
+             he.geometry.mix3_cached_scale_bytes());
+      }
+
+      // 1C. Pre-probe layers (0 .. probe_idx - 1): dense boundary/miss + GDN jump!
+      for (std::size_t si = seg_begin; si < seg_end; ++si) {
+        const auto &ps = plan.segments[si];
+        const U32 rel_start = ps.segment.start - win_prefix;
+        const U32 run_len = ps.is_cache_hit()
+                                ? std::min<U32>(ps.segment.boundary_window,
+                                                ps.segment.length)
+                                : ps.segment.length;
+        if (run_len > 0U) {
+          e1.begin_stage("blend_pre_probe.seg" + std::to_string(rel_start));
+          e1.delegated_prefill = (run_len >= 16U);
+          const Ref seg_tok{token_ids.buffer,
+                            token_ids.offset + mul(rel_start, 4ULL),
+                            mul(run_len, 4ULL)};
+          embedding_lookup(e1, embedding, seg_tok, hidden, zero, v, h, run_len);
+          const bool seg_w4a8 = use_w4a8_for_t(run_len, false);
+          for (U32 li = 0; li < probe_idx; ++li) {
+            const auto &blk = blocks[li];
+            if (seg_w4a8) {
+              emit_rmsnorm_a8_g64(e1, hidden, direct(blk.get("input_norm"), h),
+                                  norm, a8_qa, a8_sa, a8_ra, h,
+                                  float(config.rms_norm_eps),
+                                  normalization_weight_offset, true, run_len);
+              e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+            } else {
+              normalize(e1, blk.get("input_norm"), hidden, norm, run_len);
+            }
+            const std::array<MaterializedWeightView, 2> qkvz_parts{
+                blk.get("gdn_qkv"), blk.get("gdn_z")};
+            const std::array<U32, 2> qkvz_ns{conv, gv};
+            const std::array<MaterializedWeightView, 2> ab_parts{
+                blk.get("gdn_a"), blk.get("gdn_b")};
+            const std::array<U32, 2> ab_ns{hv, hv};
+            if (seg_w4a8 &&
+                try_concat_w4a8_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                    qkvz_ns, h, norm, concat_out, run_len)) {
+              emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+            } else if (seg_w4a8) {
+              if (!try_linear_w4a8_base(e1, qkvz_parts[0], norm, qkv, conv, h,
+                                        run_len))
+                linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
+              if (!try_linear_w4a8_base(e1, qkvz_parts[1], norm, z, gv, h,
+                                        run_len))
+                linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+            } else if (try_concat_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                      qkvz_ns, h, false, norm, concat_out,
+                                      run_len)) {
+              emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+            } else {
+              linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
+              linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+            }
+            if (seg_w4a8 &&
+                try_concat_w4a8_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out, run_len)) {
+              emit_split2(e1, concat_out, a, b, hv, hv, run_len);
+            } else if (seg_w4a8) {
+              if (!try_linear_w4a8_base(e1, ab_parts[0], norm, a, hv, h,
+                                        run_len))
+                linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
+              if (!try_linear_w4a8_base(e1, ab_parts[1], norm, b, hv, h,
+                                        run_len))
+                linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
+            } else if (try_concat_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                      h, false, norm, concat_out, run_len)) {
+              emit_split2(e1, concat_out, a, b, hv, hv, run_len);
+            } else {
+              linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
+              linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
+            }
+            emit_blend_gdn_slice(e1, blk, blk.state0, blk.state1, 0U, run_len);
+            if (!(seg_w4a8 &&
+                  try_linear_w4a8_base(e1, blk.get("gdn_out"), mixer, delta, h,
+                                       gv, run_len))) {
+              linear(e1, blk.get("gdn_out"), mixer, delta, h, gv, run_len);
+            }
+            if (seg_w4a8) {
+              emit_add_rmsnorm_a8_g64(
+                  e1, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                  norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                  normalization_weight_offset, (config.num_experts > 0),
+                  run_len);
+              e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+            } else {
+              add_normalize(e1, blk.get("post_attention_norm"), hidden, delta,
+                            norm, run_len);
+            }
+            mlp(e1, blk, li, false, run_len, nullptr, std::nullopt, false,
+                seg_w4a8, /*verify=*/false);
+            add(e1, run_len);
+          }
+          copy(e1, hidden,
+               Ref{full_hidden_ref.buffer,
+                   full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
+                   mul(run_len, mul(h, 2ULL))},
+               mul(run_len, mul(h, 2ULL)));
+        }
+        if (ps.is_cache_hit() && ps.segment.length > run_len) {
+          U32 gdn_i = 0U;
+          for (U32 li = 0; li < probe_idx; ++li) {
+            if (blocks[li].type != LayerType::full_attention) {
+              emit_gdn_jump(e1, blocks[li], gdn_i, *ps.hit_entry);
+              ++gdn_i;
+            }
+          }
+        }
+      }
+
+      // 1D. Layer probe_idx (Layer 3): scatter mandatory K/V, cross-chunk Attn, HKVD!
+      {
+        const auto &pblk = blocks[probe_idx];
+        e1.begin_stage("blend_probe_layer");
+        e1.delegated_prefill = false;
+        if (use_w4a8_win) {
+          emit_rmsnorm_a8_g64(
+              e1, full_hidden_ref, direct(pblk.get("input_norm"), h), norm,
+              a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+          e1.set_a8_quant(make_a8_key(e1, norm, h));
+        } else {
+          normalize(e1, pblk.get("input_norm"), full_hidden_ref, norm);
+        }
+
+        if (m_mand > 0U) {
+          e1.delegated_prefill = (m_mand >= 16U);
+          detail::BlendGatherScatterParams gp{
+              .max_active_tokens = m_mand, .width = h, .use_device_count = 0U,
+              .residual_add = 0U};
+          const U32 gx = (h % 4U == 0U) ? (h / 4U) : h;
+          auto &gm = e1.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                             {.width = gx, .height = m_mand},
+                             {.width = std::min<U32>(128U, gx)},
+                             {norm, mand_idx_ref, zero, delta});
+          e1.dynamic(gm, 4, pod_bytes(gp));
+          const bool mand_w4a8 = use_w4a8_for_t(m_mand, false);
+          if (!(mand_w4a8 &&
+                try_linear_w4a8_base(e1, pblk.get("attention_k"), delta, key,
+                                     kv, h, m_mand))) {
+            linear_base(e1, pblk.get("attention_k"), delta, key, kv, h, m_mand);
+          }
+          if (!(mand_w4a8 &&
+                try_linear_w4a8_base(e1, pblk.get("attention_v"), delta, value,
+                                     kv, h, m_mand))) {
+            linear_base(e1, pblk.get("attention_v"), delta, value, kv, h,
+                        m_mand);
+          }
+          e1.delegated_prefill = false;
+          detail::BlendQkNormRopeScatterParams sp{};
+          sp.query_heads = 0U;
+          sp.key_value_heads = kvh;
+          sp.head_dim = U32(config.head_dim);
+          sp.rotary_dim = rot_dim;
+          sp.max_active_tokens = m_mand;
+          sp.query_token_stride = q * 2U;
+          sp.query_head_stride = U32(config.head_dim * 2);
+          sp.key_token_stride = kv;
+          sp.key_head_stride = U32(config.head_dim);
+          sp.value_token_stride = kv;
+          sp.page_tokens = 64U;
+          sp.use_device_count = 0U;
+          sp.epsilon = float(config.rms_norm_eps);
+          sp.theta = float(config.rope_theta);
+          sp.weight_offset = normalization_weight_offset;
+          auto &skv = e1.emit(
+              "cache_blend",
+              "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
+              {.width = 32U, .height = U64(m_mand) * kvh}, {.width = 32U},
+              {query, key, value, direct(pblk.get("q_norm"), config.head_dim),
+               direct(pblk.get("k_norm"), config.head_dim), pblk.state0,
+               pblk.state1, table_ref, mand_pos_ref, zero});
+          e1.dynamic(skv, 10, pod_bytes(sp));
+          emit_refresh_pages(e1, pblk);
+        }
+
+        if (!(use_w4a8_win &&
+              try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
+                                   2 * q, h))) {
+          linear_base(e1, pblk.get("attention_q"), norm, query, 2 * q, h);
+        }
+        {
+          auto &post = e1.emit(
+              "attention_exact", "omlx_m5_attention_qk_norm_rope_exact",
+              {.width = 32U, .height = U64(win_len) * (qh + kvh)},
+              {.width = 32U},
+              {query, key, direct(pblk.get("q_norm"), config.head_dim),
+               direct(pblk.get("k_norm"), config.head_dim), prompt_pos_ref});
+          e1.dynamic(post, 5,
+                     words({qh, kvh, U32(config.head_dim), rot_dim, win_len,
+                            q * 2, U32(config.head_dim * 2), kv,
+                            U32(config.head_dim), win_prefix,
+                            word(float(config.rms_norm_eps)),
+                            word(float(config.rope_theta)),
+                            word(normalization_weight_offset)}));
+        }
+        emit_blend_attn_route_b(e1, pblk, win_len, win_prefix, ctx_env,
+                                prompt_pos_ref);
+        copy(e1, mixer, full_mixer_ref, mul(win_len, mul(q, 2ULL)));
+
+        detail::BlendHkvdSelectParams hp{};
+        hp.total_tokens = win_len;
+        hp.mix_width = q;
+        hp.cached_is_int8 = 1U;
+        hp.compute_l2_inline = 0U;
+        hp.explicit_hkvd_k = 0U;
+        hp.hkvd_ratio = detail::kBlendDefaultHkvdRatio;
+        auto &l2 = e1.emit("cache_blend", "omlx_m5_blend_hkvd_l2_score",
+                           {.width = 128U, .height = win_len},
+                           {.width = 128U},
+                           {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
+                            l2_ref});
+        e1.dynamic(l2, 5, pod_bytes(hp));
+        auto &tk = e1.emit("cache_blend", "omlx_m5_blend_hkvd_topk_select",
+                           {.width = 256U}, {.width = 256U},
+                           {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
+                            prompt_pos_ref, l2_ref, act_idx_ref, act_pos_ref,
+                            act_cnt_ref});
+        e1.dynamic(tk, 9, pod_bytes(hp));
+      }
+
+      auto prof1 = e1.finish();
+      prof1.parameters.write("step", prof1.parameter_data);
+      run_blend_exec_profile(prof1);
+
+      U32 m_active = 0U;
+      {
+        const auto cnt_b = active_cnt_buf.read(0, 4);
+        std::memcpy(&m_active, cnt_b.data(), 4);
+      }
+      if (m_active == 0U || m_active > win_len) {
+        throw std::runtime_error("CacheBlend HKVD produced invalid M_active");
+      }
+      std::vector<U32> active_idx_host(m_active);
+      std::vector<U32> active_pos_host(m_active);
+      {
+        const auto ib = active_idx_buf.read(0, mul(m_active, 4ULL));
+        const auto pb = active_pos_buf.read(0, mul(m_active, 4ULL));
+        std::memcpy(active_idx_host.data(), ib.data(), ib.size());
+        std::memcpy(active_pos_host.data(), pb.data(), pb.size());
+      }
+      const_cast<MetalBuffer *>(attention_positions.buffer)
+          ->write(std::as_bytes(std::span(active_pos_host)));
+
+      U32 recomputed_hit_tokens = 0U;
+      for (const U32 rel_i : active_idx_host) {
+        const U32 abs_p = win_prefix + rel_i;
+        for (std::size_t si = seg_begin; si < seg_end; ++si) {
+          const auto &ps = plan.segments[si];
+          if (ps.is_cache_hit() && abs_p >= ps.segment.start &&
+              abs_p < ps.segment.start + ps.segment.length) {
+            ++recomputed_hit_tokens;
+            break;
+          }
+        }
+      }
+
+      // ====================================================================
+      // Stage 2: Deep Layers (Layer 3 finish + Layers 4..L-1) on [M_active, H]
+      // Composes active Route A (BF16/W4A8) + Route B (Exact/Sage2/MInf) +
+      // Dual-ANE co-execution whenever ane_active_ && m_active >= ane_chunk!
+      // ====================================================================
+      const bool use_w4a8_active = use_w4a8_for_t(m_active, false);
+      const U64 gdn_state_bytes =
+          (config.linear_attention_layers() > 0)
+              ? mul(mul(U64(hv), 128ULL * 128ULL), 4ULL)
+              : 256ULL;
+      const U64 gdn_hist_bytes =
+          (config.linear_attention_layers() > 0) ? gdn_tail_bytes : 256ULL;
+      MetalBuffer gdn_tmp_state = context.make_private_buffer(gdn_state_bytes);
+      MetalBuffer gdn_tmp_hist = context.make_private_buffer(gdn_hist_bytes);
+      const Ref gdn_tmp_s_ref{&gdn_tmp_state, 0, gdn_state_bytes};
+      const Ref gdn_tmp_h_ref{&gdn_tmp_hist, 0, gdn_hist_bytes};
+
+      U32 pre_probe_gdn_count = 0U;
+      for (U32 li = 0; li <= probe_idx; ++li) {
+        if (blocks[li].type != LayerType::full_attention) {
+          ++pre_probe_gdn_count;
+        }
+      }
+
+      struct ActiveSegSlice {
+        const detail::BlendPlannedSegment *planned = nullptr;
+        U32 a_begin = 0U;
+        U32 w_bnd_count = 0U;
+        U32 a_end = 0U;
+      };
+      std::vector<ActiveSegSlice> seg_slices;
+      seg_slices.reserve(seg_end - seg_begin);
+      {
+        U32 cursor = 0U;
+        for (std::size_t si = seg_begin; si < seg_end; ++si) {
+          const auto &ps = plan.segments[si];
+          const U32 seg_rel_start = ps.segment.start - win_prefix;
+          const U32 seg_rel_end = seg_rel_start + ps.segment.length;
+          const U32 a_begin = cursor;
+          U32 w_bnd_cnt = 0U;
+          const U32 bnd_end =
+              seg_rel_start +
+              (ps.is_cache_hit()
+                   ? std::min<U32>(ps.segment.boundary_window, ps.segment.length)
+                   : 0U);
+          while (cursor < m_active && active_idx_host[cursor] < seg_rel_end) {
+            if (active_idx_host[cursor] < bnd_end) {
+              ++w_bnd_cnt;
+            }
+            ++cursor;
+          }
+          seg_slices.push_back({&ps, a_begin, w_bnd_cnt, cursor});
+        }
+      }
+
+      auto emit_stage2_head_and_sample = [&](Encoder &eh) {
+        eh.begin_stage("blend_head");
+        Ref last_hidden{delta.buffer, 0, mul(h, 2)};
+        Ref last_norm{norm.buffer, 0, mul(h, 2)};
+        Ref row0_logits{logits.buffer, 0, mul(v, 2)};
+        {
+          auto &extract =
+              eh.emit("qwen_forward", "omlx_m5_forward_last_row", {.width = h},
+                      {.width = 256}, {hidden, last_hidden});
+          eh.dynamic(extract, 2, words({m_active, h}));
+        }
+        normalize(eh, final_norm, last_hidden, last_norm, 1U);
+        linear(eh, head, last_norm, row0_logits, v, h, 1U);
+        eh.begin_stage("blend_sample");
+        const bool use_64tg_argmax =
+            (v >= 256U) && (argmax_scratch.buffer != nullptr) &&
+            !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_64TG_ARGMAX");
+        if (sampling_contract == SamplingContract::PositionCoupledV1) {
+          if (use_64tg_argmax) {
+            auto &st1 = eh.emit("position_sampling",
+                                "omlx_m5_position_argmax_stage1_64tg",
+                                {.width = 64U * 256U, .height = 1U},
+                                {.width = 256U}, {row0_logits, argmax_scratch});
+            eh.constant(st1, 2, words({v, 1, 1, 0}));
+            auto &sample = eh.emit(
+                "position_sampling", "omlx_m5_position_sample_logits_stage2",
+                {.width = 256U}, {.width = 256U},
+                {row0_logits, argmax_scratch, sampled, position_ids,
+                 position_scores});
+            eh.profile.sampling_offset = eh.dynamic(
+                sample, 5, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+            eh.constant(sample, 6, words({v, 1, 1, 0}));
+          } else {
+            auto &sample =
+                eh.emit("position_sampling", "omlx_m5_position_sample_logits",
+                        {.width = 256}, {.width = 256},
+                        {row0_logits, sampled, position_ids, position_scores});
+            eh.profile.sampling_offset = eh.dynamic(
+                sample, 4, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+            eh.constant(sample, 5, words({v, 1, 1, 0}));
+          }
+        } else if (use_64tg_argmax) {
+          Ref vocab_parts{argmax_scratch.buffer, 0, 512U};
+          auto &st1 =
+              eh.emit("vocab", "omlx_m5_vocab_argmax_stage1_64tg",
+                      {.width = 64U * 256U}, {.width = 256U},
+                      {row0_logits, vocab_parts});
+          eh.constant(st1, 2, words({v}));
+          auto &sample =
+              eh.emit("vocab", "omlx_m5_sample_logits_stage2", {.width = 256U},
+                      {.width = 256U}, {row0_logits, vocab_parts, sampled});
+          eh.profile.sampling_offset =
+              eh.dynamic(sample, 3, std::vector<std::byte>(sizeof(SampleParams)));
+        } else {
+          auto &sample = eh.emit("vocab", "omlx_m5_sample_logits", {.width = 256},
+                                 {.width = 256}, {row0_logits, sampled});
+          eh.profile.sampling_offset =
+              eh.dynamic(sample, 2, std::vector<std::byte>(sizeof(SampleParams)));
+        }
+      };
+
+      auto patch_stage2_sampling = [&](Profile &hp) {
+        if (sampling_contract == SamplingContract::PositionCoupledV1) {
+          const PositionSamplingRow row{.seed = sampling.seed,
+                                        .position = win_end,
+                                        .top_k = sampling.top_k,
+                                        .temperature = sampling.temperature,
+                                        .top_p = sampling.top_p};
+          std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &row,
+                      sizeof(row));
+        } else {
+          const SampleParams sp{v,
+                                sampling.top_k,
+                                sampling.temperature,
+                                sampling.top_p,
+                                sampling.seed,
+                                sampling.stream,
+                                win_end - 1U};
+          std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &sp,
+                      sizeof(sp));
+        }
+      };
+
+      const bool stage2_ane =
+          ane_active_ && ane_engine_ != nullptr && ane_chunk_tokens_ > 0U &&
+          m_active >= ane_chunk_tokens_ && config.num_experts == 0 &&
+          !inspect_routes_enabled && !inspect_tensors_workspace &&
+          bypass_lora_ == nullptr && feature_layers.empty();
+
+      bool stage2_used_w4a8 = use_w4a8_active;
+      bool stage2_used_sage2 = false;
+      bool stage2_used_minf = false;
+      U32 stage2_minf_env = 0U;
+      U32 stage2_ane_offload_rows = 0U;
+
+      if (stage2_ane) {
+        const U32 ane_blk_t = ane_chunk_tokens_;
+        const U32 n_ane_blks = m_active / ane_blk_t;
+        const U32 ane_rows_total = n_ane_blks * ane_blk_t;
+        const U32 tail_rows = m_active - ane_rows_total;
+        stage2_ane_offload_rows = ane_rows_total;
+
+        // Pointer-stable profile storage kept alive until after classic barrier.
+        std::deque<Profile> stage2_profiles;
+        const U64 seq2 =
+            blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+        const std::string base_tag =
+            "qwen.blend.warm2.ane." + std::to_string(seq2) + plan_key_suffix();
+
+        auto submit_stage2_prof = [&](Profile &&pr) {
+          stage2_profiles.push_back(std::move(pr));
+          auto &stored = stage2_profiles.back();
+          if (stored.used_w4a8)
+            stage2_used_w4a8 = true;
+          if (stored.used_sage2)
+            stage2_used_sage2 = true;
+          if (stored.used_minference) {
+            stage2_used_minf = true;
+            stage2_minf_env = stored.minf_context_envelope;
+          }
+          stored.parameters.write("step", stored.parameter_data);
+          const std::array calls{MetalCommandInvocation{
+              .plan = &stored.plan,
+              .bindings = stored.bindings,
+              .parameters = &stored.parameters}};
+          context.submit_classic_async(calls);
+        };
+
+        auto run_stage2_ane_linear =
+            [&](U32 li, ane::AneProjectionRole role,
+                const MaterializedWeightView &w, Ref src, Ref dst, U32 n_out,
+                U32 k_in, bool op_w4a8, bool carried_a8,
+                const std::string &tag) {
+              const auto *op = ane_engine_->find_op(li, role);
+              const bool offload =
+                  (op != nullptr && op->split.enabled() &&
+                   can_gpu_suffix_linear(w, n_out, k_in, op_w4a8));
+              if (!offload) {
+                Encoder e(context, libraries, m_active, base_tag + tag);
+                e.begin_stage("blend_ane_fb");
+                if (op_w4a8 && carried_a8) {
+                  e.set_a8_quant(make_a8_key(e, src, k_in));
+                }
+                if (!(op_w4a8 &&
+                      try_linear_w4a8_base(e, w, src, dst, n_out, k_in))) {
+                  linear(e, w, src, dst, n_out, k_in);
+                }
+                submit_stage2_prof(e.finish());
+                return;
+              }
+              for (U32 bi = 0U; bi < n_ane_blks; ++bi) {
+                const U32 row0 = bi * ane_blk_t;
+                const Ref src_s{src.buffer,
+                                src.offset + mul(row0, mul(k_in, 2ULL)),
+                                mul(ane_blk_t, mul(k_in, 2ULL))};
+                const Ref dst_s{dst.buffer,
+                                dst.offset + mul(row0, mul(n_out, 2ULL)),
+                                mul(ane_blk_t, mul(n_out, 2ULL))};
+                Encoder e(context, libraries, ane_blk_t,
+                          base_tag + tag + ".b" + std::to_string(bi));
+                e.begin_stage("blend_ane_gpu_sfx");
+                if (op_w4a8 && carried_a8 && row0 == 0U &&
+                    w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
+                  e.set_a8_quant(make_a8_key(e, src_s, k_in));
+                }
+                (void)emit_gpu_suffix_linear(
+                    e, w, src_s, dst_s, n_out, k_in, op_w4a8,
+                    op->split.gpu_row_offset, n_out, op->split.gpu_rows);
+                stage2_profiles.push_back(e.finish());
+                auto &stored = stage2_profiles.back();
+                if (stored.used_w4a8)
+                  stage2_used_w4a8 = true;
+                stored.parameters.write("step", stored.parameter_data);
+                ane_engine_->enqueue_op(
+                    op->op_id, src_s.buffer->native_mtl_buffer(), src_s.offset,
+                    dst_s.buffer->native_mtl_buffer(), dst_s.offset, n_out,
+                    [&](void *mtl_cb) {
+                      const std::array calls{MetalCommandInvocation{
+                          .plan = &stored.plan,
+                          .bindings = stored.bindings,
+                          .parameters = &stored.parameters}};
+                      context.encode_into_command_buffer(mtl_cb, calls);
+                    },
+                    k_in);
+              }
+              if (tail_rows > 0U) {
+                const Ref src_t{src.buffer,
+                                src.offset +
+                                    mul(ane_rows_total, mul(k_in, 2ULL)),
+                                mul(tail_rows, mul(k_in, 2ULL))};
+                const Ref dst_t{dst.buffer,
+                                dst.offset +
+                                    mul(ane_rows_total, mul(n_out, 2ULL)),
+                                mul(tail_rows, mul(n_out, 2ULL))};
+                const bool tail_w4a8 =
+                    op_w4a8 && use_w4a8_for_t(tail_rows, false);
+                Encoder e(context, libraries, tail_rows,
+                          base_tag + tag + ".tail");
+                e.begin_stage("blend_ane_tail");
+                if (!(tail_w4a8 &&
+                      try_linear_w4a8_base(e, w, src_t, dst_t, n_out, k_in))) {
+                  linear(e, w, src_t, dst_t, n_out, k_in);
+                }
+                submit_stage2_prof(e.finish());
+              }
+            };
+
+        auto run_stage2_ane_swiglu =
+            [&](U32 li, const MaterializedWeightView &gw,
+                const MaterializedWeightView &uw, Ref src, Ref dst, U32 n_out,
+                U32 k_in, bool op_w4a8, bool carried_a8,
+                const std::string &tag) {
+              const auto *op = ane_engine_->find_op(
+                  li, ane::AneProjectionRole::MlpGateUpSwiGlu);
+              const bool offload =
+                  (op != nullptr && op->split.enabled() &&
+                   can_gpu_suffix_swiglu(gw, uw, n_out, k_in, op_w4a8));
+              if (!offload) {
+                Encoder e(context, libraries, m_active, base_tag + tag);
+                e.begin_stage("blend_ane_gu_fb");
+                if (op_w4a8 && carried_a8) {
+                  e.set_a8_quant(make_a8_key(e, src, k_in));
+                }
+                if (!(op_w4a8 &&
+                      try_linear_w4a8_swiglu(e, gw, uw, src, dst, n_out,
+                                             k_in))) {
+                  if (!try_linear_swiglu(e, gw, uw, src, dst, n_out, k_in)) {
+                    linear_base(e, gw, src, gate, n_out, k_in);
+                    linear_base(e, uw, src, up, n_out, k_in);
+                    swiglu(e, m_active, n_out);
+                  }
+                }
+                submit_stage2_prof(e.finish());
+                return;
+              }
+              for (U32 bi = 0U; bi < n_ane_blks; ++bi) {
+                const U32 row0 = bi * ane_blk_t;
+                const Ref src_s{src.buffer,
+                                src.offset + mul(row0, mul(k_in, 2ULL)),
+                                mul(ane_blk_t, mul(k_in, 2ULL))};
+                const Ref dst_s{dst.buffer,
+                                dst.offset + mul(row0, mul(n_out, 2ULL)),
+                                mul(ane_blk_t, mul(n_out, 2ULL))};
+                Encoder e(context, libraries, ane_blk_t,
+                          base_tag + tag + ".b" + std::to_string(bi));
+                e.begin_stage("blend_ane_gu_sfx");
+                if (op_w4a8 && carried_a8 && row0 == 0U &&
+                    w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
+                  e.set_a8_quant(make_a8_key(e, src_s, k_in));
+                }
+                (void)emit_gpu_suffix_swiglu(
+                    e, gw, uw, src_s, dst_s, n_out, k_in, op_w4a8,
+                    op->split.gpu_row_offset, n_out, op->split.gpu_rows);
+                stage2_profiles.push_back(e.finish());
+                auto &stored = stage2_profiles.back();
+                if (stored.used_w4a8)
+                  stage2_used_w4a8 = true;
+                stored.parameters.write("step", stored.parameter_data);
+                ane_engine_->enqueue_op(
+                    op->op_id, src_s.buffer->native_mtl_buffer(), src_s.offset,
+                    dst_s.buffer->native_mtl_buffer(), dst_s.offset, n_out,
+                    [&](void *mtl_cb) {
+                      const std::array calls{MetalCommandInvocation{
+                          .plan = &stored.plan,
+                          .bindings = stored.bindings,
+                          .parameters = &stored.parameters}};
+                      context.encode_into_command_buffer(mtl_cb, calls);
+                    },
+                    k_in);
+              }
+              if (tail_rows > 0U) {
+                const Ref src_t{src.buffer,
+                                src.offset +
+                                    mul(ane_rows_total, mul(k_in, 2ULL)),
+                                mul(tail_rows, mul(k_in, 2ULL))};
+                const Ref dst_t{dst.buffer,
+                                dst.offset +
+                                    mul(ane_rows_total, mul(n_out, 2ULL)),
+                                mul(tail_rows, mul(n_out, 2ULL))};
+                const bool tail_w4a8 =
+                    op_w4a8 && use_w4a8_for_t(tail_rows, false);
+                Encoder e(context, libraries, tail_rows,
+                          base_tag + tag + ".tail");
+                e.begin_stage("blend_ane_gu_tail");
+                if (!(tail_w4a8 &&
+                      try_linear_w4a8_swiglu(e, gw, uw, src_t, dst_t, n_out,
+                                             k_in))) {
+                  if (!try_linear_swiglu(e, gw, uw, src_t, dst_t, n_out,
+                                         k_in)) {
+                    linear_base(e, gw, src_t, gate, n_out, k_in);
+                    linear_base(e, uw, src_t, up, n_out, k_in);
+                    auto &sw = e.emit("mlp_layer", "omlx_m5_mlp_swiglu",
+                                      {.width = U64(tail_rows) * n_out},
+                                      {.width = 256}, {gate, up, dst_t});
+                    e.dynamic(sw, 3, words({tail_rows, n_out}));
+                  }
+                }
+                submit_stage2_prof(e.finish());
+              }
+            };
+
+        auto run_stage2_ane_mlp_and_add = [&](U32 li, const Block &blk) {
+          const std::string ltag = ".L" + std::to_string(li);
+          {
+            Encoder e(context, libraries, m_active,
+                      base_tag + ltag + ".post_norm");
+            e.begin_stage("post_norm");
+            if (use_w4a8_active) {
+              emit_add_rmsnorm_a8_g64(
+                  e, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                  norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                  normalization_weight_offset, /*write_bf16=*/true);
+            } else {
+              add_normalize(e, blk.get("post_attention_norm"), hidden, delta,
+                            norm);
+            }
+            submit_stage2_prof(e.finish());
+          }
+          run_stage2_ane_swiglu(li, blk.get("mlp_gate"), blk.get("mlp_up"),
+                                norm, product, f, h, use_w4a8_active,
+                                use_w4a8_active, ltag + ".mlp_gu");
+          run_stage2_ane_linear(li, ane::AneProjectionRole::MlpDown,
+                                blk.get("mlp_down"), product, delta, h, f,
+                                use_w4a8_active && w4a8_down_proj_, false,
+                                ltag + ".mlp_dn");
+          {
+            Encoder e(context, libraries, m_active, base_tag + ltag + ".add");
+            e.begin_stage("add");
+            add(e);
+            submit_stage2_prof(e.finish());
+          }
+        };
+
+        // Gather active rows for Layer probe_idx finish.
+        {
+          Encoder e(context, libraries, m_active, base_tag + ".gather");
+          e.begin_stage("blend_gather_active");
+          detail::BlendGatherScatterParams gh{
+              .max_active_tokens = m_active, .width = h, .use_device_count = 0U,
+              .residual_add = 0U};
+          const U32 gxh = (h % 4U == 0U) ? (h / 4U) : h;
+          auto &g1 = e.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                            {.width = gxh, .height = m_active},
+                            {.width = std::min<U32>(128U, gxh)},
+                            {full_hidden_ref, act_idx_ref, act_cnt_ref, hidden});
+          e.dynamic(g1, 4, pod_bytes(gh));
+          detail::BlendGatherScatterParams gm{
+              .max_active_tokens = m_active, .width = q, .use_device_count = 0U,
+              .residual_add = 0U};
+          const U32 gxq = (q % 4U == 0U) ? (q / 4U) : q;
+          auto &g2 = e.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                            {.width = gxq, .height = m_active},
+                            {.width = std::min<U32>(128U, gxq)},
+                            {full_mixer_ref, act_idx_ref, act_cnt_ref, mixer});
+          e.dynamic(g2, 4, pod_bytes(gm));
+          submit_stage2_prof(e.finish());
+        }
+
+        // Finish Layer probe_idx with Dual-ANE on o_proj + MLP.
+        {
+          const auto &pblk = blocks[probe_idx];
+          run_stage2_ane_linear(probe_idx, ane::AneProjectionRole::AttnOProj,
+                                pblk.get("attention_o"), mixer, delta, h, q,
+                                use_w4a8_active, false, ".probe.o");
+          run_stage2_ane_mlp_and_add(probe_idx, pblk);
+        }
+
+        // Deep layers probe_idx + 1 .. blocks.size() - 1 with Dual-ANE streaming!
+        U32 gdn_idx = pre_probe_gdn_count;
+        for (U32 li = probe_idx + 1U; li < blocks.size(); ++li) {
           const auto &blk = blocks[li];
-          if (seg_w4a8) {
-            emit_rmsnorm_a8_g64(e1, hidden, direct(blk.get("input_norm"), h),
+          const std::string ltag = ".L" + std::to_string(li);
+          if (blk.type == LayerType::full_attention) {
+            {
+              Encoder e(context, libraries, m_active,
+                        base_tag + ltag + ".attn_pre");
+              e.begin_stage("blend_deep_attn");
+              if (use_w4a8_active) {
+                emit_rmsnorm_a8_g64(e, hidden, direct(blk.get("input_norm"), h),
+                                    norm, a8_qa, a8_sa, a8_ra, h,
+                                    float(config.rms_norm_eps),
+                                    normalization_weight_offset, true);
+                e.set_a8_quant(make_a8_key(e, norm, h));
+              } else {
+                normalize(e, blk.get("input_norm"), hidden, norm);
+              }
+              const std::array<MaterializedWeightView, 3> parts{
+                  blk.get("attention_q"), blk.get("attention_k"),
+                  blk.get("attention_v")};
+              const std::array<U32, 3> part_ns{2 * q, kv, kv};
+              if (use_w4a8_active &&
+                  try_concat_w4a8_nax(e, blk.concat_qkv_id, parts, part_ns, h,
+                                      norm, concat_out)) {
+                emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+              } else if (use_w4a8_active) {
+                if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
+                  linear_base(e, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
+                  linear_base(e, parts[1], norm, key, kv, h);
+                if (!try_linear_w4a8_base(e, parts[2], norm, value, kv, h))
+                  linear_base(e, parts[2], norm, value, kv, h);
+              } else if (try_concat_nax(e, blk.concat_qkv_id, parts, part_ns, h,
+                                        false, norm, concat_out)) {
+                emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+              } else {
+                linear_base(e, parts[0], norm, query, 2 * q, h);
+                linear_base(e, parts[1], norm, key, kv, h);
+                linear_base(e, parts[2], norm, value, kv, h);
+              }
+              detail::BlendQkNormRopeScatterParams sp{};
+              sp.query_heads = qh;
+              sp.key_value_heads = kvh;
+              sp.head_dim = U32(config.head_dim);
+              sp.rotary_dim = rot_dim;
+              sp.max_active_tokens = m_active;
+              sp.query_token_stride = q * 2U;
+              sp.query_head_stride = U32(config.head_dim * 2);
+              sp.key_token_stride = kv;
+              sp.key_head_stride = U32(config.head_dim);
+              sp.value_token_stride = kv;
+              sp.page_tokens = 64U;
+              sp.use_device_count = 0U;
+              sp.epsilon = float(config.rms_norm_eps);
+              sp.theta = float(config.rope_theta);
+              sp.weight_offset = normalization_weight_offset;
+              auto &sc = e.emit(
+                  "cache_blend",
+                  "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
+                  {.width = 32U, .height = U64(m_active) * (qh + kvh)},
+                  {.width = 32U},
+                  {query, key, value, direct(blk.get("q_norm"), config.head_dim),
+                   direct(blk.get("k_norm"), config.head_dim), blk.state0,
+                   blk.state1, table_ref, attention_positions, zero});
+              e.dynamic(sc, 10, pod_bytes(sp));
+              emit_refresh_pages(e, blk);
+              emit_blend_attn_route_b(e, blk, m_active, active_pos_host.front(),
+                                      ctx_env, attention_positions);
+              submit_stage2_prof(e.finish());
+            }
+            run_stage2_ane_linear(li, ane::AneProjectionRole::AttnOProj,
+                                  blk.get("attention_o"), mixer, delta, h, q,
+                                  use_w4a8_active, false, ltag + ".o");
+          } else {
+            // GDN input_norm + in_proj_qkv/a/b strictly 100% GPU (NEVER ANE!).
+            {
+              Encoder e(context, libraries, m_active,
+                        base_tag + ltag + ".gdn_qkvab");
+              e.begin_stage("blend_deep_gdn_qkvab");
+              if (use_w4a8_active) {
+                emit_rmsnorm_a8_g64(e, hidden, direct(blk.get("input_norm"), h),
+                                    norm, a8_qa, a8_sa, a8_ra, h,
+                                    float(config.rms_norm_eps),
+                                    normalization_weight_offset,
+                                    /*write_bf16=*/true);
+                e.set_a8_quant(make_a8_key(e, norm, h));
+              } else {
+                normalize(e, blk.get("input_norm"), hidden, norm);
+              }
+              const std::array<MaterializedWeightView, 2> ab_parts{
+                  blk.get("gdn_a"), blk.get("gdn_b")};
+              const std::array<U32, 2> ab_ns{hv, hv};
+              if (!(use_w4a8_active &&
+                    try_linear_w4a8_base(e, blk.get("gdn_qkv"), norm, qkv, conv,
+                                         h))) {
+                linear_base(e, blk.get("gdn_qkv"), norm, qkv, conv, h);
+              }
+              if (use_w4a8_active &&
+                  try_concat_w4a8_nax(e, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                      h, norm, concat_out)) {
+                emit_split2(e, concat_out, a, b, hv, hv);
+              } else if (use_w4a8_active) {
+                if (!try_linear_w4a8_base(e, ab_parts[0], norm, a, hv, h))
+                  linear_base(e, ab_parts[0], norm, a, hv, h);
+                if (!try_linear_w4a8_base(e, ab_parts[1], norm, b, hv, h))
+                  linear_base(e, ab_parts[1], norm, b, hv, h);
+              } else if (try_concat_nax(e, blk.concat_gdn_ab_id, ab_parts,
+                                        ab_ns, h, false, norm, concat_out)) {
+                emit_split2(e, concat_out, a, b, hv, hv);
+              } else {
+                linear_base(e, ab_parts[0], norm, a, hv, h);
+                linear_base(e, ab_parts[1], norm, b, hv, h);
+              }
+              submit_stage2_prof(e.finish());
+            }
+            // GDN in_proj_z on Dual-ANE || GPU suffix!
+            run_stage2_ane_linear(li, ane::AneProjectionRole::GdnInProjZ,
+                                  blk.get("gdn_z"), norm, z, gv, h,
+                                  use_w4a8_active, use_w4a8_active,
+                                  ltag + ".gdn_z");
+            // GDN recurrence slices + state jump on GPU.
+            {
+              Encoder e(context, libraries, m_active,
+                        base_tag + ltag + ".gdn_rec");
+              e.begin_stage("blend_deep_gdn_rec");
+              for (const auto &ss : seg_slices) {
+                const auto &ps = *ss.planned;
+                const U32 seg_m = ss.a_end - ss.a_begin;
+                if (ps.is_cache_hit()) {
+                  if (ss.w_bnd_count > 0U) {
+                    emit_blend_gdn_slice(e, blk, blk.state0, blk.state1,
+                                         ss.a_begin, ss.w_bnd_count);
+                  }
+                  const U32 hkvd_m = seg_m - ss.w_bnd_count;
+                  if (hkvd_m > 0U) {
+                    copy(e, blk.state0, gdn_tmp_s_ref, gdn_state_bytes);
+                    copy(e, blk.state1, gdn_tmp_h_ref, gdn_hist_bytes);
+                    emit_blend_gdn_slice(e, blk, gdn_tmp_s_ref, gdn_tmp_h_ref,
+                                         ss.a_begin + ss.w_bnd_count, hkvd_m);
+                  }
+                  if (ps.segment.length > ss.w_bnd_count) {
+                    emit_gdn_jump(e, blk, gdn_idx, *ps.hit_entry);
+                  }
+                } else if (seg_m > 0U) {
+                  emit_blend_gdn_slice(e, blk, blk.state0, blk.state1,
+                                       ss.a_begin, seg_m);
+                }
+              }
+              submit_stage2_prof(e.finish());
+            }
+            // GDN out_proj on Dual-ANE || GPU suffix!
+            run_stage2_ane_linear(li, ane::AneProjectionRole::GdnOutProj,
+                                  blk.get("gdn_out"), mixer, delta, h, gv,
+                                  use_w4a8_active, false, ltag + ".gdn_out");
+            ++gdn_idx;
+          }
+          run_stage2_ane_mlp_and_add(li, blk);
+        }
+
+        if (is_final_window) {
+          Encoder eh(context, libraries, m_active, base_tag + ".head");
+          emit_stage2_head_and_sample(eh);
+          auto hp = eh.finish();
+          patch_stage2_sampling(hp);
+          submit_stage2_prof(std::move(hp));
+        }
+        ane_engine_->flush_and_wait();
+        static_cast<void>(context.submit_classic_barrier());
+      } else {
+        const U64 seq2 =
+            blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+        Encoder e2(context, libraries, m_active,
+                   "qwen.blend.warm2." + std::to_string(seq2) +
+                       plan_key_suffix());
+        if (use_w4a8_active) {
+          e2.profile.used_w4a8 = true;
+        }
+
+        // Gather hidden[0..M_active, H] and mixer[0..M_active, q] for probe finish.
+        e2.begin_stage("blend_gather_active");
+        {
+          detail::BlendGatherScatterParams gh{
+              .max_active_tokens = m_active, .width = h, .use_device_count = 0U,
+              .residual_add = 0U};
+          const U32 gxh = (h % 4U == 0U) ? (h / 4U) : h;
+          auto &g1 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                             {.width = gxh, .height = m_active},
+                             {.width = std::min<U32>(128U, gxh)},
+                             {full_hidden_ref, act_idx_ref, act_cnt_ref, hidden});
+          e2.dynamic(g1, 4, pod_bytes(gh));
+
+          detail::BlendGatherScatterParams gm{
+              .max_active_tokens = m_active, .width = q, .use_device_count = 0U,
+              .residual_add = 0U};
+          const U32 gxq = (q % 4U == 0U) ? (q / 4U) : q;
+          auto &g2 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                             {.width = gxq, .height = m_active},
+                             {.width = std::min<U32>(128U, gxq)},
+                             {full_mixer_ref, act_idx_ref, act_cnt_ref, mixer});
+          e2.dynamic(g2, 4, pod_bytes(gm));
+        }
+
+        // Finish Layer probe_idx on [M_active, H].
+        {
+          const auto &pblk = blocks[probe_idx];
+          e2.begin_stage("blend_probe_finish");
+          if (!(use_w4a8_active &&
+                try_linear_w4a8_base(e2, pblk.get("attention_o"), mixer, delta,
+                                     h, q))) {
+            linear(e2, pblk.get("attention_o"), mixer, delta, h, q);
+          }
+          if (use_w4a8_active) {
+            emit_add_rmsnorm_a8_g64(
+                e2, hidden, delta, direct(pblk.get("post_attention_norm"), h),
+                norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                normalization_weight_offset, (config.num_experts > 0));
+            e2.set_a8_quant(make_a8_key(e2, norm, h));
+          } else {
+            add_normalize(e2, pblk.get("post_attention_norm"), hidden, delta,
+                          norm);
+          }
+          mlp(e2, pblk, probe_idx, false, {}, nullptr, std::nullopt, false,
+              use_w4a8_active, /*verify=*/false);
+          add(e2);
+        }
+
+        U32 gdn_idx = pre_probe_gdn_count;
+        for (U32 li = probe_idx + 1U; li < blocks.size(); ++li) {
+          const auto &blk = blocks[li];
+          e2.begin_stage("blend_deep.L" + std::to_string(li));
+          if (use_w4a8_active) {
+            emit_rmsnorm_a8_g64(e2, hidden, direct(blk.get("input_norm"), h),
                                 norm, a8_qa, a8_sa, a8_ra, h,
                                 float(config.rms_norm_eps),
-                                normalization_weight_offset, true, run_len);
-            e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+                                normalization_weight_offset, true);
+            e2.set_a8_quant(make_a8_key(e2, norm, h));
           } else {
-            normalize(e1, blk.get("input_norm"), hidden, norm, run_len);
+            normalize(e2, blk.get("input_norm"), hidden, norm);
           }
-          // Pre-probe layers are GDN (probe_idx is the first full_attention layer).
-          const std::array<MaterializedWeightView, 2> qkvz_parts{
-              blk.get("gdn_qkv"), blk.get("gdn_z")};
-          const std::array<U32, 2> qkvz_ns{conv, gv};
-          const std::array<MaterializedWeightView, 2> ab_parts{
-              blk.get("gdn_a"), blk.get("gdn_b")};
-          const std::array<U32, 2> ab_ns{hv, hv};
-          if (seg_w4a8 &&
-              try_concat_w4a8_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
-                                  qkvz_ns, h, norm, concat_out, run_len)) {
-            emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
-          } else if (seg_w4a8) {
-            if (!try_linear_w4a8_base(e1, qkvz_parts[0], norm, qkv, conv, h,
-                                      run_len))
-              linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
-            if (!try_linear_w4a8_base(e1, qkvz_parts[1], norm, z, gv, h,
-                                      run_len))
-              linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
-          } else if (try_concat_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
-                                    qkvz_ns, h, false, norm, concat_out,
-                                    run_len)) {
-            emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+
+          if (blk.type == LayerType::full_attention) {
+            const std::array<MaterializedWeightView, 3> parts{
+                blk.get("attention_q"), blk.get("attention_k"),
+                blk.get("attention_v")};
+            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            if (use_w4a8_active &&
+                try_concat_w4a8_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
+                                    norm, concat_out)) {
+              emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+            } else if (use_w4a8_active) {
+              if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h))
+                linear_base(e2, parts[0], norm, query, 2 * q, h);
+              if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h))
+                linear_base(e2, parts[1], norm, key, kv, h);
+              if (!try_linear_w4a8_base(e2, parts[2], norm, value, kv, h))
+                linear_base(e2, parts[2], norm, value, kv, h);
+            } else if (try_concat_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
+                                      false, norm, concat_out)) {
+              emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+            } else {
+              linear_base(e2, parts[0], norm, query, 2 * q, h);
+              linear_base(e2, parts[1], norm, key, kv, h);
+              linear_base(e2, parts[2], norm, value, kv, h);
+            }
+
+            detail::BlendQkNormRopeScatterParams sp{};
+            sp.query_heads = qh;
+            sp.key_value_heads = kvh;
+            sp.head_dim = U32(config.head_dim);
+            sp.rotary_dim = rot_dim;
+            sp.max_active_tokens = m_active;
+            sp.query_token_stride = q * 2U;
+            sp.query_head_stride = U32(config.head_dim * 2);
+            sp.key_token_stride = kv;
+            sp.key_head_stride = U32(config.head_dim);
+            sp.value_token_stride = kv;
+            sp.page_tokens = 64U;
+            sp.use_device_count = 0U;
+            sp.epsilon = float(config.rms_norm_eps);
+            sp.theta = float(config.rope_theta);
+            sp.weight_offset = normalization_weight_offset;
+            auto &sc = e2.emit(
+                "cache_blend",
+                "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
+                {.width = 32U, .height = U64(m_active) * (qh + kvh)},
+                {.width = 32U},
+                {query, key, value, direct(blk.get("q_norm"), config.head_dim),
+                 direct(blk.get("k_norm"), config.head_dim), blk.state0,
+                 blk.state1, table_ref, attention_positions, zero});
+            e2.dynamic(sc, 10, pod_bytes(sp));
+            emit_refresh_pages(e2, blk);
+
+            emit_blend_attn_route_b(e2, blk, m_active, active_pos_host.front(),
+                                    ctx_env, attention_positions);
+            if (!(use_w4a8_active &&
+                  try_linear_w4a8_base(e2, blk.get("attention_o"), mixer, delta,
+                                       h, q))) {
+              linear(e2, blk.get("attention_o"), mixer, delta, h, q);
+            }
           } else {
-            linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
-            linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+            const std::array<MaterializedWeightView, 2> qkvz_parts{
+                blk.get("gdn_qkv"), blk.get("gdn_z")};
+            const std::array<U32, 2> qkvz_ns{conv, gv};
+            const std::array<MaterializedWeightView, 2> ab_parts{
+                blk.get("gdn_a"), blk.get("gdn_b")};
+            const std::array<U32, 2> ab_ns{hv, hv};
+            if (use_w4a8_active &&
+                try_concat_w4a8_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                    qkvz_ns, h, norm, concat_out)) {
+              emit_split2(e2, concat_out, qkv, z, conv, gv);
+            } else if (use_w4a8_active) {
+              if (!try_linear_w4a8_base(e2, qkvz_parts[0], norm, qkv, conv, h))
+                linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
+              if (!try_linear_w4a8_base(e2, qkvz_parts[1], norm, z, gv, h))
+                linear_base(e2, qkvz_parts[1], norm, z, gv, h);
+            } else if (try_concat_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                      qkvz_ns, h, false, norm, concat_out)) {
+              emit_split2(e2, concat_out, qkv, z, conv, gv);
+            } else {
+              linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
+              linear_base(e2, qkvz_parts[1], norm, z, gv, h);
+            }
+            if (use_w4a8_active &&
+                try_concat_w4a8_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out)) {
+              emit_split2(e2, concat_out, a, b, hv, hv);
+            } else if (use_w4a8_active) {
+              if (!try_linear_w4a8_base(e2, ab_parts[0], norm, a, hv, h))
+                linear_base(e2, ab_parts[0], norm, a, hv, h);
+              if (!try_linear_w4a8_base(e2, ab_parts[1], norm, b, hv, h))
+                linear_base(e2, ab_parts[1], norm, b, hv, h);
+            } else if (try_concat_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                      h, false, norm, concat_out)) {
+              emit_split2(e2, concat_out, a, b, hv, hv);
+            } else {
+              linear_base(e2, ab_parts[0], norm, a, hv, h);
+              linear_base(e2, ab_parts[1], norm, b, hv, h);
+            }
+
+            for (const auto &ss : seg_slices) {
+              const auto &ps = *ss.planned;
+              const U32 seg_m = ss.a_end - ss.a_begin;
+              if (ps.is_cache_hit()) {
+                if (ss.w_bnd_count > 0U) {
+                  emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1,
+                                       ss.a_begin, ss.w_bnd_count);
+                }
+                const U32 hkvd_m = seg_m - ss.w_bnd_count;
+                if (hkvd_m > 0U) {
+                  copy(e2, blk.state0, gdn_tmp_s_ref, gdn_state_bytes);
+                  copy(e2, blk.state1, gdn_tmp_h_ref, gdn_hist_bytes);
+                  emit_blend_gdn_slice(e2, blk, gdn_tmp_s_ref, gdn_tmp_h_ref,
+                                       ss.a_begin + ss.w_bnd_count, hkvd_m);
+                }
+                if (ps.segment.length > ss.w_bnd_count) {
+                  emit_gdn_jump(e2, blk, gdn_idx, *ps.hit_entry);
+                }
+              } else if (seg_m > 0U) {
+                emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1,
+                                     ss.a_begin, seg_m);
+              }
+            }
+
+            if (!(use_w4a8_active &&
+                  try_linear_w4a8_base(e2, blk.get("gdn_out"), mixer, delta, h,
+                                       gv))) {
+              linear(e2, blk.get("gdn_out"), mixer, delta, h, gv);
+            }
+            ++gdn_idx;
           }
-          if (seg_w4a8 &&
-              try_concat_w4a8_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
-                                  norm, concat_out, run_len)) {
-            emit_split2(e1, concat_out, a, b, hv, hv, run_len);
-          } else if (seg_w4a8) {
-            if (!try_linear_w4a8_base(e1, ab_parts[0], norm, a, hv, h, run_len))
-              linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
-            if (!try_linear_w4a8_base(e1, ab_parts[1], norm, b, hv, h, run_len))
-              linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
-          } else if (try_concat_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
-                                    h, false, norm, concat_out, run_len)) {
-            emit_split2(e1, concat_out, a, b, hv, hv, run_len);
-          } else {
-            linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
-            linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
-          }
-          emit_blend_gdn_slice(e1, blk, blk.state0, blk.state1, 0U, run_len);
-          if (!(seg_w4a8 && try_linear_w4a8_base(e1, blk.get("gdn_out"), mixer,
-                                                 delta, h, gv, run_len))) {
-            linear(e1, blk.get("gdn_out"), mixer, delta, h, gv, run_len);
-          }
-          if (seg_w4a8) {
+
+          if (use_w4a8_active) {
             emit_add_rmsnorm_a8_g64(
-                e1, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                e2, hidden, delta, direct(blk.get("post_attention_norm"), h),
                 norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
-                normalization_weight_offset, (config.num_experts > 0), run_len);
-            e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+                normalization_weight_offset, (config.num_experts > 0));
+            e2.set_a8_quant(make_a8_key(e2, norm, h));
           } else {
-            add_normalize(e1, blk.get("post_attention_norm"), hidden, delta,
-                          norm, run_len);
+            add_normalize(e2, blk.get("post_attention_norm"), hidden, delta,
+                          norm);
           }
-          mlp(e1, blk, li, false, run_len, nullptr, std::nullopt, false,
-              seg_w4a8, /*verify=*/false);
-          add(e1, run_len);
+          mlp(e2, blk, li, false, {}, nullptr, std::nullopt, false,
+              use_w4a8_active, /*verify=*/false);
+          add(e2);
         }
-        // Write fresh boundary/miss hidden into full_hidden[rel_start..+run_len).
-        copy(e1, hidden,
-             Ref{full_hidden_ref.buffer,
-                 full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
-                 mul(run_len, mul(h, 2ULL))},
-             mul(run_len, mul(h, 2ULL)));
+
+        if (is_final_window) {
+          emit_stage2_head_and_sample(e2);
+        }
+        auto prof2 = e2.finish();
+        if (is_final_window) {
+          patch_stage2_sampling(prof2);
+        }
+        prof2.parameters.write("step", prof2.parameter_data);
+        run_blend_exec_profile(prof2);
+        stage2_used_w4a8 = prof2.used_w4a8;
+        stage2_used_sage2 = prof2.used_sage2;
+        stage2_used_minf = prof2.used_minference;
+        stage2_minf_env = prof2.minf_context_envelope;
       }
-      // For hit segments, jump pre-probe GDN states across interior [W_bnd, L_m).
-      if (ps.is_cache_hit() && ps.segment.length > run_len) {
-        U32 gdn_i = 0U;
-        for (U32 li = 0; li < probe_idx; ++li) {
-          if (blocks[li].type != LayerType::full_attention) {
-            emit_gdn_jump(e1, blocks[li], gdn_i, *ps.hit_entry);
-            ++gdn_i;
+
+      QwenForwardResult result{
+          .tokens = win_len,
+          .executed_layers = U32(blocks.size()),
+      };
+      if (is_final_window) {
+        const auto tok_bytes = sampled.buffer->read(
+            0, sampling_contract == SamplingContract::PositionCoupledV1 ? 8 : 4);
+        std::memcpy(&result.token, tok_bytes.data(), 4);
+        result.host_read_bytes = tok_bytes.size();
+        if (sampling_contract == SamplingContract::PositionCoupledV1) {
+          U32 flag = 0;
+          std::memcpy(&flag, tok_bytes.data() + 4, 4);
+          if (flag & 2U)
+            throw std::runtime_error("nonfinite position target logits");
+          if (flag & 1U) {
+            auto ib = position_ids.buffer->read(0, U64(sampling.top_k) * 4);
+            auto sb = position_scores.buffer->read(0, U64(sampling.top_k) * 4);
+            std::vector<U32> ids(sampling.top_k);
+            std::vector<float> scores(sampling.top_k);
+            std::memcpy(ids.data(), ib.data(), ib.size());
+            std::memcpy(scores.data(), sb.data(), sb.size());
+            result.token = position_sample_candidates(
+                ids, scores,
+                {.seed = sampling.seed,
+                 .position = win_end,
+                 .top_k = sampling.top_k,
+                 .temperature = sampling.temperature,
+                 .top_p = sampling.top_p});
+            result.host_read_bytes += ib.size() + sb.size();
           }
+        } else if (result.token >= v) {
+          throw std::runtime_error("nonfinite or invalid legacy sampled token");
+        }
+        if (inspect_tensors) {
+          result.hidden = bf16_values(*norm.buffer, h);
+          result.logits = bf16_values(*logits.buffer, v);
+          result.host_read_bytes += mul(U64(h) + U64(v), 2ULL);
         }
       }
-    }
 
-    // 1D. Layer probe_idx (Layer 3): scatter mandatory K/V, run cross-chunk Attention, HKVD select!
-    {
-      const auto &pblk = blocks[probe_idx];
-      e1.begin_stage("blend_probe_layer");
-      e1.delegated_prefill = false;
-      if (use_w4a8_suffix) {
-        emit_rmsnorm_a8_g64(
-            e1, full_hidden_ref, direct(pblk.get("input_norm"), h), norm, a8_qa,
-            a8_sa, a8_ra, h, float(config.rms_norm_eps),
-            normalization_weight_offset, /*write_bf16=*/true);
-        e1.set_a8_quant(make_a8_key(e1, norm, h));
-      } else {
-        normalize(e1, pblk.get("input_norm"), full_hidden_ref, norm);
-      }
+      page_pool->commit(win_len);
+      page_guard.active = false;
+      next_position += win_len;
+      last_logits_row = 0U;
+      has_last_logits = is_final_window;
 
-      // Scatter mandatory K, V into Layer-3 KvPagePool.
-      if (m_mand > 0U) {
-        e1.delegated_prefill = (m_mand >= 16U);
-        detail::BlendGatherScatterParams gp{
-            .max_active_tokens = m_mand, .width = h, .use_device_count = 0U,
-            .residual_add = 0U};
-        const U32 gx = (h % 4U == 0U) ? (h / 4U) : h;
-        auto &gm = e1.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
-                           {.width = gx, .height = m_mand},
-                           {.width = std::min<U32>(128U, gx)},
-                           {norm, mand_idx_ref, zero, delta});
-        e1.dynamic(gm, 4, pod_bytes(gp));
-        const bool mand_w4a8 = use_w4a8_for_t(m_mand, false);
-        if (!(mand_w4a8 &&
-              try_linear_w4a8_base(e1, pblk.get("attention_k"), delta, key, kv,
-                                   h, m_mand))) {
-          linear_base(e1, pblk.get("attention_k"), delta, key, kv, h, m_mand);
+      const bool any_w4a8 = prof1.used_w4a8 || stage2_used_w4a8;
+      const bool any_sage2 = prof1.used_sage2 || stage2_used_sage2;
+      const bool any_minf = stage2_used_minf || prof1.used_minference;
+      const U32 minf_cap = stage2_used_minf ? m_active : win_len;
+      const U32 minf_env =
+          stage2_used_minf ? stage2_minf_env : prof1.minf_context_envelope;
+      QwenPrefillTelemetry win_delta;
+      record_prefill_telemetry(
+          m_active, active_pos_host.front(), any_w4a8, any_sage2, any_minf,
+          minf_cap, minf_env, /*used_ane=*/stage2_ane, &win_delta,
+          stage2_ane ? std::optional<U32>{stage2_ane_offload_rows}
+                     : std::nullopt);
+      prefill_telemetry_.prefill_cache_blend_hit_tokens += win_hit_tokens;
+      prefill_telemetry_.prefill_cache_blend_recomputed_tokens +=
+          recomputed_hit_tokens;
+      accum.prefill_w4a8_tokens += win_delta.prefill_w4a8_tokens;
+      accum.prefill_sage2_tokens += win_delta.prefill_sage2_tokens;
+      accum.prefill_minference_blocks_total +=
+          win_delta.prefill_minference_blocks_total;
+      accum.prefill_minference_blocks_skipped +=
+          win_delta.prefill_minference_blocks_skipped;
+      accum.prefill_ane_offload_tokens += win_delta.prefill_ane_offload_tokens;
+      accum.prefill_ane_fallback_tokens +=
+          win_delta.prefill_ane_fallback_tokens;
+      accum.prefill_cache_blend_hit_tokens += win_hit_tokens;
+      accum.prefill_cache_blend_recomputed_tokens += recomputed_hit_tokens;
+      return result;
+    };
+
+    // ======================================================================
+    // Unified Multi-Window Execution across arbitrary 16K-256K prompts!
+    // Groups consecutive warm-hit + dense-tail segments into <= workspace_rows_
+    // windows while capturing every cold CacheableChunk along the way.
+    // ======================================================================
+    QwenPrefillTelemetry accum;
+    accum.prefill_ane_active = ane_active_;
+    accum.prefill_ane_split_alpha = ane_split_alpha_;
+    QwenForwardResult final_res{};
+
+    std::size_t si = 0U;
+    while (si < plan.segments.size()) {
+      const auto &ps = plan.segments[si];
+      if (!ps.is_cache_hit() || ps.segment.length > workspace_rows_) {
+        const bool is_last_seg = (si + 1U == plan.segments.size());
+        if (!is_last_seg && !ps.is_cache_hit() &&
+            ps.segment.kind == detail::BlendSegmentKind::CacheableChunk &&
+            ps.segment.length <= workspace_rows_) {
+          capture_and_insert_blend_chunk(
+              prompt.subspan(ps.segment.start, ps.segment.length),
+              ps.segment.start, eff_cfg.boundary_window, blend_cache,
+              model_exec_hash, accum);
+        } else {
+          final_res = run_standard_chunked(
+              ps.segment.start, ps.segment.start + ps.segment.length,
+              is_last_seg, accum);
         }
-        if (!(mand_w4a8 &&
-              try_linear_w4a8_base(e1, pblk.get("attention_v"), delta, value,
-                                   kv, h, m_mand))) {
-          linear_base(e1, pblk.get("attention_v"), delta, value, kv, h, m_mand);
-        }
-        e1.delegated_prefill = false;
-        detail::BlendQkNormRopeScatterParams sp{};
-        sp.query_heads = 0U; // K/V scatter only!
-        sp.key_value_heads = kvh;
-        sp.head_dim = U32(config.head_dim);
-        sp.rotary_dim = rot_dim;
-        sp.max_active_tokens = m_mand;
-        sp.query_token_stride = q * 2U;
-        sp.query_head_stride = U32(config.head_dim * 2);
-        sp.key_token_stride = kv;
-        sp.key_head_stride = U32(config.head_dim);
-        sp.value_token_stride = kv;
-        sp.page_tokens = 64U;
-        sp.use_device_count = 0U;
-        sp.epsilon = float(config.rms_norm_eps);
-        sp.theta = float(config.rope_theta);
-        sp.weight_offset = normalization_weight_offset;
-        auto &skv = e1.emit(
-            "cache_blend",
-            "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
-            {.width = 32U, .height = U64(m_mand) * kvh}, {.width = 32U},
-            {query, key, value, direct(pblk.get("q_norm"), config.head_dim),
-             direct(pblk.get("k_norm"), config.head_dim), pblk.state0,
-             pblk.state1, table_ref, mand_pos_ref, zero});
-        e1.dynamic(skv, 10, pod_bytes(sp));
-        emit_refresh_pages(e1, pblk);
+        ++si;
+        continue;
       }
 
-      // Compute Q for all suffix_len rows, apply q_norm + RoPE, run Route B cross-chunk Attention!
-      if (!(use_w4a8_suffix &&
-            try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
-                                 2 * q, h))) {
-        linear_base(e1, pblk.get("attention_q"), norm, query, 2 * q, h);
-      }
-      {
-        auto &post = e1.emit(
-            "attention_exact", "omlx_m5_attention_qk_norm_rope_exact",
-            {.width = 32U, .height = U64(suffix_len) * (qh + kvh)},
-            {.width = 32U},
-            {query, key, direct(pblk.get("q_norm"), config.head_dim),
-             direct(pblk.get("k_norm"), config.head_dim), prompt_pos_ref});
-        e1.dynamic(post, 5,
-                   words({qh, kvh, U32(config.head_dim), rot_dim, suffix_len,
-                          q * 2, U32(config.head_dim * 2), kv,
-                          U32(config.head_dim), prefix_tokens,
-                          word(float(config.rms_norm_eps)),
-                          word(float(config.rope_theta)),
-                          word(normalization_weight_offset)}));
-      }
-      emit_blend_attn_route_b(e1, pblk, suffix_len, prefix_tokens, ctx_env,
-                              prompt_pos_ref);
-      // Save full_mixer_ref before gathering active rows.
-      copy(e1, mixer, full_mixer_ref, mul(suffix_len, mul(q, 2ULL)));
-
-      // HKVD L2 scoring + Top-K selection (~15% interior + 100% mandatory).
-      detail::BlendHkvdSelectParams hp{};
-      hp.total_tokens = suffix_len;
-      hp.mix_width = q;
-      hp.cached_is_int8 = 1U;
-      hp.compute_l2_inline = 0U;
-      hp.explicit_hkvd_k = 0U;
-      hp.hkvd_ratio = detail::kBlendDefaultHkvdRatio;
-      auto &l2 = e1.emit("cache_blend", "omlx_m5_blend_hkvd_l2_score",
-                         {.width = 128U, .height = suffix_len},
-                         {.width = 128U},
-                         {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
-                          l2_ref});
-      e1.dynamic(l2, 5, pod_bytes(hp));
-      auto &tk = e1.emit("cache_blend", "omlx_m5_blend_hkvd_topk_select",
-                         {.width = 256U}, {.width = 256U},
-                         {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
-                          prompt_pos_ref, l2_ref, act_idx_ref, act_pos_ref,
-                          act_cnt_ref});
-      e1.dynamic(tk, 9, pod_bytes(hp));
-    }
-
-    auto prof1 = e1.finish();
-    // Single-use plan: all run_len / m_mand / suffix_len & prefix_tokens are baked in.
-    prof1.parameters.write("step", prof1.parameter_data);
-    run_blend_exec_profile(prof1);
-
-    // Read M_active and active_idx / active_pos (strictly ascending).
-    U32 m_active = 0U;
-    {
-      const auto cnt_b = active_cnt_buf.read(0, 4);
-      std::memcpy(&m_active, cnt_b.data(), 4);
-    }
-    if (m_active == 0U || m_active > suffix_len) {
-      throw std::runtime_error("CacheBlend HKVD produced invalid M_active");
-    }
-    std::vector<U32> active_idx_host(m_active);
-    std::vector<U32> active_pos_host(m_active);
-    {
-      const auto ib = active_idx_buf.read(0, mul(m_active, 4ULL));
-      const auto pb = active_pos_buf.read(0, mul(m_active, 4ULL));
-      std::memcpy(active_idx_host.data(), ib.data(), ib.size());
-      std::memcpy(active_pos_host.data(), pb.data(), pb.size());
-    }
-    const_cast<MetalBuffer *>(attention_positions.buffer)
-        ->write(std::as_bytes(std::span(active_pos_host)));
-
-    // Count how many recomputed active tokens belong to cache-hit segments.
-    U32 recomputed_hit_tokens = 0U;
-    for (const U32 rel_i : active_idx_host) {
-      const U32 abs_p = prefix_tokens + rel_i;
-      for (const auto &ps : plan.segments) {
-        if (ps.is_cache_hit() && abs_p >= ps.segment.start &&
-            abs_p < ps.segment.start + ps.segment.length) {
-          ++recomputed_hit_tokens;
+      // Warm window starting at a hit segment: pack consecutive hit/dense-tail
+      // segments up to workspace_rows_ (stopping before uncached CacheableChunks
+      // so newly-seen cacheable documents are still captured into the cache).
+      std::size_t w_end = si;
+      U32 win_len = 0U;
+      while (w_end < plan.segments.size()) {
+        const auto &cand = plan.segments[w_end];
+        if (!cand.is_cache_hit() &&
+            cand.segment.kind == detail::BlendSegmentKind::CacheableChunk) {
           break;
         }
-      }
-    }
-
-    // ======================================================================
-    // Stage 2: Deep Layers (Layer 3 post-attn + Layers 4..L-1) on Packed [M_active, H]
-    // ======================================================================
-    const bool use_w4a8_active = use_w4a8_for_t(m_active, false);
-    const U64 gdn_state_bytes =
-        (config.linear_attention_layers() > 0)
-            ? mul(mul(U64(hv), 128ULL * 128ULL), 4ULL)
-            : 256ULL;
-    const U64 gdn_hist_bytes =
-        (config.linear_attention_layers() > 0) ? gdn_tail_bytes : 256ULL;
-    MetalBuffer gdn_tmp_state = context.make_private_buffer(gdn_state_bytes);
-    MetalBuffer gdn_tmp_hist = context.make_private_buffer(gdn_hist_bytes);
-    const Ref gdn_tmp_s_ref{&gdn_tmp_state, 0, gdn_state_bytes};
-    const Ref gdn_tmp_h_ref{&gdn_tmp_hist, 0, gdn_hist_bytes};
-
-    const U64 seq2 = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
-    Encoder e2(context, libraries, m_active,
-               "qwen.blend.warm2." + std::to_string(seq2) + plan_key_suffix());
-    if (use_w4a8_active) {
-      e2.profile.used_w4a8 = true;
-    }
-
-    // Gather hidden[0..M_active, H] and mixer[0..M_active, q] for Layer probe_idx finish!
-    e2.begin_stage("blend_gather_active");
-    {
-      detail::BlendGatherScatterParams gh{
-          .max_active_tokens = m_active, .width = h, .use_device_count = 0U,
-          .residual_add = 0U};
-      const U32 gxh = (h % 4U == 0U) ? (h / 4U) : h;
-      auto &g1 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
-                         {.width = gxh, .height = m_active},
-                         {.width = std::min<U32>(128U, gxh)},
-                         {full_hidden_ref, act_idx_ref, act_cnt_ref, hidden});
-      e2.dynamic(g1, 4, pod_bytes(gh));
-
-      detail::BlendGatherScatterParams gm{
-          .max_active_tokens = m_active, .width = q, .use_device_count = 0U,
-          .residual_add = 0U};
-      const U32 gxq = (q % 4U == 0U) ? (q / 4U) : q;
-      auto &g2 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
-                         {.width = gxq, .height = m_active},
-                         {.width = std::min<U32>(128U, gxq)},
-                         {full_mixer_ref, act_idx_ref, act_cnt_ref, mixer});
-      e2.dynamic(g2, 4, pod_bytes(gm));
-    }
-
-    // Finish Layer probe_idx (o_proj + post_attention_norm + mlp + residual add) on [M_active, H].
-    {
-      const auto &pblk = blocks[probe_idx];
-      e2.begin_stage("blend_probe_finish");
-      if (!(use_w4a8_active &&
-            try_linear_w4a8_base(e2, pblk.get("attention_o"), mixer, delta, h,
-                                 q))) {
-        linear(e2, pblk.get("attention_o"), mixer, delta, h, q);
-      }
-      if (use_w4a8_active) {
-        emit_add_rmsnorm_a8_g64(
-            e2, hidden, delta, direct(pblk.get("post_attention_norm"), h), norm,
-            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
-            normalization_weight_offset, (config.num_experts > 0));
-        e2.set_a8_quant(make_a8_key(e2, norm, h));
-      } else {
-        add_normalize(e2, pblk.get("post_attention_norm"), hidden, delta, norm);
-      }
-      mlp(e2, pblk, probe_idx, false, {}, nullptr, std::nullopt, false,
-          use_w4a8_active, /*verify=*/false);
-      add(e2);
-    }
-
-    // Count pre-existing GDN layers up through probe_idx.
-    U32 gdn_idx = 0U;
-    for (U32 li = 0; li <= probe_idx; ++li) {
-      if (blocks[li].type != LayerType::full_attention) {
-        ++gdn_idx;
-      }
-    }
-
-    // Precompute active_idx partitions per segment for GDN layers > probe_idx.
-    struct ActiveSegSlice {
-      const detail::BlendPlannedSegment *planned = nullptr;
-      U32 a_begin = 0U;
-      U32 w_bnd_count = 0U;
-      U32 a_end = 0U;
-    };
-    std::vector<ActiveSegSlice> seg_slices;
-    seg_slices.reserve(plan.segments.size());
-    {
-      U32 cursor = 0U;
-      for (const auto &ps : plan.segments) {
-        const U32 seg_rel_start = ps.segment.start - prefix_tokens;
-        const U32 seg_rel_end = seg_rel_start + ps.segment.length;
-        const U32 a_begin = cursor;
-        U32 w_bnd_cnt = 0U;
-        const U32 bnd_end =
-            seg_rel_start +
-            (ps.is_cache_hit()
-                 ? std::min<U32>(ps.segment.boundary_window, ps.segment.length)
-                 : 0U);
-        while (cursor < m_active && active_idx_host[cursor] < seg_rel_end) {
-          if (active_idx_host[cursor] < bnd_end) {
-            ++w_bnd_cnt;
-          }
-          ++cursor;
+        if (win_len > 0U && win_len + cand.segment.length > workspace_rows_) {
+          break;
         }
-        seg_slices.push_back({&ps, a_begin, w_bnd_cnt, cursor});
+        win_len += cand.segment.length;
+        ++w_end;
       }
-    }
-
-    // Deep layers probe_idx + 1 .. blocks.size() - 1 on packed [M_active, H].
-    for (U32 li = probe_idx + 1U; li < blocks.size(); ++li) {
-      const auto &blk = blocks[li];
-      e2.begin_stage("blend_deep.L" + std::to_string(li));
-      if (use_w4a8_active) {
-        emit_rmsnorm_a8_g64(e2, hidden, direct(blk.get("input_norm"), h), norm,
-                            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
-                            normalization_weight_offset, true);
-        e2.set_a8_quant(make_a8_key(e2, norm, h));
-      } else {
-        normalize(e2, blk.get("input_norm"), hidden, norm);
+      const bool is_final_window = (w_end == plan.segments.size());
+      auto w_res = execute_warm_blend_window(si, w_end, is_final_window, accum);
+      if (is_final_window) {
+        final_res = std::move(w_res);
       }
-
-      if (blk.type == LayerType::full_attention) {
-        const std::array<MaterializedWeightView, 3> parts{
-            blk.get("attention_q"), blk.get("attention_k"),
-            blk.get("attention_v")};
-        const std::array<U32, 3> part_ns{2 * q, kv, kv};
-        if (use_w4a8_active &&
-            try_concat_w4a8_nax(e2, blk.concat_qkv_id, parts, part_ns, h, norm,
-                                concat_out)) {
-          emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
-        } else if (use_w4a8_active) {
-          if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h))
-            linear_base(e2, parts[0], norm, query, 2 * q, h);
-          if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h))
-            linear_base(e2, parts[1], norm, key, kv, h);
-          if (!try_linear_w4a8_base(e2, parts[2], norm, value, kv, h))
-            linear_base(e2, parts[2], norm, value, kv, h);
-        } else if (try_concat_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
-                                  false, norm, concat_out)) {
-          emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
-        } else {
-          linear_base(e2, parts[0], norm, query, 2 * q, h);
-          linear_base(e2, parts[1], norm, key, kv, h);
-          linear_base(e2, parts[2], norm, value, kv, h);
-        }
-
-        // Scattered QK-Norm + RoPE(active_pos) + KV scatter into KvPagePool!
-        detail::BlendQkNormRopeScatterParams sp{};
-        sp.query_heads = qh;
-        sp.key_value_heads = kvh;
-        sp.head_dim = U32(config.head_dim);
-        sp.rotary_dim = rot_dim;
-        sp.max_active_tokens = m_active;
-        sp.query_token_stride = q * 2U;
-        sp.query_head_stride = U32(config.head_dim * 2);
-        sp.key_token_stride = kv;
-        sp.key_head_stride = U32(config.head_dim);
-        sp.value_token_stride = kv;
-        sp.page_tokens = 64U;
-        sp.use_device_count = 0U;
-        sp.epsilon = float(config.rms_norm_eps);
-        sp.theta = float(config.rope_theta);
-        sp.weight_offset = normalization_weight_offset;
-        auto &sc = e2.emit(
-            "cache_blend",
-            "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
-            {.width = 32U, .height = U64(m_active) * (qh + kvh)},
-            {.width = 32U},
-            {query, key, value, direct(blk.get("q_norm"), config.head_dim),
-             direct(blk.get("k_norm"), config.head_dim), blk.state0, blk.state1,
-             table_ref, attention_positions, zero});
-        e2.dynamic(sc, 10, pod_bytes(sp));
-        emit_refresh_pages(e2, blk);
-
-        // Cross-chunk Attention over packed M_active queries via active Route B!
-        emit_blend_attn_route_b(e2, blk, m_active, active_pos_host.front(),
-                                ctx_env, attention_positions);
-        if (!(use_w4a8_active &&
-              try_linear_w4a8_base(e2, blk.get("attention_o"), mixer, delta, h,
-                                   q))) {
-          linear(e2, blk.get("attention_o"), mixer, delta, h, q);
-        }
-      } else {
-        const std::array<MaterializedWeightView, 2> qkvz_parts{
-            blk.get("gdn_qkv"), blk.get("gdn_z")};
-        const std::array<U32, 2> qkvz_ns{conv, gv};
-        const std::array<MaterializedWeightView, 2> ab_parts{
-            blk.get("gdn_a"), blk.get("gdn_b")};
-        const std::array<U32, 2> ab_ns{hv, hv};
-        if (use_w4a8_active &&
-            try_concat_w4a8_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts, qkvz_ns,
-                                h, norm, concat_out)) {
-          emit_split2(e2, concat_out, qkv, z, conv, gv);
-        } else if (use_w4a8_active) {
-          if (!try_linear_w4a8_base(e2, qkvz_parts[0], norm, qkv, conv, h))
-            linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
-          if (!try_linear_w4a8_base(e2, qkvz_parts[1], norm, z, gv, h))
-            linear_base(e2, qkvz_parts[1], norm, z, gv, h);
-        } else if (try_concat_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
-                                  qkvz_ns, h, false, norm, concat_out)) {
-          emit_split2(e2, concat_out, qkv, z, conv, gv);
-        } else {
-          linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
-          linear_base(e2, qkvz_parts[1], norm, z, gv, h);
-        }
-        if (use_w4a8_active &&
-            try_concat_w4a8_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
-                                norm, concat_out)) {
-          emit_split2(e2, concat_out, a, b, hv, hv);
-        } else if (use_w4a8_active) {
-          if (!try_linear_w4a8_base(e2, ab_parts[0], norm, a, hv, h))
-            linear_base(e2, ab_parts[0], norm, a, hv, h);
-          if (!try_linear_w4a8_base(e2, ab_parts[1], norm, b, hv, h))
-            linear_base(e2, ab_parts[1], norm, b, hv, h);
-        } else if (try_concat_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
-                                  false, norm, concat_out)) {
-          emit_split2(e2, concat_out, a, b, hv, hv);
-        } else {
-          linear_base(e2, ab_parts[0], norm, a, hv, h);
-          linear_base(e2, ab_parts[1], norm, b, hv, h);
-        }
-
-        // Advance GDN per segment: boundary dense -> HKVD scratch -> NAX state jump -> dense tail!
-        for (const auto &ss : seg_slices) {
-          const auto &ps = *ss.planned;
-          const U32 seg_m = ss.a_end - ss.a_begin;
-          if (ps.is_cache_hit()) {
-            if (ss.w_bnd_count > 0U) {
-              emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1, ss.a_begin,
-                                   ss.w_bnd_count);
-            }
-            const U32 hkvd_m = seg_m - ss.w_bnd_count;
-            if (hkvd_m > 0U) {
-              copy(e2, blk.state0, gdn_tmp_s_ref, gdn_state_bytes);
-              copy(e2, blk.state1, gdn_tmp_h_ref, gdn_hist_bytes);
-              emit_blend_gdn_slice(e2, blk, gdn_tmp_s_ref, gdn_tmp_h_ref,
-                                   ss.a_begin + ss.w_bnd_count, hkvd_m);
-            }
-            if (ps.segment.length > ss.w_bnd_count) {
-              emit_gdn_jump(e2, blk, gdn_idx, *ps.hit_entry);
-            }
-          } else if (seg_m > 0U) {
-            emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1, ss.a_begin,
-                                 seg_m);
-          }
-        }
-
-        if (!(use_w4a8_active &&
-              try_linear_w4a8_base(e2, blk.get("gdn_out"), mixer, delta, h, gv))) {
-          linear(e2, blk.get("gdn_out"), mixer, delta, h, gv);
-        }
-        ++gdn_idx;
-      }
-
-      if (use_w4a8_active) {
-        emit_add_rmsnorm_a8_g64(
-            e2, hidden, delta, direct(blk.get("post_attention_norm"), h), norm,
-            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
-            normalization_weight_offset, (config.num_experts > 0));
-        e2.set_a8_quant(make_a8_key(e2, norm, h));
-      } else {
-        add_normalize(e2, blk.get("post_attention_norm"), hidden, delta, norm);
-      }
-      mlp(e2, blk, li, false, {}, nullptr, std::nullopt, false,
-          use_w4a8_active, /*verify=*/false);
-      add(e2);
+      si = w_end;
     }
 
-    // Final norm + lm_head + sample on last active row (M_active - 1 == prompt end!).
-    e2.begin_stage("blend_head");
-    Ref last_hidden{delta.buffer, 0, mul(h, 2)};
-    Ref last_norm{norm.buffer, 0, mul(h, 2)};
-    Ref row0_logits{logits.buffer, 0, mul(v, 2)};
-    {
-      auto &extract =
-          e2.emit("qwen_forward", "omlx_m5_forward_last_row", {.width = h},
-                  {.width = 256}, {hidden, last_hidden});
-      e2.dynamic(extract, 2, words({m_active, h}));
-    }
-    normalize(e2, final_norm, last_hidden, last_norm, 1U);
-    linear(e2, head, last_norm, row0_logits, v, h, 1U);
-    e2.begin_stage("blend_sample");
-    const bool use_64tg_argmax =
-        (v >= 256U) && (argmax_scratch.buffer != nullptr) &&
-        !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_64TG_ARGMAX");
-    if (sampling_contract == SamplingContract::PositionCoupledV1) {
-      if (use_64tg_argmax) {
-        auto &st1 = e2.emit("position_sampling",
-                            "omlx_m5_position_argmax_stage1_64tg",
-                            {.width = 64U * 256U, .height = 1U},
-                            {.width = 256U}, {row0_logits, argmax_scratch});
-        e2.constant(st1, 2, words({v, 1, 1, 0}));
-        auto &sample = e2.emit(
-            "position_sampling", "omlx_m5_position_sample_logits_stage2",
-            {.width = 256U}, {.width = 256U},
-            {row0_logits, argmax_scratch, sampled, position_ids,
-             position_scores});
-        e2.profile.sampling_offset = e2.dynamic(
-            sample, 5, std::vector<std::byte>(sizeof(PositionSamplingRow)));
-        e2.constant(sample, 6, words({v, 1, 1, 0}));
-      } else {
-        auto &sample =
-            e2.emit("position_sampling", "omlx_m5_position_sample_logits",
-                    {.width = 256}, {.width = 256},
-                    {row0_logits, sampled, position_ids, position_scores});
-        e2.profile.sampling_offset = e2.dynamic(
-            sample, 4, std::vector<std::byte>(sizeof(PositionSamplingRow)));
-        e2.constant(sample, 5, words({v, 1, 1, 0}));
-      }
-    } else if (use_64tg_argmax) {
-      Ref vocab_parts{argmax_scratch.buffer, 0, 512U};
-      auto &st1 =
-          e2.emit("vocab", "omlx_m5_vocab_argmax_stage1_64tg",
-                  {.width = 64U * 256U}, {.width = 256U},
-                  {row0_logits, vocab_parts});
-      e2.constant(st1, 2, words({v}));
-      auto &sample =
-          e2.emit("vocab", "omlx_m5_sample_logits_stage2", {.width = 256U},
-                  {.width = 256U}, {row0_logits, vocab_parts, sampled});
-      e2.profile.sampling_offset =
-          e2.dynamic(sample, 3, std::vector<std::byte>(sizeof(SampleParams)));
-    } else {
-      auto &sample = e2.emit("vocab", "omlx_m5_sample_logits", {.width = 256},
-                             {.width = 256}, {row0_logits, sampled});
-      e2.profile.sampling_offset =
-          e2.dynamic(sample, 2, std::vector<std::byte>(sizeof(SampleParams)));
-    }
-
-    auto prof2 = e2.finish();
-    // Single-use plan: all m_active / 1U / active_pos_host values are baked in;
-    // only sampling parameters need updating.
-    if (sampling_contract == SamplingContract::PositionCoupledV1) {
-      const PositionSamplingRow row{.seed = sampling.seed,
-                                    .position = total_tokens,
-                                    .top_k = sampling.top_k,
-                                    .temperature = sampling.temperature,
-                                    .top_p = sampling.top_p};
-      std::memcpy(prof2.parameter_data.data() + prof2.sampling_offset, &row,
-                  sizeof(row));
-    } else {
-      const SampleParams sp{v,
-                            sampling.top_k,
-                            sampling.temperature,
-                            sampling.top_p,
-                            sampling.seed,
-                            sampling.stream,
-                            total_tokens - 1U};
-      std::memcpy(prof2.parameter_data.data() + prof2.sampling_offset, &sp,
-                  sizeof(sp));
-    }
-    prof2.parameters.write("step", prof2.parameter_data);
-    run_blend_exec_profile(prof2);
-
-    QwenForwardResult result{
-        .tokens = suffix_len,
-        .executed_layers = U32(blocks.size()),
-    };
-    const auto tok_bytes = sampled.buffer->read(
-        0, sampling_contract == SamplingContract::PositionCoupledV1 ? 8 : 4);
-    std::memcpy(&result.token, tok_bytes.data(), 4);
-    result.host_read_bytes = tok_bytes.size();
-    if (sampling_contract == SamplingContract::PositionCoupledV1) {
-      U32 flag = 0;
-      std::memcpy(&flag, tok_bytes.data() + 4, 4);
-      if (flag & 2U)
-        throw std::runtime_error("nonfinite position target logits");
-      if (flag & 1U) {
-        auto ib = position_ids.buffer->read(0, U64(sampling.top_k) * 4);
-        auto sb = position_scores.buffer->read(0, U64(sampling.top_k) * 4);
-        std::vector<U32> ids(sampling.top_k);
-        std::vector<float> scores(sampling.top_k);
-        std::memcpy(ids.data(), ib.data(), ib.size());
-        std::memcpy(scores.data(), sb.data(), sb.size());
-        result.token = position_sample_candidates(
-            ids, scores,
-            {.seed = sampling.seed,
-             .position = total_tokens,
-             .top_k = sampling.top_k,
-             .temperature = sampling.temperature,
-             .top_p = sampling.top_p});
-        result.host_read_bytes += ib.size() + sb.size();
-      }
-    } else if (result.token >= v) {
-      throw std::runtime_error("nonfinite or invalid legacy sampled token");
-    }
-
-    if (inspect_tensors) {
-      result.hidden = bf16_values(*norm.buffer, h);
-      result.logits = bf16_values(*logits.buffer, v);
-      result.host_read_bytes += mul(U64(h) + U64(v), 2ULL);
-    }
-
-    page_pool->commit(suffix_len);
-    page_guard.active = false;
-    next_position += suffix_len;
-    last_logits_row = 0U;
-    has_last_logits = true;
-
-    const bool any_w4a8 = prof1.used_w4a8 || prof2.used_w4a8;
-    const bool any_sage2 = prof1.used_sage2 || prof2.used_sage2;
-    const bool any_minf = prof2.used_minference || prof1.used_minference;
-    const U32 minf_cap = prof2.used_minference ? m_active : suffix_len;
-    const U32 minf_env = prof2.used_minference ? prof2.minf_context_envelope
-                                               : prof1.minf_context_envelope;
-    record_prefill_telemetry(m_active, active_pos_host.front(), any_w4a8,
-                             any_sage2, any_minf, minf_cap, minf_env,
-                             /*used_ane=*/false, &result.prefill_delta);
-    prefill_telemetry_.prefill_cache_blend_hit_tokens += plan.hit_tokens;
-    prefill_telemetry_.prefill_cache_blend_recomputed_tokens +=
-        recomputed_hit_tokens;
-    result.prefill_delta.prefill_cache_blend_hit_tokens += plan.hit_tokens;
-    result.prefill_delta.prefill_cache_blend_recomputed_tokens +=
-        recomputed_hit_tokens;
-    return result;
+    final_res.tokens = suffix_len;
+    final_res.prefill_delta = accum;
+    return final_res;
   }
 
   const MetalContext &context;
@@ -11304,6 +11883,41 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
     GpuSamplingOptions unused_samp{.contract = p.sampling_contract};
     return p.execute_ane_chunk(tokens, unused_samp, /*trunk_only=*/true);
   }
+  if (p.ane_chunk_tokens_ > 0U && count > p.ane_chunk_tokens_ &&
+      (count % p.ane_chunk_tokens_) == 0U &&
+      p.can_run_ane_chunk(p.ane_chunk_tokens_, false, false, false)) {
+    GpuSamplingOptions unused_samp{.contract = p.sampling_contract};
+    QwenForwardResult total_res{};
+    total_res.tokens = count;
+    total_res.executed_layers = U32(p.blocks.size());
+    for (U32 off = 0U; off < count; off += p.ane_chunk_tokens_) {
+      auto sub_res = p.execute_ane_chunk(
+          tokens.subspan(off, p.ane_chunk_tokens_), unused_samp,
+          /*trunk_only=*/true);
+      total_res.submission.timing.gpu_ms += sub_res.submission.timing.gpu_ms;
+      total_res.submission.timing.wall_ms += sub_res.submission.timing.wall_ms;
+      total_res.submission.dispatch_count += sub_res.submission.dispatch_count;
+      total_res.submission.shared_event_value =
+          sub_res.submission.shared_event_value;
+      total_res.prefill_delta.prefill_w4a8_tokens +=
+          sub_res.prefill_delta.prefill_w4a8_tokens;
+      total_res.prefill_delta.prefill_sage2_tokens +=
+          sub_res.prefill_delta.prefill_sage2_tokens;
+      total_res.prefill_delta.prefill_minference_blocks_skipped +=
+          sub_res.prefill_delta.prefill_minference_blocks_skipped;
+      total_res.prefill_delta.prefill_minference_blocks_total +=
+          sub_res.prefill_delta.prefill_minference_blocks_total;
+      total_res.prefill_delta.prefill_ane_active =
+          sub_res.prefill_delta.prefill_ane_active;
+      total_res.prefill_delta.prefill_ane_split_alpha =
+          sub_res.prefill_delta.prefill_ane_split_alpha;
+      total_res.prefill_delta.prefill_ane_offload_tokens +=
+          sub_res.prefill_delta.prefill_ane_offload_tokens;
+      total_res.prefill_delta.prefill_ane_fallback_tokens +=
+          sub_res.prefill_delta.prefill_ane_fallback_tokens;
+    }
+    return total_res;
+  }
 
   auto &pp = p.prefill_pipe_[0];
   Profile *lc_prof =
@@ -11810,10 +12424,51 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
         *this, tokens, sampling, use_icb);
   }
 
-  // Module 4b: Dual-ANE streaming co-execution for fixed T_chunk prefill steps.
+  // Module 4b: Dual-ANE streaming co-execution for fixed T_chunk prefill steps
+  // (and exact multiples of T_chunk so callers passing 2048+ never silently bypass ANE).
   if (p.can_run_ane_chunk(U32(tokens.size()), verify, inspect_tensors,
                           profile_stages)) {
     return p.execute_ane_chunk(tokens, sampling, /*trunk_only=*/false);
+  }
+  if (p.ane_chunk_tokens_ > 0U && tokens.size() > p.ane_chunk_tokens_ &&
+      (tokens.size() % p.ane_chunk_tokens_) == 0U &&
+      p.can_run_ane_chunk(p.ane_chunk_tokens_, verify, inspect_tensors,
+                          profile_stages)) {
+    QwenForwardResult total_res{};
+    total_res.tokens = U32(tokens.size());
+    total_res.executed_layers = U32(p.blocks.size());
+    for (std::size_t off = 0U; off < tokens.size(); off += p.ane_chunk_tokens_) {
+      const bool is_last = (off + p.ane_chunk_tokens_ == tokens.size());
+      auto sub_res = p.execute_ane_chunk(
+          tokens.subspan(off, p.ane_chunk_tokens_), sampling,
+          /*trunk_only=*/!is_last);
+      total_res.submission.timing.gpu_ms += sub_res.submission.timing.gpu_ms;
+      total_res.submission.timing.wall_ms += sub_res.submission.timing.wall_ms;
+      total_res.submission.dispatch_count += sub_res.submission.dispatch_count;
+      total_res.submission.shared_event_value =
+          sub_res.submission.shared_event_value;
+      total_res.prefill_delta.prefill_w4a8_tokens +=
+          sub_res.prefill_delta.prefill_w4a8_tokens;
+      total_res.prefill_delta.prefill_sage2_tokens +=
+          sub_res.prefill_delta.prefill_sage2_tokens;
+      total_res.prefill_delta.prefill_minference_blocks_skipped +=
+          sub_res.prefill_delta.prefill_minference_blocks_skipped;
+      total_res.prefill_delta.prefill_minference_blocks_total +=
+          sub_res.prefill_delta.prefill_minference_blocks_total;
+      total_res.prefill_delta.prefill_ane_active =
+          sub_res.prefill_delta.prefill_ane_active;
+      total_res.prefill_delta.prefill_ane_split_alpha =
+          sub_res.prefill_delta.prefill_ane_split_alpha;
+      total_res.prefill_delta.prefill_ane_offload_tokens +=
+          sub_res.prefill_delta.prefill_ane_offload_tokens;
+      total_res.prefill_delta.prefill_ane_fallback_tokens +=
+          sub_res.prefill_delta.prefill_ane_fallback_tokens;
+      if (is_last) {
+        total_res.token = sub_res.token;
+        total_res.host_read_bytes = sub_res.host_read_bytes;
+      }
+    }
+    return total_res;
   }
 
   Profile *selected_profile = nullptr;

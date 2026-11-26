@@ -2943,12 +2943,18 @@ public:
       const auto pf_contract = owner_.effective_prefill_contract();
       const auto canonical =
           prefill_next_chunk(offset_, prompt_.size(), pf_contract);
+      const std::uint32_t primary_ws_rows =
+          owner_.program_at(0).memory_plan().workspace_rows;
+      const std::uint32_t uncontended_cap =
+          (program().ane_offload_active() && program().ane_chunk_tokens() > 0U)
+              ? std::min<std::uint32_t>(primary_ws_rows,
+                                        program().ane_chunk_tokens())
+              : primary_ws_rows;
       auto count =
           (!had_active_decodes && contended_cap == 0 &&
            owner_.active_occupied_count() == 1U)
-              ? prefill_next_uncontended_chunk(
-                    offset_, prompt_.size(), pf_contract,
-                    owner_.program_at(0).memory_plan().workspace_rows)
+              ? prefill_next_uncontended_chunk(offset_, prompt_.size(),
+                                               pf_contract, uncontended_cap)
               : prefill_next_contended_chunk(offset_, prompt_.size(),
                                              pf_contract, contended_cap);
       const std::size_t pre_tail = pre_tail_anchor_offset();

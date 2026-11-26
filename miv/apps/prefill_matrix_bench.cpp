@@ -333,6 +333,13 @@ struct CliOptions {
   bool prefill_sparse_minference = false;
   bool prefill_cache_blend = false;
   bool prefill_ane_offload = false;
+
+  // Optional CacheBlend priming controls for Wave 3 benchmarks.
+  std::filesystem::path blend_prime_tokens_file;
+  std::filesystem::path blend_prime_text_file;
+  std::uint32_t blend_budget_mib = 4096U;
+  std::optional<std::uint32_t> blend_delim_token;
+  bool blend_cold_only = false;
 };
 
 std::string format_help() {
@@ -369,6 +376,11 @@ Orthogonal prefill switches (for Wave 2/3 runtime builds):
   --prefill-sparse-minference / --no-prefill-sparse-minference
   --prefill-cache-blend / --no-prefill-cache-blend
   --prefill-ane-offload / --no-prefill-ane-offload
+  --blend-prime-tokens-file PATH   Optional priming prompt tokens JSON for CacheBlend warm pass
+  --blend-prime-text-file PATH     Optional priming prompt UTF-8 text for CacheBlend warm pass
+  --blend-budget-mib N             ChunkBlendCache UMA budget in MiB (default: 4096)
+  --blend-delim-token ID           Optional delimiter token ID for explicit chunk cuts
+  --blend-cold-only                Skip CacheBlend warm priming pass (benchmark cold populate only)
 )";
 }
 
@@ -474,6 +486,16 @@ CliOptions parse_args(int argc, char **argv) {
       o.prefill_ane_offload = true;
     } else if (key == "--no-prefill-ane-offload") {
       o.prefill_ane_offload = false;
+    } else if (key == "--blend-prime-tokens-file") {
+      o.blend_prime_tokens_file = serve::expand_user_path(value());
+    } else if (key == "--blend-prime-text-file") {
+      o.blend_prime_text_file = serve::expand_user_path(value());
+    } else if (key == "--blend-budget-mib") {
+      o.blend_budget_mib = parse_u32(value(), key);
+    } else if (key == "--blend-delim-token") {
+      o.blend_delim_token = parse_u32(value(), key);
+    } else if (key == "--blend-cold-only") {
+      o.blend_cold_only = true;
     } else {
       throw std::invalid_argument("unknown argument: " + key);
     }
@@ -574,6 +596,7 @@ struct LoadedModel {
   QwenModelConfig config;
   std::filesystem::path artifact_path;
   std::filesystem::path metallib_dir;
+  std::string artifact_digest;
   SamplingContract contract = SamplingContract::PositionCoupledV1;
   std::optional<MaterializedModel> weights;
   std::optional<QwenLayerCatalog> layers;
@@ -634,6 +657,7 @@ std::unique_ptr<LoadedModel> load_forward_model(const CliOptions &o,
   const bool enable_flash_nax_prefill = flash_nax_eligible && apple10_nax;
 
   const auto artifact_digest = execution_artifact_digest(artifact);
+  loaded->artifact_digest = artifact_digest;
   QwenPrefillOptions pf_opts{
       .linear_mode = parse_prefill_linear_mode(o.prefill_linear_mode),
       .attention_mode = parse_prefill_attention_mode(o.prefill_attention_mode),
@@ -880,43 +904,156 @@ int run_ppl(const CliOptions &o) {
   return 0;
 }
 
+std::vector<std::uint32_t> load_tokens_from_paths(
+    const CliOptions &o, const std::filesystem::path &tokens_file,
+    const std::filesystem::path &text_file) {
+  std::vector<std::uint32_t> tokens;
+  if (!tokens_file.empty()) {
+    const Json parsed = Json::parse(read_file_bytes(tokens_file, true));
+    const Json &arr = parsed.is_object() && parsed.contains("tokens")
+                          ? parsed.at("tokens")
+                          : parsed;
+    if (!arr.is_array()) {
+      throw std::invalid_argument(
+          "tokens JSON file must contain an array or {\"tokens\": [...]}");
+    }
+    tokens.reserve(arr.size());
+    for (const auto &el : arr) {
+      if (!el.is_number_integer()) {
+        throw std::invalid_argument("token id must be integer");
+      }
+      const auto id = el.get<std::int64_t>();
+      if (id < 0 || id > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("token id out of range");
+      }
+      tokens.push_back(static_cast<std::uint32_t>(id));
+    }
+  } else if (!text_file.empty()) {
+    if (o.model_dir.empty()) {
+      throw std::invalid_argument("--model-dir is required to tokenize text");
+    }
+    const auto tok = load_model_tokenizer(o.model_dir);
+    const std::string text = read_file_bytes(text_file, true);
+    const auto encoded = tok.encode(text);
+    tokens.reserve(encoded.size());
+    for (const int id : encoded) {
+      tokens.push_back(static_cast<std::uint32_t>(id));
+    }
+  }
+  if (o.max_tokens > 0 && tokens.size() > o.max_tokens) {
+    tokens.resize(o.max_tokens);
+  }
+  return tokens;
+}
+
 int run_prefill_logits(const CliOptions &o) {
   export_prefill_switch_env(o);
   const auto tokens = load_input_tokens(o);
   if (tokens.empty()) {
     throw std::invalid_argument("prefill-logits requires non-empty input");
   }
-  const std::uint32_t needed_ctx = static_cast<std::uint32_t>(
-      tokens.size() + std::max<std::uint32_t>(o.max_new_tokens, 1U));
+  std::vector<std::uint32_t> prime_tokens;
+  if (o.prefill_cache_blend && !o.blend_cold_only) {
+    if (!o.blend_prime_tokens_file.empty() || !o.blend_prime_text_file.empty()) {
+      prime_tokens = load_tokens_from_paths(o, o.blend_prime_tokens_file,
+                                            o.blend_prime_text_file);
+    } else {
+      prime_tokens = tokens;
+    }
+  }
+  const std::uint32_t max_prompt_len = static_cast<std::uint32_t>(
+      std::max(tokens.size(), prime_tokens.size()));
+  const std::uint32_t needed_ctx =
+      max_prompt_len + std::max<std::uint32_t>(o.max_new_tokens, 1U);
   const std::uint32_t effective_ctx = std::max(o.max_context, needed_ctx);
   auto loaded = load_forward_model(o, effective_ctx);
   const std::uint32_t ws_rows = loaded->forward->memory_plan().workspace_rows;
+  const std::uint32_t trunk_cap =
+      (loaded->forward->ane_offload_active() &&
+       loaded->forward->ane_chunk_tokens() > 0U)
+          ? std::min<std::uint32_t>(ws_rows, loaded->forward->ane_chunk_tokens())
+          : ws_rows;
   std::uint64_t peak_phys = current_phys_footprint_bytes();
 
-  const auto pf_t0 = std::chrono::steady_clock::now();
-  // Run trunk on prefix tokens [0 .. L-1) in production ws_rows chunks.
-  const std::size_t prefix_len = tokens.size() - 1;
-  std::size_t offset = 0;
-  while (offset < prefix_len) {
-    const std::size_t step = std::min<std::size_t>(ws_rows, prefix_len - offset);
-    static_cast<void>(loaded->forward->run_trunk(
-        std::span<const std::uint32_t>(tokens.data() + offset, step),
-        /*use_icb=*/true));
+  QwenForwardResult last_res{};
+  double prefill_s = 0.0;
+  double blend_prime_s = 0.0;
+  std::size_t blend_cache_entries = 0;
+  std::uint64_t blend_cache_bytes = 0;
+  QwenPrefillTelemetry pf_tel{};
+
+  if (o.prefill_cache_blend && loaded->forward->cache_blend_eligible()) {
+    detail::ChunkBlendCache blend_cache(
+        static_cast<std::uint64_t>(std::max<std::uint32_t>(o.blend_budget_mib, 64U))
+        << 20U);
+    const std::uint64_t exec_hash = detail::compute_blend_model_exec_hash(
+        loaded->artifact_digest, o.kv_dtype, o.prefill_linear_mode,
+        o.prefill_attention_mode, o.prefill_sparse_minference,
+        o.prefill_ane_offload);
+    detail::BlendSegmentConfig seg_cfg;
+    if (o.blend_delim_token.has_value()) {
+      seg_cfg.prefix_delimiters.push_back({*o.blend_delim_token});
+    }
+    const detail::BlendSegmentConfig *seg_cfg_ptr =
+        o.blend_delim_token.has_value() ? &seg_cfg : nullptr;
+
+    if (!prime_tokens.empty()) {
+      GpuSamplingOptions prime_samp{};
+      prime_samp.absolute_position = prime_tokens.size() - 1;
+      prime_samp.contract = loaded->contract;
+      const auto p_t0 = std::chrono::steady_clock::now();
+      static_cast<void>(loaded->forward->run_blend_prefill(
+          prime_tokens, 0U, blend_cache, exec_hash, prime_samp,
+          /*inspect_tensors=*/false, seg_cfg_ptr));
+      blend_prime_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - p_t0)
+              .count();
+      peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
+      loaded->forward->reset();
+    }
+
+    GpuSamplingOptions pf_sampling{};
+    pf_sampling.absolute_position = tokens.size() - 1;
+    pf_sampling.contract = loaded->contract;
+    const auto pf_t0 = std::chrono::steady_clock::now();
+    last_res = loaded->forward->run_blend_prefill(
+        tokens, 0U, blend_cache, exec_hash, pf_sampling,
+        /*inspect_tensors=*/true, seg_cfg_ptr);
+    prefill_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0)
+            .count();
     peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
-    offset += step;
+    blend_cache_entries = blend_cache.size();
+    blend_cache_bytes = blend_cache.cached_bytes();
+    pf_tel = last_res.prefill_delta;
+  } else {
+    const auto pf_t0 = std::chrono::steady_clock::now();
+    // Run trunk on prefix tokens [0 .. L-1) in ANE-aware production chunks.
+    const std::size_t prefix_len = tokens.size() - 1;
+    std::size_t offset = 0;
+    while (offset < prefix_len) {
+      const std::size_t step =
+          std::min<std::size_t>(trunk_cap, prefix_len - offset);
+      static_cast<void>(loaded->forward->run_trunk(
+          std::span<const std::uint32_t>(tokens.data() + offset, step),
+          /*use_icb=*/true));
+      peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
+      offset += step;
+    }
+    // Final prompt token produces exact last-token logits + first greedy token.
+    const std::uint32_t last_prompt_tok = tokens.back();
+    GpuSamplingOptions pf_sampling{};
+    pf_sampling.absolute_position = tokens.size() - 1;
+    pf_sampling.contract = loaded->contract;
+    last_res = loaded->forward->run(
+        std::span<const std::uint32_t>(&last_prompt_tok, 1), pf_sampling,
+        /*inspect_tensors=*/true, /*use_icb=*/true, /*profile_stages=*/false);
+    prefill_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0)
+            .count();
+    peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
+    pf_tel = loaded->forward->prefill_telemetry();
   }
-  // Final prompt token produces exact last-token logits + first greedy token.
-  const std::uint32_t last_prompt_tok = tokens.back();
-  GpuSamplingOptions pf_sampling{};
-  pf_sampling.absolute_position = tokens.size() - 1;
-  pf_sampling.contract = loaded->contract;
-  const auto last_res = loaded->forward->run(
-      std::span<const std::uint32_t>(&last_prompt_tok, 1), pf_sampling,
-      /*inspect_tensors=*/true, /*use_icb=*/true, /*profile_stages=*/false);
-  const double prefill_s =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0)
-          .count();
-  peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
 
   const auto last_stats = compute_row_stats(last_res.logits);
   if (!o.logits_out.empty()) {
@@ -950,7 +1087,6 @@ int run_prefill_logits(const CliOptions &o) {
             .count();
   }
 
-  const auto pf_tel = loaded->forward->prefill_telemetry();
   Json report = {
       {"mode", "prefill-logits"},
       {"model_dir", o.model_dir.string()},
@@ -961,6 +1097,10 @@ int run_prefill_logits(const CliOptions &o) {
       {"sampling_contract", o.sampling_contract},
       {"max_context", effective_ctx},
       {"workspace_rows", ws_rows},
+      {"trunk_chunk_cap", trunk_cap},
+      {"blend_prime_wall_s", blend_prime_s},
+      {"blend_cache_entries", blend_cache_entries},
+      {"blend_cache_bytes", blend_cache_bytes},
       {"prefill_switches",
        {
            {"prefill_linear_mode", o.prefill_linear_mode},

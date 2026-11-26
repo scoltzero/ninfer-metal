@@ -1173,21 +1173,27 @@ int main(int argc, char **argv) {
                 "w4a8+ane_offload did not offload T=1024 chunk");
       }
 
-      // Engine::create end-to-end check for W4A8 + ANE (1024-tok chunk + 32-tok tail).
+      // Engine::create end-to-end check for W4A8 + ANE with max_context=4096
+      // (ws_rows == 2048) and a 2080-token prompt (1024 + 1024 + 32) verifying
+      // ANE is NOT silently bypassed on >= 2048-token prompts!
+      constexpr std::int32_t kEngCtx = 4096;
+      const auto prompt2080 = make_tokens(2080U, 55U);
       auto eng = Engine::create(make_load_options(
-          dense_oq, libs, static_cast<std::int32_t>(kCtx),
-          PrefillLinearMode::W4A8, PrefillAttentionMode::ExactNax, false, false,
-          true, true));
-      static_cast<void>(run_engine_request(*eng, prompt1056, 4));
+          dense_oq, libs, kEngCtx, PrefillLinearMode::W4A8,
+          PrefillAttentionMode::ExactNax, false, false, true, true));
+      static_cast<void>(run_engine_request(*eng, prompt2080, 4));
       const auto st = eng->stats();
       require(st.prefill_linear_mode == "w4a8" && st.prefill_ane_offload &&
-                  st.prefill_w4a8_tokens >= 1056ULL,
-              "Engine w4a8+ane_offload telemetry mismatch");
+                  st.prefill_w4a8_tokens >= 2080ULL,
+              "Engine w4a8+ane_offload 2080-tok telemetry mismatch");
       if (st.prefill_ane_active) {
         require(std::abs(st.prefill_ane_split_alpha - 0.15) < 1e-6 &&
-                    st.prefill_ane_offload_tokens >= 1024ULL &&
+                    st.prefill_ane_offload_tokens >= 2048ULL &&
                     st.prefill_ane_fallback_tokens >= 32ULL,
-                "Engine w4a8+ane_offload chunk/tail split counters wrong");
+                "Engine w4a8+ane_offload >=2048 prompt chunk/tail counters wrong (offload=" +
+                    std::to_string(st.prefill_ane_offload_tokens) +
+                    ", fallback=" +
+                    std::to_string(st.prefill_ane_fallback_tokens) + ")");
       }
       eng->shutdown();
 
@@ -1344,6 +1350,151 @@ int main(int argc, char **argv) {
           {"hit_tokens", st_warm.prefill_cache_blend_hit_tokens},
           {"recomputed_tokens", st_warm.prefill_cache_blend_recomputed_tokens},
       };
+
+      // Multi-window CacheBlend (suffix_len = 3200 > workspace_rows_ = 2048):
+      // 3 x 1024-tok docs + 128-tok query, cold populate -> warm reordered [C][A][B][Q]!
+      {
+        constexpr U32 kMultiCtx = 4096U;
+        auto ld4k = LoadedDirect::open(dense_oq, kMultiCtx);
+        const auto mw_a = make_doc(1024U, 131U);
+        const auto mw_b = make_doc(1024U, 149U);
+        const auto mw_c = make_doc(1024U, 167U);
+        const auto mw_q = make_tokens(128U, 181U, 240U);
+
+        std::vector<U32> p_abc;
+        p_abc.insert(p_abc.end(), mw_a.begin(), mw_a.end());
+        p_abc.insert(p_abc.end(), mw_b.begin(), mw_b.end());
+        p_abc.insert(p_abc.end(), mw_c.begin(), mw_c.end());
+        p_abc.insert(p_abc.end(), mw_q.begin(), mw_q.end());
+
+        std::vector<U32> p_cab;
+        p_cab.insert(p_cab.end(), mw_c.begin(), mw_c.end());
+        p_cab.insert(p_cab.end(), mw_a.begin(), mw_a.end());
+        p_cab.insert(p_cab.end(), mw_b.begin(), mw_b.end());
+        p_cab.insert(p_cab.end(), mw_q.begin(), mw_q.end());
+
+        QwenPrefillOptions mw_opts{
+            .linear_mode = PrefillLinearMode::W4A8,
+            .attention_mode = PrefillAttentionMode::Sage2,
+            .sparse_minference = false,
+            .cache_blend = true,
+            .ane_offload = false};
+        auto fwd_mw = make_forward(ld4k, dense_oq, libs, kMultiCtx, mw_opts);
+        require(fwd_mw->memory_plan().workspace_rows == 2048U &&
+                    p_cab.size() > fwd_mw->memory_plan().workspace_rows,
+                "multi-window CacheBlend test did not exceed workspace_rows");
+        const auto cold_cab_logits =
+            run_prefill_and_last_logits(*fwd_mw, p_cab);
+
+        detail::ChunkBlendCache mw_cache(1ULL << 30);
+        const U64 mw_hash = detail::compute_blend_model_exec_hash(
+            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, false);
+        GpuSamplingOptions mw_samp{};
+        mw_samp.absolute_position = p_abc.size() - 1U;
+        mw_samp.contract = SamplingContract::PositionCoupledV1;
+
+        fwd_mw->reset();
+        const auto r_mw_cold = fwd_mw->run_blend_prefill(
+            p_abc, 0U, mw_cache, mw_hash, mw_samp, true, &seg_cfg);
+        require(mw_cache.size() >= 3U,
+                "multi-window cold blend did not capture all 3 x 1024-tok docs");
+        require(r_mw_cold.prefill_delta.prefill_cache_blend_hit_tokens == 0ULL,
+                "multi-window cold blend unexpectedly reported hits");
+
+        fwd_mw->reset();
+        const auto r_mw_warm = fwd_mw->run_blend_prefill(
+            p_cab, 0U, mw_cache, mw_hash, mw_samp, true, &seg_cfg);
+        const auto &mwd = r_mw_warm.prefill_delta;
+        require(mwd.prefill_cache_blend_hit_tokens == 3072ULL,
+                "multi-window warm hit_tokens != 3072 (got " +
+                    std::to_string(mwd.prefill_cache_blend_hit_tokens) + ")");
+        require(mwd.prefill_cache_blend_recomputed_tokens > 0ULL &&
+                    mwd.prefill_cache_blend_recomputed_tokens < 3072ULL,
+                "multi-window warm recomputed_tokens not strictly < 3072");
+        require(mwd.prefill_w4a8_tokens > 0ULL &&
+                    mwd.prefill_sage2_tokens > 0ULL,
+                "multi-window warm blend did not compose W4A8 + Sage2");
+        const double cos_cab =
+            cosine_similarity(cold_cab_logits, r_mw_warm.logits);
+        require(cos_cab >= 0.94,
+                "multi-window warm reordered CacheBlend cosine too low: " +
+                    std::to_string(cos_cab));
+        case6["multi_window_3200"] = {
+            {"cos_sim_vs_cold", cos_cab},
+            {"hit_tokens", mwd.prefill_cache_blend_hit_tokens},
+            {"recomputed_tokens", mwd.prefill_cache_blend_recomputed_tokens},
+            {"w4a8_tokens", mwd.prefill_w4a8_tokens},
+            {"sage2_tokens", mwd.prefill_sage2_tokens},
+        };
+
+        // Stage-2 Dual-ANE + CacheBlend + W4A8 + Sage2 simultaneous composition
+        // (M_active >= 1024 inside a single warm window: 1024-tok HIT + 960-tok dense tail).
+        QwenPrefillOptions all5_opts{
+            .linear_mode = PrefillLinearMode::W4A8,
+            .attention_mode = PrefillAttentionMode::Sage2,
+            .sparse_minference = false,
+            .cache_blend = true,
+            .ane_offload = true};
+        auto fwd_all5 = make_forward(ld4k, dense_oq, libs, kMultiCtx, all5_opts);
+        const auto prime_tail = make_tokens(128U, 211U, 240U);
+        const auto large_tail = make_tokens(960U, 223U, 240U);
+        std::vector<U32> p_prime = mw_a;
+        p_prime.insert(p_prime.end(), prime_tail.begin(), prime_tail.end());
+        std::vector<U32> p_warm_ane = mw_a;
+        p_warm_ane.insert(p_warm_ane.end(), large_tail.begin(),
+                          large_tail.end());
+
+        const auto cold_ane_blend_logits =
+            run_prefill_and_last_logits(*fwd_all5, p_warm_ane);
+
+        detail::ChunkBlendCache ane_cache(1ULL << 30);
+        const U64 all5_hash = detail::compute_blend_model_exec_hash(
+            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, true);
+        detail::BlendSegmentConfig tail960_cfg = seg_cfg;
+        tail960_cfg.dense_tail_tokens = 960U;
+
+        GpuSamplingOptions s_prime{};
+        s_prime.absolute_position = p_prime.size() - 1U;
+        s_prime.contract = SamplingContract::PositionCoupledV1;
+        fwd_all5->reset();
+        static_cast<void>(fwd_all5->run_blend_prefill(
+            p_prime, 0U, ane_cache, all5_hash, s_prime, false, &seg_cfg));
+        require(ane_cache.size() >= 1U,
+                "Stage-2 ANE+CacheBlend prime did not insert Doc A");
+
+        GpuSamplingOptions s_warm_ane{};
+        s_warm_ane.absolute_position = p_warm_ane.size() - 1U;
+        s_warm_ane.contract = SamplingContract::PositionCoupledV1;
+        fwd_all5->reset();
+        const auto r_all5 = fwd_all5->run_blend_prefill(
+            p_warm_ane, 0U, ane_cache, all5_hash, s_warm_ane, true,
+            &tail960_cfg);
+        const auto &ad = r_all5.prefill_delta;
+        require(ad.prefill_cache_blend_hit_tokens == 1024ULL &&
+                    ad.prefill_cache_blend_recomputed_tokens < 1024ULL &&
+                    ad.prefill_w4a8_tokens >= 1024ULL &&
+                    ad.prefill_sage2_tokens >= 1024ULL,
+                "Stage-2 ANE+CacheBlend+W4A8+Sage2 telemetry mismatch");
+        if (ane::is_ane_available() && fwd_all5->ane_offload_active()) {
+          require(ad.prefill_ane_offload_tokens >= 1024ULL,
+                  "Stage-2 CacheBlend did not compose Dual-ANE when M_active >= 1024 (got " +
+                      std::to_string(ad.prefill_ane_offload_tokens) + ")");
+        }
+        const double cos_all5 =
+            cosine_similarity(cold_ane_blend_logits, r_all5.logits);
+        require(cos_all5 >= 0.94,
+                "Stage-2 ANE+CacheBlend+W4A8+Sage2 cosine too low: " +
+                    std::to_string(cos_all5));
+        case6["stage2_ane_w4a8_sage2_blend"] = {
+            {"cos_sim_vs_cold", cos_all5},
+            {"hit_tokens", ad.prefill_cache_blend_hit_tokens},
+            {"recomputed_tokens", ad.prefill_cache_blend_recomputed_tokens},
+            {"ane_offload_tokens", ad.prefill_ane_offload_tokens},
+            {"w4a8_tokens", ad.prefill_w4a8_tokens},
+            {"sage2_tokens", ad.prefill_sage2_tokens},
+        };
+      }
+
       report["case6_cache_blend"] = case6;
     }
 

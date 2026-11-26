@@ -204,12 +204,18 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     const U64 qh = positive(c.num_attention_heads);
     const U64 kvh = positive(c.num_key_value_heads);
     const U64 repeat = std::max<U64>(1ULL, qh / kvh);
-    const U64 wm = (workspace_rows > 96U) ? 8ULL : (workspace_rows > 16U ? 6ULL : 4ULL);
-    const U64 bm_tok = std::max<U64>(1ULL, (wm * 16ULL) / repeat);
+    const auto q_blocks_for = [&](U64 t_tier, U64 wm_tier) -> U64 {
+      const U64 eff_t = std::min<U64>(U64(workspace_rows), t_tier);
+      const U64 bm_tok = std::max<U64>(1ULL, (wm_tier * 16ULL) / repeat);
+      return std::max<U64>(1ULL, (eff_t + bm_tok - 1ULL) / bm_tok);
+    };
     const U64 max_kv_blocks =
         std::min<U64>(8192ULL, std::max<U64>(128ULL, (U64(max_context) + 31ULL) / 32ULL));
-    const U64 max_q_blocks =
-        std::max<U64>(1ULL, (U64(workspace_rows) + bm_tok - 1ULL) / bm_tok);
+    const U64 max_q_blocks = std::max({
+        q_blocks_for(U64(workspace_rows), 8ULL),
+        q_blocks_for(96ULL, 6ULL),
+        q_blocks_for(16ULL, 4ULL),
+    });
     const U64 split_count =
         std::clamp<U64>((max_kv_blocks + 127ULL) / 128ULL, 1ULL, 64ULL);
     const auto align256 = [](U64 x) { return (x + 255ULL) & ~255ULL; };
