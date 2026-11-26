@@ -2725,3 +2725,31 @@ add_test(
     $<TARGET_FILE:omlx_m5_serve_e2e>
     "${CMAKE_SOURCE_DIR}/models"
     $<TARGET_FILE:omlx_m5_mock_spi_provider>)
+
+add_executable(
+  omlx_m5_prefill_switches_spi_tests
+  tests/prefill_switches_spi_tests.cpp)
+target_include_directories(
+  omlx_m5_prefill_switches_spi_tests
+  SYSTEM PRIVATE
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(
+  omlx_m5_prefill_switches_spi_tests
+  PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror)
+target_link_libraries(
+  omlx_m5_prefill_switches_spi_tests
+  PRIVATE
+  omlx_m5_serve_lib
+  omlx_m5_core_runtime)
+add_dependencies(
+  omlx_m5_prefill_switches_spi_tests
+  mseries_backendd)
+add_test(
+  NAME prefill_switches_spi_tests
+  COMMAND
+    $<TARGET_FILE:omlx_m5_prefill_switches_spi_tests>
+    $<TARGET_FILE:mseries_backendd>)

@@ -28,6 +28,12 @@ struct ModelServeConfig {
   std::int32_t max_context = 32768;
   std::string kv_dtype = "bf16";
   std::string prefill_engine = "auto";
+  PrefillLinearMode prefill_linear_mode = PrefillLinearMode::BFloat16;
+  PrefillAttentionMode prefill_attention_mode = PrefillAttentionMode::ExactNax;
+  bool prefill_sparse_minference = false;
+  bool prefill_cache_blend = false;
+  bool prefill_ane_offload = false;
+  bool prefill_ane_offload_explicit = false;
   std::string spec_search = "auto";
   std::string sampling_contract = kDefaultServingSamplingContract;
   std::optional<bool> rolling_prefix_cache;
@@ -54,6 +60,11 @@ struct SidecarModelOverride {
   std::optional<std::int32_t> max_context;
   std::optional<std::string> kv_dtype;
   std::optional<std::string> prefill_engine;
+  std::optional<PrefillLinearMode> prefill_linear_mode;
+  std::optional<PrefillAttentionMode> prefill_attention_mode;
+  std::optional<bool> prefill_sparse_minference;
+  std::optional<bool> prefill_cache_blend;
+  std::optional<bool> prefill_ane_offload;
   std::optional<std::string> spec_search;
   std::optional<std::string> sampling_contract;
   std::optional<bool> rolling_prefix_cache;
@@ -113,12 +124,23 @@ struct ServeConfig {
   bool cli_draft_artifact_override = false;
   bool cli_mtp_artifact_override = false;
   bool cli_kernel_dir_override = false;
+  bool cli_prefill_linear_mode_override = false;
+  bool cli_prefill_attention_mode_override = false;
+  bool cli_prefill_sparse_minference_override = false;
+  bool cli_prefill_cache_blend_override = false;
+  bool cli_prefill_ane_offload_override = false;
 
   // [engine]
   std::int32_t max_concurrency = 1;
   std::int32_t max_context = 32768;
   std::string kv_dtype = "bf16";
   std::string prefill_engine = "auto";
+  PrefillLinearMode prefill_linear_mode = PrefillLinearMode::BFloat16;
+  PrefillAttentionMode prefill_attention_mode = PrefillAttentionMode::ExactNax;
+  bool prefill_sparse_minference = false;
+  bool prefill_cache_blend = false;
+  bool prefill_ane_offload = false;
+  bool prefill_ane_offload_explicit = false;
   std::string spec_search = "auto";
   std::string sampling_contract = kDefaultServingSamplingContract;
   std::optional<bool> rolling_prefix_cache;

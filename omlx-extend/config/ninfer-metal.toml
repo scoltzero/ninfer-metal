@@ -26,11 +26,16 @@ providers_dir = ["~/Library/Application Support/oMLX/Providers"]
 
 [engine]
 max_concurrency = 4
-max_context = 65536
+max_context = 262144
 kv_dtype = "affine4_g128"
 rolling_prefix_cache = true
 prefix_cache_gb = 4.0
 sampling_contract = "position_coupled_v1"
+prefill_linear_mode = "bf16"
+prefill_attention_mode = "exact_nax"
+prefill_sparse_minference = false
+prefill_cache_blend = false
+prefill_ane_offload = false
 lora_adapter = ""
 lora_mode = "merge"
 

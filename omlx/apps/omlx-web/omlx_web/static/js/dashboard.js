@@ -5026,15 +5026,61 @@
                 if (zh) {
                     const zhLabels = {
                         max_concurrency: '并发槽位 (B/C)',
+                        max_context: '最大上下文长度 (Tokens)',
                         rolling_prefix_cache: '滚动前缀缓存',
                         prefix_cache_gb: '前缀缓存预算 (GiB)',
+                        prefill_linear_mode: '预填充线性层精度 (BF16 / W4A8)',
+                        prefill_attention_mode: '预填充注意力内核 (Exact NAX / Sage2)',
+                        prefill_sparse_minference: '  ↳ MInference 动态稀疏注意力 (需开启 Sage2)',
+                        prefill_cache_blend: '跨分块非连续 KV 复用 (CacheBlend)',
+                        prefill_ane_offload: '双 ANE 神经网络引擎协同预填充',
                         sampling_contract: '采样协议 (Sampling Contract)',
                         artifact_path: '权重产物路径 (.miv)',
                         draft_artifact_path: '草稿产物路径 (.miv)',
                     };
                     if (zhLabels[item.key]) return zhLabels[item.key];
                 }
+                const enLabels = {
+                    max_context: 'Max Context Window',
+                    prefill_linear_mode: 'Prefill Linear Precision',
+                    prefill_attention_mode: 'Prefill Attention Kernel',
+                    prefill_sparse_minference: '  ↳ MInference Sparse Tiles (Sage2)',
+                    prefill_cache_blend: 'Cross-Chunk CacheBlend (RAG)',
+                    prefill_ane_offload: 'Dual-ANE Co-Execution Offload',
+                };
+                if (enLabels[item.key]) return enLabels[item.key];
                 return item.label || item.key;
+            },
+
+            externalEngineOptionIndented(item) {
+                return Boolean(item && item.key === 'prefill_sparse_minference');
+            },
+
+            externalEngineOptionDisabled(item) {
+                if (!item || item.key !== 'prefill_sparse_minference') return false;
+                const schema = this.externalEngineGeneralOptionsSchema();
+                const attnItem = schema.find(s => s && s.key === 'prefill_attention_mode')
+                    || { key: 'prefill_attention_mode', type: 'enum', default: 'exact_nax' };
+                return this.getExternalEngineOption(attnItem) !== 'sage2';
+            },
+
+            externalEngineOptionTooltip(item) {
+                if (!this.externalEngineOptionDisabled(item)) return '';
+                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
+                return zh
+                    ? '需将「预填充注意力内核」设为 sage2 时生效'
+                    : 'Active when Prefill Attention Kernel is set to sage2';
+            },
+
+            externalEngineOptionContainerClass(item) {
+                const classes = [];
+                if (this.externalEngineOptionIndented(item)) {
+                    classes.push('pl-4', 'border-l-2', 'border-neutral-200');
+                }
+                if (this.externalEngineOptionDisabled(item)) {
+                    classes.push('opacity-50');
+                }
+                return classes.join(' ');
             },
 
             externalEngineEnumOptionLabel(item, opt) {

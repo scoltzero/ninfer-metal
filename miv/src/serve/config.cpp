@@ -432,6 +432,33 @@ void apply_sidecar_model_override(ModelServeConfig &m,
   if (ov->prefill_engine.has_value()) {
     m.prefill_engine = *ov->prefill_engine;
   }
+  if (ov->prefill_linear_mode.has_value() &&
+      !(respect_cli_overrides && config.cli_prefill_linear_mode_override)) {
+    m.prefill_linear_mode = *ov->prefill_linear_mode;
+  }
+  if (ov->prefill_attention_mode.has_value() &&
+      !(respect_cli_overrides && config.cli_prefill_attention_mode_override)) {
+    m.prefill_attention_mode = *ov->prefill_attention_mode;
+  }
+  if (ov->prefill_sparse_minference.has_value() &&
+      !(respect_cli_overrides &&
+        config.cli_prefill_sparse_minference_override)) {
+    m.prefill_sparse_minference = *ov->prefill_sparse_minference;
+  }
+  if (ov->prefill_cache_blend.has_value() &&
+      !(respect_cli_overrides && config.cli_prefill_cache_blend_override)) {
+    m.prefill_cache_blend = *ov->prefill_cache_blend;
+  }
+  if (ov->prefill_ane_offload.has_value() &&
+      !(respect_cli_overrides && config.cli_prefill_ane_offload_override)) {
+    m.prefill_ane_offload = *ov->prefill_ane_offload;
+    m.prefill_ane_offload_explicit = true;
+  } else if (ov->prefill_engine.has_value() &&
+             *ov->prefill_engine == "nax_ane" &&
+             !(respect_cli_overrides &&
+               config.cli_prefill_ane_offload_override)) {
+    m.prefill_ane_offload = true;
+  }
   if (ov->spec_search.has_value()) {
     m.spec_search = *ov->spec_search;
   }
@@ -486,6 +513,12 @@ ModelServeConfig default_model_from_serve_config(const ServeConfig &config,
   m.max_context = config.max_context;
   m.kv_dtype = config.kv_dtype;
   m.prefill_engine = config.prefill_engine;
+  m.prefill_linear_mode = config.prefill_linear_mode;
+  m.prefill_attention_mode = config.prefill_attention_mode;
+  m.prefill_sparse_minference = config.prefill_sparse_minference;
+  m.prefill_cache_blend = config.prefill_cache_blend;
+  m.prefill_ane_offload = config.prefill_ane_offload;
+  m.prefill_ane_offload_explicit = config.prefill_ane_offload_explicit;
   m.spec_search = config.spec_search;
   m.sampling_contract = config.sampling_contract;
   m.rolling_prefix_cache = config.rolling_prefix_cache;
@@ -702,6 +735,19 @@ SidecarModelOverride parse_sidecar_model_override(const toml::table &entry,
   if (const auto v = read_toml_optional_string(entry, "prefill_engine")) {
     ov.prefill_engine = *v;
   }
+  if (const auto v = read_toml_optional_string(entry, "prefill_linear_mode")) {
+    ov.prefill_linear_mode = parse_prefill_linear_mode(*v);
+  }
+  if (const auto v =
+          read_toml_optional_string(entry, "prefill_attention_mode")) {
+    ov.prefill_attention_mode = parse_prefill_attention_mode(*v);
+  }
+  read_toml_optional_bool_or_on_off(entry, "prefill_sparse_minference",
+                                    ov.prefill_sparse_minference);
+  read_toml_optional_bool_or_on_off(entry, "prefill_cache_blend",
+                                    ov.prefill_cache_blend);
+  read_toml_optional_bool_or_on_off(entry, "prefill_ane_offload",
+                                    ov.prefill_ane_offload);
   if (const auto v = read_toml_optional_string(entry, "spec_search")) {
     ov.spec_search = *v;
   }
@@ -1125,6 +1171,29 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     if (const auto v = (*engine)["prefill_engine"].value<std::string>()) {
       config.prefill_engine = *v;
     }
+    if (const auto v =
+            read_toml_optional_string(*engine, "prefill_linear_mode")) {
+      config.prefill_linear_mode = parse_prefill_linear_mode(*v);
+    }
+    if (const auto v =
+            read_toml_optional_string(*engine, "prefill_attention_mode")) {
+      config.prefill_attention_mode = parse_prefill_attention_mode(*v);
+    }
+    read_toml_bool_or_on_off(*engine, "prefill_sparse_minference",
+                             config.prefill_sparse_minference);
+    read_toml_bool_or_on_off(*engine, "prefill_cache_blend",
+                             config.prefill_cache_blend);
+    {
+      std::optional<bool> ane_opt;
+      read_toml_optional_bool_or_on_off(*engine, "prefill_ane_offload",
+                                        ane_opt);
+      if (ane_opt.has_value()) {
+        config.prefill_ane_offload = *ane_opt;
+        config.prefill_ane_offload_explicit = true;
+      } else if (config.prefill_engine == "nax_ane") {
+        config.prefill_ane_offload = true;
+      }
+    }
     if (const auto v = (*engine)["spec_search"].value<std::string>()) {
       config.spec_search = *v;
     }
@@ -1219,6 +1288,30 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     }
     if (const auto v = (*sidecar)["prefill_engine"].value<std::string>()) {
       config.prefill_engine = *v;
+    }
+    if (const auto v =
+            read_toml_optional_string(*sidecar, "prefill_linear_mode")) {
+      config.prefill_linear_mode = parse_prefill_linear_mode(*v);
+    }
+    if (const auto v =
+            read_toml_optional_string(*sidecar, "prefill_attention_mode")) {
+      config.prefill_attention_mode = parse_prefill_attention_mode(*v);
+    }
+    read_toml_bool_or_on_off(*sidecar, "prefill_sparse_minference",
+                             config.prefill_sparse_minference);
+    read_toml_bool_or_on_off(*sidecar, "prefill_cache_blend",
+                             config.prefill_cache_blend);
+    {
+      std::optional<bool> ane_opt;
+      read_toml_optional_bool_or_on_off(*sidecar, "prefill_ane_offload",
+                                        ane_opt);
+      if (ane_opt.has_value()) {
+        config.prefill_ane_offload = *ane_opt;
+        config.prefill_ane_offload_explicit = true;
+      } else if ((*sidecar)["prefill_engine"].value<std::string>() ==
+                 std::optional<std::string>("nax_ane")) {
+        config.prefill_ane_offload = true;
+      }
     }
     if (const auto v = (*sidecar)["spec_search"].value<std::string>()) {
       config.spec_search = *v;
@@ -1335,6 +1428,30 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
       if (const auto v = (*entry)["prefill_engine"].value<std::string>()) {
         m.prefill_engine = *v;
       }
+      if (const auto v =
+              read_toml_optional_string(*entry, "prefill_linear_mode")) {
+        m.prefill_linear_mode = parse_prefill_linear_mode(*v);
+      }
+      if (const auto v =
+              read_toml_optional_string(*entry, "prefill_attention_mode")) {
+        m.prefill_attention_mode = parse_prefill_attention_mode(*v);
+      }
+      read_toml_bool_or_on_off(*entry, "prefill_sparse_minference",
+                               m.prefill_sparse_minference);
+      read_toml_bool_or_on_off(*entry, "prefill_cache_blend",
+                               m.prefill_cache_blend);
+      {
+        std::optional<bool> ane_opt;
+        read_toml_optional_bool_or_on_off(*entry, "prefill_ane_offload",
+                                          ane_opt);
+        if (ane_opt.has_value()) {
+          m.prefill_ane_offload = *ane_opt;
+          m.prefill_ane_offload_explicit = true;
+        } else if ((*entry)["prefill_engine"].value<std::string>() ==
+                   std::optional<std::string>("nax_ane")) {
+          m.prefill_ane_offload = true;
+        }
+      }
       if (const auto v = (*entry)["spec_search"].value<std::string>()) {
         m.spec_search = *v;
       }
@@ -1446,7 +1563,47 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     bool rolling_prefix_cache = false;
     bool prefix_cache_gb = false;
     bool sampling_contract = false;
+    bool prefill_linear_mode = false;
+    bool prefill_attention_mode = false;
+    bool prefill_sparse_minference = false;
+    bool prefill_cache_blend = false;
+    bool prefill_ane_offload = false;
   } cli_overrides;
+
+  // Apply NINFER_PREFILL_* environment overrides on top of TOML (and before
+  // CLI flags, so CLI > env > TOML > defaults).
+  if (const char *env = std::getenv("NINFER_PREFILL_LINEAR_MODE");
+      env && *env) {
+    config.prefill_linear_mode = parse_prefill_linear_mode(env);
+    cli_overrides.prefill_linear_mode = true;
+    config.cli_prefill_linear_mode_override = true;
+  }
+  if (const char *env = std::getenv("NINFER_PREFILL_ATTENTION_MODE");
+      env && *env) {
+    config.prefill_attention_mode = parse_prefill_attention_mode(env);
+    cli_overrides.prefill_attention_mode = true;
+    config.cli_prefill_attention_mode_override = true;
+  }
+  if (const char *env = std::getenv("NINFER_PREFILL_SPARSE_MINFERENCE");
+      env && *env) {
+    config.prefill_sparse_minference =
+        parse_on_off(env, "NINFER_PREFILL_SPARSE_MINFERENCE");
+    cli_overrides.prefill_sparse_minference = true;
+    config.cli_prefill_sparse_minference_override = true;
+  }
+  if (const char *env = std::getenv("NINFER_PREFILL_CACHE_BLEND");
+      env && *env) {
+    config.prefill_cache_blend = parse_on_off(env, "NINFER_PREFILL_CACHE_BLEND");
+    cli_overrides.prefill_cache_blend = true;
+    config.cli_prefill_cache_blend_override = true;
+  }
+  if (const char *env = std::getenv("NINFER_PREFILL_ANE_OFFLOAD");
+      env && *env) {
+    config.prefill_ane_offload = parse_on_off(env, "NINFER_PREFILL_ANE_OFFLOAD");
+    config.prefill_ane_offload_explicit = true;
+    cli_overrides.prefill_ane_offload = true;
+    config.cli_prefill_ane_offload_override = true;
+  }
 
   // Pass 2: apply all CLI flags on top of TOML values.
   for (int i = 1; i < argc; ++i) {
@@ -1574,6 +1731,79 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       config.sampling_contract = std::string(next_val());
       cli_overrides.sampling_contract = true;
       config.cli_sampling_contract_override = true;
+    } else if (flag == "--prefill-linear-mode") {
+      config.prefill_linear_mode = parse_prefill_linear_mode(next_val());
+      cli_overrides.prefill_linear_mode = true;
+      config.cli_prefill_linear_mode_override = true;
+    } else if (flag == "--prefill-attention-mode") {
+      config.prefill_attention_mode = parse_prefill_attention_mode(next_val());
+      cli_overrides.prefill_attention_mode = true;
+      config.cli_prefill_attention_mode_override = true;
+    } else if (flag == "--prefill-sparse-minference") {
+      if (inline_value.has_value()) {
+        config.prefill_sparse_minference = parse_on_off(*inline_value, flag);
+      } else if (i + 1 < argc) {
+        const std::string_view peek(argv[i + 1]);
+        if (peek == "on" || peek == "off" || peek == "true" ||
+            peek == "false" || peek == "1" || peek == "0") {
+          config.prefill_sparse_minference = parse_on_off(peek, flag);
+          ++i;
+        } else {
+          config.prefill_sparse_minference = true;
+        }
+      } else {
+        config.prefill_sparse_minference = true;
+      }
+      cli_overrides.prefill_sparse_minference = true;
+      config.cli_prefill_sparse_minference_override = true;
+    } else if (flag == "--no-prefill-sparse-minference") {
+      config.prefill_sparse_minference = false;
+      cli_overrides.prefill_sparse_minference = true;
+      config.cli_prefill_sparse_minference_override = true;
+    } else if (flag == "--prefill-cache-blend") {
+      if (inline_value.has_value()) {
+        config.prefill_cache_blend = parse_on_off(*inline_value, flag);
+      } else if (i + 1 < argc) {
+        const std::string_view peek(argv[i + 1]);
+        if (peek == "on" || peek == "off" || peek == "true" ||
+            peek == "false" || peek == "1" || peek == "0") {
+          config.prefill_cache_blend = parse_on_off(peek, flag);
+          ++i;
+        } else {
+          config.prefill_cache_blend = true;
+        }
+      } else {
+        config.prefill_cache_blend = true;
+      }
+      cli_overrides.prefill_cache_blend = true;
+      config.cli_prefill_cache_blend_override = true;
+    } else if (flag == "--no-prefill-cache-blend") {
+      config.prefill_cache_blend = false;
+      cli_overrides.prefill_cache_blend = true;
+      config.cli_prefill_cache_blend_override = true;
+    } else if (flag == "--prefill-ane-offload") {
+      if (inline_value.has_value()) {
+        config.prefill_ane_offload = parse_on_off(*inline_value, flag);
+      } else if (i + 1 < argc) {
+        const std::string_view peek(argv[i + 1]);
+        if (peek == "on" || peek == "off" || peek == "true" ||
+            peek == "false" || peek == "1" || peek == "0") {
+          config.prefill_ane_offload = parse_on_off(peek, flag);
+          ++i;
+        } else {
+          config.prefill_ane_offload = true;
+        }
+      } else {
+        config.prefill_ane_offload = true;
+      }
+      config.prefill_ane_offload_explicit = true;
+      cli_overrides.prefill_ane_offload = true;
+      config.cli_prefill_ane_offload_override = true;
+    } else if (flag == "--no-prefill-ane-offload") {
+      config.prefill_ane_offload = false;
+      config.prefill_ane_offload_explicit = true;
+      cli_overrides.prefill_ane_offload = true;
+      config.cli_prefill_ane_offload_override = true;
     } else if (flag == "--version") {
       config.show_version = true;
     } else if (flag == "--help" || flag == "-h") {
@@ -1649,6 +1879,22 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       }
       if (cli_overrides.sampling_contract) {
         m.sampling_contract = config.sampling_contract;
+      }
+      if (cli_overrides.prefill_linear_mode) {
+        m.prefill_linear_mode = config.prefill_linear_mode;
+      }
+      if (cli_overrides.prefill_attention_mode) {
+        m.prefill_attention_mode = config.prefill_attention_mode;
+      }
+      if (cli_overrides.prefill_sparse_minference) {
+        m.prefill_sparse_minference = config.prefill_sparse_minference;
+      }
+      if (cli_overrides.prefill_cache_blend) {
+        m.prefill_cache_blend = config.prefill_cache_blend;
+      }
+      if (cli_overrides.prefill_ane_offload) {
+        m.prefill_ane_offload = config.prefill_ane_offload;
+        m.prefill_ane_offload_explicit = true;
       }
     }
   } else if (cli_model_dirs.size() == 1) {
@@ -1777,6 +2023,15 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   opts.max_context = resolved.max_context;
   opts.kv_dtype = resolved.kv_dtype;
   opts.prefill_engine = resolved.prefill_engine;
+  opts.prefill_linear_mode = resolved.prefill_linear_mode;
+  opts.prefill_attention_mode = resolved.prefill_attention_mode;
+  opts.prefill_sparse_minference = resolved.prefill_sparse_minference;
+  opts.prefill_cache_blend = resolved.prefill_cache_blend;
+  opts.prefill_ane_offload = resolved.prefill_ane_offload;
+  if (!resolved.prefill_ane_offload_explicit &&
+      resolved.prefill_engine == "nax_ane") {
+    opts.prefill_ane_offload = true;
+  }
   opts.spec_search = resolved.spec_search;
   opts.sampling_contract = resolved.sampling_contract;
   opts.memory_budget_bytes = resolved.memory_budget_bytes;
@@ -1929,7 +2184,17 @@ std::string format_help_string() {
       << "  --prefix-cache-gb FLOAT          Prefix cache memory budget in GiB "
          "(0..128)\n"
       << "  --sampling-contract NAME         Sampling contract "
-         "(legacy_rejection_v1|position_coupled_v1)\n\n"
+         "(legacy_rejection_v1|position_coupled_v1)\n"
+      << "  --prefill-linear-mode MODE       Prefill linear precision: "
+         "bf16|w4a8 (env: NINFER_PREFILL_LINEAR_MODE)\n"
+      << "  --prefill-attention-mode MODE    Prefill attention kernel: "
+         "exact_nax|sage2 (env: NINFER_PREFILL_ATTENTION_MODE)\n"
+      << "  --[no-]prefill-sparse-minference MInference dynamic sparse tiles "
+         "under sage2 (env: NINFER_PREFILL_SPARSE_MINFERENCE)\n"
+      << "  --[no-]prefill-cache-blend       Cross-chunk non-contiguous RAG "
+         "CacheBlend (env: NINFER_PREFILL_CACHE_BLEND)\n"
+      << "  --[no-]prefill-ane-offload       Dual-ANE output-channel-split "
+         "co-execution (env: NINFER_PREFILL_ANE_OFFLOAD)\n\n"
       << "Info:\n"
       << "  --version                        Print version identity and exit\n"
       << "  --help, -h                       Show this help message and exit\n";

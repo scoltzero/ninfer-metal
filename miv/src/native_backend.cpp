@@ -1448,6 +1448,7 @@ public:
       execution_fields.emplace("lora", loaded_lora->fingerprint);
       execution_fields.emplace("lora_mode", effective_lora_mode);
     }
+    append_prefill_execution_identity_fields(options, execution_fields);
     execution_identity = execution_identity_digest(execution_fields);
     for (std::size_t index = 0; index < occupied.size(); ++index)
       program_at(index).bind_execution_identity(execution_identity);
@@ -3963,6 +3964,7 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
                                  : ar_program_->lora_mode_active;
   backend_stats_.lora_buffer_bytes = ar_program_->lora_buffer_bytes;
   backend_stats_.lora_adapted_layers = ar_program_->lora_adapted_layers;
+  populate_prefill_config_stats(options_, backend_stats_);
 }
 
 NativeBackend::~NativeBackend() = default;
@@ -5502,6 +5504,30 @@ void NativeBackend::populate_stats(StatsReport &stats) const {
   stats.lora_mode = backend_stats_.lora_mode;
   stats.lora_buffer_bytes = backend_stats_.lora_buffer_bytes;
   stats.lora_adapted_layers = backend_stats_.lora_adapted_layers;
+  stats.prefill_linear_mode = backend_stats_.prefill_linear_mode;
+  stats.prefill_attention_mode = backend_stats_.prefill_attention_mode;
+  stats.prefill_sparse_minference = backend_stats_.prefill_sparse_minference;
+  stats.prefill_sparse_minference_effective =
+      backend_stats_.prefill_sparse_minference_effective;
+  stats.prefill_sparse_minference_inactive_reason =
+      backend_stats_.prefill_sparse_minference_inactive_reason;
+  stats.prefill_cache_blend = backend_stats_.prefill_cache_blend;
+  stats.prefill_ane_offload = backend_stats_.prefill_ane_offload;
+  stats.prefill_ane_active = backend_stats_.prefill_ane_active;
+  stats.prefill_ane_split_alpha = backend_stats_.prefill_ane_split_alpha;
+  stats.prefill_w4a8_tokens = backend_stats_.prefill_w4a8_tokens;
+  stats.prefill_sage2_tokens = backend_stats_.prefill_sage2_tokens;
+  stats.prefill_minference_blocks_skipped =
+      backend_stats_.prefill_minference_blocks_skipped;
+  stats.prefill_minference_blocks_total =
+      backend_stats_.prefill_minference_blocks_total;
+  stats.prefill_cache_blend_hit_tokens =
+      backend_stats_.prefill_cache_blend_hit_tokens;
+  stats.prefill_cache_blend_recomputed_tokens =
+      backend_stats_.prefill_cache_blend_recomputed_tokens;
+  stats.prefill_ane_offload_tokens = backend_stats_.prefill_ane_offload_tokens;
+  stats.prefill_ane_fallback_tokens =
+      backend_stats_.prefill_ane_fallback_tokens;
 }
 
 TrimCacheReport NativeBackend::trim_cache(std::uint64_t target_free_bytes) {

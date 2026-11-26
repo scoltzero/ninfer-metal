@@ -1796,13 +1796,18 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
               auto_cfg.config_path);
     check(auto_cfg.host == "127.0.0.1" && auto_cfg.port == 8080 &&
               auto_cfg.cors == true && auto_cfg.max_concurrency == 4 &&
-              auto_cfg.max_context == 65536 &&
+              auto_cfg.max_context == 262144 &&
               auto_cfg.kv_dtype == "affine4_g128" &&
               auto_cfg.rolling_prefix_cache.has_value() &&
               *auto_cfg.rolling_prefix_cache == true &&
               auto_cfg.prefix_cache_gb.has_value() &&
               *auto_cfg.prefix_cache_gb == 4.0 &&
               auto_cfg.sampling_contract == "position_coupled_v1" &&
+              auto_cfg.prefill_linear_mode == PrefillLinearMode::BFloat16 &&
+              auto_cfg.prefill_attention_mode ==
+                  PrefillAttentionMode::ExactNax &&
+              !auto_cfg.prefill_sparse_minference &&
+              !auto_cfg.prefill_cache_blend && !auto_cfg.prefill_ane_offload &&
               auto_cfg.lora_adapter.empty() &&
               auto_cfg.lora_mode == "merge" &&
               auto_cfg.spec_backend_auto == true && auto_cfg.draft_tokens == 0,
