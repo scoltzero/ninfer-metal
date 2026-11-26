@@ -2725,3 +2725,46 @@ add_test(
     $<TARGET_FILE:omlx_m5_serve_e2e>
     "${CMAKE_SOURCE_DIR}/models"
     $<TARGET_FILE:omlx_m5_mock_spi_provider>)
+
+# Module 1: Route A W4A8 Dense & MoE Metal 4 NAX kernels & standalone verification tests.
+if(OMLX_M5_BUILD_NAX_METALLIB AND
+   OMLX_M5_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 27.0)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_nax.metal")
+    omlx_m5_compile_metallib(
+      omlx_m5_w4a8_nax_metallib
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_nax.metal"
+      "omlx_m5_w4a8_nax.metallib"
+      "27.0"
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+    add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a8_nax_metallib)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_moe_nax.metal")
+    omlx_m5_compile_metallib(
+      omlx_m5_w4a8_moe_nax_metallib
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_moe_nax.metal"
+      "omlx_m5_w4a8_moe_nax.metallib"
+      "27.0"
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+    add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a8_moe_nax_metallib)
+  endif()
+  if(TARGET omlx_m5_w4a8_nax_metallib AND TARGET omlx_m5_w4a8_moe_nax_metallib)
+    add_executable(omlx_m5_w4a8_nax_tests tests/w4a8_nax_tests.cpp)
+    target_include_directories(omlx_m5_w4a8_nax_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+    target_compile_options(omlx_m5_w4a8_nax_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(omlx_m5_w4a8_nax_tests PRIVATE omlx_m5_core_runtime)
+    add_dependencies(omlx_m5_w4a8_nax_tests
+      omlx_m5_qwen_forward_resources
+      omlx_m5_w4a8_nax_metallib
+      omlx_m5_w4a8_moe_nax_metallib
+      omlx_m5_affine_nax_metallib
+      omlx_m5_mxfp4_nax_metallib
+      omlx_m5_moe_nax_metallib)
+    if(TARGET omlx_m5_gdn_chunk_nax_metallib)
+      add_dependencies(omlx_m5_w4a8_nax_tests omlx_m5_gdn_chunk_nax_metallib)
+    endif()
+    add_test(NAME omlx_m5_w4a8_nax COMMAND $<TARGET_FILE:omlx_m5_w4a8_nax_tests>
+      "${OMLX_M5_METAL_OUTPUT_DIR}")
+  endif()
+endif()

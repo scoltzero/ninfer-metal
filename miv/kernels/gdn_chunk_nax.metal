@@ -2031,6 +2031,533 @@ inline void gdn_chunk_recurrence_dv32_c64_impl(
   }
 }
 
+// ============================================================================
+// Stage 2 Lossless Base 1.1 (`dv64`: 2 x [128 x 64] Split for 80-Core M5 Ultra):
+//   Splits value_dim=128 into 2 independent kDvSlice64=64 TGs per value_head:
+//     - 27B     (Hv=48): 48 * 2 = 96 TGs <= 160 resident slots -> 1 SINGLE WAVE!
+//     - 35B-A3B (Hv=32): 32 * 2 = 64 TGs -> 1 exact wave on 64-core & lowest SLC traffic!
+//   Cuts ws_nk / ws_nq / ctrl_solve / ctrl_mqk / tg_nkT traffic by 2.0x vs dv32,
+//   keeps static TG SRAM at EXACT 16,384 B (16.00 KiB -> 2 TGs/core = 160 slots/80c),
+//   uses causal block pruning (kt <= sg, 10/16 blocks), coalesced bfloat4 stores,
+//   and preserves EXACT 0-ULP bit-for-bit IEEE-754 parity with dv32!
+// ============================================================================
+
+constant constexpr uint kDvSlice64 = 64u;
+constant constexpr uint kNkTPad16 = 24u; // 16 + 8 (16-byte bfloat4 aligned, 128*24 = 3,072 bfloats)
+
+template <bool FuseConv, typename ParamsT>
+inline void gdn_chunk_recurrence_dv64_c64_apple9(
+    device const bfloat *qkv_or_conv,
+    device const bfloat *conv_weight,
+    device const bfloat *history,
+    device const bfloat *qk_ws,
+    device const uchar *ctrl_ws,
+    device float *state,
+    device bfloat *out_bf16,
+    constant ParamsT &params,
+    threadgroup float *tg_f32,
+    uint lane,
+    uint sg,
+    uint hv,
+    uint dv_slice) {
+  // Portable Apple9 (M4) fallback: execute two sequential dv32 halves so live
+  // cooperative_tensor pressure matches dv32 (0 spills under MTL_SHADER_VALIDATION=1,
+  // guaranteed 0-ULP parity). Apple10 (M5 Ultra) compiles this branch out completely.
+  gdn_chunk_recurrence_dv32_c64_apple9<FuseConv>(
+      qkv_or_conv, conv_weight, history, qk_ws, ctrl_ws, state, out_bf16,
+      params, tg_f32, lane, sg, hv, dv_slice * 2u + 0u);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  gdn_chunk_recurrence_dv32_c64_apple9<FuseConv>(
+      qkv_or_conv, conv_weight, history, qk_ws, ctrl_ws, state, out_bf16,
+      params, tg_f32, lane, sg, hv, dv_slice * 2u + 1u);
+}
+
+template <bool FuseConv, typename ParamsT>
+inline void gdn_chunk_recurrence_dv64_c64_impl(
+    device const bfloat *qkv_or_conv,
+    device const bfloat *conv_weight,
+    device const bfloat *history,
+    device const bfloat *qk_ws,
+    device const uchar *ctrl_ws,
+    device float *state,
+    device bfloat *out_bf16,
+    constant ParamsT &params,
+    threadgroup float *tg_f32,
+    uint lane,
+    uint sg,
+    uint3 tg) {
+  const uint hv = tg.x;
+  const uint dv_slice = tg.y;
+  if (hv >= params.value_heads || dv_slice >= 2u || sg >= 4u ||
+      params.key_dim != kKeyDim || params.value_dim != kValDim ||
+      params.tokens == 0u) {
+    return;
+  }
+
+  if (!gdn_has_apple10_nax_layout()) {
+    gdn_chunk_recurrence_dv64_c64_apple9<FuseConv>(
+        qkv_or_conv, conv_weight, history, qk_ws, ctrl_ws, state, out_bf16,
+        params, tg_f32, lane, sg, hv, dv_slice);
+    return;
+  }
+
+  const uint tid = sg * 32u + lane;
+  const uint repeat = params.value_heads / params.key_heads;
+  const uint hk = hv / repeat;
+  const uint key_width = params.key_heads * kKeyDim;
+  const uint value_width = params.value_heads * kValDim;
+  const uint dv_tg_base = dv_slice * kDvSlice64;
+  const uint out_tg_col_base = hv * kValDim + dv_tg_base;
+  const uint v_tg_col_base = 2u * key_width + out_tg_col_base;
+  const uint dk_sg_base = sg * 32u;
+  const uint r_sg_base = sg * 16u;
+
+  const uint qid = lane >> 2u;
+  const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
+  const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
+
+  float4 vw0 = float4(0.0f), vw1 = float4(0.0f), vw2 = float4(0.0f), vw3 = float4(0.0f);
+  if constexpr (FuseConv) {
+    if (params.conv_kernel == 4u && (params.conv_width & 3u) == 0u) {
+      gdn_load_conv4_weights_vec4(
+          conv_weight, v_tg_col_base + (tid & 15u) * 4u, vw0, vw1, vw2, vw3);
+    }
+  }
+
+  // Persistent IEEE FP32 state S[vh=0..1][vs=0..1][ks=0..1] (64 floats/lane total).
+  vec<float, 8> S[2][2][2];
+  #pragma clang loop unroll(full)
+  for (uint vh = 0u; vh < 2u; ++vh) {
+    #pragma clang loop unroll(full)
+    for (uint vs = 0u; vs < 2u; ++vs) {
+      #pragma clang loop unroll(full)
+      for (uint ks = 0u; ks < 2u; ++ks) {
+        const uint dk_col = dk_sg_base + ks * 16u + fn;
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          const uint dv_l = vh * 32u + vs * 16u + fm + h * 8u;
+          const float4 f4 = *reinterpret_cast<device const float4 *>(
+              state + ulong(out_tg_col_base + dv_l) * kKeyDim + dk_col);
+          S[vh][vs][ks][h * 4u + 0u] = f4[0];
+          S[vh][vs][ks][h * 4u + 1u] = f4[1];
+          S[vh][vs][ks][h * 4u + 2u] = f4[2];
+          S[vh][vs][ks][h * 4u + 3u] = f4[3];
+        }
+      }
+    }
+  }
+
+  threadgroup bfloat *tg_bf16 = reinterpret_cast<threadgroup bfloat *>(tg_f32);
+
+  for (uint c = 0u; c * kChunkSize < params.tokens; ++c) {
+    const uint t0 = c * kChunkSize;
+    const uint clen = min(kChunkSize, params.tokens - t0);
+    const bool has_hi = (clen > kHalfChunk);
+
+    device const bfloat *ws_nk =
+        qk_ws + (ulong(c) * ulong(params.key_heads) + ulong(hk)) * kQkPairBfloats;
+    device const bfloat *ws_nq = ws_nk + ulong(kChunkSize) * ulong(kKeyDim);
+
+    device const uchar *ctrl_raw =
+        ctrl_ws + (ulong(c) * ulong(params.value_heads) + ulong(hv)) * kCtrlStrideBytes;
+    device const bfloat *ctrl_solve =
+        reinterpret_cast<device const bfloat *>(ctrl_raw);
+    device const bfloat *ctrl_mqk =
+        reinterpret_cast<device const bfloat *>(ctrl_raw + kCtrlMqkByteOff);
+    device const float *ctrl_pref =
+        reinterpret_cast<device const float *>(ctrl_raw + kCtrlPrefByteOff);
+    device const float *ctrl_suff =
+        reinterpret_cast<device const float *>(ctrl_raw + kCtrlSuffByteOff);
+    const float decay_last =
+        reinterpret_cast<device const float *>(ctrl_raw + kCtrlMetaByteOff)[0];
+
+    // Load ws_mat ONCE per rh half and project against BOTH vh=0 and vh=1 (2x less Q/K traffic!).
+    auto reduce_proj_apple10_dv64 = [&](device const bfloat *ws_mat,
+                                        thread vec<float, 8> (&out_sg)[2][2]) {
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        out_sg[vh][0] = vec<float, 8>(0.0f);
+        out_sg[vh][1] = vec<float, 8>(0.0f);
+      }
+      for (uint rh = 0u; rh < (has_hi ? 2u : 1u); ++rh) {
+        const uint r_off = rh * 32u;
+        const vec<bfloat, 8> a00 =
+            gdn_load_frag_dev_bf16(ws_mat + r_off * kKeyDim + dk_sg_base + 0u, kKeyDim, fm, fn);
+        const vec<bfloat, 8> a01 =
+            gdn_load_frag_dev_bf16(ws_mat + r_off * kKeyDim + dk_sg_base + 16u, kKeyDim, fm, fn);
+        const vec<bfloat, 8> a10 =
+            gdn_load_frag_dev_bf16(ws_mat + (r_off + 16u) * kKeyDim + dk_sg_base + 0u, kKeyDim, fm, fn);
+        const vec<bfloat, 8> a11 =
+            gdn_load_frag_dev_bf16(ws_mat + (r_off + 16u) * kKeyDim + dk_sg_base + 16u, kKeyDim, fm, fn);
+
+        #pragma clang loop unroll(full)
+        for (uint vh = 0u; vh < 2u; ++vh) {
+          vec<bfloat, 8> Sb00, Sb01, Sb10, Sb11;
+          #pragma clang loop unroll(full)
+          for (ushort e = 0u; e < 8u; ++e) {
+            Sb00[e] = bfloat(S[vh][0][0][e]);
+            Sb01[e] = bfloat(S[vh][0][1][e]);
+            Sb10[e] = bfloat(S[vh][1][0][e]);
+            Sb11[e] = bfloat(S[vh][1][1][e]);
+          }
+          vec<float, 8> part[2][2];
+          part[0][0] = vec<float, 8>(0.0f);
+          part[0][1] = vec<float, 8>(0.0f);
+          part[1][0] = vec<float, 8>(0.0f);
+          part[1][1] = vec<float, 8>(0.0f);
+
+          volatile int cbar_p;
+          gdn_mma_16x32x16_bf16(part[0][0], part[0][1], a00, Sb00, Sb10);
+          gdn_mma_16x32x16_bf16(part[0][0], part[0][1], a01, Sb01, Sb11);
+          gdn_mma_16x32x16_bf16(part[1][0], part[1][1], a10, Sb00, Sb10);
+          gdn_mma_16x32x16_bf16(part[1][0], part[1][1], a11, Sb01, Sb11);
+          (void)cbar_p;
+
+          threadgroup float *my_f32 = tg_f32 + sg * 1024u;
+          #pragma clang loop unroll(full)
+          for (uint mm = 0u; mm < 2u; ++mm) {
+            #pragma clang loop unroll(full)
+            for (uint nn = 0u; nn < 2u; ++nn) {
+              #pragma clang loop unroll(full)
+              for (uint h = 0u; h < 2u; ++h) {
+                const uint r_l = mm * 16u + fm + h * 8u;
+                const uint dv_l = nn * 16u + fn;
+                *reinterpret_cast<threadgroup float4 *>(my_f32 + r_l * 32u + dv_l) =
+                    float4(part[mm][nn][h * 4u + 0u], part[mm][nn][h * 4u + 1u],
+                           part[mm][nn][h * 4u + 2u], part[mm][nn][h * 4u + 3u]);
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if ((sg >> 1u) == rh) {
+            const uint sub_m = (sg & 1u) * 16u;
+            #pragma clang loop unroll(full)
+            for (uint nn = 0u; nn < 2u; ++nn) {
+              #pragma clang loop unroll(full)
+              for (uint h = 0u; h < 2u; ++h) {
+                const uint idx_flat = (sub_m + fm + h * 8u) * 32u + nn * 16u + fn;
+                const float4 s0 = *reinterpret_cast<const threadgroup float4 *>(tg_f32 + idx_flat);
+                const float4 s1 = *reinterpret_cast<const threadgroup float4 *>(tg_f32 + 1024u + idx_flat);
+                const float4 s2 = *reinterpret_cast<const threadgroup float4 *>(tg_f32 + 2048u + idx_flat);
+                const float4 s3 = *reinterpret_cast<const threadgroup float4 *>(tg_f32 + 3072u + idx_flat);
+                const float4 tot = (((s0 + s1) + s2) + s3);
+                out_sg[vh][nn][h * 4u + 0u] = tot[0];
+                out_sg[vh][nn][h * 4u + 1u] = tot[1];
+                out_sg[vh][nn][h * 4u + 2u] = tot[2];
+                out_sg[vh][nn][h * 4u + 3u] = tot[3];
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+    };
+
+    vec<float, 8> P_sg[2][2];
+    reduce_proj_apple10_dv64(ws_nk, P_sg);
+
+    // Stage Conv1D+SiLU(V) [64 x 64] into tg_bf16[0 .. 4095] if FuseConv.
+    threadgroup bfloat *tg_V = tg_bf16;
+    if constexpr (FuseConv) {
+      const uint dv_l4 = (tid & 15u) * 4u;
+      const uint ch0 = v_tg_col_base + dv_l4;
+      const uint r_start = (tid >> 4u) * 8u;
+      if (params.conv_kernel == 4u && (params.conv_width & 3u) == 0u) {
+        float4 xm3 = float4(0.0f), xm2 = float4(0.0f), xm1 = float4(0.0f);
+        if (r_start < clen) {
+          const int base_tok = int(t0 + r_start);
+          xm3 = gdn_read_qkv_or_hist_vec4(qkv_or_conv, history, base_tok - 3, ch0, params.conv_width);
+          xm2 = gdn_read_qkv_or_hist_vec4(qkv_or_conv, history, base_tok - 2, ch0, params.conv_width);
+          xm1 = gdn_read_qkv_or_hist_vec4(qkv_or_conv, history, base_tok - 1, ch0, params.conv_width);
+        }
+        #pragma clang loop unroll(full)
+        for (uint s = 0u; s < 8u; ++s) {
+          const uint r = r_start + s;
+          bfloat4 out_v = bfloat4(bfloat(0.0f));
+          if (r < clen) {
+            const float4 xcur = float4(*reinterpret_cast<device const bfloat4 *>(
+                qkv_or_conv + ulong(t0 + r) * ulong(params.conv_width) + ulong(ch0)));
+            float4 sum = fma(xm3, vw0, float4(0.0f));
+            sum = fma(xm2, vw1, sum);
+            sum = fma(xm1, vw2, sum);
+            sum = fma(xcur, vw3, sum);
+            out_v = bfloat4(sum / (1.0f + exp(-sum)));
+            xm3 = xm2;
+            xm2 = xm1;
+            xm1 = xcur;
+          }
+          *reinterpret_cast<threadgroup bfloat4 *>(tg_V + r * kDvSlice64 + dv_l4) = out_v;
+        }
+      } else {
+        for (uint s = 0u; s < 8u; ++s) {
+          const uint r = r_start + s;
+          for (uint j = 0u; j < 4u; ++j) {
+            tg_V[r * kDvSlice64 + dv_l4 + j] =
+                (r < clen)
+                    ? gdn_eval_conv_silu_scalar(qkv_or_conv, conv_weight, history,
+                                                t0 + r, ch0 + j, params.conv_width,
+                                                params.conv_kernel)
+                    : bfloat(0.0f);
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Pack rhs = bfloat(v - pref * P_sg) into 16 uint32 regs (freeing P_sg & tg_V before H_sg!).
+    vec<bfloat, 8> rhs_bf[2][2];
+    #pragma clang loop unroll(full)
+    for (uint h = 0u; h < 2u; ++h) {
+      const uint r = r_sg_base + fm + h * 8u;
+      const float pref = (r < clen) ? ctrl_pref[r] : 0.0f;
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        #pragma clang loop unroll(full)
+        for (uint nn = 0u; nn < 2u; ++nn) {
+          const uint dv_base = vh * 32u + nn * 16u + fn;
+          if (r < clen) {
+            const bfloat4 v4 = FuseConv
+                ? *reinterpret_cast<const threadgroup bfloat4 *>(tg_V + r * kDvSlice64 + dv_base)
+                : *reinterpret_cast<device const bfloat4 *>(
+                      qkv_or_conv + ulong(t0 + r) * ulong(params.conv_width) +
+                      ulong(v_tg_col_base + dv_base));
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) {
+              const uint e = h * 4u + j;
+              rhs_bf[vh][nn][e] = bfloat(fma(-pref, P_sg[vh][nn][e], float(v4[j])));
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) {
+              rhs_bf[vh][nn][h * 4u + j] = bfloat(0.0f);
+            }
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    vec<float, 8> H_sg[2][2];
+    reduce_proj_apple10_dv64(ws_nq, H_sg);
+
+    // Stage tg_rhsT [64 x 72] into tg_bf16[0 .. 4607] and scale H_sg by prefix[r].
+    threadgroup bfloat *tg_rhsT = tg_bf16;
+    #pragma clang loop unroll(full)
+    for (uint h = 0u; h < 2u; ++h) {
+      const uint r = r_sg_base + fm + h * 8u;
+      const float pref = (r < clen) ? ctrl_pref[r] : 0.0f;
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        #pragma clang loop unroll(full)
+        for (uint nn = 0u; nn < 2u; ++nn) {
+          const uint dv_base = vh * 32u + nn * 16u + fn;
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            const uint e = h * 4u + j;
+            tg_rhsT[(dv_base + j) * kRhsPad + r] = rhs_bf[vh][nn][e];
+            H_sg[vh][nn][e] = (r < clen) ? (H_sg[vh][nn][e] * pref) : 0.0f;
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: delta = solve @ rhs (causal kt <= sg, 10/16 blocks, ctrl_solve loaded ONCE!)
+    vec<float, 8> D_sg[2][2] = {
+        {vec<float, 8>(0.0f), vec<float, 8>(0.0f)},
+        {vec<float, 8>(0.0f), vec<float, 8>(0.0f)}};
+    if (r_sg_base < clen) {
+      for (uint kt = 0u; kt <= sg; ++kt) {
+        if (kt * 16u < clen) {
+          const uint k_off = kt * 16u;
+          volatile int cbar_d;
+          const vec<bfloat, 8> a_sol =
+              gdn_load_frag_dev_bf16(ctrl_solve + r_sg_base * kChunkSize + k_off, kChunkSize, fm, fn);
+          #pragma clang loop unroll(full)
+          for (uint vh = 0u; vh < 2u; ++vh) {
+            const vec<bfloat, 8> b_r0 =
+                gdn_load_frag_tg_bf16<kRhsPad>(tg_rhsT + (vh * 32u) * kRhsPad + k_off, fm, fn);
+            const vec<bfloat, 8> b_r1 =
+                gdn_load_frag_tg_bf16<kRhsPad>(tg_rhsT + (vh * 32u + 16u) * kRhsPad + k_off, fm, fn);
+            gdn_mma_16x32x16_bf16(D_sg[vh][0], D_sg[vh][1], a_sol, b_r0, b_r1);
+          }
+          (void)cbar_d;
+        }
+      }
+    }
+
+    vec<bfloat, 8> dsuff_bf[2][2];
+    #pragma clang loop unroll(full)
+    for (uint h = 0u; h < 2u; ++h) {
+      const uint r = r_sg_base + fm + h * 8u;
+      const float suff = (r < clen) ? ctrl_suff[r] : 0.0f;
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        #pragma clang loop unroll(full)
+        for (uint nn = 0u; nn < 2u; ++nn) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            const uint e = h * 4u + j;
+            dsuff_bf[vh][nn][e] = (r < clen) ? bfloat(suff * D_sg[vh][nn][e]) : bfloat(0.0f);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reuse tg_bf16[0 .. 4607] for tg_deltaT [64 x 72].
+    threadgroup bfloat *tg_deltaT = tg_bf16;
+    #pragma clang loop unroll(full)
+    for (uint h = 0u; h < 2u; ++h) {
+      const uint r = r_sg_base + fm + h * 8u;
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        #pragma clang loop unroll(full)
+        for (uint nn = 0u; nn < 2u; ++nn) {
+          const uint dv_base = vh * 32u + nn * 16u + fn;
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            const uint e = h * 4u + j;
+            tg_deltaT[(dv_base + j) * kRhsPad + r] =
+                (r < clen) ? bfloat(D_sg[vh][nn][e]) : bfloat(0.0f);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: c_out = H_sg + mqk @ tg_deltaT (causal kt <= sg, ctrl_mqk loaded ONCE!) -> coalesced bfloat4 store!
+    if (r_sg_base < clen) {
+      for (uint kt = 0u; kt <= sg; ++kt) {
+        if (kt * 16u < clen) {
+          const uint k_off = kt * 16u;
+          volatile int cbar_c;
+          const vec<bfloat, 8> a_mqk =
+              gdn_load_frag_dev_bf16(ctrl_mqk + r_sg_base * kChunkSize + k_off, kChunkSize, fm, fn);
+          #pragma clang loop unroll(full)
+          for (uint vh = 0u; vh < 2u; ++vh) {
+            const vec<bfloat, 8> b_d0 =
+                gdn_load_frag_tg_bf16<kRhsPad>(tg_deltaT + (vh * 32u) * kRhsPad + k_off, fm, fn);
+            const vec<bfloat, 8> b_d1 =
+                gdn_load_frag_tg_bf16<kRhsPad>(tg_deltaT + (vh * 32u + 16u) * kRhsPad + k_off, fm, fn);
+            gdn_mma_16x32x16_bf16(H_sg[vh][0], H_sg[vh][1], a_mqk, b_d0, b_d1);
+          }
+          (void)cbar_c;
+        }
+      }
+      #pragma clang loop unroll(full)
+      for (uint h = 0u; h < 2u; ++h) {
+        const uint r = r_sg_base + fm + h * 8u;
+        if (r < clen) {
+          #pragma clang loop unroll(full)
+          for (uint vh = 0u; vh < 2u; ++vh) {
+            #pragma clang loop unroll(full)
+            for (uint nn = 0u; nn < 2u; ++nn) {
+              const bfloat4 out4 = bfloat4(
+                  bfloat(H_sg[vh][nn][h * 4u + 0u]),
+                  bfloat(H_sg[vh][nn][h * 4u + 1u]),
+                  bfloat(H_sg[vh][nn][h * 4u + 2u]),
+                  bfloat(H_sg[vh][nn][h * 4u + 3u]));
+              *reinterpret_cast<device bfloat4 *>(
+                  out_bf16 + ulong(t0 + r) * ulong(value_width) +
+                  ulong(out_tg_col_base + vh * 32u + nn * 16u + fn)) = out4;
+            }
+          }
+        }
+      }
+    }
+
+    // Step 4: S = decay_last * S + tg_deltaSuffT @ nk (exact 15.0 KiB <= 16.0 KiB!)
+    #pragma clang loop unroll(full)
+    for (uint vh = 0u; vh < 2u; ++vh) {
+      S[vh][0][0] *= decay_last;
+      S[vh][0][1] *= decay_last;
+      S[vh][1][0] *= decay_last;
+      S[vh][1][1] *= decay_last;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup bfloat *tg_deltaSuffT = tg_bf16;          // [0 .. 4607] (64 * 72)
+    threadgroup bfloat *tg_nkT = tg_bf16 + 4608u;         // [4608 .. 7679] (128 * 24)
+    #pragma clang loop unroll(full)
+    for (uint h = 0u; h < 2u; ++h) {
+      const uint r = r_sg_base + fm + h * 8u;
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        #pragma clang loop unroll(full)
+        for (uint nn = 0u; nn < 2u; ++nn) {
+          const uint dv_base = vh * 32u + nn * 16u + fn;
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            tg_deltaSuffT[(dv_base + j) * kRhsPad + r] = dsuff_bf[vh][nn][h * 4u + j];
+          }
+        }
+      }
+    }
+
+    const uint t_r = tid >> 3u;
+    const uint t_dk0 = (tid & 7u) * 16u;
+    const uint n_rs = has_hi ? 4u : 2u;
+    for (uint rs = 0u; rs < n_rs; ++rs) {
+      if (rs > 0u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const uint r_src = rs * 16u + t_r;
+      device const bfloat4 *nk_src4 =
+          reinterpret_cast<device const bfloat4 *>(ws_nk + r_src * kKeyDim + t_dk0);
+      #pragma clang loop unroll(full)
+      for (uint v4 = 0u; v4 < 4u; ++v4) {
+        const bfloat4 w4 = nk_src4[v4];
+        const uint dk_b = t_dk0 + v4 * 4u;
+        tg_nkT[(dk_b + 0u) * kNkTPad16 + t_r] = w4[0];
+        tg_nkT[(dk_b + 1u) * kNkTPad16 + t_r] = w4[1];
+        tg_nkT[(dk_b + 2u) * kNkTPad16 + t_r] = w4[2];
+        tg_nkT[(dk_b + 3u) * kNkTPad16 + t_r] = w4[3];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const uint r_sub_ds = rs * 16u;
+      volatile int cbar_s;
+      const vec<bfloat, 8> b_nk0 =
+          gdn_load_frag_tg_bf16<kNkTPad16>(tg_nkT + dk_sg_base * kNkTPad16, fm, fn);
+      const vec<bfloat, 8> b_nk1 =
+          gdn_load_frag_tg_bf16<kNkTPad16>(tg_nkT + (dk_sg_base + 16u) * kNkTPad16, fm, fn);
+      #pragma clang loop unroll(full)
+      for (uint vh = 0u; vh < 2u; ++vh) {
+        const vec<bfloat, 8> a_ds0 =
+            gdn_load_frag_tg_bf16<kRhsPad>(tg_deltaSuffT + (vh * 32u) * kRhsPad + r_sub_ds, fm, fn);
+        const vec<bfloat, 8> a_ds1 =
+            gdn_load_frag_tg_bf16<kRhsPad>(tg_deltaSuffT + (vh * 32u + 16u) * kRhsPad + r_sub_ds, fm, fn);
+        gdn_mma_16x32x16_bf16(S[vh][0][0], S[vh][0][1], a_ds0, b_nk0, b_nk1);
+        gdn_mma_16x32x16_bf16(S[vh][1][0], S[vh][1][1], a_ds1, b_nk0, b_nk1);
+      }
+      (void)cbar_s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Coalesced float4 writeback of persistent state S[2][2][2].
+  #pragma clang loop unroll(full)
+  for (uint vh = 0u; vh < 2u; ++vh) {
+    #pragma clang loop unroll(full)
+    for (uint vs = 0u; vs < 2u; ++vs) {
+      #pragma clang loop unroll(full)
+      for (uint ks = 0u; ks < 2u; ++ks) {
+        const uint dk_col = dk_sg_base + ks * 16u + fn;
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          const uint dv_l = vh * 32u + vs * 16u + fm + h * 8u;
+          *reinterpret_cast<device float4 *>(
+              state + ulong(out_tg_col_base + dv_l) * kKeyDim + dk_col) =
+              float4(S[vh][vs][ks][h * 4u + 0u], S[vh][vs][ks][h * 4u + 1u],
+                     S[vh][vs][ks][h * 4u + 2u], S[vh][vs][ks][h * 4u + 3u]);
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 // Static TG SRAM = 64 * 128 * 2 B = 16,384 B (16.00 KiB <= 32,768 B)
@@ -2107,6 +2634,44 @@ kernel void omlx_m5_gdn_chunk_recurrence_conv_dv32_c64(
     uint3 tg [[threadgroup_position_in_grid]]) {
   alignas(16) threadgroup float tg_f32[4096u];
   gdn_chunk_recurrence_dv32_c64_impl<true>(
+      qkv, conv_weight, history, qk_ws, ctrl_ws, state, recurrent_out, params,
+      tg_f32, lane, sg, tg);
+}
+
+// Static TG SRAM = 4096 * 4 B = 16,384 B (16.00 KiB <= 32,768 B; 128 threads/TG, grid=(Hv, 2))
+[[max_total_threads_per_threadgroup(128)]]
+kernel void omlx_m5_gdn_chunk_recurrence_dv64_c64(
+    device const bfloat *convolved [[buffer(0)]],
+    device const bfloat *qk_ws [[buffer(1)]],
+    device const uchar *ctrl_ws [[buffer(2)]],
+    device float *state [[buffer(3)]],
+    device bfloat *recurrent [[buffer(4)]],
+    constant GdnChunkLayerParams &params [[buffer(5)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  alignas(16) threadgroup float tg_f32[4096u];
+  gdn_chunk_recurrence_dv64_c64_impl<false>(
+      convolved, nullptr, nullptr, qk_ws, ctrl_ws, state, recurrent, params,
+      tg_f32, lane, sg, tg);
+}
+
+// Static TG SRAM = 4096 * 4 B = 16,384 B (16.00 KiB <= 32,768 B; 128 threads/TG, grid=(Hv, 2))
+[[max_total_threads_per_threadgroup(128)]]
+kernel void omlx_m5_gdn_chunk_recurrence_conv_dv64_c64(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *conv_weight [[buffer(1)]],
+    device const bfloat *history [[buffer(2)]],
+    device const bfloat *qk_ws [[buffer(3)]],
+    device const uchar *ctrl_ws [[buffer(4)]],
+    device float *state [[buffer(5)]],
+    device bfloat *recurrent_out [[buffer(6)]],
+    constant GdnChunkMegaParams &params [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  alignas(16) threadgroup float tg_f32[4096u];
+  gdn_chunk_recurrence_dv64_c64_impl<true>(
       qkv, conv_weight, history, qk_ws, ctrl_ws, state, recurrent_out, params,
       tg_f32, lane, sg, tg);
 }

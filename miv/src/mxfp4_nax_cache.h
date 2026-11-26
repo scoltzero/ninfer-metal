@@ -502,14 +502,52 @@ inline void linear_mxfp4_nax_direct_f16(Encoder &e, const TiledMxfp4Weight &tw,
   e.dynamic(d, 5, words({tw.n, tw.k, mp, t}), tokens_patch);
 }
 
+inline bool mxfp4_nax_swiglu_out64_enabled() noexcept {
+  if (const char *dis = std::getenv("OMLX_M5_DISABLE_SWIGLU_OUT64");
+      dis != nullptr && std::string_view(dis) == "1") {
+    return false;
+  }
+  return true;
+}
+
 inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
                              Ref y, Ref f16_scratch, Ref f16_row_scale,
                              std::optional<U32> explicit_t = {},
-                             U32 gpu_cores = 64u) {
+                             U32 gpu_cores = 64u,
+                             U32 row_offset = 0u,
+                             U32 out_stride = 0u,
+                             U32 slice_n = 0u) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
   const auto sel_exp = nax_effective_select_explicit_t(e, explicit_t);
+  if (row_offset > 0u || (out_stride > 0u && out_stride != tw.n) ||
+      (slice_n > 0u && slice_n != tw.n)) {
+    if ((row_offset % 64u) != 0u || row_offset >= tw.n) {
+      throw std::invalid_argument(
+          "linear_mxfp4_nax slice requires row_offset % 64 == 0 && row_offset < n");
+    }
+    const U32 eff_n = (slice_n > 0u) ? slice_n : (tw.n - row_offset);
+    if (row_offset + eff_n > tw.n) {
+      throw std::invalid_argument("linear_mxfp4_nax slice exceeds weight n");
+    }
+    const U32 eff_stride = (out_stride > 0u) ? out_stride : tw.n;
+    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 y_tiles = (t + 63u) / 64u;
+    const std::string fn = "omlx_m5_mxfp4_nax_bf16_bm64_bn64_bns" +
+                           std::to_string(tw.bn) + "_slice_sk1";
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 128u,
+                                 .height = y_tiles};
+    const MetalDispatchSize threads{.width = 128u};
+    const std::optional<U32> tokens_patch =
+        explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+    e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+    auto &d = e.emit("mxfp4_nax", fn, grid, threads,
+                     {x, tw.codes, tw.scales, y});
+    e.dynamic(d, 4, words({eff_n, tw.k, mp, t, row_offset, eff_stride}),
+              tokens_patch);
+    return;
+  }
   const auto wide =
       mxfp4_nax_select_wide(tw, sel_t, sel_exp, gpu_cores, false);
   if (wide != NaxWidePrefillTile::none) {
@@ -624,13 +662,46 @@ inline void linear_mxfp4_nax_swiglu_direct_f16(
 inline void linear_mxfp4_nax_swiglu(
     Encoder &e, const TiledMxfp4Weight &gw, const TiledMxfp4Weight &uw,
     Ref x, Ref f16_scratch, Ref f16_row_scale, Ref y_out, U32 gpu_cores = 64u,
-    std::optional<U32> explicit_t = {}) {
+    std::optional<U32> explicit_t = {},
+    U32 row_offset = 0u,
+    U32 out_stride = 0u,
+    U32 slice_n = 0u) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
   const auto sel_exp = nax_effective_select_explicit_t(e, explicit_t);
+  const bool is_slice = (row_offset > 0u) ||
+                        (out_stride > 0u && out_stride != gw.n) ||
+                        (slice_n > 0u && slice_n != gw.n);
   const auto wide =
       mxfp4_nax_select_wide(gw, sel_t, sel_exp, gpu_cores, true);
+  if (is_slice || (wide == NaxWidePrefillTile::bm64_bn64 &&
+                   mxfp4_nax_swiglu_out64_enabled())) {
+    if ((row_offset % 64u) != 0u || row_offset >= gw.n) {
+      throw std::invalid_argument(
+          "linear_mxfp4_nax_swiglu out64 requires row_offset % 64 == 0 && row_offset < n");
+    }
+    const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+    if (row_offset + eff_n > gw.n) {
+      throw std::invalid_argument("linear_mxfp4_nax_swiglu slice exceeds weight n");
+    }
+    const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 y_tiles = (t + 63u) / 64u;
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 256u,
+                                 .height = y_tiles};
+    const MetalDispatchSize threads{.width = 256u};
+    const std::optional<U32> tokens_patch =
+        explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+    e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+    auto &d = e.emit("mxfp4_nax",
+                     "omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1",
+                     grid, threads,
+                     {x, gw.codes, gw.scales, uw.codes, uw.scales, y_out});
+    e.dynamic(d, 6, words({eff_n, gw.k, mp, t, row_offset, eff_stride}),
+              tokens_patch);
+    return;
+  }
   if (wide != NaxWidePrefillTile::none) {
     const bool is_64 = (wide == NaxWidePrefillTile::bm64_bn64);
     const U32 tile_m = is_64 ? 64u : 32u;
