@@ -5844,7 +5844,7 @@ index 75fd00b..58869e6 100644
    "modal.model_settings.trust_remote_code": "信任远程代码",
    "modal.model_settings.trust_remote_code_hint": "允许模型仓库在加载时运行任意 Python 代码。请仅对可信的发布者启用。",
 diff --git a/apps/omlx-web/omlx_web/static/js/dashboard.js b/apps/omlx-web/omlx_web/static/js/dashboard.js
-index 62235bb..8e1e643 100644
+index 62235bb..22a1c5c 100644
 --- a/apps/omlx-web/omlx_web/static/js/dashboard.js
 +++ b/apps/omlx-web/omlx_web/static/js/dashboard.js
 @@ -332,6 +332,7 @@
@@ -5989,7 +5989,7 @@ index 62235bb..8e1e643 100644
                      }
                      const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                          method: 'PUT',
-@@ -4848,13 +4887,259 @@
+@@ -4848,13 +4887,305 @@
                  return this.modelSettings.model_format === 'gguf';
              },
  
@@ -6133,15 +6133,61 @@ index 62235bb..8e1e643 100644
 +                if (zh) {
 +                    const zhLabels = {
 +                        max_concurrency: '并发槽位 (B/C)',
++                        max_context: '最大上下文长度 (Tokens)',
 +                        rolling_prefix_cache: '滚动前缀缓存',
 +                        prefix_cache_gb: '前缀缓存预算 (GiB)',
++                        prefill_linear_mode: '预填充线性层精度 (BF16 / W4A8)',
++                        prefill_attention_mode: '预填充注意力内核 (Exact NAX / Sage2)',
++                        prefill_sparse_minference: '  ↳ MInference 动态稀疏注意力 (需开启 Sage2)',
++                        prefill_cache_blend: '跨分块非连续 KV 复用 (CacheBlend)',
++                        prefill_ane_offload: '双 ANE 神经网络引擎协同预填充',
 +                        sampling_contract: '采样协议 (Sampling Contract)',
 +                        artifact_path: '权重产物路径 (.miv)',
 +                        draft_artifact_path: '草稿产物路径 (.miv)',
 +                    };
 +                    if (zhLabels[item.key]) return zhLabels[item.key];
 +                }
++                const enLabels = {
++                    max_context: 'Max Context Window',
++                    prefill_linear_mode: 'Prefill Linear Precision',
++                    prefill_attention_mode: 'Prefill Attention Kernel',
++                    prefill_sparse_minference: '  ↳ MInference Sparse Tiles (Sage2)',
++                    prefill_cache_blend: 'Cross-Chunk CacheBlend (RAG)',
++                    prefill_ane_offload: 'Dual-ANE Co-Execution Offload',
++                };
++                if (enLabels[item.key]) return enLabels[item.key];
 +                return item.label || item.key;
++            },
++
++            externalEngineOptionIndented(item) {
++                return Boolean(item && item.key === 'prefill_sparse_minference');
++            },
++
++            externalEngineOptionDisabled(item) {
++                if (!item || item.key !== 'prefill_sparse_minference') return false;
++                const schema = this.externalEngineGeneralOptionsSchema();
++                const attnItem = schema.find(s => s && s.key === 'prefill_attention_mode')
++                    || { key: 'prefill_attention_mode', type: 'enum', default: 'exact_nax' };
++                return this.getExternalEngineOption(attnItem) !== 'sage2';
++            },
++
++            externalEngineOptionTooltip(item) {
++                if (!this.externalEngineOptionDisabled(item)) return '';
++                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
++                return zh
++                    ? '需将「预填充注意力内核」设为 sage2 时生效'
++                    : 'Active when Prefill Attention Kernel is set to sage2';
++            },
++
++            externalEngineOptionContainerClass(item) {
++                const classes = [];
++                if (this.externalEngineOptionIndented(item)) {
++                    classes.push('pl-4', 'border-l-2', 'border-neutral-200');
++                }
++                if (this.externalEngineOptionDisabled(item)) {
++                    classes.push('opacity-50');
++                }
++                return classes.join(' ');
 +            },
 +
 +            externalEngineEnumOptionLabel(item, opt) {
@@ -6251,7 +6297,7 @@ index 62235bb..8e1e643 100644
                  const engines = this.modelSettings.external_engines || [];
                  const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
 diff --git a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
-index 2e9a43b..8e5a4f3 100644
+index 2e9a43b..950e091 100644
 --- a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 +++ b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 @@ -1,3 +1,7 @@
@@ -6543,7 +6589,7 @@ index 2e9a43b..8e5a4f3 100644
                                          ]"
                                          role="switch"
                                          :aria-checked="effectiveExternalEngine() ? 'true' : 'false'"
-@@ -1061,6 +1093,74 @@
+@@ -1061,6 +1093,78 @@
                                  </select>
                                  <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.external_engine_select_hint') }}</p>
                              </div>
@@ -6552,7 +6598,9 @@ index 2e9a43b..8e5a4f3 100644
 +                                 x-cloak x-transition
 +                                 class="pt-3 mt-1 border-t border-neutral-100 space-y-3">
 +                                <template x-for="opt in externalEngineGeneralOptionsSchema()" :key="opt.key">
-+                                    <div class="space-y-1.5">
++                                    <div class="space-y-1.5"
++                                         :class="externalEngineOptionContainerClass(opt)"
++                                         :title="externalEngineOptionTooltip(opt)">
 +                                        <template x-if="opt.type === 'bool'">
 +                                            <div class="flex items-start justify-between gap-3">
 +                                                <div class="min-w-0">
@@ -6560,9 +6608,11 @@ index 2e9a43b..8e5a4f3 100644
 +                                                    <p x-show="opt.description" class="text-xs text-neutral-500 mt-0.5" x-text="opt.description"></p>
 +                                                </div>
 +                                                <button type="button" role="switch"
++                                                        :disabled="externalEngineOptionDisabled(opt)"
++                                                        :aria-disabled="externalEngineOptionDisabled(opt) ? 'true' : 'false'"
 +                                                        :aria-checked="getExternalEngineOption(opt) ? 'true' : 'false'"
-+                                                        @click="setExternalEngineOption(opt, !getExternalEngineOption(opt))"
-+                                                        :class="getExternalEngineOption(opt) ? 'bg-black' : 'bg-neutral-200'"
++                                                        @click="if (!externalEngineOptionDisabled(opt)) setExternalEngineOption(opt, !getExternalEngineOption(opt))"
++                                                        :class="[getExternalEngineOption(opt) ? 'bg-black' : 'bg-neutral-200', externalEngineOptionDisabled(opt) ? 'cursor-not-allowed' : '']"
 +                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
 +                                                    <span :class="getExternalEngineOption(opt) ? 'translate-x-5' : 'translate-x-0'"
 +                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -6618,7 +6668,7 @@ index 2e9a43b..8e5a4f3 100644
                          </div>
  
                          <!-- Trust Remote Code (security-sensitive) -->
-@@ -1087,7 +1187,7 @@
+@@ -1087,7 +1191,7 @@
                               x-show="!modelSettings.is_diffusion_model" x-cloak>
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
@@ -6627,7 +6677,7 @@ index 2e9a43b..8e5a4f3 100644
                                      <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                  </div>
                                  <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
-@@ -1365,25 +1465,47 @@
+@@ -1365,25 +1469,47 @@
  
                          <!-- LoRA Adapter -->
                          <div class="px-4 py-3.5 space-y-2" x-show="!modelSettings.is_diffusion_model" x-cloak>
@@ -6692,7 +6742,7 @@ index 2e9a43b..8e5a4f3 100644
                          </div>
                      </div>
  
-@@ -1779,7 +1901,7 @@
+@@ -1779,7 +1905,7 @@
                              </div>
                              <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                  <div>
@@ -6783,7 +6833,7 @@ index 86dbd45..4cf4072 100644
          await app.saveModelSettings();
          assert.equal(payload.mtp_adaptive_max_depth, depth);
 diff --git a/apps/omlx-web/tests/test_admin_model_settings_template.py b/apps/omlx-web/tests/test_admin_model_settings_template.py
-index d0ed9da..429d76f 100644
+index d0ed9da..3b82da0 100644
 --- a/apps/omlx-web/tests/test_admin_model_settings_template.py
 +++ b/apps/omlx-web/tests/test_admin_model_settings_template.py
 @@ -702,10 +702,39 @@ test('Save sends only fields edited since the modal opened', async () => {
@@ -6827,7 +6877,7 @@ index d0ed9da..429d76f 100644
  test('Apply response cannot replace another model editor', async () => {
      let resolve;
      const state = setup(() => new Promise(r => {resolve=r;}));
-@@ -1059,3 +1088,155 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
+@@ -1059,3 +1088,252 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
      for path in sorted(i18n_dir.glob("*.json")):
          catalog = json.loads(path.read_text())
          assert key in catalog, f"{path.name} is missing {key}"
@@ -6982,6 +7032,103 @@ index d0ed9da..429d76f 100644
 +        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
 +    )
 +    assert result.returncode == 0, result.stdout + result.stderr
++
++
++def test_external_engine_prefill_switches_orthogonality_labels_and_minference_gating():
++    template = _model_settings_template()
++    assert "externalEngineOptionContainerClass(opt)" in template
++    assert "externalEngineOptionDisabled(opt)" in template
++    assert "externalEngineOptionTooltip(opt)" in template
++
++    node = shutil.which("node")
++    if node is None:
++        pytest.skip("Node.js is required to exercise dashboard state")
++    root = Path(__file__).resolve().parents[1]
++    script = (
++        """
++const assert = require('node:assert/strict');
++globalThis.localStorage = {getItem: () => null};
++globalThis.window = {t: key => key};
++globalThis.document = {documentElement: {lang: 'en'}};
++"""
++        + _dashboard_script()
++        + """
++const app = dashboard();
++const m5EngineRow = {
++    id: 'm5rt',
++    provider_id: 'io.ninfer.metal',
++    label: 'miv Core Backend (ninfer-metal)',
++    compatible: true,
++    options_schema: [
++        {key: 'max_context', label: 'Max Context Window', type: 'int', min: 1024, max: 1048576, default: 262144},
++        {key: 'prefill_linear_mode', label: 'Prefill Linear Precision', type: 'enum', options: ['bf16', 'w4a8'], default: 'bf16'},
++        {key: 'prefill_attention_mode', label: 'Prefill Attention Kernel', type: 'enum', options: ['exact_nax', 'sage2'], default: 'exact_nax'},
++        {key: 'prefill_sparse_minference', label: 'MInference Sparse Tiles (Sage2)', type: 'bool', default: false},
++        {key: 'prefill_cache_blend', label: 'Cross-Chunk CacheBlend (RAG)', type: 'bool', default: false},
++        {key: 'prefill_ane_offload', label: 'Dual-ANE Co-Execution Offload', type: 'bool', default: false},
++    ],
++};
++app.modelSettings = app.buildModelSettingsState(
++    {external_engines: [m5EngineRow], auto_external_engine: 'm5rt'},
++    {}
++);
++const opts = Object.fromEntries(app.externalEngineGeneralOptionsSchema().map(o => [o.key, o]));
++
++// EN labels
++assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'Prefill Linear Precision');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Prefill Attention Kernel');
++assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference Sparse Tiles'));
++assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'Cross-Chunk CacheBlend (RAG)');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), 'Dual-ANE Co-Execution Offload');
++
++// ZH labels
++globalThis.document.documentElement.lang = 'zh-CN';
++assert.ok(app.externalEngineOptionLabel(opts.prefill_linear_mode).includes('BF16 / W4A8'));
++assert.ok(app.externalEngineOptionLabel(opts.prefill_attention_mode).includes('Exact NAX / Sage2'));
++assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
++assert.ok(app.externalEngineOptionLabel(opts.prefill_cache_blend).includes('CacheBlend'));
++assert.ok(app.externalEngineOptionLabel(opts.prefill_ane_offload).includes('ANE'));
++globalThis.document.documentElement.lang = 'en';
++
++// When prefill_attention_mode === 'exact_nax', ONLY prefill_sparse_minference is indented & disabled/dimmed
++assert.equal(app.externalEngineOptionIndented(opts.prefill_sparse_minference), true);
++assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), true);
++assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
++assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('pl-4'));
++assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), 'Active when Prefill Attention Kernel is set to sage2');
++
++// All other switches stay 100% independent and never disabled
++for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_cache_blend', 'prefill_ane_offload']) {
++    assert.equal(app.externalEngineOptionDisabled(opts[k]), false);
++    assert.equal(app.externalEngineOptionIndented(opts[k]), false);
++}
++
++// Enabling sage2 enables prefill_sparse_minference; enabling prefill_ane_offload NEVER disables any other switch
++app.setExternalEngineOption(opts.prefill_linear_mode, 'w4a8');
++app.setExternalEngineOption(opts.prefill_attention_mode, 'sage2');
++assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), false);
++assert.ok(!app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
++assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), '');
++
++app.setExternalEngineOption(opts.prefill_sparse_minference, true);
++app.setExternalEngineOption(opts.prefill_cache_blend, true);
++app.setExternalEngineOption(opts.prefill_ane_offload, true);
++app.setExternalEngineOption(opts.max_context, '262144');
++
++const payload = app.buildModelSettingsPayload(app.modelSettings);
++assert.equal(payload.external_engine_options.m5rt.max_context, 262144);
++assert.equal(payload.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
++assert.equal(payload.external_engine_options.m5rt.prefill_attention_mode, 'sage2');
++assert.equal(payload.external_engine_options.m5rt.prefill_sparse_minference, true);
++assert.equal(payload.external_engine_options.m5rt.prefill_cache_blend, true);
++assert.equal(payload.external_engine_options.m5rt.prefill_ane_offload, true);
++"""
++    )
++    result = subprocess.run(
++        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
 +
 diff --git a/docs/admin-api.md b/docs/admin-api.md
 index 83b42a6..9b1ab47 100644
@@ -8256,10 +8403,10 @@ index 7b0e787..e06e4de 100644
          """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..99fee75
+index 0000000..30a0b5b
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7663 @@
+@@ -0,0 +1,7902 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -8456,6 +8603,19 @@ index 0000000..99fee75
 +        "reload_required": True,
 +    },
 +    {
++        "key": "max_context",
++        "label": "Max Context Window",
++        "type": "int",
++        "min": 1024,
++        "max": 1048576,
++        "default": 262144,
++        "description": (
++            "Maximum sequence context length in tokens (supports 256K = 262144 "
++            "and above when model permits)."
++        ),
++        "reload_required": True,
++    },
++    {
 +        "key": "rolling_prefix_cache",
 +        "label": "Rolling Prefix Cache",
 +        "type": "bool",
@@ -8469,6 +8629,68 @@ index 0000000..99fee75
 +        "min": 0,
 +        "max": 128,
 +        "default": 4,
++        "reload_required": True,
++    },
++    {
++        "key": "prefill_linear_mode",
++        "label": "Prefill Linear Precision",
++        "type": "enum",
++        "options": ["bf16", "w4a8"],
++        "option_labels": {
++            "bf16": "BF16 NAX (Default / Exact)",
++            "w4a8": "W4A8 INT8/FP8 TensorOps",
++        },
++        "description": (
++            "Prefill dense linear GEMM precision route (BF16 NAX vs W4A8 INT8/FP8 TensorOps)."
++        ),
++        "default": "bf16",
++        "reload_required": True,
++    },
++    {
++        "key": "prefill_attention_mode",
++        "label": "Prefill Attention Kernel",
++        "type": "enum",
++        "options": ["exact_nax", "sage2"],
++        "option_labels": {
++            "exact_nax": "Exact NAX Flash (Default)",
++            "sage2": "SageAttention2 (INT8 QK + FP8 PV)",
++        },
++        "description": (
++            "Prefill full-attention kernel route (Exact NAX vs SageAttention2 INT8 QK + FP8 PV)."
++        ),
++        "default": "exact_nax",
++        "reload_required": True,
++    },
++    {
++        "key": "prefill_sparse_minference",
++        "label": "MInference Sparse Tiles (Sage2)",
++        "type": "bool",
++        "description": (
++            "Enable MInference vertical-slash dynamic sparse attention tiles when "
++            "prefill_attention_mode is sage2."
++        ),
++        "default": False,
++        "reload_required": True,
++    },
++    {
++        "key": "prefill_cache_blend",
++        "label": "Cross-Chunk CacheBlend (RAG)",
++        "type": "bool",
++        "description": (
++            "Enable cross-chunk non-contiguous RAG KV+GDN cache reuse with ~15% HKVD "
++            "selective recomputation."
++        ),
++        "default": False,
++        "reload_required": True,
++    },
++    {
++        "key": "prefill_ane_offload",
++        "label": "Dual-ANE Co-Execution Offload",
++        "type": "bool",
++        "description": (
++            "Enable Dual-ANE output-channel-split co-execution alongside GPU BF16 or W4A8 prefill."
++        ),
++        "default": False,
 +        "reload_required": True,
 +    },
 +    {
@@ -8562,6 +8784,8 @@ index 0000000..99fee75
 +SUPPORTED_PROTOCOLS = frozenset({1, 2})
 +VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
 +VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
++VALID_PREFILL_LINEAR_MODES = frozenset({"bf16", "w4a8"})
++VALID_PREFILL_ATTENTION_MODES = frozenset({"exact_nax", "sage2"})
 +M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
 +M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
 +M5RT_MAX_REPETITION_CONTEXT_SIZE = 4096
@@ -8905,6 +9129,11 @@ index 0000000..99fee75
 +    max_concurrency: int = 1
 +    kv_dtype: str = "bf16"
 +    prefill_engine: str = "auto"
++    prefill_linear_mode: str = "bf16"
++    prefill_attention_mode: str = "exact_nax"
++    prefill_sparse_minference: bool = False
++    prefill_cache_blend: bool = False
++    prefill_ane_offload: bool = False
 +    sampling_contract: str = M5RT_DEFAULT_SAMPLING_CONTRACT
 +    speculative_backend: str = "none"
 +    speculative_policy: str = "auto"
@@ -8921,6 +9150,36 @@ index 0000000..99fee75
 +    trust_remote_code: bool = False
 +    lora_adapter: str = ""
 +    lora_mode: str = "merge"
++
++    def to_rpc_dict(self) -> dict[str, Any]:
++        """Serialize resolved M5 options for the sidecar `load` RPC payload."""
++        payload: dict[str, Any] = {
++            "max_concurrency": self.max_concurrency,
++            "max_context": self.max_context,
++            "kv_dtype": self.kv_dtype,
++            "prefill_engine": self.prefill_engine,
++            "prefill_linear_mode": self.prefill_linear_mode,
++            "prefill_attention_mode": self.prefill_attention_mode,
++            "prefill_sparse_minference": bool(self.prefill_sparse_minference),
++            "prefill_cache_blend": bool(self.prefill_cache_blend),
++            "prefill_ane_offload": bool(self.prefill_ane_offload),
++            "sampling_contract": self.sampling_contract,
++            "lora_adapter": self.lora_adapter,
++            "lora_mode": self.lora_mode,
++            "speculative": {
++                "backend": self.speculative_backend,
++                "draft_tokens": self.draft_tokens,
++            },
++        }
++        if self.spec_search is not None:
++            payload["spec_search"] = self.spec_search
++        if self.memory_budget_bytes > 0:
++            payload["memory_budget_bytes"] = int(self.memory_budget_bytes)
++        if self.rolling_prefix_cache is not None:
++            payload["rolling_prefix_cache"] = "on" if self.rolling_prefix_cache else "off"
++        if self.path_overrides:
++            payload["path_overrides"] = dict(self.path_overrides)
++        return payload
 +
 +
 +def _executable(path: Path) -> bool:
@@ -9432,6 +9691,28 @@ index 0000000..99fee75
 +            raise ValueError("m5rt_options.lora_adapter must be a string")
 +        cleaned["lora_adapter"] = raw_lora.strip()
 +
++    if "prefill_linear_mode" in options and options.get("prefill_linear_mode") is not None:
++        raw_plm = options.get("prefill_linear_mode")
++        if not isinstance(raw_plm, str) or raw_plm.strip().lower() not in VALID_PREFILL_LINEAR_MODES:
++            raise ValueError(
++                f"m5rt_options.prefill_linear_mode must be one of {sorted(VALID_PREFILL_LINEAR_MODES)}"
++            )
++        cleaned["prefill_linear_mode"] = raw_plm.strip().lower()
++
++    if "prefill_attention_mode" in options and options.get("prefill_attention_mode") is not None:
++        raw_pam = options.get("prefill_attention_mode")
++        if not isinstance(raw_pam, str) or raw_pam.strip().lower() not in VALID_PREFILL_ATTENTION_MODES:
++            raise ValueError(
++                f"m5rt_options.prefill_attention_mode must be one of {sorted(VALID_PREFILL_ATTENTION_MODES)}"
++            )
++        cleaned["prefill_attention_mode"] = raw_pam.strip().lower()
++
++    for bool_key in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
++        if bool_key in options and options.get(bool_key) is not None:
++            parsed = _parse_optional_toggle(options.get(bool_key), f"m5rt_options.{bool_key}")
++            if parsed is not None:
++                cleaned[bool_key] = parsed
++
 +    return cleaned
 +
 +
@@ -9708,6 +9989,11 @@ index 0000000..99fee75
 +            "max_context",
 +            "kv_dtype",
 +            "prefill_engine",
++            "prefill_linear_mode",
++            "prefill_attention_mode",
++            "prefill_sparse_minference",
++            "prefill_cache_blend",
++            "prefill_ane_offload",
 +            "spec_search",
 +            "speculative_backend",
 +            "sampling_contract",
@@ -11422,6 +11708,49 @@ index 0000000..99fee75
 +    return resolved_lora, lora_mode
 +
 +
++def _estimate_shared_kv_pool_bytes(
++    text_cfg: dict[str, Any],
++    kv_dtype: str,
++    max_context: int,
++    max_concurrency: int,
++    *,
++    model_type: str | None = None,
++) -> int:
++    """Estimate shared `KvPagePool` base allocation matching `native_backend.cpp`."""
++    eff_kv_dtype = str(kv_dtype or "").strip().lower()
++    if eff_kv_dtype in ("", "auto"):
++        mt = str(model_type or text_cfg.get("model_type") or "").strip().lower()
++        eff_kv_dtype = "affine4_g128" if mt in M5RT_SUPPORTED_MODEL_TYPES else "bf16"
++    layer_types = text_cfg.get("layer_types") or []
++    full_layers = sum(1 for k in layer_types if k == "full_attention")
++    if not full_layers:
++        num_layers = int(text_cfg.get("num_hidden_layers") or 0)
++        interval = max(1, int(text_cfg.get("full_attention_interval") or 1))
++        full_layers = num_layers // interval
++    kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
++    head_dim = int(text_cfg.get("head_dim") or 128)
++    if full_layers <= 0 or kv_heads <= 0 or head_dim <= 0 or max_context <= 0:
++        return 0
++    page_tokens = 64
++    logical_pages = (int(max_context) + page_tokens - 1) // page_tokens
++    b_slots = max(1, int(max_concurrency))
++    if b_slots > 1:
++        physical_pages = min(
++            logical_pages * b_slots + b_slots,
++            max(logical_pages + 8 * b_slots, 1088),
++        )
++        physical_pages = max(physical_pages, logical_pages + 1)
++    else:
++        physical_pages = logical_pages + 1
++    if eff_kv_dtype == "affine4_g128":
++        vec_bytes = (head_dim // 2) + 16
++        head_bytes = page_tokens * vec_bytes + 32
++        kv_page_b = kv_heads * head_bytes
++    else:
++        kv_page_b = page_tokens * kv_heads * head_dim * 2
++    return physical_pages * full_layers * 2 * kv_page_b
++
++
 +def m5rt_memory_estimate(
 +    model_path: str | Path,
 +    target: M5Target,
@@ -11452,7 +11781,9 @@ index 0000000..99fee75
 +    )
 +    if target.fake:
 +        return 64 * 1024**2 + lora_bytes
-+    text_cfg = _text_config(_read_json(mdir / "config.json") or {})
++    raw_cfg = _read_json(mdir / "config.json") or {}
++    text_cfg = _text_config(raw_cfg)
++    model_type = str(raw_cfg.get("model_type") or text_cfg.get("model_type") or "").strip().lower()
 +    vocab_size = max(256, int(text_cfg.get("vocab_size") or 248320))
 +
 +    if target.artifact_path is not None:
@@ -11479,9 +11810,18 @@ index 0000000..99fee75
 +        draft = int(draft_st * 1.01) if draft_st > 0 else 0
 +    else:
 +        draft = 0
-+    kv = _kv_bytes_per_token(text_cfg, plan.kv_dtype) * plan.max_context * plan.max_concurrency
++    kv = _estimate_shared_kv_pool_bytes(
++        text_cfg,
++        plan.kv_dtype,
++        plan.max_context,
++        plan.max_concurrency,
++        model_type=model_type,
++    )
 +    workspace = max(64 * 1024**2, 1024 * vocab_size * 2 * plan.max_concurrency)
 +    return weights + draft + kv + workspace + plan.prefix_cache_bytes + lora_bytes
++
++
++estimate_m5rt_memory_bytes = m5rt_memory_estimate
 +
 +
 +def _safe_lora_fingerprint(
@@ -11708,7 +12048,10 @@ index 0000000..99fee75
 +    native_ctx = int(native_ctx_raw) if native_ctx_raw else max(32768, int(configured_ctx or 32768))
 +    max_context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
 +    policy = getattr(getattr(global_settings, "sampling", None), "max_context_window_policy", None)
-+    if not getattr(model_settings, "max_context_window", None) and policy:
++    has_explicit_model_ctx = bool(getattr(model_settings, "max_context_window", None)) or (
++        explicit_opts.get("max_context") is not None
++    )
++    if not has_explicit_model_ctx and policy:
 +        max_context = max(1024, min(max_context, int(policy)))
 +
 +    max_concurrency = _resolve_effective_concurrency(opts, global_settings)
@@ -11801,11 +12144,55 @@ index 0000000..99fee75
 +    batch_mode = _parse_optional_toggle(
 +        raw_batch_mode, f"{eff_engine_id}.batch_mode"
 +    )
++
++    raw_linear_mode = str(opts.get("prefill_linear_mode") or "bf16").strip().lower()
++    if raw_linear_mode not in VALID_PREFILL_LINEAR_MODES:
++        raise ValueError(
++            f"{eff_engine_id}.prefill_linear_mode must be one of {sorted(VALID_PREFILL_LINEAR_MODES)}"
++        )
++    raw_attn_mode = str(opts.get("prefill_attention_mode") or "exact_nax").strip().lower()
++    if raw_attn_mode not in VALID_PREFILL_ATTENTION_MODES:
++        raise ValueError(
++            f"{eff_engine_id}.prefill_attention_mode must be one of {sorted(VALID_PREFILL_ATTENTION_MODES)}"
++        )
++    prefill_sparse_minference = bool(
++        _parse_optional_toggle(
++            opts.get("prefill_sparse_minference"),
++            f"{eff_engine_id}.prefill_sparse_minference",
++        )
++        or False
++    )
++    prefill_cache_blend = bool(
++        _parse_optional_toggle(
++            opts.get("prefill_cache_blend"),
++            f"{eff_engine_id}.prefill_cache_blend",
++        )
++        or False
++    )
++    prefill_ane_offload = False
++    for layer in (explicit_opts, model_toml, shared_toml):
++        if layer.get("prefill_ane_offload") is not None:
++            prefill_ane_offload = bool(
++                _parse_optional_toggle(
++                    layer.get("prefill_ane_offload"),
++                    f"{eff_engine_id}.prefill_ane_offload",
++                )
++            )
++            break
++        if str(layer.get("prefill_engine") or "").strip().lower() == "nax_ane":
++            prefill_ane_offload = True
++            break
++
 +    return M5Options(
 +        max_context=max_context,
 +        max_concurrency=max_concurrency,
 +        kv_dtype=kv_dtype,
 +        prefill_engine=str(opts.get("prefill_engine") or "auto"),
++        prefill_linear_mode=raw_linear_mode,
++        prefill_attention_mode=raw_attn_mode,
++        prefill_sparse_minference=prefill_sparse_minference,
++        prefill_cache_blend=prefill_cache_blend,
++        prefill_ane_offload=prefill_ane_offload,
 +        sampling_contract=str(opts.get("sampling_contract") or (
 +            M5RT_DEFAULT_SAMPLING_CONTRACT if is_miv else "legacy_rejection_v1"
 +        )),
@@ -13223,6 +13610,11 @@ index 0000000..99fee75
 +                "max_context": opts.max_context,
 +                "kv_dtype": opts.kv_dtype,
 +                "prefill_engine": opts.prefill_engine,
++                "prefill_linear_mode": opts.prefill_linear_mode,
++                "prefill_attention_mode": opts.prefill_attention_mode,
++                "prefill_sparse_minference": bool(opts.prefill_sparse_minference),
++                "prefill_cache_blend": bool(opts.prefill_cache_blend),
++                "prefill_ane_offload": bool(opts.prefill_ane_offload),
 +                "sampling_contract": "legacy_rejection_v1",
 +                "lora_adapter": opts.lora_adapter,
 +                "lora_mode": opts.lora_mode,
@@ -13303,13 +13695,7 @@ index 0000000..99fee75
 +        payload: dict[str, Any] = {
 +            "model_dir": str(self._path),
 +            "draft_dir": str(self._target.draft_dir) if self._target.draft_dir else "",
-+            "max_concurrency": opts.max_concurrency,
-+            "max_context": opts.max_context,
-+            "kv_dtype": opts.kv_dtype,
-+            "prefill_engine": opts.prefill_engine,
-+            "sampling_contract": opts.sampling_contract,
-+            "lora_adapter": opts.lora_adapter,
-+            "lora_mode": opts.lora_mode,
++            **opts.to_rpc_dict(),
 +            "speculative": {
 +                "backend": spec_backend,
 +                "draft_tokens": draft_tokens,
@@ -19387,10 +19773,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..1908370
+index 0000000..fa87009
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4318 @@
+@@ -0,0 +1,4567 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -22292,11 +22678,16 @@ index 0000000..1908370
 +            model_id="Qwen3.8-SharedDefault",
 +        )
 +        assert opts.max_concurrency == 4
-+        assert opts.max_context == 65536
++        assert opts.max_context == 262144
 +        assert opts.kv_dtype == "affine4_g128"
 +        assert opts.rolling_prefix_cache is True
 +        assert opts.prefix_cache_bytes == 4 * (1 << 30)
 +        assert opts.sampling_contract == "position_coupled_v1"
++        assert opts.prefill_linear_mode == "bf16"
++        assert opts.prefill_attention_mode == "exact_nax"
++        assert opts.prefill_sparse_minference is False
++        assert opts.prefill_cache_blend is False
++        assert opts.prefill_ane_offload is False
 +        # speculative.backend = "auto" on plain model resolves cleanly to "none" without error
 +        assert opts.speculative_backend == "none"
 +        assert opts.draft_tokens == 0
@@ -23708,6 +24099,250 @@ index 0000000..1908370
 +        mtp_dir, t_mtp, ModelSettings(), default_context=65536, memory_budget_bytes=0
 +    )
 +    assert p_mtp.speculative_backend == "mtp"
++
++
++def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
++    tmp_path: Path, monkeypatch
++):
++    monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
++    monkeypatch.delenv("NINFER_METAL_CONFIG", raising=False)
++
++    schema_by_key = {item["key"]: item for item in m5_mod.M5RT_DEFAULT_OPTIONS_SCHEMA}
++    assert schema_by_key["max_context"]["max"] >= 262144
++    assert schema_by_key["max_context"]["default"] == 262144
++    assert schema_by_key["prefill_linear_mode"]["options"] == ["bf16", "w4a8"]
++    assert schema_by_key["prefill_linear_mode"]["default"] == "bf16"
++    assert schema_by_key["prefill_attention_mode"]["options"] == ["exact_nax", "sage2"]
++    assert schema_by_key["prefill_attention_mode"]["default"] == "exact_nax"
++    for bkey in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
++        assert schema_by_key[bkey]["type"] == "bool"
++        assert schema_by_key[bkey]["default"] is False
++
++    model_dir = _write_test_model(tmp_path / "Qwen3.8-27B-SPI")
++    cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
++    cfg["model_type"] = "qwen3_8"
++    cfg["text_config"]["max_position_embeddings"] = 262144
++    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
++
++    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
++    binary, err = find_m5rt_binary(str(fake_bin))
++    assert binary is not None and err == ""
++    target = M5Target(
++        binary=binary,
++        artifact_path=model_dir / "model.omlxm5",
++        metallib_dir=tmp_path / "bin",
++        fake=False,
++    )
++
++    combos = 0
++    seen_sigs = set()
++    for lm in ("bf16", "w4a8"):
++        for am in ("exact_nax", "sage2"):
++            for sp in (False, True):
++                for cb in (False, True):
++                    for ane in (False, True):
++                        combos += 1
++                        raw = {
++                            "max_context": 262144,
++                            "prefill_linear_mode": lm,
++                            "prefill_attention_mode": am,
++                            "prefill_sparse_minference": sp,
++                            "prefill_cache_blend": cb,
++                            "prefill_ane_offload": ane,
++                        }
++                        validated = m5_mod.validate_m5rt_options(raw)
++                        assert validated is not None
++                        assert validated["prefill_linear_mode"] == lm
++                        assert validated["prefill_attention_mode"] == am
++                        assert validated["prefill_sparse_minference"] is sp
++                        assert validated["prefill_cache_blend"] is cb
++                        assert validated["prefill_ane_offload"] is ane
++
++                        ms = ModelSettings(
++                            external_engine=M5RT_ENGINE_ID,
++                            external_engine_options={M5RT_ENGINE_ID: raw},
++                        )
++                        plan = m5_mod.build_m5rt_options(
++                            model_dir,
++                            target,
++                            ms,
++                            default_context=32768,
++                            memory_budget_bytes=0,
++                        )
++                        assert plan.max_context == 262144
++                        assert plan.prefill_linear_mode == lm
++                        assert plan.prefill_attention_mode == am
++                        assert plan.prefill_sparse_minference is sp
++                        assert plan.prefill_cache_blend is cb
++                        assert plan.prefill_ane_offload is ane
++
++                        rpc = plan.to_rpc_dict()
++                        assert rpc["prefill_linear_mode"] == lm
++                        assert rpc["prefill_attention_mode"] == am
++                        assert rpc["prefill_sparse_minference"] is sp
++                        assert rpc["prefill_cache_blend"] is cb
++                        assert rpc["prefill_ane_offload"] is ane
++
++                        eng = M5SidecarEngine(
++                            str(model_dir), "spi-test", target, tmp_path / "logs", plan
++                        )
++                        load_params = eng._build_load_params()
++                        assert load_params["prefill_linear_mode"] == lm
++                        assert load_params["prefill_attention_mode"] == am
++                        assert load_params["prefill_sparse_minference"] is sp
++                        assert load_params["prefill_cache_blend"] is cb
++                        assert load_params["prefill_ane_offload"] is ane
++
++                        sig = m5_mod.m5rt_runtime_signature(
++                            ms,
++                            None,
++                            model_path=model_dir,
++                            target=target,
++                            default_context=32768,
++                        )
++                        seen_sigs.add(json.dumps(sig, sort_keys=True))
++
++    assert combos == 32
++    assert len(seen_sigs) == 32
++
++    # Invalid values must raise ValueError
++    with pytest.raises(ValueError, match="prefill_linear_mode"):
++        m5_mod.validate_m5rt_options({"prefill_linear_mode": "int4"})
++    with pytest.raises(ValueError, match="prefill_attention_mode"):
++        m5_mod.validate_m5rt_options({"prefill_attention_mode": "flash2"})
++
++    # Legacy prefill_engine = "nax_ane" shim maps prefill_ane_offload=True
++    # WITHOUT touching w4a8 / sage2 / minference / cache_blend!
++    ms_legacy = ModelSettings(
++        external_engine=M5RT_ENGINE_ID,
++        external_engine_options={
++            M5RT_ENGINE_ID: {
++                "prefill_engine": "nax_ane",
++                "prefill_linear_mode": "w4a8",
++                "prefill_attention_mode": "sage2",
++                "prefill_sparse_minference": True,
++                "prefill_cache_blend": True,
++            }
++        },
++    )
++    plan_legacy = m5_mod.build_m5rt_options(
++        model_dir, target, ms_legacy, default_context=32768, memory_budget_bytes=0
++    )
++    assert plan_legacy.prefill_ane_offload is True
++    assert plan_legacy.prefill_linear_mode == "w4a8"
++    assert plan_legacy.prefill_attention_mode == "sage2"
++    assert plan_legacy.prefill_sparse_minference is True
++    assert plan_legacy.prefill_cache_blend is True
++
++    # Explicit prefill_ane_offload=False beats legacy prefill_engine="nax_ane"
++    ms_override = ModelSettings(
++        external_engine=M5RT_ENGINE_ID,
++        external_engine_options={
++            M5RT_ENGINE_ID: {
++                "prefill_engine": "nax_ane",
++                "prefill_ane_offload": False,
++                "prefill_linear_mode": "w4a8",
++            }
++        },
++    )
++    plan_override = m5_mod.build_m5rt_options(
++        model_dir, target, ms_override, default_context=32768, memory_budget_bytes=0
++    )
++    assert plan_override.prefill_ane_offload is False
++    assert plan_override.prefill_linear_mode == "w4a8"
++
++
++def test_m4a_c5_max_context_policy_unclamping_and_c6_shared_kv_memory_estimate(
++    tmp_path: Path, monkeypatch
++):
++    monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
++    monkeypatch.delenv("NINFER_METAL_CONFIG", raising=False)
++
++    # Qwen3.8-27B geometry: 48 GDN + 16 Full-Attn, 4 KV heads, head_dim=256, 256K native ctx
++    model_dir = _write_test_model(tmp_path / "Qwen3.8-27B-256K")
++    cfg = {
++        "model_type": "qwen3_8",
++        "text_config": {
++            "model_type": "qwen3_8",
++            "max_position_embeddings": 262144,
++            "num_hidden_layers": 64,
++            "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 16,
++            "num_key_value_heads": 4,
++            "head_dim": 256,
++            "vocab_size": 248320,
++        },
++    }
++    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
++
++    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
++    binary, _ = find_m5rt_binary(str(fake_bin))
++    assert binary is not None
++    target = M5Target(
++        binary=binary,
++        artifact_path=model_dir / "model.omlxm5",
++        metallib_dir=tmp_path / "bin",
++        fake=False,
++    )
++
++    # C5: global max_context_window_policy MUST NOT clamp explicit ext_opts["max_context"]
++    gs = GlobalSettings(base_path=tmp_path / "base")
++    gs.sampling.max_context_window_policy = 32768
++
++    ms_explicit_ext = ModelSettings(
++        external_engine=M5RT_ENGINE_ID,
++        external_engine_options={M5RT_ENGINE_ID: {"max_context": 262144}},
++    )
++    plan_ext = m5_mod.build_m5rt_options(
++        model_dir,
++        target,
++        ms_explicit_ext,
++        default_context=32768,
++        memory_budget_bytes=0,
++        global_settings=gs,
++    )
++    assert plan_ext.max_context == 262144
++
++    # When neither max_context_window nor ext_opts["max_context"] is set, policy still clamps
++    plan_clamped = m5_mod.build_m5rt_options(
++        model_dir,
++        target,
++        ModelSettings(),
++        default_context=262144,
++        memory_budget_bytes=0,
++        global_settings=gs,
++    )
++    assert plan_clamped.max_context == 32768
++
++    # C6: estimate_m5rt_memory_bytes resolves "auto" -> "affine4_g128" for Qwen3.8
++    # and uses shared KvPagePool page count (4128 pages at 262144, B=4 -> ~4.55 GiB KV),
++    # NOT B * max_context * bf16 (~64 GiB)!
++    plan_auto = m5_mod.M5Options(
++        max_context=262144,
++        max_concurrency=4,
++        kv_dtype="auto",
++        prefix_cache_bytes=0,
++    )
++    plan_aff4 = m5_mod.M5Options(
++        max_context=262144,
++        max_concurrency=4,
++        kv_dtype="affine4_g128",
++        prefix_cache_bytes=0,
++    )
++    est_auto = m5_mod.estimate_m5rt_memory_bytes(
++        model_dir, target, 262144, plan=plan_auto
++    )
++    est_aff4 = m5_mod.estimate_m5rt_memory_bytes(
++        model_dir, target, 262144, plan=plan_aff4
++    )
++    assert est_auto == est_aff4
++
++    # Exact shared KvPagePool formula: 4128 * 1,183,744 = 4,886,495,232 (~4.55 GiB)
++    expected_kv = 4128 * 1183744
++    weights_sz = (model_dir / "model.omlxm5").stat().st_size
++    expected_ws = max(64 * 1024**2, 1024 * 248320 * 2 * 4)
++    assert est_auto == weights_sz + expected_kv + expected_ws
++    assert est_auto < 10 * (1 << 30)  # Far below old 64 GiB bf16*B overestimate!
++
 +
 diff --git a/tests/test_microkernel_manager.py b/tests/test_microkernel_manager.py
 new file mode 100644

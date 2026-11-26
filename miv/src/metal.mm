@@ -516,6 +516,7 @@ public:
   std::unordered_map<std::string, std::shared_ptr<PipelineEntry>> pipelines;
   std::unordered_map<std::string, CommandPlanCacheEntry> command_plans;
   MetalRegistryStats stats;
+  std::string last_classic_async_error;
   std::atomic<std::uint64_t> next_event_value{0};
 };
 
@@ -614,6 +615,10 @@ std::uint64_t MetalBuffer::size() const {
 
 std::uint64_t MetalBuffer::gpu_address() const {
   return impl_ == nullptr ? 0 : impl_->buffer.gpuAddress;
+}
+
+void *MetalBuffer::native_mtl_buffer() const noexcept {
+  return impl_ == nullptr ? nullptr : (__bridge void *)impl_->buffer;
 }
 
 std::vector<std::byte> MetalBuffer::read(std::uint64_t offset,
@@ -3501,14 +3506,241 @@ GpuTiming MetalContext::submit_barrier() const {
           }
           [encoder endEncoding];
         });
+    std::string async_err;
     {
       std::scoped_lock lock(state.mutex);
       ++state.stats.command_buffers_submitted;
       ++state.stats.classic_command_buffers_submitted;
       state.stats.last_shared_event_value =
           std::max(state.stats.last_shared_event_value, submitted.event_value);
+      if (!state.last_classic_async_error.empty()) {
+        async_err = std::move(state.last_classic_async_error);
+        state.last_classic_async_error.clear();
+      }
+    }
+    if (!async_err.empty()) {
+      throw std::runtime_error("Metal classic async submission failed: " +
+                               async_err);
     }
     return submitted.timing;
+  }
+}
+
+GpuTiming MetalContext::submit_classic_barrier() const {
+  auto &state = *impl_->state;
+  @autoreleasepool {
+    const auto submitted = submit_classic_work(
+        state, @"omlx_m5.classic.barrier", true,
+        "Metal classic barrier allocation failed",
+        "Metal classic barrier failed: ",
+        [&](id<MTLCommandBuffer> command_buffer) {
+          id<MTLBlitCommandEncoder> encoder =
+              [command_buffer blitCommandEncoder];
+          if (encoder == nil) {
+            std::scoped_lock lock(state.mutex);
+            ++state.stats.submission_failures;
+            throw std::runtime_error("Metal classic barrier allocation failed");
+          }
+          [encoder endEncoding];
+        });
+    std::string async_err;
+    {
+      std::scoped_lock lock(state.mutex);
+      ++state.stats.command_buffers_submitted;
+      ++state.stats.classic_command_buffers_submitted;
+      state.stats.last_shared_event_value =
+          std::max(state.stats.last_shared_event_value, submitted.event_value);
+      if (!state.last_classic_async_error.empty()) {
+        async_err = std::move(state.last_classic_async_error);
+        state.last_classic_async_error.clear();
+      }
+    }
+    if (!async_err.empty()) {
+      throw std::runtime_error("Metal classic async submission failed: " +
+                               async_err);
+    }
+    return submitted.timing;
+  }
+}
+
+void *MetalContext::native_mtl_device() const noexcept {
+  return (impl_ == nullptr || impl_->state == nullptr)
+             ? nullptr
+             : (__bridge void *)impl_->state->device;
+}
+
+void *MetalContext::native_mtl_command_queue() const noexcept {
+  return (impl_ == nullptr || impl_->state == nullptr)
+             ? nullptr
+             : (__bridge void *)impl_->state->queue;
+}
+
+std::uint64_t MetalContext::encode_into_command_buffer(
+    void *mtl_command_buffer,
+    std::span<const MetalCommandInvocation> invocations) const {
+  if (mtl_command_buffer == nullptr) {
+    throw std::invalid_argument("Metal command buffer pointer is null");
+  }
+  if (invocations.empty()) {
+    return 0;
+  }
+  std::vector<Impl::ResourceBindingMap> invocation_resources;
+  invocation_resources.reserve(invocations.size());
+  std::set<const MetalParameterTable::Impl *> locked_parameter_tables;
+  std::vector<std::unique_lock<std::mutex>> parameter_locks;
+  parameter_locks.reserve(invocations.size());
+  std::uint64_t total_dispatches = 0;
+  for (const auto &invocation : invocations) {
+    if (invocation.plan == nullptr || invocation.plan->impl_ == nullptr ||
+        invocation.plan->impl_->owner.get() != impl_->state.get()) {
+      throw std::invalid_argument(
+          "Metal command plan belongs to another context");
+    }
+    const auto requires_parameters =
+        std::ranges::any_of(invocation.plan->impl_->descriptor.dispatches,
+                            [](const MetalDispatchDescriptor &dispatch) {
+                              return !dispatch.dynamic_arguments.empty();
+                            });
+    if (requires_parameters &&
+        (invocation.parameters == nullptr ||
+         invocation.parameters->impl_ == nullptr ||
+         invocation.parameters->impl_->owner.get() != impl_->state.get())) {
+      throw std::invalid_argument(
+          "Metal parameter table is missing or foreign");
+    }
+    if (requires_parameters &&
+        locked_parameter_tables.insert(invocation.parameters->impl_.get())
+            .second) {
+      parameter_locks.emplace_back(invocation.parameters->impl_->mutex);
+    }
+    auto resources = Impl::validate_dispatch_bindings(
+        *impl_->state->ledger, *invocation.plan->impl_, invocation.bindings,
+        requires_parameters ? &invocation.parameters->impl_->buffer : nullptr,
+        "Metal encode", true);
+    total_dispatches += invocation.plan->impl_->descriptor.dispatches.size();
+    invocation_resources.push_back(std::move(resources));
+  }
+
+  auto &state = *impl_->state;
+  @autoreleasepool {
+    id<MTLCommandBuffer> command_buffer =
+        (__bridge id<MTLCommandBuffer>)mtl_command_buffer;
+    for (std::size_t invocation_index = 0;
+         invocation_index < invocations.size(); ++invocation_index) {
+      const auto &invocation = invocations[invocation_index];
+      const auto &resources = invocation_resources[invocation_index];
+      for (std::size_t index = 0;
+           index < invocation.plan->impl_->descriptor.dispatches.size();
+           ++index) {
+        const auto &dispatch =
+            invocation.plan->impl_->descriptor.dispatches[index];
+        id<MTLComputeCommandEncoder> encoder =
+            [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+          std::scoped_lock lock(state.mutex);
+          ++state.stats.submission_failures;
+          throw std::runtime_error("Metal compute encoder allocation failed");
+        }
+        [encoder setComputePipelineState:invocation.plan->impl_
+                                             ->pipelines[index]
+                                             ->pipeline];
+        for (const auto &resource : dispatch.resources) {
+          const auto *selected = resources.at(resource.resource_slot);
+          [encoder setBuffer:selected->buffer->impl_->buffer
+                      offset:checked_ns_integer(selected->offset,
+                                                "buffer offset")
+                     atIndex:resource.argument_index];
+        }
+        for (const auto &argument :
+             invocation.plan->impl_->stable_arguments[index]) {
+          [encoder setBuffer:argument.buffer.impl_->buffer
+                      offset:0
+                     atIndex:argument.argument_index];
+        }
+        for (const auto &argument : dispatch.dynamic_arguments) {
+          [encoder setBuffer:invocation.parameters->impl_->buffer.impl_->buffer
+                      offset:checked_ns_integer(argument.parameter_offset,
+                                                "parameter offset")
+                     atIndex:argument.argument_index];
+        }
+        if (dispatch.kind == MetalDispatchKind::threads) {
+          [encoder dispatchThreads:make_mtl_size(dispatch.grid, "dispatch grid")
+              threadsPerThreadgroup:make_mtl_size(
+                                        dispatch.threads_per_threadgroup,
+                                        "threads per threadgroup")];
+        } else if (dispatch.kind == MetalDispatchKind::threadgroups_indirect) {
+          const auto *ind =
+              resources.at(dispatch.indirect_grid_resource_slot);
+          const auto ind_off = checked_ns_integer(
+              checked_add(ind->offset, dispatch.indirect_grid_offset,
+                          "indirect grid offset"),
+              "indirect grid offset");
+          [encoder dispatchThreadgroupsWithIndirectBuffer:ind->buffer->impl_
+                                                              ->buffer
+                                     indirectBufferOffset:ind_off
+                                    threadsPerThreadgroup:
+                                        make_mtl_size(
+                                            dispatch.threads_per_threadgroup,
+                                            "threads per threadgroup")];
+        } else {
+          [encoder
+               dispatchThreadgroups:make_mtl_size(dispatch.grid,
+                                                  "dispatch grid")
+              threadsPerThreadgroup:make_mtl_size(
+                                        dispatch.threads_per_threadgroup,
+                                        "threads per threadgroup")];
+        }
+        [encoder endEncoding];
+      }
+    }
+  }
+  {
+    std::scoped_lock lock(state.mutex);
+    state.stats.dispatches_submitted += total_dispatches;
+  }
+  return total_dispatches;
+}
+
+std::uint64_t MetalContext::submit_classic_async(
+    std::span<const MetalCommandInvocation> invocations) const {
+  if (invocations.empty()) {
+    return 0;
+  }
+  auto &state = *impl_->state;
+  @autoreleasepool {
+    id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
+    if (command_buffer == nil) {
+      std::scoped_lock lock(state.mutex);
+      ++state.stats.submission_failures;
+      throw std::runtime_error("Metal async command buffer allocation failed");
+    }
+    command_buffer.label = to_ns_string(
+        invocations.size() == 1
+            ? invocations.front().plan->impl_->descriptor.key + ".async"
+            : "omlx_m5.classic_async." + std::to_string(invocations.size()));
+    const auto dispatches =
+        encode_into_command_buffer((__bridge void *)command_buffer, invocations);
+    auto state_shared = impl_->state;
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+      if (completed.status == MTLCommandBufferStatusError) {
+        std::scoped_lock lock(state_shared->mutex);
+        ++state_shared->stats.submission_failures;
+        if (state_shared->last_classic_async_error.empty()) {
+          state_shared->last_classic_async_error =
+              ns_string([completed.error localizedDescription]);
+        }
+      }
+    }];
+    {
+      std::scoped_lock submission_lock(state.submission_mutex);
+      [command_buffer commit];
+    }
+    {
+      std::scoped_lock lock(state.mutex);
+      ++state.stats.command_buffers_submitted;
+      ++state.stats.classic_command_buffers_submitted;
+    }
+    return dispatches;
   }
 }
 

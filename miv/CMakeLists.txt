@@ -131,6 +131,7 @@ target_compile_options(
 target_link_libraries(
   omlx_m5_core_runtime
   PUBLIC
+  "-framework IOSurface"
   "-framework CoreFoundation"
   "-framework Foundation"
   "-framework IOKit"
@@ -2789,36 +2790,6 @@ target_include_directories(
   ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
 target_compile_options(
   omlx_m5_prefill_switches_spi_tests
-# Module 4b: Native Dual-ANE Fixed-Chunk Output-Channel-Split Co-Execution Engine
-omlx_m5_compile_metallib(
-  omlx_m5_ane_pack_unpack_metallib
-  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ane_pack_unpack.metal"
-  "omlx_m5_ane_pack_unpack.metallib"
-  "15.0")
-
-add_library(
-  omlx_m5_ane_dual_offload
-  STATIC
-  src/ane/ane_dual_offload.mm)
-target_include_directories(
-  omlx_m5_ane_dual_offload
-  PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  PRIVATE
-  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
-target_compile_features(omlx_m5_ane_dual_offload PUBLIC cxx_std_20)
-target_compile_options(
-  omlx_m5_ane_dual_offload
-# Module 5: Full-Matrix Prefill / PPL / Logits Benchmark Helper
-add_executable(
-  omlx_m5_prefill_matrix_bench
-  apps/prefill_matrix_bench.cpp)
-target_include_directories(
-  omlx_m5_prefill_matrix_bench
-  SYSTEM PRIVATE
-  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
-target_compile_options(
-  omlx_m5_prefill_matrix_bench
   PRIVATE
   -Wall
   -Wextra
@@ -2826,7 +2797,6 @@ target_compile_options(
   -Werror)
 target_link_libraries(
   omlx_m5_prefill_switches_spi_tests
-  omlx_m5_prefill_matrix_bench
   PRIVATE
   omlx_m5_serve_lib
   omlx_m5_core_runtime)
@@ -2838,6 +2808,7 @@ add_test(
   COMMAND
     $<TARGET_FILE:omlx_m5_prefill_switches_spi_tests>
     $<TARGET_FILE:mseries_backendd>)
+
 # Module 1: Route A W4A8 Dense & MoE Metal 4 NAX kernels & standalone verification tests.
 if(OMLX_M5_BUILD_NAX_METALLIB AND
    OMLX_M5_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 27.0)
@@ -2880,20 +2851,33 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       "${OMLX_M5_METAL_OUTPUT_DIR}")
   endif()
 endif()
-  -Werror
-  "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+
+# Module 4b: Native Dual-ANE Fixed-Chunk Output-Channel-Split Co-Execution Engine
+omlx_m5_compile_metallib(
+  omlx_m5_ane_pack_unpack_metallib
+  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ane_pack_unpack.metal"
+  "omlx_m5_ane_pack_unpack.metallib"
+  "15.0")
+add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_ane_pack_unpack_metallib)
+
+target_sources(
+  omlx_m5_core_runtime
+  PRIVATE
+  src/ane/ane_dual_offload.mm)
+target_include_directories(
+  omlx_m5_core_runtime
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_library(omlx_m5_ane_dual_offload INTERFACE)
+target_include_directories(
+  omlx_m5_ane_dual_offload
+  INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(
   omlx_m5_ane_dual_offload
-  PUBLIC
-  omlx_m5_core_runtime
-  "-framework IOSurface"
-  "-framework CoreFoundation"
-  "-framework Foundation"
-  "-framework IOKit"
-  "-framework Metal")
-add_dependencies(
-  omlx_m5_ane_dual_offload
-  omlx_m5_ane_pack_unpack_metallib)
+  INTERFACE
+  omlx_m5_core_runtime)
 
 add_executable(
   omlx_m5_ane_dual_offload_tests
@@ -2925,6 +2909,7 @@ add_test(
   COMMAND
     $<TARGET_FILE:omlx_m5_ane_dual_offload_tests>
     "${OMLX_M5_METAL_OUTPUT_DIR}")
+
 # Module 3: Hybrid 48-GDN + 16-Full-Attn Cross-Chunk Reuse (`GDN-CacheBlend`).
 target_sources(
   omlx_m5_core_runtime
@@ -2973,5 +2958,63 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       $<TARGET_FILE:omlx_m5_cache_blend_hybrid_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
 endif()
+
+# Module 5: Full-Matrix Prefill / PPL / Logits Benchmark Helper
+add_executable(
+  omlx_m5_prefill_matrix_bench
+  apps/prefill_matrix_bench.cpp)
+target_include_directories(
+  omlx_m5_prefill_matrix_bench
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(
+  omlx_m5_prefill_matrix_bench
+  SYSTEM PRIVATE
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(
+  omlx_m5_prefill_matrix_bench
+  PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror)
+target_link_libraries(
+  omlx_m5_prefill_matrix_bench
+  PRIVATE
+  omlx_m5_serve_lib
+  omlx_m5_core_runtime)
+add_dependencies(
   omlx_m5_prefill_matrix_bench
   omlx_m5_qwen_forward_resources)
+
+# Wave 2: Unified End-to-End All-Modes Prefill Integration Test
+if(OMLX_M5_BUILD_NAX_METALLIB AND
+   OMLX_M5_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 27.0)
+  add_executable(
+    omlx_m5_prefill_all_modes_e2e_tests
+    tests/prefill_all_modes_e2e_tests.cpp)
+  target_include_directories(
+    omlx_m5_prefill_all_modes_e2e_tests
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+  target_compile_options(
+    omlx_m5_prefill_all_modes_e2e_tests
+    PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror)
+  target_link_libraries(
+    omlx_m5_prefill_all_modes_e2e_tests
+    PRIVATE
+    omlx_m5_core_runtime)
+  add_dependencies(
+    omlx_m5_prefill_all_modes_e2e_tests
+    omlx_m5_qwen_forward_resources)
+  add_test(
+    NAME omlx_m5_prefill_all_modes_e2e
+    COMMAND
+      $<TARGET_FILE:omlx_m5_prefill_all_modes_e2e_tests>
+      "${OMLX_M5_METAL_OUTPUT_DIR}")
+endif()

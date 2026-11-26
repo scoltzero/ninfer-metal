@@ -15,15 +15,45 @@
 #include "omlx_m5/materialization.h"
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/row_exact.h"
+#include "omlx_m5/types.h"
 #include "omlx_m5/vocab.h"
 #include "omlx_m5/attention.h"
 
 namespace omlx::m5 {
 
+namespace detail {
+class ChunkBlendCache;
+struct BlendSegmentConfig;
+} // namespace detail
+
 class KvPagePool;
 class QwenForward;
 struct QwenMergedLoraOverrides;
 struct QwenBypassLoraRuntime;
+
+struct QwenPrefillOptions {
+  PrefillLinearMode linear_mode = PrefillLinearMode::BFloat16;
+  PrefillAttentionMode attention_mode = PrefillAttentionMode::ExactNax;
+  bool sparse_minference = false;
+  bool cache_blend = false;
+  bool ane_offload = false;
+  std::string artifact_digest;
+  // Optional override for Dual-ANE fixed chunk tokens (0 => default 1024).
+  std::uint32_t ane_chunk_tokens = 0;
+};
+
+struct QwenPrefillTelemetry {
+  std::uint64_t prefill_w4a8_tokens = 0;
+  std::uint64_t prefill_sage2_tokens = 0;
+  std::uint64_t prefill_minference_blocks_skipped = 0;
+  std::uint64_t prefill_minference_blocks_total = 0;
+  bool prefill_ane_active = false;
+  double prefill_ane_split_alpha = 0.0;
+  std::uint64_t prefill_ane_offload_tokens = 0;
+  std::uint64_t prefill_ane_fallback_tokens = 0;
+  std::uint64_t prefill_cache_blend_hit_tokens = 0;
+  std::uint64_t prefill_cache_blend_recomputed_tokens = 0;
+};
 
 // P02-TF controls Linear arithmetic only. Attention/GDN/sampling qualification
 // is separate; selecting this does not claim a whole-Program exact contract.
@@ -66,7 +96,9 @@ plan_qwen_forward_memory(const QwenModelConfig &, std::uint32_t max_context,
                          std::uint32_t workspace_rows = 1024,
                          bool affine4_kv = false,
                          std::uint32_t kv_pool_pages = 0,
-                         bool flash_nax_prefill = false);
+                         bool flash_nax_prefill = false,
+                         bool enable_w4a8_workspace = false,
+                         bool enable_minference_workspace = false);
 
 struct QwenLoadBudget {
   std::uint64_t required_bytes = 0;
@@ -159,6 +191,7 @@ struct QwenForwardResult {
   std::vector<std::uint32_t> layer_routes;
   std::vector<float> router_logits;
   std::vector<float> router_scores;
+  QwenPrefillTelemetry prefill_delta;
 };
 
 // A complete, committed C1 continuation. The KV lease pins GPU pages;
@@ -303,7 +336,8 @@ public:
               bool enable_flash_nax_prefill = false,
               std::uint32_t kv_pool_pages = 0,
               std::shared_ptr<const QwenMergedLoraOverrides> merged_lora = nullptr,
-              std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr);
+              std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr,
+              QwenPrefillOptions prefill_options = {});
   ~QwenForward();
   QwenForward(QwenForward &&) noexcept;
   QwenForward &operator=(QwenForward &&) noexcept;
@@ -317,6 +351,16 @@ public:
                                       bool profile_stages = false);
   [[nodiscard]] QwenForwardResult
   run_trunk(std::span<const std::uint32_t> tokens, bool use_icb = true);
+  [[nodiscard]] QwenForwardResult run_blend_prefill(
+      std::span<const std::uint32_t> prompt, std::uint32_t prefix_tokens,
+      detail::ChunkBlendCache &blend_cache, std::uint64_t model_exec_hash,
+      const GpuSamplingOptions &sampling = {}, bool inspect_tensors = false,
+      const detail::BlendSegmentConfig *seg_cfg = nullptr);
+  [[nodiscard]] QwenPrefillTelemetry prefill_telemetry() const noexcept;
+  [[nodiscard]] bool ane_offload_active() const noexcept;
+  [[nodiscard]] double ane_split_alpha() const noexcept;
+  [[nodiscard]] std::uint32_t ane_chunk_tokens() const noexcept;
+  [[nodiscard]] bool cache_blend_eligible() const noexcept;
   [[nodiscard]] bool can_pipeline_prefill(std::size_t count) const noexcept;
   [[nodiscard]] QwenAsyncPrefillStep
   enqueue_prefill_step(std::span<const std::uint32_t> tokens);

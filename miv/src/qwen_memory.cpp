@@ -51,7 +51,9 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
                          bool position_sampling, bool exact_attention,
                          bool inspect_tensors, U32 feature_ring_rows,
                          U32 workspace_rows, bool affine4_kv,
-                         U32 kv_pool_pages, bool flash_nax_prefill) {
+                         U32 kv_pool_pages, bool flash_nax_prefill,
+                         bool enable_w4a8_workspace,
+                         bool enable_minference_workspace) {
   const U32 max_ws_rows = c.num_experts > 1 ? 4096U : 2048U;
   if (max_context == 0 || workspace_rows == 0 || workspace_rows > max_ws_rows ||
       c.num_hidden_layers <= 0 ||
@@ -187,6 +189,47 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
         multiply(multiply(max_chunks, positive(c.linear_num_value_heads)),
                  17152ULL);
     append("qwen.workspace.gdn_chunk", add(qk_bytes, ctrl_bytes));
+  }
+  if (enable_w4a8_workspace) {
+    const U64 a8_mp = ((U64(workspace_rows) + 63ULL) / 64ULL) * 64ULL;
+    const U64 raw_max_k = std::max({h, q, gv, f, shared_f});
+    const U64 a8_k = ((raw_max_k + 63ULL) / 64ULL) * 64ULL;
+    const U64 a8_groups = a8_k / 64ULL;
+    append("a8_qa", multiply(a8_mp, a8_k));
+    append("a8_sa", multiply(multiply(a8_groups, a8_mp), 4ULL));
+    append("a8_ra", multiply(multiply(a8_groups, a8_mp), 4ULL));
+  }
+  if (enable_minference_workspace && c.full_attention_layers() > 0 &&
+      c.head_dim == 256) {
+    const U64 qh = positive(c.num_attention_heads);
+    const U64 kvh = positive(c.num_key_value_heads);
+    const U64 repeat = std::max<U64>(1ULL, qh / kvh);
+    const U64 wm = (workspace_rows > 96U) ? 8ULL : (workspace_rows > 16U ? 6ULL : 4ULL);
+    const U64 bm_tok = std::max<U64>(1ULL, (wm * 16ULL) / repeat);
+    const U64 max_kv_blocks =
+        std::min<U64>(8192ULL, std::max<U64>(128ULL, (U64(max_context) + 31ULL) / 32ULL));
+    const U64 max_q_blocks =
+        std::max<U64>(1ULL, (U64(workspace_rows) + bm_tok - 1ULL) / bm_tok);
+    const U64 split_count =
+        std::clamp<U64>((max_kv_blocks + 127ULL) / 128ULL, 1ULL, 64ULL);
+    const auto align256 = [](U64 x) { return (x + 255ULL) & ~255ULL; };
+    U64 cursor = 0;
+    const auto add_sub = [&](U64 nbytes) {
+      cursor = align256(add(cursor, std::max<U64>(256ULL, nbytes)));
+    };
+    const U64 probe_rows = multiply(64ULL, qh);
+    add_sub(multiply(multiply(probe_rows, split_count), 4ULL));
+    add_sub(multiply(multiply(probe_rows, split_count), 4ULL));
+    add_sub(multiply(probe_rows, 4ULL));
+    add_sub(multiply(probe_rows, 4ULL));
+    add_sub(multiply(multiply(kvh, max_kv_blocks), 4ULL));
+    add_sub(multiply(multiply(kvh, max_kv_blocks), 4ULL));
+    add_sub(multiply(multiply(kvh, 256ULL), 2ULL));
+    add_sub(multiply(multiply(kvh, 256ULL), 2ULL));
+    add_sub(multiply(multiply(kvh, 2ULL), 4ULL));
+    add_sub(multiply(multiply(multiply(kvh, max_q_blocks), 512ULL), 2ULL));
+    add_sub(multiply(multiply(kvh, max_q_blocks), 4ULL));
+    append("minference_scratch", cursor);
   }
   append("zero", 256);
   append("argmax_partials", 1024ULL);

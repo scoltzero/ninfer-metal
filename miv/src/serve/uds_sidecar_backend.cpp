@@ -1190,6 +1190,34 @@ StatsReport UdsSidecarBackend::stats() const {
   st.lora_buffer_bytes = read_u64_field(res, "lora_buffer_bytes");
   st.lora_adapted_layers =
       static_cast<std::uint32_t>(read_u64_field(res, "lora_adapted_layers"));
+  st.prefill_linear_mode =
+      res.value("prefill_linear_mode", std::string("bf16"));
+  st.prefill_attention_mode =
+      res.value("prefill_attention_mode", std::string("exact_nax"));
+  st.prefill_sparse_minference =
+      res.value("prefill_sparse_minference", false);
+  st.prefill_sparse_minference_effective =
+      res.value("prefill_sparse_minference_effective", false);
+  st.prefill_sparse_minference_inactive_reason =
+      res.value("prefill_sparse_minference_inactive_reason", std::string{});
+  st.prefill_cache_blend = res.value("prefill_cache_blend", false);
+  st.prefill_ane_offload = res.value("prefill_ane_offload", false);
+  st.prefill_ane_active = res.value("prefill_ane_active", false);
+  st.prefill_ane_split_alpha = res.value("prefill_ane_split_alpha", 0.0);
+  st.prefill_w4a8_tokens = read_u64_field(res, "prefill_w4a8_tokens");
+  st.prefill_sage2_tokens = read_u64_field(res, "prefill_sage2_tokens");
+  st.prefill_minference_blocks_skipped =
+      read_u64_field(res, "prefill_minference_blocks_skipped");
+  st.prefill_minference_blocks_total =
+      read_u64_field(res, "prefill_minference_blocks_total");
+  st.prefill_cache_blend_hit_tokens =
+      read_u64_field(res, "prefill_cache_blend_hit_tokens");
+  st.prefill_cache_blend_recomputed_tokens =
+      read_u64_field(res, "prefill_cache_blend_recomputed_tokens");
+  st.prefill_ane_offload_tokens =
+      read_u64_field(res, "prefill_ane_offload_tokens");
+  st.prefill_ane_fallback_tokens =
+      read_u64_field(res, "prefill_ane_fallback_tokens");
   return st;
 }
 

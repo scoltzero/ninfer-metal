@@ -1043,21 +1043,43 @@ inline void run_superblock_nax_g128(
       op_qk.run(tq, tk, c_qk);
 
       const uint elems = c_qk.get_capacity();
-      threadgroup float *score_slice = tg_scores + sg * (16u * 64u);
       const threadgroup float *q_sum_g = tg_q_sum + sg * 16u;
-      for (uint i = 0u; i < elems; ++i) {
-        if (c_qk.is_valid_element(i)) {
-          const auto coord = c_qk.get_multidimensional_index(i);
-          const uint col = uint(coord[0]);
-          const uint row = uint(coord[1]);
-          const float sk = float(k_meta[col].scale[sg]);
-          const float zk = float(k_meta[col].zero[sg]);
-          score_slice[row * 64u + col] =
-              fma(sk, c_qk[i], zk * q_sum_g[row]);
+      if (sg == 0u) {
+        for (uint i = 0u; i < elems; ++i) {
+          if (c_qk.is_valid_element(i)) {
+            const auto coord = c_qk.get_multidimensional_index(i);
+            const uint col = uint(coord[0]);
+            const uint row = uint(coord[1]);
+            const float sk = float(k_meta[col].scale[0]);
+            const float zk = float(k_meta[col].zero[0]);
+            tg_scores[row * 64u + col] =
+                fma(sk, c_qk[i], zk * q_sum_g[row]);
+          }
         }
       }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if constexpr (Groups == 2u) {
+        if (sg == 1u) {
+          for (uint i = 0u; i < elems; ++i) {
+            if (c_qk.is_valid_element(i)) {
+              const auto coord = c_qk.get_multidimensional_index(i);
+              const uint col = uint(coord[0]);
+              const uint row = uint(coord[1]);
+              const float sk = float(k_meta[col].scale[1]);
+              const float zk = float(k_meta[col].zero[1]);
+              tg_scores[row * 64u + col] +=
+                  fma(sk, c_qk[i], zk * q_sum_g[row]);
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    } else {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if constexpr (Groups == 2u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (flat_tid < kChunkRows) {
       const uint r = flat_tid;
@@ -1070,19 +1092,14 @@ inline void run_superblock_nax_g128(
         for (uint g = 0u; g < Groups; ++g) {
           tg_v_scale[g * 16u + r] = 0.0f;
           tg_v_bias[g * 16u + r] = 0.0f;
-          threadgroup half *p_row = tg_p + g * (16u * 64u) + r * 64u;
-          for (uint c = 0u; c < 64u; ++c) {
-            p_row[c] = half(0.0h);
-          }
+        }
+        for (uint c = 0u; c < 64u; ++c) {
+          tg_scores[r * 64u + c] = 0.0f;
         }
       } else {
         float page_max = kNegInf;
         for (uint c = 0u; c < row_valid; ++c) {
-          float raw = tg_scores[r * 64u + c];
-          if constexpr (Groups == 2u) {
-            raw += tg_scores[16u * 64u + r * 64u + c];
-          }
-          const float s = raw * attn_scale;
+          const float s = tg_scores[r * 64u + c] * attn_scale;
           tg_scores[r * 64u + c] = s;
           page_max = max(page_max, s);
         }
@@ -1103,28 +1120,18 @@ inline void run_superblock_nax_g128(
           }
         }
 
-        float inv_v_max[Groups];
-        for (uint g = 0u; g < Groups; ++g) {
-          inv_v_max[g] =
-              (v_max_s[g] > 0.0f) ? precise::divide(1.0f, v_max_s[g]) : 0.0f;
-        }
-
         float page_sum = 0.0f;
         for (uint c = 0u; c < row_valid; ++c) {
           const float p_val = exp(tg_scores[r * 64u + c] - new_m);
+          tg_scores[r * 64u + c] = p_val;
           page_sum += p_val;
           for (uint g = 0u; g < Groups; ++g) {
-            const float sv = float(v_meta[c].scale[g]);
             const float zv = float(v_meta[c].zero[g]);
             v_bias[g] = fma(p_val, zv, v_bias[g]);
-            tg_p[g * (16u * 64u) + r * 64u + c] =
-                half((p_val * sv) * inv_v_max[g]);
           }
         }
         for (uint c = row_valid; c < 64u; ++c) {
-          for (uint g = 0u; g < Groups; ++g) {
-            tg_p[g * (16u * 64u) + r * 64u + c] = half(0.0h);
-          }
+          tg_scores[r * 64u + c] = 0.0f;
         }
 
         tg_rescale[r] = rescale;
@@ -1133,6 +1140,34 @@ inline void run_superblock_nax_g128(
         for (uint g = 0u; g < Groups; ++g) {
           tg_v_scale[g * 16u + r] = v_max_s[g];
           tg_v_bias[g * 16u + r] = v_bias[g];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage p_val from tg_scores into registers so tg_p can alias tg_scores
+    // safely (halving TG memory to stay well under 32 KiB even under 2x shader
+    // validation instrumentation).
+    {
+      constexpr uint kTotalThreads = Groups * 32u;
+      constexpr uint kPerThr = 1024u / kTotalThreads;
+      float p_loc[kPerThr];
+      for (uint k = 0u; k < kPerThr; ++k) {
+        p_loc[k] = tg_scores[flat_tid + k * kTotalThreads];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint k = 0u; k < kPerThr; ++k) {
+        const uint idx = flat_tid + k * kTotalThreads;
+        const uint r = idx >> 6u;
+        const uint c = idx & 63u;
+        const float p_val = p_loc[k];
+        for (uint g = 0u; g < Groups; ++g) {
+          const float vmax = tg_v_scale[g * 16u + r];
+          const float inv_vmax =
+              (vmax > 0.0f) ? precise::divide(1.0f, vmax) : 0.0f;
+          const float sv = float(v_meta[c].scale[g]);
+          tg_p[g * (16u * 64u) + idx] =
+              (p_val > 0.0f) ? half((p_val * sv) * inv_vmax) : half(0.0h);
         }
       }
     }
@@ -2756,8 +2791,8 @@ kernel void omlx_m5_paged_causal_attention_affine4_g128_hd256(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup half tg_q[2 * 16 * 128];
-  threadgroup float tg_scores[2 * 16 * 64];
-  threadgroup half tg_p[2 * 16 * 64];
+  threadgroup float tg_scores[16 * 64];
+  threadgroup half *tg_p = reinterpret_cast<threadgroup half *>(tg_scores);
   threadgroup float tg_q_sum[2 * 16];
   threadgroup uint tg_row_ctx[16];
   threadgroup float tg_rescale[16];

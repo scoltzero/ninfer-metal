@@ -255,6 +255,7 @@ public:
 
   [[nodiscard]] std::uint64_t size() const;
   [[nodiscard]] std::uint64_t gpu_address() const;
+  [[nodiscard]] void *native_mtl_buffer() const noexcept;
   [[nodiscard]] std::vector<std::byte> read(std::uint64_t offset = 0,
                                             std::uint64_t length = 0) const;
   [[nodiscard]] std::span<const std::byte> view(std::uint64_t offset = 0,
@@ -486,6 +487,18 @@ public:
                  MetalIcbCanaryOptions options = {}) const;
   [[nodiscard]] MetalRegistryStats registry_stats() const;
   [[nodiscard]] GpuTiming submit_barrier() const;
+  [[nodiscard]] GpuTiming submit_classic_barrier() const;
+  [[nodiscard]] void *native_mtl_device() const noexcept;
+  [[nodiscard]] void *native_mtl_command_queue() const noexcept;
+  // Encodes invocations into a caller-owned classic id<MTLCommandBuffer>
+  // without committing or waiting (used for Dual-ANE GPU-suffix overlap).
+  std::uint64_t encode_into_command_buffer(
+      void *mtl_command_buffer,
+      std::span<const MetalCommandInvocation> invocations) const;
+  // Allocates a command buffer on the classic MTLCommandQueue, encodes all
+  // invocations, and commits asynchronously without waiting on the CPU.
+  std::uint64_t submit_classic_async(
+      std::span<const MetalCommandInvocation> invocations) const;
 
 private:
   class Impl;

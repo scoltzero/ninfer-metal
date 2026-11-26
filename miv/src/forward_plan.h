@@ -186,6 +186,10 @@ struct Profile {
   std::string gdn_numeric_contract_id = "gdn.sequential.simd32.f32_state.conv_bf16.v1";
   bool gdn_row_exact_eligible = false;
   bool fused_final_norm_t1 = false;
+  bool used_w4a8 = false;
+  bool used_sage2 = false;
+  bool used_minference = false;
+  U32 minf_context_envelope = 0;
 };
 
 inline void ensure_profile_icb(const MetalContext &context, Profile &profile) {
@@ -226,6 +230,21 @@ public:
     bool dynamic_rows = false;
     bool operator==(const F16CastKey &) const = default;
   };
+  struct A8QuantKey {
+    const MetalBuffer *input_buffer = nullptr;
+    U64 input_offset = 0;
+    const MetalBuffer *qa_buffer = nullptr;
+    U64 qa_offset = 0;
+    const MetalBuffer *sa_buffer = nullptr;
+    U64 sa_offset = 0;
+    const MetalBuffer *ra_buffer = nullptr;
+    U64 ra_offset = 0;
+    U32 k = 0;
+    U32 rows = 0;
+    U32 mp = 0;
+    bool dynamic_tokens = false;
+    bool operator==(const A8QuantKey &) const = default;
+  };
 
   Encoder(const MetalContext &context, const std::filesystem::path &directory,
           U32 capacity, std::string prefix = "qwen.forward")
@@ -242,6 +261,7 @@ public:
     close_stage();
     cached_group_sum.reset();
     cached_f16_cast.reset();
+    cached_a8_quant.reset();
     active_stage = std::move(name);
     stage_start = U32(descriptor.dispatches.size());
   }
@@ -258,10 +278,19 @@ public:
 
   void set_f16_cast(F16CastKey key) { cached_f16_cast = std::move(key); }
 
+  [[nodiscard]] bool has_a8_quant(const A8QuantKey &key) const {
+    return cached_a8_quant.has_value() && *cached_a8_quant == key;
+  }
+
+  void set_a8_quant(A8QuantKey key) { cached_a8_quant = std::move(key); }
+
+  void clear_a8_quant() { cached_a8_quant.reset(); }
+
   void clear_dynamic_parameter_cache() {
     dynamic_parameters.clear();
     cached_group_sum.reset();
     cached_f16_cast.reset();
+    cached_a8_quant.reset();
   }
 
   void record_weight(const MaterializedWeightView &weight, U32 n, U32 k,
@@ -393,6 +422,17 @@ public:
         }
       }
     }
+    if (cached_a8_quant) {
+      for (const auto *buf : dispatch_writes) {
+        if (buf == cached_a8_quant->input_buffer ||
+            buf == cached_a8_quant->qa_buffer ||
+            buf == cached_a8_quant->sa_buffer ||
+            buf == cached_a8_quant->ra_buffer) {
+          cached_a8_quant.reset();
+          break;
+        }
+      }
+    }
     command.barrier_before = need_barrier;
     descriptor.dispatches.push_back(std::move(command));
     return descriptor.dispatches.back();
@@ -488,6 +528,7 @@ private:
   std::unordered_set<const MetalBuffer *> written_since_barrier;
   std::optional<GroupSumKey> cached_group_sum;
   std::optional<F16CastKey> cached_f16_cast;
+  std::optional<A8QuantKey> cached_a8_quant;
 };
 struct ForwardLinearSelection {
   std::string library, function, group_function, family;
@@ -933,8 +974,10 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
 inline void embedding_lookup(Encoder &e,
                              const MaterializedWeightView &embedding,
                              Ref token_ids, Ref hidden, Ref zero, U32 v,
-                             U32 h) {
-  const U32 t = e.profile.capacity;
+                             U32 h, std::optional<U32> explicit_t = {}) {
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const std::optional<U32> tok_word =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>{5U};
   std::string function = "omlx_m5_embedding_";
   std::vector<std::byte> embed_params =
       words({v, 0, v, h, U32(embedding.padded_k), t, 0, 0});
@@ -942,13 +985,13 @@ inline void embedding_lookup(Encoder &e,
     auto &d =
         e.emit("vocab", function + "bf16", {.width = U64(t) * h},
                {.width = 256}, {token_ids, plane(embedding, "data"), hidden});
-    e.dynamic(d, 3, embed_params, 5);
+    e.dynamic(d, 3, embed_params, tok_word);
   } else if (embedding.format == "mxfp4_e2m1_g32_e8m0_v1") {
     auto &d = e.emit("vocab", function + "mxfp4", {.width = U64(t) * h},
                      {.width = 256},
                      {token_ids, plane(embedding, "data"),
                       plane(embedding, "scale"), hidden});
-    e.dynamic(d, 4, embed_params, 5);
+    e.dynamic(d, 4, embed_params, tok_word);
   } else if (embedding.format.starts_with("oq_affine_q")) {
     U32 bits = std::stoul(embedding.format.substr(11));
     U32 group =
@@ -960,7 +1003,7 @@ inline void embedding_lookup(Encoder &e,
                        {token_ids, plane(embedding, "low_2bit"),
                         plane(embedding, "high_bit"), plane(embedding, "scale"),
                         plane(embedding, "bias"), hidden});
-      e.dynamic(d, 6, embed_params, 5);
+      e.dynamic(d, 6, embed_params, tok_word);
       return;
     }
     Ref high = bits == 5   ? plane(embedding, "high_bit")
@@ -972,7 +1015,7 @@ inline void embedding_lookup(Encoder &e,
         {.width = U64(t) * h}, {.width = 256},
         {token_ids, plane(embedding, bits == 8 ? "code" : "base_code"), high,
          plane(embedding, "scale"), plane(embedding, "bias"), hidden});
-    e.dynamic(d, 6, embed_params, 5);
+    e.dynamic(d, 6, embed_params, tok_word);
   } else
     throw std::invalid_argument("Qwen embedding format unsupported");
 }

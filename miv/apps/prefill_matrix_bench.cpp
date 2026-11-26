@@ -27,7 +27,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include "chunk_blend_cache.h"
 #include "omlx_m5/artifact.h"
+#include "omlx_m5/execution_contract.h"
 #include "omlx_m5/layer_schedule.h"
 #include "omlx_m5/materialization.h"
 #include "omlx_m5/metal.h"
@@ -631,13 +633,22 @@ std::unique_ptr<LoadedModel> load_forward_model(const CliOptions &o,
                   "omlx_m5_attention_nax_prefill.metallib")));
   const bool enable_flash_nax_prefill = flash_nax_eligible && apple10_nax;
 
+  const auto artifact_digest = execution_artifact_digest(artifact);
+  QwenPrefillOptions pf_opts{
+      .linear_mode = parse_prefill_linear_mode(o.prefill_linear_mode),
+      .attention_mode = parse_prefill_attention_mode(o.prefill_attention_mode),
+      .sparse_minference = o.prefill_sparse_minference,
+      .cache_blend = o.prefill_cache_blend,
+      .ane_offload = o.prefill_ane_offload,
+      .artifact_digest = artifact_digest,
+  };
   loaded->forward = std::make_unique<QwenForward>(
       *loaded->context, *loaded->weights, *loaded->layers, loaded->config,
       max_context, loaded->metallib_dir, std::span<const std::uint32_t>{},
       false, false, cap.device_name == "Apple M4", std::nullopt,
       apple9_or_newer, false, std::nullopt, lin_policy, loaded->contract,
       attn_policy, false, o.kv_dtype, nullptr, enable_flash_nax_prefill, 0U,
-      nullptr, nullptr);
+      nullptr, nullptr, pf_opts);
 
   loaded->load_wall_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
@@ -804,6 +815,7 @@ int run_ppl(const CliOptions &o) {
                            static_cast<double>(scored_tokens))
                         : 0.0;
 
+  const auto pf_tel = loaded->forward->prefill_telemetry();
   Json report = {
       {"mode", "ppl"},
       {"model_dir", o.model_dir.string()},
@@ -822,6 +834,23 @@ int run_ppl(const CliOptions &o) {
            {"prefill_sparse_minference", o.prefill_sparse_minference},
            {"prefill_cache_blend", o.prefill_cache_blend},
            {"prefill_ane_offload", o.prefill_ane_offload},
+       }},
+      {"prefill_telemetry",
+       {
+           {"prefill_w4a8_tokens", pf_tel.prefill_w4a8_tokens},
+           {"prefill_sage2_tokens", pf_tel.prefill_sage2_tokens},
+           {"prefill_minference_blocks_skipped",
+            pf_tel.prefill_minference_blocks_skipped},
+           {"prefill_minference_blocks_total",
+            pf_tel.prefill_minference_blocks_total},
+           {"prefill_ane_active", pf_tel.prefill_ane_active},
+           {"prefill_ane_split_alpha", pf_tel.prefill_ane_split_alpha},
+           {"prefill_ane_offload_tokens", pf_tel.prefill_ane_offload_tokens},
+           {"prefill_ane_fallback_tokens", pf_tel.prefill_ane_fallback_tokens},
+           {"prefill_cache_blend_hit_tokens",
+            pf_tel.prefill_cache_blend_hit_tokens},
+           {"prefill_cache_blend_recomputed_tokens",
+            pf_tel.prefill_cache_blend_recomputed_tokens},
        }},
       {"num_tokens", tokens.size()},
       {"scored_tokens", scored_tokens},
@@ -921,6 +950,7 @@ int run_prefill_logits(const CliOptions &o) {
             .count();
   }
 
+  const auto pf_tel = loaded->forward->prefill_telemetry();
   Json report = {
       {"mode", "prefill-logits"},
       {"model_dir", o.model_dir.string()},
@@ -931,6 +961,31 @@ int run_prefill_logits(const CliOptions &o) {
       {"sampling_contract", o.sampling_contract},
       {"max_context", effective_ctx},
       {"workspace_rows", ws_rows},
+      {"prefill_switches",
+       {
+           {"prefill_linear_mode", o.prefill_linear_mode},
+           {"prefill_attention_mode", o.prefill_attention_mode},
+           {"prefill_sparse_minference", o.prefill_sparse_minference},
+           {"prefill_cache_blend", o.prefill_cache_blend},
+           {"prefill_ane_offload", o.prefill_ane_offload},
+       }},
+      {"prefill_telemetry",
+       {
+           {"prefill_w4a8_tokens", pf_tel.prefill_w4a8_tokens},
+           {"prefill_sage2_tokens", pf_tel.prefill_sage2_tokens},
+           {"prefill_minference_blocks_skipped",
+            pf_tel.prefill_minference_blocks_skipped},
+           {"prefill_minference_blocks_total",
+            pf_tel.prefill_minference_blocks_total},
+           {"prefill_ane_active", pf_tel.prefill_ane_active},
+           {"prefill_ane_split_alpha", pf_tel.prefill_ane_split_alpha},
+           {"prefill_ane_offload_tokens", pf_tel.prefill_ane_offload_tokens},
+           {"prefill_ane_fallback_tokens", pf_tel.prefill_ane_fallback_tokens},
+           {"prefill_cache_blend_hit_tokens",
+            pf_tel.prefill_cache_blend_hit_tokens},
+           {"prefill_cache_blend_recomputed_tokens",
+            pf_tel.prefill_cache_blend_recomputed_tokens},
+       }},
       {"prompt_tokens", tokens.size()},
       {"load_wall_s", loaded->load_wall_s},
       {"prefill_wall_s", prefill_s},

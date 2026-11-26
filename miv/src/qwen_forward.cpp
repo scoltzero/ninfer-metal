@@ -1,13 +1,17 @@
 #include "omlx_m5/qwen_forward.h"
 #include "affine_nax_cache.h"
+#include "ane/ane_dual_offload.h"
 #include "attention_nax.h"
+#include "attention_sage2.h"
 #include "bf16_nax.h"
+#include "chunk_blend_cache.h"
 #include "forward_plan.h"
 #include "gdn_prefill.h"
 #include "lora_runtime.h"
 #include "moe_nax.h"
 #include "mxfp4_nax_cache.h"
 #include "silicon_tuning.h"
+#include "w4a8_nax.h"
 #include "omlx_m5/execution_contract.h"
 #include "omlx_m5/kv_page_pool.h"
 
@@ -398,7 +402,8 @@ public:
        QwenForward *shared_primary, bool enable_flash_nax_prefill,
        U32 kv_pool_pages = 0U,
        std::shared_ptr<const QwenMergedLoraOverrides> merged_lora = nullptr,
-       std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr)
+       std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora = nullptr,
+       QwenPrefillOptions prefill_options = {})
       : context(context), weights(weights), config(std::move(config)),
         max_context(max_context), libraries(libraries),
         silicon_tuning(detail::resolve_silicon_tuning(context)),
@@ -428,7 +433,8 @@ public:
         split_attention_enabled(enable_attention_split),
         batch_enabled(enable_batch),
         diagnostic_override(std::move(diagnostic_override)),
-        moe_override(std::move(moe_override)) {
+        moe_override(std::move(moe_override)),
+        prefill_options_(std::move(prefill_options)) {
     merged_lora_ = std::move(merged_lora);
     bypass_lora_ = std::move(bypass_lora);
     (void)sampling_contract_name(sampling_contract);
@@ -484,13 +490,19 @@ public:
     conv = 2 * gk + gv;
 
     const bool affine4_kv = (kv_format_ == KvStorageFormat::Affine4Group128);
+    const bool enable_w4a8_ws =
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A8);
+    const bool enable_minf_ws =
+        (prefill_options_.attention_mode == PrefillAttentionMode::Sage2 &&
+         prefill_options_.sparse_minference && c.full_attention_layers() > 0 &&
+         c.head_dim == 256);
     allocation_plan = plan_qwen_forward_memory(
         c, max_context, U32(feature_layers.size()), inspect_routes, speculative,
         enable_attention_split,
         sampling_contract == SamplingContract::PositionCoupledV1,
         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1,
         inspect_tensors_workspace, 0U, workspace_rows_, affine4_kv, 0U,
-        flash_nax_prefill_);
+        flash_nax_prefill_, enable_w4a8_ws, enable_minf_ws);
     feature_ring_rows_ = allocation_plan.feature_ring_rows;
 
     if (allocation_plan.largest_buffer_bytes >
@@ -551,6 +563,15 @@ public:
     if (workspace_rows_ >= 64U && c.linear_attention_layers() > 0 &&
         c.linear_key_head_dim == 128 && c.linear_value_head_dim == 128)
       gdn_chunk_ws = allocate("qwen.workspace.gdn_chunk");
+    if (enable_w4a8_ws) {
+      a8_qa = allocate_private("a8_qa");
+      a8_sa = allocate_private("a8_sa");
+      a8_ra = allocate_private("a8_ra");
+      a8_workspace_mp_ = w4a8_nax_mp(workspace_rows_);
+    }
+    if (enable_minf_ws) {
+      minference_scratch = allocate("minference_scratch");
+    }
     zero = allocate("zero");
     const_cast<MetalBuffer *>(zero.buffer)->zero();
     argmax_scratch = allocate_private("argmax_partials");
@@ -792,9 +813,16 @@ public:
         merged_lora_ ? static_cast<const void *>(merged_lora_.get())
                      : static_cast<const void *>(&weights);
 
+    const bool w4a8_requested =
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A8 &&
+         a8_qa.buffer != nullptr &&
+         w4a8_nax_runtime_eligible(context, libraries));
+    w4a8_min_tokens_ = w4a8_nax_min_tokens();
+    w4a8_down_proj_ = w4a8_down_proj_enabled();
+
     if (mxfp4_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         mxfp4_w4a4_prefill_enabled() || has_pretiled_mxfp4 ||
+         w4a8_requested || mxfp4_w4a4_prefill_enabled() || has_pretiled_mxfp4 ||
          (t_domain_active() && pretiled_qmv_t1_enabled()))) {
       mxfp4_nax_cache = Mxfp4NaxCache::acquire(
           cache_owner_key, context, libraries, candidates,
@@ -878,7 +906,7 @@ public:
 
     if (affine_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         has_pretiled_affine ||
+         w4a8_requested || has_pretiled_affine ||
          (t_domain_active() && pretiled_qmv_t1_enabled()))) {
       affine_nax_cache = AffineNaxCache::acquire(
           cache_owner_key, context, libraries, zero, candidates,
@@ -974,6 +1002,92 @@ public:
             U32(c.linear_num_value_heads), U32(c.linear_key_head_dim),
             U32(c.linear_value_head_dim));
 
+    w4a8_nax_enabled_ =
+        w4a8_requested &&
+        (mxfp4_nax_active() || affine_nax_active() || moe_nax_ws.active);
+
+    const bool affine4_planar_ok =
+        (kv_format_ != KvStorageFormat::Affine4Group128) ||
+        affine4_kv_runtime_eligible(context, libraries,
+                                    U32(c.num_attention_heads),
+                                    U32(c.num_key_value_heads),
+                                    U32(c.head_dim));
+    sage2_enabled_ =
+        (prefill_options_.attention_mode == PrefillAttentionMode::Sage2) &&
+        c.full_attention_layers() > 0 && affine4_planar_ok &&
+        sage2_runtime_eligible(context, libraries, U32(c.num_attention_heads),
+                               U32(c.num_key_value_heads), U32(c.head_dim));
+    minference_enabled_ =
+        sage2_enabled_ && prefill_options_.sparse_minference &&
+        minference_scratch.buffer != nullptr &&
+        minference_runtime_eligible(context, libraries,
+                                    U32(c.num_attention_heads),
+                                    U32(c.num_key_value_heads),
+                                    U32(c.head_dim));
+
+    if (attention_positions.buffer == nullptr && c.full_attention_layers() > 0 &&
+        (sage2_enabled_ || prefill_options_.cache_blend)) {
+      const U64 ap_bytes = mul(workspace_rows_, 4U);
+      auto ap_buf = std::make_unique<MetalBuffer>(context.make_buffer(ap_bytes));
+      attention_positions = Ref{ap_buf.get(), 0, ap_bytes};
+      track_extra_workspace("prefill_attention_positions", *ap_buf);
+      buffers.push_back(std::move(ap_buf));
+    }
+
+    cache_blend_kernels_ready_ =
+        affine4_planar_ok &&
+        std::filesystem::is_regular_file(libraries / "omlx_m5_cache_blend.metallib") &&
+        context.capabilities().profile.probe.runtime_os_major >= 27 &&
+        context.capabilities().profile.probe.metal4_compiler &&
+        context.capabilities().profile.probe.tensor_api;
+
+    // Module 4b: Initialize Native Dual-ANE Co-Execution Engine on primary Dense slot.
+    // Preserves W4A8 orthogonally (alpha_bf16=0.25, alpha_w4a8=0.15).
+    if (!shared_primary_ && prefill_options_.ane_offload && c.num_experts == 0) {
+      ane::AneDualOffloadConfig ane_cfg;
+      ane_cfg.chunk_tokens = prefill_options_.ane_chunk_tokens
+                                 ? prefill_options_.ane_chunk_tokens
+                                 : ane::kAneDefaultChunkTokens;
+      ane_cfg.linear_route =
+          (prefill_options_.linear_mode == PrefillLinearMode::W4A8)
+              ? ane::AneLinearRoute::W4A8
+              : ane::AneLinearRoute::BF16;
+      ane_cfg.alpha_bf16 = ane::kAneDefaultAlphaBf16;
+      ane_cfg.alpha_w4a8 = ane::kAneDefaultAlphaW4A8;
+      ane_cfg.artifact_digest = prefill_options_.artifact_digest;
+      ane_cfg.metallib_path = libraries / "omlx_m5_ane_pack_unpack.metallib";
+      ane_cfg.external_mtl_device = context.native_mtl_device();
+      ane_cfg.external_mtl_command_queue = context.native_mtl_command_queue();
+      if (const char *env_chunk = std::getenv("OMLX_M5_ANE_CHUNK_TOKENS")) {
+        const auto parsed = std::strtoul(env_chunk, nullptr, 10);
+        if (parsed >= 64UL && parsed <= workspace_rows_) {
+          ane_cfg.chunk_tokens = static_cast<U32>(parsed);
+        }
+      }
+      if (const char *env_alpha = std::getenv("OMLX_M5_ANE_ALPHA")) {
+        const double parsed = std::strtod(env_alpha, nullptr);
+        if (std::isfinite(parsed) && parsed > 0.0 && parsed <= ane::kAneMaxAlpha) {
+          ane_cfg.alpha_override = parsed;
+        }
+      }
+      if (ane_cfg.chunk_tokens <= workspace_rows_ &&
+          std::filesystem::is_regular_file(ane_cfg.metallib_path)) {
+        try {
+          ane_engine_ =
+              ane::AneDualOffloadEngine::build_from_model(weights, layers, ane_cfg);
+        } catch (...) {
+          ane_engine_.reset();
+        }
+        if (ane_engine_ && ane_engine_->is_active()) {
+          ane_active_ = true;
+          ane_chunk_tokens_ = ane_engine_->stats().chunk_tokens;
+          ane_split_alpha_ = ane_engine_->stats().target_alpha;
+        }
+      }
+    }
+    prefill_telemetry_.prefill_ane_active = ane_active_;
+    prefill_telemetry_.prefill_ane_split_alpha = ane_split_alpha_;
+
     reset();
 
     if (!speculative_enabled && !inspect_routes_enabled &&
@@ -1049,6 +1163,26 @@ public:
     if (merged_lora_ && !merged_lora_->fingerprint.empty()) {
       base_fields.emplace("merged_lora", merged_lora_->fingerprint);
     }
+    if (prefill_options_.linear_mode != PrefillLinearMode::BFloat16) {
+      base_fields.emplace(
+          "prefill_linear_mode",
+          std::string(prefill_linear_mode_to_string(prefill_options_.linear_mode)));
+    }
+    if (prefill_options_.attention_mode != PrefillAttentionMode::ExactNax) {
+      base_fields.emplace(
+          "prefill_attention_mode",
+          std::string(
+              prefill_attention_mode_to_string(prefill_options_.attention_mode)));
+    }
+    if (prefill_options_.sparse_minference) {
+      base_fields.emplace("prefill_sparse_minference", "1");
+    }
+    if (prefill_options_.cache_blend) {
+      base_fields.emplace("prefill_cache_blend", "1");
+    }
+    if (prefill_options_.ane_offload) {
+      base_fields.emplace("prefill_ane_offload", "1");
+    }
     base_shared_contract_identity_ = execution_identity_digest(base_fields);
     base_fields.emplace("owner", std::to_string(owner_id));
     base_execution_identity_ = execution_identity_digest(base_fields);
@@ -1105,6 +1239,8 @@ public:
     split_profiles.clear();
     split_batch_profiles.clear();
     split_verify_profiles.clear();
+    long_ctx_profiles_.clear();
+    ane_layer_plans_.clear();
     packed_cache_.clear();
     verify_async_profile_ = nullptr;
     for (auto &ap : ar_pipe_)
@@ -1283,6 +1419,44 @@ public:
                                         {}, pp.attn_pos, {}, tag,
                                         /*trunk_only=*/true, pp.token_ids));
           ensure_profile_icb(context, pp.profiles.back());
+        }
+      }
+    }
+    if ((minference_enabled_ ||
+         (flash_nax_prefill_ && split_attention_enabled &&
+          config.head_dim == 256)) &&
+        max_context >= kMInferenceMinContextTokens && !inspect_tensors_workspace) {
+      std::vector<U32> lc_envs{max_context};
+      if (max_context > kMInferenceMinContextTokens) {
+        lc_envs.push_back(kMInferenceMinContextTokens);
+      }
+      std::ranges::sort(lc_envs);
+      lc_envs.erase(std::unique(lc_envs.begin(), lc_envs.end()), lc_envs.end());
+      std::vector<U32> lc_caps;
+      const U32 max_cap = std::min(max_context, workspace_rows_);
+      for (U32 cap : {64U, 256U, 1024U, max_cap}) {
+        if (cap >= kFlashNaxPrefillMinTokens && cap <= max_cap) {
+          lc_caps.push_back(cap);
+        }
+      }
+      std::ranges::sort(lc_caps);
+      lc_caps.erase(std::unique(lc_caps.begin(), lc_caps.end()), lc_caps.end());
+      for (const U32 env : lc_envs) {
+        for (const U32 cap : lc_caps) {
+          const LongCtxProfileKey fk{cap, env, false, false};
+          auto prof = compile(cap, false, false, env, false);
+          ensure_profile_icb(context, prof);
+          long_ctx_profiles_.emplace(fk, std::move(prof));
+          if (!shared_primary_ && !inspect_routes_enabled &&
+              prefill_pipe_[0].token_ids.buffer != nullptr && cap >= 64U) {
+            const LongCtxProfileKey tk{cap, env, true, true};
+            auto tprof = compile(cap, false, false, env, false, {},
+                                 prefill_pipe_[0].attn_pos, {}, ".pf_pipe0",
+                                 /*trunk_only=*/true,
+                                 prefill_pipe_[0].token_ids);
+            ensure_profile_icb(context, tprof);
+            long_ctx_profiles_.emplace(tk, std::move(tprof));
+          }
         }
       }
     }
@@ -1783,6 +1957,365 @@ public:
               U32 k, std::optional<U32> explicit_t = {}) {
     linear_base(e, w, x, y, n, k, explicit_t);
     emit_bypass_for_weight(e, w, x, y, n, explicit_t);
+  }
+
+  bool use_w4a8_for_t(U32 t, bool verify) const noexcept {
+    return w4a8_nax_enabled_ && !verify && t >= w4a8_min_tokens_ &&
+           a8_qa.buffer != nullptr && (h % 64U) == 0U && !diagnostic_override;
+  }
+
+  bool use_w4a8_prefill(const Encoder &e, bool verify,
+                        std::optional<U32> explicit_t = {}) const noexcept {
+    return use_w4a8_for_t(nax_effective_select_t(e, explicit_t), verify);
+  }
+
+  Encoder::A8QuantKey make_a8_key(const Encoder &e, Ref input, U32 k,
+                                  std::optional<U32> explicit_t = {}) const {
+    const U32 t = explicit_t.value_or(e.profile.capacity);
+    const bool dyn_rows = !explicit_t.has_value() && t != 1U;
+    return Encoder::A8QuantKey{
+        .input_buffer = input.buffer,
+        .input_offset = input.offset,
+        .qa_buffer = a8_qa.buffer,
+        .qa_offset = a8_qa.offset,
+        .sa_buffer = a8_sa.buffer,
+        .sa_offset = a8_sa.offset,
+        .ra_buffer = a8_ra.buffer,
+        .ra_offset = a8_ra.offset,
+        .k = k,
+        .rows = t,
+        .mp = w4a8_nax_mp(t),
+        .dynamic_tokens = dyn_rows,
+    };
+  }
+
+  bool ensure_a8_quant(Encoder &e, Ref input, U32 k,
+                       std::optional<U32> explicit_t = {}) {
+    if (a8_qa.buffer == nullptr || a8_sa.buffer == nullptr ||
+        a8_ra.buffer == nullptr || (k % 64U) != 0U || k == 0U) {
+      return false;
+    }
+    const auto key = make_a8_key(e, input, k, explicit_t);
+    if (e.has_a8_quant(key)) {
+      return true;
+    }
+    emit_quantize_a8_g64(e, input, a8_qa, a8_sa, a8_ra, k, explicit_t);
+    e.set_a8_quant(key);
+    return true;
+  }
+
+  bool can_w4a8_weight(const MaterializedWeightView &w, U32 n, U32 k) const {
+    if (!w4a8_nax_enabled_ || is_overridden(w) || (k % 64U) != 0U ||
+        a8_qa.buffer == nullptr) {
+      return false;
+    }
+    if (mxfp4_nax_active() && (k % 128U) == 0U) {
+      if (const auto *tw = mxfp4_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      if (const auto *tw = affine_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool try_linear_w4a8_base(Encoder &e, const MaterializedWeightView &w, Ref x,
+                            Ref y, U32 n, U32 k,
+                            std::optional<U32> explicit_t = {},
+                            U32 row_offset = 0U, U32 out_stride = 0U,
+                            U32 slice_n = 0U) {
+    if (!w4a8_nax_enabled_ || is_overridden(w) || (k % 64U) != 0U ||
+        a8_qa.buffer == nullptr) {
+      return false;
+    }
+    if (mxfp4_nax_active() && (k % 128U) == 0U) {
+      if (const auto *tw = mxfp4_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        if (!ensure_a8_quant(e, x, k, explicit_t)) {
+          return false;
+        }
+        linear_mxfp4_w4a8_nax(e, *tw, a8_qa, a8_sa, y, explicit_t, row_offset,
+                              out_stride, slice_n);
+        e.record_weight(w, n, k, "mxfp4_w4a8_nax_m5_v1", "mxfp4_w4a8_nax_m5_v1",
+                        {}, "w4a8_prefill_v1", "mxfp4.w4a8.bm64_bn64.sk1.v1",
+                        false, explicit_t);
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      if (const auto *tw = affine_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        if (!ensure_a8_quant(e, x, k, explicit_t)) {
+          return false;
+        }
+        linear_affine_w4a8_nax(e, *tw, a8_qa, a8_sa, a8_ra, y, explicit_t,
+                               row_offset, out_stride, slice_n);
+        e.record_weight(
+            w, n, k, "affine_w4a8_nax_m5_v1", "affine_w4a8_nax_m5_v1", {},
+            "w4a8_prefill_v1",
+            "oq.w4a8.q" + std::to_string(tw->bits) + "_g" +
+                std::to_string(tw->group_size) + ".bm64_bn64.sk1.v1",
+            false, explicit_t);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool try_linear_w4a8_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
+                              const MaterializedWeightView &up_w, Ref x, Ref y,
+                              U32 n, U32 k, std::optional<U32> explicit_t = {},
+                              U32 row_offset = 0U, U32 out_stride = 0U,
+                              U32 slice_n = 0U) {
+    if (!w4a8_nax_enabled_ || is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) || (k % 64U) != 0U ||
+        a8_qa.buffer == nullptr) {
+      return false;
+    }
+    if (mxfp4_nax_active() && (k % 128U) == 0U) {
+      const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+      const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        if (!ensure_a8_quant(e, x, k, explicit_t)) {
+          return false;
+        }
+        linear_mxfp4_w4a8_nax_swiglu(e, *gw, *uw, a8_qa, a8_sa, y, explicit_t,
+                                     row_offset, out_stride, slice_n);
+        e.record_weight(gate_w, n, k, "mxfp4_w4a8_nax_m5_v1",
+                        "mxfp4_w4a8_swiglu_out64_v1", {}, "w4a8_prefill_v1",
+                        "mxfp4.w4a8.swiglu_out64.sk1.v1", false, explicit_t);
+        e.record_weight(up_w, n, k, "mxfp4_w4a8_nax_m5_v1",
+                        "mxfp4_w4a8_swiglu_out64_v1", {}, "w4a8_prefill_v1",
+                        "mxfp4.w4a8.swiglu_out64.sk1.v1", false, explicit_t);
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      const auto *gw = affine_nax_cache->find(gate_w.object_id);
+      const auto *uw = affine_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        const std::string tag_g = affine_nax_mode_tag(gw->bits);
+        const std::string tag_u = affine_nax_mode_tag(uw->bits);
+        const bool pair_ok = (tag_g == tag_u) ||
+                             (tag_g == "q4" && tag_u == "q56") ||
+                             (tag_g == "q56" && tag_u == "q4");
+        if (pair_ok && ensure_a8_quant(e, x, k, explicit_t)) {
+          linear_affine_w4a8_nax_swiglu(e, *gw, *uw, a8_qa, a8_sa, a8_ra, y,
+                                        explicit_t, row_offset, out_stride,
+                                        slice_n);
+          const std::string grp = "oq.w4a8." + tag_g + "_" + tag_u +
+                                  ".swiglu_out64.sk1.v1";
+          e.record_weight(gate_w, n, k, "affine_w4a8_nax_m5_v1",
+                          "affine_w4a8_swiglu_out64_v1", {}, "w4a8_prefill_v1",
+                          grp, false, explicit_t);
+          e.record_weight(up_w, n, k, "affine_w4a8_nax_m5_v1",
+                          "affine_w4a8_swiglu_out64_v1", {}, "w4a8_prefill_v1",
+                          grp, false, explicit_t);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool try_concat_w4a8_nax(Encoder &e, U32 concat_id,
+                           std::span<const MaterializedWeightView> parts,
+                           std::span<const U32> part_ns, U32 k, Ref x_bf16,
+                           Ref dst_concat,
+                           std::optional<U32> explicit_t = {}) {
+    if (!w4a8_nax_enabled_ || !concat_id || !dst_concat.buffer ||
+        parts.empty() || (k % 64U) != 0U || a8_qa.buffer == nullptr) {
+      return false;
+    }
+    U32 total_n = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      if (is_overridden(parts[i])) {
+        return false;
+      }
+      total_n += part_ns[i];
+    }
+    if (mxfp4_nax_active() && (k % 128U) == 0U) {
+      if (const auto *tw = mxfp4_nax_cache->find(concat_id);
+          tw != nullptr && tw->n == total_n && tw->k == k) {
+        if (!ensure_a8_quant(e, x_bf16, k, explicit_t)) {
+          return false;
+        }
+        linear_mxfp4_w4a8_nax(e, *tw, a8_qa, a8_sa, dst_concat, explicit_t);
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+          e.record_weight(parts[i], part_ns[i], k, "mxfp4_w4a8_nax_m5_v1",
+                          "mxfp4_w4a8_nax_m5_v1", {}, "w4a8_prefill_v1",
+                          "mxfp4.w4a8.bm64_bn64.sk1.v1", false, explicit_t);
+        }
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      if (const auto *tw = affine_nax_cache->find(concat_id);
+          tw != nullptr && tw->n == total_n && tw->k == k) {
+        if (!ensure_a8_quant(e, x_bf16, k, explicit_t)) {
+          return false;
+        }
+        linear_affine_w4a8_nax(e, *tw, a8_qa, a8_sa, a8_ra, dst_concat,
+                               explicit_t);
+        const std::string grp = "oq.w4a8.q" + std::to_string(tw->bits) + "_g" +
+                                std::to_string(tw->group_size) +
+                                ".bm64_bn64.sk1.v1";
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+          e.record_weight(parts[i], part_ns[i], k, "affine_w4a8_nax_m5_v1",
+                          "affine_w4a8_nax_m5_v1", {}, "w4a8_prefill_v1", grp,
+                          false, explicit_t);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool can_gpu_suffix_linear(const MaterializedWeightView &w, U32 n, U32 k,
+                             bool use_w4a8) const {
+    if (is_overridden(w) || has_bypass_lora(w)) {
+      return false;
+    }
+    if (use_w4a8 && can_w4a8_weight(w, n, k)) {
+      return true;
+    }
+    if (mxfp4_nax_active()) {
+      if (const auto *tw = mxfp4_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      if (const auto *tw = affine_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool emit_gpu_suffix_linear(Encoder &e, const MaterializedWeightView &w,
+                              Ref x, Ref y, U32 n, U32 k, bool use_w4a8,
+                              U32 row_offset, U32 out_stride, U32 slice_n,
+                              std::optional<U32> explicit_t = {}) {
+    if (use_w4a8 && try_linear_w4a8_base(e, w, x, y, n, k, explicit_t,
+                                         row_offset, out_stride, slice_n)) {
+      return true;
+    }
+    if (mxfp4_nax_active()) {
+      if (const auto *tw = mxfp4_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        linear_mxfp4_nax(e, *tw, x, y, f16_scratch, f16_row_scale, explicit_t,
+                         silicon_tuning.gpu_cores, row_offset, out_stride,
+                         slice_n);
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      if (const auto *tw = affine_nax_cache->find(w.object_id);
+          tw != nullptr && tw->n == n && tw->k == k) {
+        linear_affine_nax(e, *tw, x, affine_nax_xs, y, explicit_t,
+                          silicon_tuning.gpu_cores, row_offset, out_stride,
+                          slice_n);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool can_gpu_suffix_swiglu(const MaterializedWeightView &gate_w,
+                             const MaterializedWeightView &up_w, U32 n, U32 k,
+                             bool use_w4a8) const {
+    if (is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w)) {
+      return false;
+    }
+    if (use_w4a8 && can_w4a8_weight(gate_w, n, k) &&
+        can_w4a8_weight(up_w, n, k)) {
+      if (mxfp4_nax_active() && (k % 128U) == 0U) {
+        const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+        const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+        if (gw && uw && gw->bn == 16U && uw->bn == 16U) {
+          return true;
+        }
+      }
+      if (affine_nax_active()) {
+        const auto *gw = affine_nax_cache->find(gate_w.object_id);
+        const auto *uw = affine_nax_cache->find(up_w.object_id);
+        if (gw && uw && gw->bn == 16U && uw->bn == 16U) {
+          const std::string tg = affine_nax_mode_tag(gw->bits);
+          const std::string tu = affine_nax_mode_tag(uw->bits);
+          if (tg == tu || (tg == "q4" && tu == "q56") ||
+              (tg == "q56" && tu == "q4")) {
+            return true;
+          }
+        }
+      }
+    }
+    if (mxfp4_nax_active()) {
+      const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+      const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      const auto *gw = affine_nax_cache->find(gate_w.object_id);
+      const auto *uw = affine_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        const std::string tg = affine_nax_mode_tag(gw->bits);
+        const std::string tu = affine_nax_mode_tag(uw->bits);
+        if (tg == tu || (tg == "q4" && tu == "q56") ||
+            (tg == "q56" && tu == "q4")) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool emit_gpu_suffix_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
+                              const MaterializedWeightView &up_w, Ref x, Ref y,
+                              U32 n, U32 k, bool use_w4a8, U32 row_offset,
+                              U32 out_stride, U32 slice_n,
+                              std::optional<U32> explicit_t = {}) {
+    if (use_w4a8 &&
+        try_linear_w4a8_swiglu(e, gate_w, up_w, x, y, n, k, explicit_t,
+                               row_offset, out_stride, slice_n)) {
+      return true;
+    }
+    if (mxfp4_nax_active()) {
+      const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+      const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        linear_mxfp4_nax_swiglu(e, *gw, *uw, x, f16_scratch, f16_row_scale, y,
+                                silicon_tuning.gpu_cores, explicit_t,
+                                row_offset, out_stride, slice_n);
+        return true;
+      }
+    }
+    if (affine_nax_active()) {
+      const auto *gw = affine_nax_cache->find(gate_w.object_id);
+      const auto *uw = affine_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16U && uw->bn == 16U && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k) {
+        linear_affine_nax_swiglu(e, *gw, *uw, x, affine_nax_xs, y,
+                                 silicon_tuning.gpu_cores, explicit_t,
+                                 row_offset, out_stride, slice_n);
+        return true;
+      }
+    }
+    return false;
   }
 
   // 9e163eee N-concatenated sibling projection helper (2-way or 3-way).
@@ -2700,10 +3233,35 @@ public:
         return true;
       }
     }
-    if (gate_w.format != up_w.format) {
+    if (explicit_t.has_value() && t > e.profile.capacity) {
       return false;
     }
-    if (explicit_t.has_value() && t > e.profile.capacity) {
+    if (use_affine_nax_for_weight(gate_w, sel_t) &&
+        use_affine_nax_for_weight(up_w, sel_t)) {
+      const auto *gw = affine_nax_cache->find(gate_w.object_id);
+      const auto *uw = affine_nax_cache->find(up_w.object_id);
+      if (gw && uw && gw->bn == 16u && uw->bn == 16u && gw->n == n &&
+          gw->k == k && uw->n == n && uw->k == k && gw->split_k == uw->split_k) {
+        const std::string tg = affine_nax_mode_tag(gw->bits);
+        const std::string tu = affine_nax_mode_tag(uw->bits);
+        const bool mixed_q4_q56 = (tg == "q4" && tu == "q56") ||
+                                  (tg == "q56" && tu == "q4");
+        if (gw->bits == uw->bits || mixed_q4_q56) {
+          linear_affine_nax_swiglu(e, *gw, *uw, x, affine_nax_xs, y,
+                                   silicon_tuning.gpu_cores, explicit_t);
+          const std::string grp = affine_nax_group(
+              e, *gw, explicit_t, silicon_tuning.gpu_cores, uw->group_size);
+          e.record_weight(gate_w, n, k, "affine_nax_m5_v1", "affine_nax_m5_v1",
+                          {}, "linear_row_exact_portable_v1", grp, true,
+                          explicit_t);
+          e.record_weight(up_w, n, k, "affine_nax_m5_v1", "affine_nax_m5_v1",
+                          {}, "linear_row_exact_portable_v1", grp, true,
+                          explicit_t);
+          return true;
+        }
+      }
+    }
+    if (gate_w.format != up_w.format) {
       return false;
     }
     if (gate_w.format == "direct_bf16_v1") {
@@ -2747,25 +3305,6 @@ public:
         e.record_weight(gate_w, n, k, "mxfp4_nax_m5_v1", "mxfp4_nax_m5_v1", {},
                         "linear_row_exact_portable_v1", grp, true, explicit_t);
         e.record_weight(up_w, n, k, "mxfp4_nax_m5_v1", "mxfp4_nax_m5_v1", {},
-                        "linear_row_exact_portable_v1", grp, true, explicit_t);
-        return true;
-      }
-    }
-    if (use_affine_nax_for_weight(gate_w, sel_t) &&
-        use_affine_nax_for_weight(up_w, sel_t)) {
-      const auto *gw = affine_nax_cache->find(gate_w.object_id);
-      const auto *uw = affine_nax_cache->find(up_w.object_id);
-      if (gw && uw && gw->bits == uw->bits && gw->bn == 16u && uw->bn == 16u &&
-          gw->n == n && gw->k == k && uw->n == n && uw->k == k &&
-          gw->split_k == uw->split_k) {
-        linear_affine_nax_swiglu(e, *gw, *uw, x, affine_nax_xs, y,
-                                 silicon_tuning.gpu_cores, explicit_t);
-        const std::string grp = affine_nax_group(
-            e, *gw, explicit_t, silicon_tuning.gpu_cores, uw->group_size);
-        e.record_weight(gate_w, n, k, "affine_nax_m5_v1", "affine_nax_m5_v1",
-                        {}, "linear_row_exact_portable_v1", grp, true,
-                        explicit_t);
-        e.record_weight(up_w, n, k, "affine_nax_m5_v1", "affine_nax_m5_v1", {},
                         "linear_row_exact_portable_v1", grp, true, explicit_t);
         return true;
       }
@@ -3048,13 +3587,57 @@ public:
               e, c, t, k_ref, v_ref, state_block.state0, state_block.state1,
               table_ref, params, tok_word_attn, pos_word_attn, pos_patches);
         }
-        if (!split && (!exact_attention || c.hidden_size >= 1024) &&
-            !pos_placeholder.has_value() && dynamic_tokens &&
-            flash_nax_prefill_ && t >= kFlashNaxPrefillMinTokens &&
-            c.head_dim == 256) {
-          emit_paged_flash_prefill_affine4_g128(
-              e, c, t, q_ref, gate_ref, state_block.state0, state_block.state1,
-              mix_ref, table_ref, attn_pos_ref, std::move(params));
+        if (!split && !pos_placeholder.has_value() && dynamic_tokens &&
+            sage2_enabled_ && t >= kFlashNaxPrefillMinTokens &&
+            c.head_dim == 256 && attn_pos_ref.buffer != nullptr) {
+          const bool use_minf =
+              minference_enabled_ &&
+              context_envelope >= kMInferenceMinContextTokens;
+          emit_paged_flash_prefill_sage2(
+              e, c, t, context_envelope, /*is_affine4=*/true, use_minf, q_ref,
+              gate_ref, state_block.state0, state_block.state1, mix_ref,
+              table_ref, attn_pos_ref, params,
+              use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
+          e.profile.used_sage2 = true;
+          if (use_minf) {
+            e.profile.used_minference = true;
+            e.profile.minf_context_envelope = context_envelope;
+          }
+        } else if (!split && (!exact_attention || c.hidden_size >= 1024) &&
+                   !pos_placeholder.has_value() && dynamic_tokens &&
+                   flash_nax_prefill_ && t >= kFlashNaxPrefillMinTokens &&
+                   c.head_dim == 256) {
+          const bool short_tail_split =
+              split_attention_enabled && split_max.buffer != nullptr &&
+              split_sum.buffer != nullptr && split_output.buffer != nullptr &&
+              gqa_flash_prefill_tail_needs_split_kv(
+                  t, U32(c.num_attention_heads), U32(c.num_key_value_heads),
+                  context_envelope, silicon_tuning.gpu_cores) &&
+              affine4_short_tail_split_tokens(
+                  t, U32(c.num_attention_heads), U32(c.num_key_value_heads),
+                  context_envelope, split_max.bytes, split_sum.bytes,
+                  split_output.bytes) > 0U;
+          if (short_tail_split) {
+            emit_paged_attention_affine4_g128(
+                e, c, t, /*split=*/true, context_envelope, slot_max_context,
+                slot_pool.physical_pages(), q_ref, gate_ref, state_block.state0,
+                state_block.state1, mix_ref, table_ref, attn_pos_ref, split_max,
+                split_sum, split_output, std::move(params), tok_word_attn,
+                pos_word_attn, pos_patches, affine4_q_prepacked);
+          } else if (flash_nax_prefill_runtime_eligible(context, libraries,
+                                                        U32(c.head_dim))) {
+            emit_paged_flash_prefill_affine4_g128(
+                e, c, t, q_ref, gate_ref, state_block.state0,
+                state_block.state1, mix_ref, table_ref, attn_pos_ref,
+                std::move(params));
+          } else {
+            emit_paged_attention_affine4_g128(
+                e, c, t, /*split=*/false, context_envelope, slot_max_context,
+                slot_pool.physical_pages(), q_ref, gate_ref, state_block.state0,
+                state_block.state1, mix_ref, table_ref, attn_pos_ref, split_max,
+                split_sum, split_output, std::move(params), tok_word_attn,
+                pos_word_attn, pos_patches, affine4_q_prepacked);
+          }
         } else {
           emit_paged_attention_affine4_g128(
               e, c, t, split, context_envelope, slot_max_context,
@@ -3106,10 +3689,71 @@ public:
     }
 
     if (!pos_placeholder.has_value() && dynamic_tokens && !split &&
+        sage2_enabled_ && t >= kFlashNaxPrefillMinTokens && c.head_dim == 256 &&
+        attn_pos_ref.buffer != nullptr) {
+      const bool use_minf =
+          minference_enabled_ &&
+          context_envelope >= kMInferenceMinContextTokens;
+      emit_paged_flash_prefill_sage2(
+          e, c, t, context_envelope, /*is_affine4=*/false, use_minf, q_ref,
+          gate_ref, state_block.state0, state_block.state1, mix_ref, table_ref,
+          attn_pos_ref, params,
+          use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
+      e.profile.used_sage2 = true;
+      if (use_minf) {
+        e.profile.used_minference = true;
+        e.profile.minf_context_envelope = context_envelope;
+      }
+      return;
+    }
+    if (!pos_placeholder.has_value() && dynamic_tokens && !split &&
         (!exact_attention || c.hidden_size >= 1024) && flash_nax_prefill_ &&
         t >= kFlashNaxPrefillMinTokens && attn_pos_ref.buffer != nullptr &&
         flash_nax_prefill_runtime_eligible(context, libraries,
                                            U32(c.head_dim))) {
+      if (c.head_dim == 256 && split_attention_enabled && exact_attention &&
+          !strict_two_pass_attn_ && split_max.buffer != nullptr &&
+          split_sum.buffer != nullptr && split_output.buffer != nullptr &&
+          gqa_flash_prefill_tail_needs_split_kv(
+              t, U32(c.num_attention_heads), U32(c.num_key_value_heads),
+              context_envelope, silicon_tuning.gpu_cores)) {
+        U32 tail_chunk = 0U;
+        U32 tail_splits = 0U;
+        for (U32 cand_chunk : {512U, 1024U, 2048U, 4096U, 8192U}) {
+          const U32 cand_splits =
+              (context_envelope + cand_chunk - 1U) / cand_chunk;
+          if (cand_splits >= 2U &&
+              U64(t) * c.num_attention_heads * cand_splits * 4ULL <=
+                  split_max.bytes &&
+              U64(t) * c.num_attention_heads * cand_splits * 4ULL <=
+                  split_sum.bytes &&
+              U64(t) * c.num_attention_heads * cand_splits * c.head_dim *
+                      4ULL <=
+                  split_output.bytes) {
+            tail_chunk = cand_chunk;
+            tail_splits = cand_splits;
+            break;
+          }
+        }
+        if (tail_splits >= 2U) {
+          e.profile.split_attention = true;
+          e.profile.split_count = tail_splits;
+          e.profile.split_workspace_bytes =
+              U64(t) * c.num_attention_heads * tail_splits *
+              (8ULL + U64(c.head_dim) * 4ULL);
+          auto split_params = words(
+              {U32(c.num_attention_heads), U32(c.num_key_value_heads),
+               U32(c.head_dim), t, pos_init, slot_max_context, 64,
+               slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv, kv,
+               q * 2, U32(c.head_dim * 2), tail_splits, tail_chunk});
+          emit_paged_split_attention_exact_1pass_gqa(
+              e, context, libraries, c, t, tail_splits, q_ref, gate_ref,
+              state_block.state0, state_block.state1, mix_ref, table_ref,
+              split_max, split_sum, split_output, attn_pos_ref,
+              std::move(split_params), tok_word_attn, pos_word_attn);
+          return;
+        }
+      }
       emit_paged_flash_prefill_nax(e, c, t, q_ref, gate_ref,
                                    state_block.state0, state_block.state1,
                                    mix_ref, table_ref, attn_pos_ref,
@@ -3286,7 +3930,8 @@ public:
                  U32 context_envelope, bool input_is_f16 = false,
                  Ref custom_attn_pos = {},
                  std::optional<U32> *io_sq_slot = nullptr,
-                 std::optional<U32> out_sq_slot = std::nullopt) {
+                 std::optional<U32> out_sq_slot = std::nullopt,
+                 bool input_is_a8 = false) {
     const U32 t = e.profile.capacity;
     Ref q_ref = query, k_ref = key, v_ref = value;
     const std::array<MaterializedWeightView, 3> parts{
@@ -3434,6 +4079,19 @@ public:
                         "pretiled_affine_qmv_concat3_t1_v3", {},
                         "legacy_route_v1", {}, false);
       }
+    } else if (!fused_qkv_norm && input_is_a8 &&
+               try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
+                                   norm, concat_out)) {
+      emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+    } else if (!fused_qkv_norm && input_is_a8) {
+      if (!try_linear_w4a8_base(e, block.get("attention_q"), norm, query, 2 * q,
+                                h))
+        linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+      if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key, kv, h))
+        linear_base(e, block.get("attention_k"), norm, key, kv, h);
+      if (!try_linear_w4a8_base(e, block.get("attention_v"), norm, value, kv,
+                                h))
+        linear_base(e, block.get("attention_v"), norm, value, kv, h);
     } else if (!fused_qkv_norm &&
                try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h,
                               input_is_f16, norm, concat_out)) {
@@ -3472,9 +4130,14 @@ public:
         v_ref, mixer,
         custom_attn_pos.buffer ? custom_attn_pos : attention_positions, t,
         split, context_envelope, true);
-    if (io_sq_slot != nullptr && out_sq_slot.has_value() &&
-        try_linear_add_sq_t1(e, block.get("attention_o"), mixer, hidden, h, q,
-                             *out_sq_slot)) {
+    if (input_is_a8 &&
+        try_linear_w4a8_base(e, block.get("attention_o"), mixer, delta, h, q)) {
+      emit_bypass_for_weight(e, block.get("attention_o"), mixer, delta, h);
+      if (io_sq_slot != nullptr)
+        *io_sq_slot = std::nullopt;
+    } else if (io_sq_slot != nullptr && out_sq_slot.has_value() &&
+               try_linear_add_sq_t1(e, block.get("attention_o"), mixer, hidden,
+                                    h, q, *out_sq_slot)) {
       *io_sq_slot = out_sq_slot;
     } else {
       linear(e, block.get("attention_o"), mixer, delta, h, q);
@@ -3501,7 +4164,10 @@ public:
                            Ref mix_ref, U32 t, bool verify, bool dynamic_tokens,
                            bool allow_f16_out, U32 slot_max_context = 0U,
                            std::optional<U32> out_sq_slot = std::nullopt,
-                           bool *out_fused_add_sq = nullptr) {
+                           bool *out_fused_add_sq = nullptr,
+                           bool out_w4a8 = false,
+                           bool out_w4a8_write_bf16 = false,
+                           bool emit_gdn_out_linear = true) {
     if (out_fused_add_sq)
       *out_fused_add_sq = false;
     const auto &c = config;
@@ -3536,15 +4202,24 @@ public:
     const U32 vd = U32(c.linear_value_head_dim);
 
     const auto &out_w = block.get("gdn_out");
+    const bool eff_out_w4a8 =
+        out_w4a8 && !verify && can_w4a8_weight(out_w, h, gv);
     const auto *gdn_out_nax =
-        (allow_f16_out && !has_bypass_lora(out_w) &&
-         use_mxfp4_nax_for_weight(out_w, t))
+        (!eff_out_w4a8 && allow_f16_out && emit_gdn_out_linear &&
+         !has_bypass_lora(out_w) && use_mxfp4_nax_for_weight(out_w, t))
             ? mxfp4_nax_cache->find(out_w.object_id)
             : nullptr;
     const bool out_f16 =
         (gdn_out_nax != nullptr && gdn_out_nax->n == h && gdn_out_nax->k == gv);
     const U32 mp = out_f16 ? mxfp4_nax_mp(t) : 0U;
     auto emit_gdn_out_bf16 = [&]() {
+      if (!emit_gdn_out_linear) {
+        return;
+      }
+      if (eff_out_w4a8 && try_linear_w4a8_base(e, out_w, mix_ref, delta, h, gv)) {
+        emit_bypass_for_weight(e, out_w, mix_ref, delta, h);
+        return;
+      }
       if (out_sq_slot.has_value() &&
           try_linear_add_sq_t1(e, out_w, mix_ref, hidden, h, gv,
                                *out_sq_slot)) {
@@ -3570,8 +4245,23 @@ public:
               U32(c.linear_num_value_heads), kd, vd, conv, qkv_ref, conv_w,
               hist_ref, a_ref, b_ref, a_log, dt_bias, state_block.state0, z_ref,
               gdn_norm, out_f16 ? f16_scratch : mix_ref, out_f16, gdn_chunk_ws,
-              gdn_chunk_nax_enabled_, params, mega_params, dynamic_tokens)) {
-        if (out_f16) {
+              gdn_chunk_nax_enabled_, params, mega_params, dynamic_tokens,
+              silicon_tuning.gpu_cores, eff_out_w4a8 ? a8_qa : Ref{},
+              eff_out_w4a8 ? a8_sa : Ref{}, eff_out_w4a8 ? a8_ra : Ref{},
+              eff_out_w4a8 ? w4a8_nax_mp(t) : 0U,
+              eff_out_w4a8 && (out_w4a8_write_bf16 || has_bypass_lora(out_w)),
+              float(c.rms_norm_eps))) {
+        if (eff_out_w4a8) {
+          e.set_a8_quant(make_a8_key(
+              e, mix_ref, gv,
+              dynamic_tokens ? std::nullopt : std::optional<U32>(t)));
+          if (emit_gdn_out_linear) {
+            if (!try_linear_w4a8_base(e, out_w, mix_ref, delta, h, gv)) {
+              linear_base(e, out_w, mix_ref, delta, h, gv);
+            }
+            emit_bypass_for_weight(e, out_w, mix_ref, delta, h);
+          }
+        } else if (out_f16) {
           linear_from_f16(e, out_w, f16_scratch, f16_ones_scale, delta, h, gv);
         } else if (allow_f16_out) {
           emit_gdn_out_bf16();
@@ -3717,7 +4407,8 @@ public:
 
   void gdn(Encoder &e, const Block &block, bool verify,
            bool input_is_f16 = false, std::optional<U32> *io_sq_slot = nullptr,
-           std::optional<U32> out_sq_slot = std::nullopt) {
+           std::optional<U32> out_sq_slot = std::nullopt,
+           bool input_is_a8 = false) {
     const auto &c = config;
     const U32 t = e.profile.capacity;
     const U32 hv = U32(c.linear_num_value_heads);
@@ -3953,6 +4644,15 @@ public:
                           "pretiled_affine_qmv_concat2_t1_v3", {},
                           "legacy_route_v1", {}, false);
         }
+      } else if (input_is_a8 &&
+                 try_concat_w4a8_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
+                                     qkvz_ns, h, norm, concat_out)) {
+        emit_split2(e, concat_out, qkv, z, conv, gv);
+      } else if (input_is_a8) {
+        if (!try_linear_w4a8_base(e, block.get("gdn_qkv"), norm, qkv, conv, h))
+          linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+        if (!try_linear_w4a8_base(e, block.get("gdn_z"), norm, z, gv, h))
+          linear_base(e, block.get("gdn_z"), norm, z, gv, h);
       } else if (try_concat_nax(e, block.concat_gdn_qkvz_id, qkvz_parts, qkvz_ns,
                                 h, input_is_f16, norm, concat_out)) {
         if (t == 1U && !inspect_tensors_workspace) {
@@ -4012,6 +4712,15 @@ public:
                           "pretiled_affine_qmv_concat2_t1_v3", {},
                           "legacy_route_v1", {}, false);
         }
+      } else if (input_is_a8 &&
+                 try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
+                                     h, norm, ab_concat)) {
+        emit_split2(e, ab_concat, a, b, hv, hv);
+      } else if (input_is_a8) {
+        if (!try_linear_w4a8_base(e, block.get("gdn_a"), norm, a, hv, h))
+          linear_base(e, block.get("gdn_a"), norm, a, hv, h);
+        if (!try_linear_w4a8_base(e, block.get("gdn_b"), norm, b, hv, h))
+          linear_base(e, block.get("gdn_b"), norm, b, hv, h);
       } else if (try_concat_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
                                 input_is_f16, norm, ab_concat)) {
         if (t == 1U && !inspect_tensors_workspace) {
@@ -4048,7 +4757,7 @@ public:
         e, block, block, qkv_ref, z_ref, a_ref, b_ref, convolved, recurrent,
         mixer, t, verify, true, true, 0U,
         io_sq_slot != nullptr ? out_sq_slot : std::optional<U32>{},
-        &gdn_fused_sq);
+        &gdn_fused_sq, /*out_w4a8=*/input_is_a8);
     if (io_sq_slot != nullptr) {
       *io_sq_slot = gdn_fused_sq ? out_sq_slot : std::nullopt;
     }
@@ -4175,7 +4884,8 @@ public:
   bool try_fused_moe_ffn(Encoder &e, const Block &block,
                          bool &wrote_expert_output,
                          Ref fused_router_logits = {},
-                         std::optional<U32> explicit_t = {}) {
+                         std::optional<U32> explicit_t = {},
+                         bool verify = false, bool input_is_a8 = false) {
     wrote_expert_output = false;
     if (moe_override)
       return false;
@@ -4189,6 +4899,18 @@ public:
       return false;
     }
     const U32 t = explicit_t.value_or(e.profile.capacity);
+    const U32 sel_t = nax_effective_select_t(e, explicit_t);
+    if (input_is_a8 && !verify &&
+        moe_w4a8_nax_runtime_eligible(context, libraries) &&
+        ensure_a8_quant(e, norm, h, explicit_t) &&
+        emit_moe_w4a8_nax_ffn(e, moe_nax_ws, gw, uw, dw, a8_qa, a8_sa, a8_ra,
+                              w4a8_nax_mp(t), route_ids, route_scores,
+                              expert_output, routed, t, h, f, 8u, 256u,
+                              explicit_t, fused_router_logits,
+                              /*emit_reduce=*/false)) {
+      wrote_expert_output = true;
+      return true;
+    }
     const bool has_moe_min_env =
         (std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
     const bool force_t1_moe_qmv =
@@ -4206,11 +4928,15 @@ public:
             : (unlock_moe_nax
                    ? silicon_tuning.moe_nax_min_tokens
                    : std::max<U32>(silicon_tuning.moe_nax_min_tokens, 8U));
+    const bool use_out64 =
+        !verify && sel_t >= 32U &&
+        !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_SWIGLU_OUT64");
     if (t >= eff_moe_min_t &&
         emit_moe_nax_ffn(e, moe_nax_ws, gw, uw, dw, norm, route_ids,
                          route_scores, expert_output, routed, t, h, f, 8u, 256u,
                          silicon_tuning.gpu_cores, explicit_t,
-                         fused_router_logits, /*emit_reduce=*/false)) {
+                         fused_router_logits, /*emit_reduce=*/false,
+                         use_out64)) {
       wrote_expert_output = true;
       return true;
     }
@@ -4331,9 +5057,45 @@ public:
            bool input_is_f16 = false, std::optional<U32> explicit_t = {},
            std::optional<U32> *io_sq_slot = nullptr,
            std::optional<U32> out_sq_slot = std::nullopt,
-           bool allow_moe9_bt = false) {
+           bool allow_moe9_bt = false, bool input_is_a8 = false,
+           bool verify = false) {
     const auto t = explicit_t.value_or(e.profile.capacity);
     if (!config.num_experts) {
+      if (input_is_a8) {
+        if (!try_linear_w4a8_swiglu(e, block.get("mlp_gate"),
+                                    block.get("mlp_up"), norm, product, f, h,
+                                    explicit_t)) {
+          if (!try_linear_w4a8_base(e, block.get("mlp_gate"), norm, gate, f, h,
+                                    explicit_t))
+            linear_base(e, block.get("mlp_gate"), norm, gate, f, h, explicit_t);
+          if (!try_linear_w4a8_base(e, block.get("mlp_up"), norm, up, f, h,
+                                    explicit_t))
+            linear_base(e, block.get("mlp_up"), norm, up, f, h, explicit_t);
+          if (const auto *mlp_gu_bypass = find_bypass_group(
+                  layer_index, QwenBypassGroupKind::mlp_gate_up);
+              mlp_gu_bypass != nullptr) {
+            const std::array<detail::lora_rt::BypassPartDest, 2> dests{{
+                {gate, f, 0U},
+                {up, f, 0U},
+            }};
+            detail::lora_rt::emit_bypass_sibling_group(
+                e, *mlp_gu_bypass, norm, dests, lora_bypass_tmp_,
+                bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, explicit_t);
+          }
+          swiglu(e, t, f, explicit_t);
+        }
+        if (w4a8_down_proj_ &&
+            try_linear_w4a8_base(e, block.get("mlp_down"), product, delta, h, f,
+                                 explicit_t)) {
+          emit_bypass_for_weight(e, block.get("mlp_down"), product, delta, h,
+                                 explicit_t);
+        } else {
+          linear(e, block.get("mlp_down"), product, delta, h, f, explicit_t);
+        }
+        if (io_sq_slot != nullptr)
+          *io_sq_slot = std::nullopt;
+        return;
+      }
       if (input_is_f16) {
         const auto &gw_v = block.get("mlp_gate");
         const auto &uw_v = block.get("mlp_up");
@@ -4611,7 +5373,8 @@ public:
     }
     bool wrote_expert_output = false;
     if (!try_fused_moe_ffn(e, block, wrote_expert_output,
-                           fuse_router_nax ? router : Ref{}, explicit_t)) {
+                           fuse_router_nax ? router : Ref{}, explicit_t,
+                           verify, input_is_a8)) {
       expert_linear(e, block.get("moe_expert_gate"), norm, gate, f, h, false,
                     explicit_t);
       expert_linear(e, block.get("moe_expert_up"), norm, up, f, h, false,
@@ -4622,13 +5385,28 @@ public:
       wrote_expert_output = true;
     }
     U32 shared_f = U32(config.shared_expert_intermediate_size);
-    if (!try_linear_swiglu(e, block.get("moe_shared_mlp_gate"),
+    const bool shared_swiglu_done =
+        (input_is_a8 &&
+         try_linear_w4a8_swiglu(e, block.get("moe_shared_mlp_gate"),
+                                block.get("moe_shared_mlp_up"), norm, product,
+                                shared_f, h, explicit_t)) ||
+        (!input_is_a8 &&
+         try_linear_swiglu(e, block.get("moe_shared_mlp_gate"),
                            block.get("moe_shared_mlp_up"), norm, product,
-                           shared_f, h, explicit_t)) {
-      linear_base(e, block.get("moe_shared_mlp_gate"), norm, gate, shared_f, h,
-                  explicit_t);
-      linear_base(e, block.get("moe_shared_mlp_up"), norm, up, shared_f, h,
-                  explicit_t);
+                           shared_f, h, explicit_t));
+    if (!shared_swiglu_done) {
+      if (!(input_is_a8 &&
+            try_linear_w4a8_base(e, block.get("moe_shared_mlp_gate"), norm,
+                                 gate, shared_f, h, explicit_t))) {
+        linear_base(e, block.get("moe_shared_mlp_gate"), norm, gate, shared_f,
+                    h, explicit_t);
+      }
+      if (!(input_is_a8 &&
+            try_linear_w4a8_base(e, block.get("moe_shared_mlp_up"), norm, up,
+                                 shared_f, h, explicit_t))) {
+        linear_base(e, block.get("moe_shared_mlp_up"), norm, up, shared_f, h,
+                    explicit_t);
+      }
       if (const auto *sgu_bypass = find_bypass_group(
               layer_index, QwenBypassGroupKind::moe_shared_gate_up);
           sgu_bypass != nullptr) {
@@ -4642,8 +5420,15 @@ public:
       }
       swiglu(e, t, shared_f, explicit_t);
     }
-    linear(e, block.get("moe_shared_mlp_down"), product, shared, h, shared_f,
-           explicit_t);
+    if (input_is_a8 && w4a8_down_proj_ &&
+        try_linear_w4a8_base(e, block.get("moe_shared_mlp_down"), product,
+                             shared, h, shared_f, explicit_t)) {
+      emit_bypass_for_weight(e, block.get("moe_shared_mlp_down"), product,
+                             shared, h, explicit_t);
+    } else {
+      linear(e, block.get("moe_shared_mlp_down"), product, shared, h, shared_f,
+             explicit_t);
+    }
     linear(e, block.get("moe_shared_gate"), norm, shared_gate, 1, h, explicit_t);
     if (wrote_expert_output) {
       auto &combine =
@@ -4775,6 +5560,21 @@ public:
              std::to_string(moe_override->capacity) + "." +
              moe_override->choice;
     }
+    if (w4a8_nax_enabled_) {
+      key += ".plm1.w4m" + std::to_string(w4a8_min_tokens_);
+      if (w4a8_down_proj_) {
+        key += ".w4dp1";
+      }
+    }
+    if (sage2_enabled_) {
+      key += ".pam1";
+      if (resolve_sage2_pv_mode() == Sage2PvMode::Mxfp8) {
+        key += ".s2mx8";
+      }
+    }
+    if (minference_enabled_) {
+      key += ".minf1";
+    }
     return key;
   }
 
@@ -4823,6 +5623,10 @@ public:
           const auto *tw = mxfp4_nax_cache->find(head.object_id);
           return tw && tw->n == v && tw->k == h;
         }();
+    const bool layer_w4a8 = use_w4a8_prefill(e, verify);
+    if (layer_w4a8) {
+      e.profile.used_w4a8 = true;
+    }
     const bool allow_t1_fused_norms =
         (t == 1U && !verify && !defer_sample && !trunk_only &&
          !speculative_enabled && allow_tdom_t1() && t_domain_active() &&
@@ -4830,18 +5634,47 @@ public:
          rms_sq_buf.buffer != nullptr && moe_tg_done_buf.buffer != nullptr &&
          h < 65536U);
     const bool affine_xs_eligible =
-        (!allow_t1_fused_norms && t > 1U && affine_nax_active() &&
+        (!layer_w4a8 && !allow_t1_fused_norms && t > 1U && affine_nax_active() &&
          affine_nax_xs.buffer != nullptr && (h % 64U) == 0U);
     const U32 num_sq_words = U32(blocks.size()) * 2U + 4U;
     const U32 num_moe_words =
         config.num_experts ? (U32(blocks.size()) + 4U) : 0U;
     std::optional<U32> pending_sq_slot;
     std::optional<Encoder::GroupSumKey> carried_affine_xs;
+    std::optional<Encoder::A8QuantKey> carried_a8_quant;
     auto restore_carried_xs = [&]() {
       if (carried_affine_xs.has_value()) {
         e.set_group_sum(*carried_affine_xs);
         carried_affine_xs.reset();
       }
+      if (carried_a8_quant.has_value()) {
+        e.set_a8_quant(*carried_a8_quant);
+        carried_a8_quant.reset();
+      }
+    };
+    auto block_input_needs_bf16 = [&](const Block &blk) -> bool {
+      if (inspect_tensors_workspace)
+        return true;
+      if (blk.type == LayerType::full_attention) {
+        return block_has_any_bypass(
+                   blk, {"attention_q", "attention_k", "attention_v"}) ||
+               !can_w4a8_weight(blk.get("attention_q"), 2 * q, h) ||
+               !can_w4a8_weight(blk.get("attention_k"), kv, h) ||
+               !can_w4a8_weight(blk.get("attention_v"), kv, h);
+      }
+      const U32 hv = U32(config.linear_num_value_heads);
+      return block_has_any_bypass(blk, {"gdn_qkv", "gdn_z", "gdn_a", "gdn_b"}) ||
+             !can_w4a8_weight(blk.get("gdn_qkv"), conv, h) ||
+             !can_w4a8_weight(blk.get("gdn_z"), gv, h) ||
+             !can_w4a8_weight(blk.get("gdn_a"), hv, h) ||
+             !can_w4a8_weight(blk.get("gdn_b"), hv, h);
+    };
+    auto block_mlp_needs_bf16 = [&](const Block &blk) -> bool {
+      if (inspect_tensors_workspace || config.num_experts > 0)
+        return true;
+      return block_has_any_bypass(blk, {"mlp_gate", "mlp_up"}) ||
+             !can_w4a8_weight(blk.get("mlp_gate"), f, h) ||
+             !can_w4a8_weight(blk.get("mlp_up"), f, h);
     };
     auto make_norm_xs_key = [&]() -> Encoder::GroupSumKey {
       return Encoder::GroupSumKey{affine_nax_xs.buffer,
@@ -4856,17 +5689,25 @@ public:
     };
     U32 layer_index = 0;
     for (const auto &block : blocks) {
-      const bool in_f16 = block_input_nax(block, t);
-      const bool mlp_f16 = block_mlp_input_nax(block, t);
-      const bool in_affine_xs = (!in_f16 && affine_xs_eligible);
-      const bool mlp_affine_xs = (!mlp_f16 && affine_xs_eligible);
-      const bool layer_fuse = allow_t1_fused_norms && !in_f16 && !mlp_f16;
+      const bool in_f16 = !layer_w4a8 && block_input_nax(block, t);
+      const bool mlp_f16 = !layer_w4a8 && block_mlp_input_nax(block, t);
+      const bool in_affine_xs = (!layer_w4a8 && !in_f16 && affine_xs_eligible);
+      const bool mlp_affine_xs = (!layer_w4a8 && !mlp_f16 && affine_xs_eligible);
+      const bool layer_fuse =
+          allow_t1_fused_norms && !layer_w4a8 && !in_f16 && !mlp_f16;
       e.begin_stage(
           "layer." + std::to_string(layer_index) +
           (block.type == LayerType::full_attention ? ".attention" : ".gdn"));
       restore_carried_xs();
       if (layer_index == 0) {
-        if (in_f16)
+        if (layer_w4a8) {
+          emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h),
+                              norm, a8_qa, a8_sa, a8_ra, h,
+                              float(config.rms_norm_eps),
+                              normalization_weight_offset,
+                              block_input_needs_bf16(block));
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (in_f16)
           normalize_f16(e, block.get("input_norm"), hidden, f16_norm);
         else if (allow_t1_fused_norms)
           normalize_init_zero_t1(e, block.get("input_norm"), hidden, norm,
@@ -4879,7 +5720,14 @@ public:
         else
           normalize(e, block.get("input_norm"), hidden, norm);
       } else if (!layer_fuse && pending_sq_slot.has_value()) {
-        if (in_f16)
+        if (layer_w4a8) {
+          emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h),
+                              norm, a8_qa, a8_sa, a8_ra, h,
+                              float(config.rms_norm_eps),
+                              normalization_weight_offset,
+                              block_input_needs_bf16(block));
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (in_f16)
           normalize_f16(e, block.get("input_norm"), hidden, f16_norm);
         else if (in_affine_xs)
           emit_affine_rmsnorm_xsum(e, hidden, direct(block.get("input_norm"), h),
@@ -4894,14 +5742,22 @@ public:
         attention(e, block, split, context_envelope, in_f16, custom_attn_pos,
                   layer_fuse ? &pending_sq_slot : nullptr,
                   layer_fuse ? std::optional<U32>{2U * layer_index}
-                             : std::optional<U32>{});
+                             : std::optional<U32>{},
+                  layer_w4a8);
       else
         gdn(e, block, verify, in_f16, layer_fuse ? &pending_sq_slot : nullptr,
             layer_fuse ? std::optional<U32>{2U * layer_index}
-                       : std::optional<U32>{});
+                       : std::optional<U32>{},
+            layer_w4a8);
       e.begin_stage("layer." + std::to_string(layer_index) + ".mlp");
       if (!pending_sq_slot.has_value()) {
-        if (mlp_f16)
+        if (layer_w4a8) {
+          emit_add_rmsnorm_a8_g64(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+              normalization_weight_offset, block_mlp_needs_bf16(block));
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (mlp_f16)
           add_normalize_f16(e, block.get("post_attention_norm"), hidden, delta,
                             f16_norm);
         else if (mlp_affine_xs)
@@ -4916,23 +5772,34 @@ public:
       mlp(e, block, layer_index, mlp_f16, {},
           layer_fuse ? &pending_sq_slot : nullptr,
           layer_fuse ? std::optional<U32>{2U * layer_index + 1U}
-                     : std::optional<U32>{});
+                     : std::optional<U32>{},
+          false, layer_w4a8, verify);
       if (!pending_sq_slot.has_value()) {
         if (layer_index + 1 < blocks.size()) {
-          const bool next_in_f16 = block_input_nax(blocks[layer_index + 1], t);
-          if (next_in_f16)
-            add_normalize_f16(e, blocks[layer_index + 1].get("input_norm"),
-                              hidden, delta, f16_norm);
-          else if (affine_xs_eligible) {
-            emit_affine_add_rmsnorm_xsum(
+          if (layer_w4a8) {
+            emit_add_rmsnorm_a8_g64(
                 e, hidden, delta,
                 direct(blocks[layer_index + 1].get("input_norm"), h), norm,
-                affine_nax_xs, h, float(config.rms_norm_eps),
-                normalization_weight_offset);
-            carried_affine_xs = make_norm_xs_key();
-          } else
-            add_normalize(e, blocks[layer_index + 1].get("input_norm"), hidden,
-                          delta, norm);
+                a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                normalization_weight_offset,
+                block_input_needs_bf16(blocks[layer_index + 1]));
+            carried_a8_quant = make_a8_key(e, norm, h);
+          } else {
+            const bool next_in_f16 = block_input_nax(blocks[layer_index + 1], t);
+            if (next_in_f16)
+              add_normalize_f16(e, blocks[layer_index + 1].get("input_norm"),
+                                hidden, delta, f16_norm);
+            else if (affine_xs_eligible) {
+              emit_affine_add_rmsnorm_xsum(
+                  e, hidden, delta,
+                  direct(blocks[layer_index + 1].get("input_norm"), h), norm,
+                  affine_nax_xs, h, float(config.rms_norm_eps),
+                  normalization_weight_offset);
+              carried_affine_xs = make_norm_xs_key();
+            } else
+              add_normalize(e, blocks[layer_index + 1].get("input_norm"), hidden,
+                            delta, norm);
+          }
         } else if (!extract_last_row_head) {
           if (nax_head)
             add_normalize_f16(e, final_norm, hidden, delta, f16_norm);
@@ -5571,8 +6438,10 @@ public:
           }
         }
         const bool use_batched_affine4_flash =
-            can_batched_affine4_attn && flash_nax_prefill_ && !skey.verify &&
-            max_w >= 16U;
+            can_batched_affine4_attn && flash_nax_prefill_ &&
+            flash_nax_prefill_runtime_eligible(context, libraries,
+                                               U32(config.head_dim)) &&
+            !skey.verify && max_w >= 16U;
         BatchedAffine4SplitPlan batched_affine4_split{};
         if (can_batched_affine4_attn && !use_batched_affine4_flash) {
           if (skey.affine4_split_env > 0U && split_max.buffer &&
@@ -7425,6 +8294,2293 @@ public:
     ++feature_epoch_;
   }
 
+  struct LongCtxProfileKey {
+    U32 capacity = 0;
+    U32 context_envelope = 0;
+    bool trunk_only = false;
+    bool uses_pipe_slot0 = false;
+    auto operator<=>(const LongCtxProfileKey &) const = default;
+  };
+
+  struct AneLayerSubPlan {
+    bool is_full_attn = false;
+    std::optional<Profile> attn_pre_o;
+    std::optional<U32> attn_o_op_id;
+    std::optional<Profile> attn_o_gpu;
+    std::optional<Profile> gdn_qkv_ab;
+    std::optional<U32> gdn_z_op_id;
+    std::optional<Profile> gdn_z_gpu;
+    std::optional<Profile> gdn_rec;
+    std::optional<U32> gdn_out_op_id;
+    std::optional<Profile> gdn_out_gpu;
+    std::optional<Profile> post_norm;
+    std::optional<U32> mlp_gu_op_id;
+    std::optional<Profile> mlp_gu_gpu;
+    std::optional<U32> mlp_down_op_id;
+    std::optional<Profile> mlp_down_gpu;
+    std::optional<Profile> next_norm;
+  };
+
+  struct AneChunkPlan {
+    U32 chunk_t = 0;
+    U32 context_envelope = 0;
+    bool trunk_only = false;
+    bool used_w4a8 = false;
+    bool used_sage2 = false;
+    bool used_minference = false;
+    std::optional<Profile> embed_norm0;
+    std::vector<AneLayerSubPlan> layers;
+    std::optional<Profile> head_sample;
+  };
+
+  template <typename T>
+  static std::vector<std::byte> pod_bytes(const T &v) {
+    const auto raw = std::as_bytes(std::span<const T, 1>(&v, 1));
+    return std::vector<std::byte>(raw.begin(), raw.end());
+  }
+
+  bool needs_long_ctx_prefill_profile(U32 count, U32 start_pos) const noexcept {
+    if (inspect_tensors_workspace || count < kFlashNaxPrefillMinTokens) {
+      return false;
+    }
+    const U32 end_pos = start_pos + count;
+    if (minference_enabled_ && end_pos >= kMInferenceMinContextTokens) {
+      return true;
+    }
+    if (!sage2_enabled_ && flash_nax_prefill_ && split_attention_enabled &&
+        config.head_dim == 256 && end_pos >= 4096U &&
+        gqa_flash_prefill_tail_needs_split_kv(
+            count, U32(config.num_attention_heads),
+            U32(config.num_key_value_heads), end_pos, silicon_tuning.gpu_cores)) {
+      return true;
+    }
+    return false;
+  }
+
+  U32 select_long_ctx_envelope(U32 end_pos) const noexcept {
+    for (U32 env : {4096U, 8192U, 16384U, 32768U, 65536U, 131072U, 262144U}) {
+      if (env >= max_context) {
+        return max_context;
+      }
+      if (end_pos <= env) {
+        return env;
+      }
+    }
+    return max_context;
+  }
+
+  Profile *select_long_ctx_prefill_profile(U32 count, U32 start_pos,
+                                           bool trunk_only,
+                                           bool use_pipe_slot0) {
+    if (!needs_long_ctx_prefill_profile(count, start_pos)) {
+      return nullptr;
+    }
+    const U32 cap = select_forward_bucket_capacity(count, max_context);
+    const U32 end_pos = start_pos + count;
+    const U32 env = select_long_ctx_envelope(end_pos);
+    const LongCtxProfileKey exact_key{cap, env, trunk_only, use_pipe_slot0};
+    if (auto it = long_ctx_profiles_.find(exact_key);
+        it != long_ctx_profiles_.end()) {
+      return &it->second;
+    }
+    // Check if an existing precompiled profile covers (cap, env) when warmup is sealed.
+    Profile *best = nullptr;
+    for (auto &[k, prof] : long_ctx_profiles_) {
+      if (k.trunk_only == trunk_only && k.uses_pipe_slot0 == use_pipe_slot0 &&
+          k.capacity >= count && k.context_envelope >= end_pos) {
+        if (!best || k.capacity < best->capacity ||
+            (k.capacity == best->capacity &&
+             k.context_envelope < best->context_envelope)) {
+          best = &prof;
+        }
+      }
+    }
+    if (context.warmup_sealed()) {
+      return best;
+    }
+    const Ref tok_ref =
+        use_pipe_slot0 ? prefill_pipe_[0].token_ids : Ref{};
+    const Ref pos_ref =
+        use_pipe_slot0 ? prefill_pipe_[0].attn_pos : Ref{};
+    const std::string tag = use_pipe_slot0 ? ".pf_pipe0" : "";
+    auto prof = compile(cap, false, false, env, false, {}, pos_ref, {}, tag,
+                        trunk_only, tok_ref);
+    ensure_profile_icb(context, prof);
+    auto [it, _] = long_ctx_profiles_.emplace(exact_key, std::move(prof));
+    return &it->second;
+  }
+
+  void record_prefill_telemetry(U32 count, U32 start_pos, bool used_w4a8,
+                                bool used_sage2, bool used_minf, U32 minf_cap,
+                                U32 minf_env, bool used_ane,
+                                QwenPrefillTelemetry *out_delta) {
+    QwenPrefillTelemetry delta;
+    delta.prefill_ane_active = ane_active_;
+    delta.prefill_ane_split_alpha = ane_split_alpha_;
+    if (used_w4a8) {
+      prefill_telemetry_.prefill_w4a8_tokens += count;
+      delta.prefill_w4a8_tokens += count;
+    }
+    if (used_sage2) {
+      prefill_telemetry_.prefill_sage2_tokens += count;
+      delta.prefill_sage2_tokens += count;
+    }
+    if (used_minf && minference_scratch.buffer != nullptr &&
+        config.full_attention_layers() > 0 && count > 0U && minf_cap > 0U &&
+        minf_env >= kMInferenceMinContextTokens) {
+      const U32 qh = U32(config.num_attention_heads);
+      const U32 kvh = U32(config.num_key_value_heads);
+      const auto lo = plan_minference_scratch(minf_cap, qh, kvh, minf_env);
+      const auto tier = select_sage2_tier(minf_cap, qh, kvh);
+      const U32 q_blocks_actual = (count + tier.bm_tok - 1U) / tier.bm_tok;
+      const U64 need_bytes = U64(kvh) * U64(lo.max_q_blocks) * sizeof(U32);
+      if (lo.active_counts_off + need_bytes <= minference_scratch.bytes) {
+        const auto raw = minference_scratch.buffer->read(
+            minference_scratch.offset + lo.active_counts_off, need_bytes);
+        std::vector<U32> counts(U64(kvh) * U64(lo.max_q_blocks), 0U);
+        std::memcpy(counts.data(), raw.data(), raw.size());
+        U64 layer_total = 0ULL;
+        U64 layer_skipped = 0ULL;
+        for (U32 kh_i = 0; kh_i < kvh; ++kh_i) {
+          for (U32 qb = 0; qb < q_blocks_actual; ++qb) {
+            const U32 max_q_pos =
+                start_pos + std::min<U32>(count - 1U,
+                                          (qb + 1U) * tier.bm_tok - 1U);
+            const U32 total_blks = (max_q_pos + 32U) / 32U;
+            const U32 active_blks = std::min<U32>(
+                total_blks, counts[U64(kh_i) * lo.max_q_blocks + qb]);
+            layer_total += total_blks;
+            layer_skipped += (total_blks - active_blks);
+          }
+        }
+        const U64 full_layers = U64(config.full_attention_layers());
+        const U64 tot = layer_total * full_layers;
+        const U64 skip = layer_skipped * full_layers;
+        prefill_telemetry_.prefill_minference_blocks_total += tot;
+        prefill_telemetry_.prefill_minference_blocks_skipped += skip;
+        delta.prefill_minference_blocks_total += tot;
+        delta.prefill_minference_blocks_skipped += skip;
+      }
+    }
+    if (ane_active_) {
+      if (used_ane) {
+        prefill_telemetry_.prefill_ane_offload_tokens += count;
+        delta.prefill_ane_offload_tokens += count;
+      } else if (count > 8U) {
+        prefill_telemetry_.prefill_ane_fallback_tokens += count;
+        delta.prefill_ane_fallback_tokens += count;
+      }
+    }
+    if (out_delta != nullptr) {
+      *out_delta = delta;
+    }
+  }
+
+  bool can_run_ane_chunk(U32 count, bool verify, bool inspect_tensors,
+                         bool profile_stages) const noexcept {
+    return !verify && !inspect_tensors && !profile_stages &&
+           shared_primary_ == nullptr && ane_active_ && ane_engine_ != nullptr &&
+           ane_engine_->can_offload_chunk(count) && bypass_lora_ == nullptr &&
+           !inspect_routes_enabled && !inspect_tensors_workspace &&
+           feature_layers.empty();
+  }
+
+  AneChunkPlan &get_or_build_ane_chunk_plan(U32 context_envelope,
+                                            bool trunk_only) {
+    const auto plan_key = std::make_pair(context_envelope, trunk_only);
+    if (auto it = ane_layer_plans_.find(plan_key);
+        it != ane_layer_plans_.end()) {
+      return it->second;
+    }
+    const U32 chunk_t = ane_chunk_tokens_;
+    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
+    const std::string pkey_sfx = ".ane.c" + std::to_string(chunk_t) + ".e" +
+                                 std::to_string(context_envelope) +
+                                 (trunk_only ? ".tr" : ".fl") +
+                                 plan_key_suffix();
+
+    AneChunkPlan plan;
+    plan.chunk_t = chunk_t;
+    plan.context_envelope = context_envelope;
+    plan.trunk_only = trunk_only;
+    plan.used_w4a8 = use_w4a8;
+
+    // 1. Embedding + Layer-0 input RMSNorm (always write BF16 norm for ANE!).
+    {
+      Encoder e(context, libraries, chunk_t, "qwen.ane.emb0" + pkey_sfx);
+      e.begin_stage("embedding");
+      embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
+      if (use_w4a8) {
+        emit_rmsnorm_a8_g64(e, hidden, direct(blocks[0].get("input_norm"), h),
+                            norm, a8_qa, a8_sa, a8_ra, h,
+                            float(config.rms_norm_eps),
+                            normalization_weight_offset, /*write_bf16=*/true);
+      } else {
+        normalize(e, blocks[0].get("input_norm"), hidden, norm);
+      }
+      plan.embed_norm0 = e.finish();
+    }
+
+    plan.layers.resize(blocks.size());
+    const U32 hv = U32(config.linear_num_value_heads);
+
+    for (U32 li = 0; li < blocks.size(); ++li) {
+      const auto &block = blocks[li];
+      auto &lp = plan.layers[li];
+      lp.is_full_attn = (block.type == LayerType::full_attention);
+      const std::string ltag = ".L" + std::to_string(li) + pkey_sfx;
+
+      if (lp.is_full_attn) {
+        // Full-Attn Q/K/V + Attention state step (100% GPU: active Route A + Route B).
+        {
+          Encoder e(context, libraries, chunk_t, "qwen.ane.attn_pre" + ltag);
+          e.begin_stage("attn_pre");
+          if (use_w4a8) {
+            e.set_a8_quant(make_a8_key(e, norm, h));
+            const std::array<MaterializedWeightView, 3> parts{
+                block.get("attention_q"), block.get("attention_k"),
+                block.get("attention_v")};
+            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            if (try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
+                                    norm, concat_out)) {
+              emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+            } else {
+              if (!try_linear_w4a8_base(e, block.get("attention_q"), norm,
+                                        query, 2 * q, h))
+                linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+              if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key,
+                                        kv, h))
+                linear_base(e, block.get("attention_k"), norm, key, kv, h);
+              if (!try_linear_w4a8_base(e, block.get("attention_v"), norm,
+                                        value, kv, h))
+                linear_base(e, block.get("attention_v"), norm, value, kv, h);
+            }
+          } else {
+            const std::array<MaterializedWeightView, 3> parts{
+                block.get("attention_q"), block.get("attention_k"),
+                block.get("attention_v")};
+            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            if (try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h, false,
+                               norm, concat_out)) {
+              emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+            } else {
+              linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+              linear_base(e, block.get("attention_k"), norm, key, kv, h);
+              linear_base(e, block.get("attention_v"), norm, value, kv, h);
+            }
+          }
+          emit_attention_state_step(
+              e, block, block, *page_pool, max_context, kv_format_, query, key,
+              value, mixer, attention_positions, chunk_t, false,
+              context_envelope, true);
+          plan.used_sage2 |= e.profile.used_sage2;
+          plan.used_minference |= e.profile.used_minference;
+          lp.attn_pre_o = e.finish();
+        }
+        // Full-Attn o_proj: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h).
+        {
+          const auto &o_w = block.get("attention_o");
+          const auto *op =
+              ane_engine_->find_op(li, ane::AneProjectionRole::AttnOProj);
+          const bool offload_o =
+              (op != nullptr && op->split.enabled() &&
+               can_gpu_suffix_linear(o_w, h, q, use_w4a8));
+          Encoder e(context, libraries, chunk_t, "qwen.ane.attn_o" + ltag);
+          e.begin_stage("attn_o");
+          if (offload_o) {
+            lp.attn_o_op_id = op->op_id;
+            (void)emit_gpu_suffix_linear(e, o_w, mixer, delta, h, q, use_w4a8,
+                                         op->split.gpu_row_offset, h,
+                                         op->split.gpu_rows);
+          } else if (use_w4a8 &&
+                     try_linear_w4a8_base(e, o_w, mixer, delta, h, q)) {
+          } else {
+            linear(e, o_w, mixer, delta, h, q);
+          }
+          lp.attn_o_gpu = e.finish();
+        }
+      } else {
+        // GDN in_proj_qkv/a/b: STRICTLY 100% GPU (NEVER ANE!).
+        {
+          Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_qkvab" + ltag);
+          e.begin_stage("gdn_qkvab");
+          if (use_w4a8) {
+            e.set_a8_quant(make_a8_key(e, norm, h));
+            if (!try_linear_w4a8_base(e, block.get("gdn_qkv"), norm, qkv, conv,
+                                      h))
+              linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+            const std::array<MaterializedWeightView, 2> ab_parts{
+                block.get("gdn_a"), block.get("gdn_b")};
+            const std::array<U32, 2> ab_ns{hv, hv};
+            if (try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out)) {
+              emit_split2(e, concat_out, a, b, hv, hv);
+            } else {
+              if (!try_linear_w4a8_base(e, block.get("gdn_a"), norm, a, hv, h))
+                linear_base(e, block.get("gdn_a"), norm, a, hv, h);
+              if (!try_linear_w4a8_base(e, block.get("gdn_b"), norm, b, hv, h))
+                linear_base(e, block.get("gdn_b"), norm, b, hv, h);
+            }
+          } else {
+            linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+            const std::array<MaterializedWeightView, 2> ab_parts{
+                block.get("gdn_a"), block.get("gdn_b")};
+            const std::array<U32, 2> ab_ns{hv, hv};
+            if (try_concat_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                               false, norm, concat_out)) {
+              emit_split2(e, concat_out, a, b, hv, hv);
+            } else {
+              linear_base(e, block.get("gdn_a"), norm, a, hv, h);
+              linear_base(e, block.get("gdn_b"), norm, b, hv, h);
+            }
+          }
+          lp.gdn_qkv_ab = e.finish();
+        }
+        // GDN in_proj_z: Dual-ANE [0..N_ane) || GPU suffix [N_ane..gv).
+        {
+          const auto &z_w = block.get("gdn_z");
+          const auto *op =
+              ane_engine_->find_op(li, ane::AneProjectionRole::GdnInProjZ);
+          const bool offload_z =
+              (op != nullptr && op->split.enabled() &&
+               can_gpu_suffix_linear(z_w, gv, h, use_w4a8));
+          Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_z" + ltag);
+          e.begin_stage("gdn_z");
+          if (use_w4a8) {
+            e.set_a8_quant(make_a8_key(e, norm, h));
+          }
+          if (offload_z) {
+            lp.gdn_z_op_id = op->op_id;
+            (void)emit_gpu_suffix_linear(e, z_w, norm, z, gv, h, use_w4a8,
+                                         op->split.gpu_row_offset, gv,
+                                         op->split.gpu_rows);
+          } else if (use_w4a8 &&
+                     try_linear_w4a8_base(e, z_w, norm, z, gv, h)) {
+          } else {
+            linear(e, z_w, norm, z, gv, h);
+          }
+          lp.gdn_z_gpu = e.finish();
+        }
+        // GDN Conv1D + Recurrence + NormGate (writes BF16 mixer + A8 if W4A8).
+        const bool stage3_writes_a8 =
+            use_w4a8 && gdn_chunk_nax_enabled_ &&
+            chunk_t >= gdn_chunk_nax_min_tokens() &&
+            can_w4a8_weight(block.get("gdn_out"), h, gv);
+        {
+          Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_rec" + ltag);
+          e.begin_stage("gdn_rec");
+          emit_gdn_state_step(
+              e, block, block, qkv, z, a, b, convolved, recurrent, mixer,
+              chunk_t, /*verify=*/false, /*dynamic_tokens=*/true,
+              /*allow_f16_out=*/false, 0U, std::nullopt, nullptr,
+              /*out_w4a8=*/stage3_writes_a8,
+              /*out_w4a8_write_bf16=*/true, /*emit_gdn_out_linear=*/false);
+          lp.gdn_rec = e.finish();
+        }
+        // GDN out_proj: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h).
+        {
+          const auto &out_w = block.get("gdn_out");
+          const auto *op =
+              ane_engine_->find_op(li, ane::AneProjectionRole::GdnOutProj);
+          const bool offload_out =
+              (op != nullptr && op->split.enabled() &&
+               can_gpu_suffix_linear(out_w, h, gv, use_w4a8));
+          Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_out" + ltag);
+          e.begin_stage("gdn_out");
+          if (stage3_writes_a8) {
+            e.set_a8_quant(make_a8_key(e, mixer, gv));
+          }
+          if (offload_out) {
+            lp.gdn_out_op_id = op->op_id;
+            (void)emit_gpu_suffix_linear(e, out_w, mixer, delta, h, gv, use_w4a8,
+                                         op->split.gpu_row_offset, h,
+                                         op->split.gpu_rows);
+          } else if (use_w4a8 &&
+                     try_linear_w4a8_base(e, out_w, mixer, delta, h, gv)) {
+          } else {
+            linear(e, out_w, mixer, delta, h, gv);
+          }
+          lp.gdn_out_gpu = e.finish();
+        }
+      }
+
+      // Post-attention residual add + RMSNorm (always write BF16 norm for ANE!).
+      {
+        Encoder e(context, libraries, chunk_t, "qwen.ane.post_norm" + ltag);
+        e.begin_stage("post_norm");
+        if (use_w4a8) {
+          emit_add_rmsnorm_a8_g64(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+        } else {
+          add_normalize(e, block.get("post_attention_norm"), hidden, delta,
+                        norm);
+        }
+        lp.post_norm = e.finish();
+      }
+
+      // Dense MLP Fused Gate+Up+SwiGLU: Dual-ANE [0..N_ane) || GPU suffix [N_ane..f).
+      {
+        const auto &gw = block.get("mlp_gate");
+        const auto &uw = block.get("mlp_up");
+        const auto *op =
+            ane_engine_->find_op(li, ane::AneProjectionRole::MlpGateUpSwiGlu);
+        const bool offload_gu =
+            (op != nullptr && op->split.enabled() &&
+             can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8));
+        Encoder e(context, libraries, chunk_t, "qwen.ane.mlp_gu" + ltag);
+        e.begin_stage("mlp_gu");
+        if (use_w4a8) {
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        }
+        if (offload_gu) {
+          lp.mlp_gu_op_id = op->op_id;
+          (void)emit_gpu_suffix_swiglu(e, gw, uw, norm, product, f, h, use_w4a8,
+                                       op->split.gpu_row_offset, f,
+                                       op->split.gpu_rows);
+        } else if (use_w4a8 &&
+                   try_linear_w4a8_swiglu(e, gw, uw, norm, product, f, h)) {
+        } else if (!try_linear_swiglu(e, gw, uw, norm, product, f, h)) {
+          linear_base(e, gw, norm, gate, f, h);
+          linear_base(e, uw, norm, up, f, h);
+          swiglu(e, chunk_t, f);
+        }
+        lp.mlp_gu_gpu = e.finish();
+      }
+
+      // Dense MLP Down: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h) (W4A16 default).
+      {
+        const auto &dw = block.get("mlp_down");
+        const bool down_w4a8 = use_w4a8 && w4a8_down_proj_;
+        const auto *op =
+            ane_engine_->find_op(li, ane::AneProjectionRole::MlpDown);
+        const bool offload_dn =
+            (op != nullptr && op->split.enabled() &&
+             can_gpu_suffix_linear(dw, h, f, down_w4a8));
+        Encoder e(context, libraries, chunk_t, "qwen.ane.mlp_dn" + ltag);
+        e.begin_stage("mlp_dn");
+        if (offload_dn) {
+          lp.mlp_down_op_id = op->op_id;
+          (void)emit_gpu_suffix_linear(e, dw, product, delta, h, f, down_w4a8,
+                                       op->split.gpu_row_offset, h,
+                                       op->split.gpu_rows);
+        } else if (down_w4a8 &&
+                   try_linear_w4a8_base(e, dw, product, delta, h, f)) {
+        } else {
+          linear(e, dw, product, delta, h, f);
+        }
+        lp.mlp_down_gpu = e.finish();
+      }
+
+      // Residual add + next layer input RMSNorm (or final add).
+      {
+        Encoder e(context, libraries, chunk_t, "qwen.ane.next_norm" + ltag);
+        e.begin_stage("next_norm");
+        if (li + 1U < blocks.size()) {
+          if (use_w4a8) {
+            emit_add_rmsnorm_a8_g64(
+                e, hidden, delta,
+                direct(blocks[li + 1U].get("input_norm"), h), norm, a8_qa, a8_sa,
+                a8_ra, h, float(config.rms_norm_eps),
+                normalization_weight_offset, /*write_bf16=*/true);
+          } else {
+            add_normalize(e, blocks[li + 1U].get("input_norm"), hidden, delta,
+                          norm);
+          }
+        } else {
+          add(e);
+        }
+        lp.next_norm = e.finish();
+      }
+    }
+
+    // Final head + sample on last row (when !trunk_only).
+    if (!trunk_only) {
+      Encoder e(context, libraries, chunk_t, "qwen.ane.head" + pkey_sfx);
+      e.begin_stage("head");
+      Ref last_hidden{delta.buffer, 0, mul(h, 2)};
+      Ref last_norm{norm.buffer, 0, mul(h, 2)};
+      Ref row0_logits{logits.buffer, 0, mul(v, 2)};
+      auto &extract =
+          e.emit("qwen_forward", "omlx_m5_forward_last_row", {.width = h},
+                 {.width = 256}, {hidden, last_hidden});
+      e.dynamic(extract, 2, words({chunk_t, h}));
+      normalize(e, final_norm, last_hidden, last_norm, 1U);
+      linear(e, head, last_norm, row0_logits, v, h, 1U);
+      e.begin_stage("sample");
+      const bool use_64tg_argmax =
+          (v >= 256U) && (argmax_scratch.buffer != nullptr) &&
+          !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_64TG_ARGMAX");
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        if (use_64tg_argmax) {
+          auto &st1 = e.emit("position_sampling",
+                             "omlx_m5_position_argmax_stage1_64tg",
+                             {.width = 64U * 256U, .height = 1U},
+                             {.width = 256U}, {row0_logits, argmax_scratch});
+          e.constant(st1, 2, words({v, 1, 1, 0}));
+          auto &sample = e.emit(
+              "position_sampling", "omlx_m5_position_sample_logits_stage2",
+              {.width = 256U}, {.width = 256U},
+              {row0_logits, argmax_scratch, sampled, position_ids,
+               position_scores});
+          e.profile.sampling_offset = e.dynamic(
+              sample, 5, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+          e.constant(sample, 6, words({v, 1, 1, 0}));
+        } else {
+          auto &sample =
+              e.emit("position_sampling", "omlx_m5_position_sample_logits",
+                     {.width = 256}, {.width = 256},
+                     {row0_logits, sampled, position_ids, position_scores});
+          e.profile.sampling_offset = e.dynamic(
+              sample, 4, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+          e.constant(sample, 5, words({v, 1, 1, 0}));
+        }
+      } else if (use_64tg_argmax) {
+        Ref vocab_parts{argmax_scratch.buffer, 0, 512U};
+        auto &st1 =
+            e.emit("vocab", "omlx_m5_vocab_argmax_stage1_64tg",
+                   {.width = 64U * 256U}, {.width = 256U},
+                   {row0_logits, vocab_parts});
+        e.constant(st1, 2, words({v}));
+        auto &sample =
+            e.emit("vocab", "omlx_m5_sample_logits_stage2", {.width = 256U},
+                   {.width = 256U}, {row0_logits, vocab_parts, sampled});
+        e.profile.sampling_offset =
+            e.dynamic(sample, 3, std::vector<std::byte>(sizeof(SampleParams)));
+      } else {
+        auto &sample = e.emit("vocab", "omlx_m5_sample_logits", {.width = 256},
+                              {.width = 256}, {row0_logits, sampled});
+        e.profile.sampling_offset =
+            e.dynamic(sample, 2, std::vector<std::byte>(sizeof(SampleParams)));
+      }
+      plan.head_sample = e.finish();
+    }
+
+    auto [it, _] = ane_layer_plans_.emplace(plan_key, std::move(plan));
+    return it->second;
+  }
+
+  QwenForwardResult execute_ane_chunk(std::span<const U32> tokens,
+                                      const GpuSamplingOptions &sampling,
+                                      bool trunk_only) {
+    const U32 count = U32(tokens.size());
+    const U32 start_pos = next_position;
+    const U32 end_pos = start_pos + count;
+    const U32 env =
+        (minference_enabled_ && end_pos >= kMInferenceMinContextTokens)
+            ? select_long_ctx_envelope(end_pos)
+            : 0U;
+    auto &plan = get_or_build_ane_chunk_plan(env, trunk_only);
+
+    std::fill_n(token_staging.begin(), count, 0U);
+    std::copy(tokens.begin(), tokens.end(), token_staging.begin());
+    const_cast<MetalBuffer *>(token_ids.buffer)
+        ->write(std::as_bytes(std::span(token_staging).first(count)));
+    if (attention_positions.buffer) {
+      std::vector<U32> positions(count);
+      for (U32 i = 0; i < count; ++i)
+        positions[i] = start_pos + i;
+      const_cast<MetalBuffer *>(attention_positions.buffer)
+          ->write(std::as_bytes(std::span(positions)));
+    }
+    for (auto &lp : plan.layers) {
+      if (lp.is_full_attn && lp.attn_pre_o.has_value()) {
+        auto &prof = *lp.attn_pre_o;
+        for (const auto &patch : prof.patches) {
+          const U32 val =
+              patch.position ? start_pos : count * patch.multiplier;
+          std::memcpy(prof.parameter_data.data() + patch.offset +
+                          patch.word * 4,
+                      &val, 4);
+        }
+        prof.parameters.write("step", prof.parameter_data);
+      }
+    }
+    if (!trunk_only && plan.head_sample.has_value()) {
+      auto &hp = *plan.head_sample;
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        const PositionSamplingRow row{.seed = sampling.seed,
+                                      .position = start_pos + count,
+                                      .top_k = sampling.top_k,
+                                      .temperature = sampling.temperature,
+                                      .top_p = sampling.top_p};
+        std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &row,
+                    sizeof(row));
+      } else {
+        const SampleParams sp{v,
+                              sampling.top_k,
+                              sampling.temperature,
+                              sampling.top_p,
+                              sampling.seed,
+                              sampling.stream,
+                              start_pos + count - 1U};
+        std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &sp,
+                    sizeof(sp));
+      }
+      hp.parameters.write("step", hp.parameter_data);
+    }
+
+    auto *pool = page_pool.get();
+    if (pool && pool->tokens() != start_pos)
+      throw std::logic_error("Qwen ANE KV page frontier disagrees with model");
+    const auto page_copies =
+        pool ? pool->begin_append(count) : std::vector<KvPageCopy>{};
+    struct PageGuard {
+      KvPagePool *pool;
+      bool active;
+      ~PageGuard() {
+        if (active)
+          try {
+            pool->abort();
+          } catch (...) {
+          }
+      }
+    } page_guard{pool, pool != nullptr};
+    execute_cow_copies(page_copies);
+
+    auto submit_prof = [&](Profile &pr) {
+      const std::array calls{MetalCommandInvocation{
+          .plan = &pr.plan, .bindings = pr.bindings, .parameters = &pr.parameters}};
+      context.submit_classic_async(calls);
+    };
+    auto run_hybrid = [&](std::optional<U32> op_id, Ref src, U32 src_stride,
+                          Ref dst, U32 out_stride, Profile &gpu_prof) {
+      if (op_id.has_value()) {
+        ane_engine_->enqueue_op(
+            *op_id, src.buffer->native_mtl_buffer(), src.offset,
+            dst.buffer->native_mtl_buffer(), dst.offset, out_stride,
+            [&](void *mtl_cb) {
+              const std::array calls{
+                  MetalCommandInvocation{.plan = &gpu_prof.plan,
+                                         .bindings = gpu_prof.bindings,
+                                         .parameters = &gpu_prof.parameters}};
+              context.encode_into_command_buffer(mtl_cb, calls);
+            },
+            src_stride);
+      } else {
+        submit_prof(gpu_prof);
+      }
+    };
+
+    // Zero per-layer waitUntilCompleted(): stream entire T_chunk across GPU || Dual-ANE!
+    submit_prof(*plan.embed_norm0);
+    for (auto &lp : plan.layers) {
+      if (lp.is_full_attn) {
+        submit_prof(*lp.attn_pre_o);
+        run_hybrid(lp.attn_o_op_id, mixer, q, delta, h, *lp.attn_o_gpu);
+      } else {
+        submit_prof(*lp.gdn_qkv_ab);
+        run_hybrid(lp.gdn_z_op_id, norm, h, z, gv, *lp.gdn_z_gpu);
+        submit_prof(*lp.gdn_rec);
+        run_hybrid(lp.gdn_out_op_id, mixer, gv, delta, h, *lp.gdn_out_gpu);
+      }
+      submit_prof(*lp.post_norm);
+      run_hybrid(lp.mlp_gu_op_id, norm, h, product, f, *lp.mlp_gu_gpu);
+      run_hybrid(lp.mlp_down_op_id, product, f, delta, h, *lp.mlp_down_gpu);
+      submit_prof(*lp.next_norm);
+    }
+    if (!trunk_only && plan.head_sample.has_value()) {
+      submit_prof(*plan.head_sample);
+    }
+
+    ane_engine_->flush_and_wait();
+    MetalSubmission sub{.timing = context.submit_classic_barrier()};
+
+    QwenForwardResult result{
+        .tokens = count,
+        .executed_layers = U32(blocks.size()),
+        .submission = std::move(sub),
+    };
+    if (!trunk_only) {
+      const auto tok_bytes = sampled.buffer->read(
+          0, sampling_contract == SamplingContract::PositionCoupledV1 ? 8 : 4);
+      std::memcpy(&result.token, tok_bytes.data(), 4);
+      result.host_read_bytes = tok_bytes.size();
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        U32 flag = 0;
+        std::memcpy(&flag, tok_bytes.data() + 4, 4);
+        if (flag & 2U)
+          throw std::runtime_error("nonfinite position target logits");
+        if (flag & 1U) {
+          auto ib = position_ids.buffer->read(0, U64(sampling.top_k) * 4);
+          auto sb = position_scores.buffer->read(0, U64(sampling.top_k) * 4);
+          std::vector<U32> ids(sampling.top_k);
+          std::vector<float> scores(sampling.top_k);
+          std::memcpy(ids.data(), ib.data(), ib.size());
+          std::memcpy(scores.data(), sb.data(), sb.size());
+          result.token = position_sample_candidates(
+              ids, scores,
+              {.seed = sampling.seed,
+               .position = start_pos + count,
+               .top_k = sampling.top_k,
+               .temperature = sampling.temperature,
+               .top_p = sampling.top_p});
+          result.host_read_bytes += ib.size() + sb.size();
+        }
+      } else if (result.token >= v) {
+        throw std::runtime_error("nonfinite or invalid legacy sampled token");
+      }
+    }
+
+    if (pool)
+      pool->commit(count);
+    page_guard.active = false;
+    next_position += count;
+    last_logits_row = 0U;
+    has_last_logits = !trunk_only;
+    record_prefill_telemetry(count, start_pos, plan.used_w4a8, plan.used_sage2,
+                             plan.used_minference, plan.chunk_t,
+                             plan.context_envelope, /*used_ane=*/true,
+                             &result.prefill_delta);
+    return result;
+  }
+
+  bool cache_blend_eligible() const noexcept {
+    if (!prefill_options_.cache_blend || !cache_blend_kernels_ready_ ||
+        kv_format_ != KvStorageFormat::Affine4Group128 || config.head_dim != 256 ||
+        config.full_attention_layers() <= 0 || page_pool == nullptr ||
+        shared_primary_ != nullptr || speculative_enabled ||
+        inspect_routes_enabled || bypass_lora_ != nullptr || (h % 128U) != 0U ||
+        (q % 128U) != 0U) {
+      return false;
+    }
+    if (config.linear_attention_layers() > 0 &&
+        (config.linear_key_head_dim != 128 ||
+         config.linear_value_head_dim != 128 || gdn_chunk_ws.buffer == nullptr ||
+         !gdn_chunk_nax_enabled_)) {
+      return false;
+    }
+    return true;
+  }
+
+  U32 blend_probe_layer_index() const noexcept {
+    for (U32 i = 0; i < blocks.size(); ++i) {
+      if (blocks[i].type == LayerType::full_attention) {
+        return i;
+      }
+    }
+    return 0U;
+  }
+
+  void run_blend_exec_profile(Profile &prof) {
+    const std::array calls{MetalCommandInvocation{
+        .plan = &prof.plan, .bindings = prof.bindings, .parameters = &prof.parameters}};
+    static_cast<void>(context.execute_batch(calls));
+  }
+
+  void emit_blend_gdn_slice(Encoder &e, const Block &block, Ref state0_ref,
+                            Ref state1_ref, U32 row_off, U32 slice_len) {
+    if (slice_len == 0U)
+      return;
+    const auto &c = config;
+    const U32 kh = U32(c.linear_num_key_heads);
+    const U32 hv = U32(c.linear_num_value_heads);
+    const U32 kd = U32(c.linear_key_head_dim);
+    const U32 vd = U32(c.linear_value_head_dim);
+    const Ref qkv_s{qkv.buffer, qkv.offset + mul(row_off, mul(conv, 2)),
+                    mul(slice_len, mul(conv, 2))};
+    const Ref z_s{z.buffer, z.offset + mul(row_off, mul(gv, 2)),
+                  mul(slice_len, mul(gv, 2))};
+    const Ref a_s{a.buffer, a.offset + mul(row_off, mul(hv, 2)),
+                  mul(slice_len, mul(hv, 2))};
+    const Ref b_s{b.buffer, b.offset + mul(row_off, mul(hv, 2)),
+                  mul(slice_len, mul(hv, 2))};
+    const Ref mix_s{mixer.buffer, mixer.offset + mul(row_off, mul(gv, 2)),
+                    mul(slice_len, mul(gv, 2))};
+    const Ref conv_w =
+        direct(block.get("gdn_conv"), U64(conv) * c.linear_conv_kernel_dim);
+    const Ref a_log = direct(block.get("gdn_a_log"), hv);
+    const Ref dt_bias = direct(block.get("gdn_dt_bias"), hv);
+    const Ref gdn_norm = direct(block.get("gdn_norm"), vd);
+    auto params =
+        words({kh, hv, kd, vd, conv, U32(c.linear_conv_kernel_dim), slice_len,
+               word(float(c.rms_norm_eps))});
+    emit_gdn_conv_silu(e, slice_len, conv, qkv_s, conv_w, state1_ref, convolved,
+                       params, /*dynamic_tokens=*/false);
+    emit_gdn_recurrent_forward(
+        e, slice_len, gv, kd, vd, convolved, a_s, b_s, a_log, dt_bias,
+        state0_ref, recurrent, params, silicon_tuning.gdn_tb8_min_tokens,
+        gdn_chunk_ws, gdn_chunk_nax_enabled_, kh, hv, /*dynamic_tokens=*/false);
+    auto &ng = e.emit("gdn_layer", "omlx_m5_gdn_norm_gate",
+                      {.width = 32U, .height = U64(slice_len) * hv},
+                      {.width = 32U}, {recurrent, z_s, gdn_norm, mix_s});
+    e.dynamic(ng, 4, params);
+  }
+
+  void emit_blend_attn_route_b(Encoder &e, const Block &block, U32 m_rows,
+                               U32 start_pos_for_params, U32 context_envelope,
+                               Ref attn_pos_ref) {
+    const auto &c = config;
+    const Ref table_ref{&page_pool->table_buffer(), 0,
+                        page_pool->table_buffer().size()};
+    const Ref gate_ref = sub(query, U64(c.head_dim) * 2);
+    auto params = words({U32(c.num_attention_heads),
+                         U32(c.num_key_value_heads),
+                         U32(c.head_dim),
+                         m_rows,
+                         start_pos_for_params,
+                         max_context,
+                         64U,
+                         page_pool->physical_pages(),
+                         q * 2,
+                         U32(c.head_dim * 2),
+                         kv,
+                         kv,
+                         q * 2,
+                         U32(c.head_dim * 2)});
+    if (sage2_enabled_ && m_rows >= kFlashNaxPrefillMinTokens) {
+      const bool use_minf =
+          minference_enabled_ &&
+          context_envelope >= kMInferenceMinContextTokens;
+      emit_paged_flash_prefill_sage2(
+          e, c, m_rows, context_envelope, /*is_affine4=*/true, use_minf, query,
+          gate_ref, block.state0, block.state1, mixer, table_ref, attn_pos_ref,
+          params,
+          use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
+      e.profile.used_sage2 = true;
+      if (use_minf) {
+        e.profile.used_minference = true;
+        e.profile.minf_context_envelope = context_envelope;
+      }
+      return;
+    }
+    const bool affine4_nax_ok = affine4_kv_runtime_eligible(
+        context, libraries, U32(c.num_attention_heads),
+        U32(c.num_key_value_heads), U32(c.head_dim));
+    if (affine4_nax_ok) {
+      const bool short_tail_split =
+          split_attention_enabled && split_max.buffer != nullptr &&
+          split_sum.buffer != nullptr && split_output.buffer != nullptr &&
+          gqa_flash_prefill_tail_needs_split_kv(
+              m_rows, U32(c.num_attention_heads), U32(c.num_key_value_heads),
+              context_envelope, silicon_tuning.gpu_cores) &&
+          affine4_short_tail_split_tokens(
+              m_rows, U32(c.num_attention_heads), U32(c.num_key_value_heads),
+              context_envelope, split_max.bytes, split_sum.bytes,
+              split_output.bytes) > 0U;
+      if (short_tail_split) {
+        emit_paged_attention_affine4_g128(
+            e, c, m_rows, /*split=*/true, context_envelope, max_context,
+            page_pool->physical_pages(), query, gate_ref, block.state0,
+            block.state1, mixer, table_ref, attn_pos_ref, split_max, split_sum,
+            split_output, std::move(params), std::nullopt, std::nullopt);
+      } else if (flash_nax_prefill_ && m_rows >= kFlashNaxPrefillMinTokens &&
+                 flash_nax_prefill_runtime_eligible(context, libraries,
+                                                    U32(c.head_dim))) {
+        emit_paged_flash_prefill_affine4_g128(
+            e, c, m_rows, query, gate_ref, block.state0, block.state1, mixer,
+            table_ref, attn_pos_ref, std::move(params));
+      } else {
+        emit_paged_attention_affine4_g128(
+            e, c, m_rows, /*split=*/false, context_envelope, max_context,
+            page_pool->physical_pages(), query, gate_ref, block.state0,
+            block.state1, mixer, table_ref, attn_pos_ref, split_max, split_sum,
+            split_output, std::move(params), std::nullopt, std::nullopt);
+      }
+      return;
+    }
+    auto &att = e.emit("qwen_forward",
+                       "omlx_m5_forward_paged_causal_attention_affine4_exact",
+                       {.width = 32U, .height = U64(m_rows) * c.num_attention_heads},
+                       {.width = 32U},
+                       {query, gate_ref, block.state0, block.state1, mixer,
+                        table_ref});
+    e.dynamic(att, 6, std::move(params));
+  }
+
+  void capture_and_insert_blend_chunk(std::span<const U32> chunk_tokens,
+                                      U32 start_pos, U32 w_bnd,
+                                      detail::ChunkBlendCache &blend_cache,
+                                      U64 model_exec_hash,
+                                      QwenPrefillTelemetry &accum_delta) {
+    const U32 lm = U32(chunk_tokens.size());
+    const U32 probe_idx = blend_probe_layer_index();
+    const U32 num_attn_layers = U32(config.full_attention_layers());
+    const U32 num_gdn_layers = U32(config.linear_attention_layers());
+    const U32 kvh = U32(config.num_key_value_heads);
+    const U32 qh = U32(config.num_attention_heads);
+    const U32 rot_dim =
+        U32(std::llround(config.head_dim * config.partial_rotary_factor));
+    const U32 kh = U32(config.linear_num_key_heads);
+    const U32 hv = U32(config.linear_num_value_heads);
+    const U32 eff_bnd = std::min<U32>(w_bnd, lm);
+
+    detail::BlendChunkGeometry geom;
+    geom.num_full_attn_layers = num_attn_layers;
+    geom.num_gdn_layers = num_gdn_layers;
+    geom.q_heads = qh;
+    geom.kv_heads = kvh;
+    geom.head_dim = U32(config.head_dim);
+    geom.rotary_dim = rot_dim;
+    geom.hidden_size = h;
+    geom.gdn_key_heads = kh;
+    geom.gdn_value_heads = hv;
+    geom.gdn_key_dim = U32(config.linear_key_head_dim);
+    geom.gdn_value_dim = U32(config.linear_value_head_dim);
+    geom.gdn_conv_width = conv;
+    geom.gdn_conv_kernel = U32(config.linear_conv_kernel_dim);
+    geom.token_length = lm;
+    geom.interior_start = eff_bnd;
+    geom.probe_layer_index = probe_idx;
+    geom.gdn_op_format = detail::BlendGdnOperatorFormat::BFloat16;
+
+    auto entry = std::make_shared<detail::BlendChunkEntry>();
+    entry->key = detail::make_blend_chunk_key(model_exec_hash, chunk_tokens);
+    entry->tokens.assign(chunk_tokens.begin(), chunk_tokens.end());
+    entry->geometry = geom;
+    entry->payload = detail::allocate_blend_chunk_payload(context, geom);
+
+    // Scratch FP32 state buffers for extracting M_C and B_C without disturbing live state0.
+    const U64 gdn_op_f32_bytes =
+        num_gdn_layers ? mul(mul(U64(hv), 128ULL * 128ULL), 4ULL) : 256ULL;
+    MetalBuffer m_tmp_buf = context.make_private_buffer(gdn_op_f32_bytes);
+    MetalBuffer b_tmp_buf = context.make_private_buffer(gdn_op_f32_bytes);
+    MetalBuffer zero_state_buf = context.make_buffer(gdn_op_f32_bytes);
+    zero_state_buf.zero();
+    const Ref m_tmp_ref{&m_tmp_buf, 0, gdn_op_f32_bytes};
+    const Ref b_tmp_ref{&b_tmp_buf, 0, gdn_op_f32_bytes};
+    const Ref zero_state_ref{&zero_state_buf, 0, gdn_op_f32_bytes};
+
+    // Upload tokens and positions.
+    std::fill_n(token_staging.begin(), lm, 0U);
+    std::copy(chunk_tokens.begin(), chunk_tokens.end(), token_staging.begin());
+    const_cast<MetalBuffer *>(token_ids.buffer)
+        ->write(std::as_bytes(std::span(token_staging).first(lm)));
+    std::vector<U32> positions(lm);
+    for (U32 i = 0; i < lm; ++i)
+      positions[i] = start_pos + i;
+    const_cast<MetalBuffer *>(attention_positions.buffer)
+        ->write(std::as_bytes(std::span(positions)));
+
+    const auto page_copies = page_pool->begin_append(lm);
+    struct PageGuard {
+      KvPagePool *pool;
+      bool active;
+      ~PageGuard() {
+        if (active)
+          try {
+            pool->abort();
+          } catch (...) {
+          }
+      }
+    } page_guard{page_pool.get(), true};
+    execute_cow_copies(page_copies);
+
+    const U32 end_pos = start_pos + lm;
+    const U32 ctx_env =
+        (minference_enabled_ && end_pos >= kMInferenceMinContextTokens)
+            ? select_long_ctx_envelope(end_pos)
+            : end_pos;
+    const bool use_w4a8 = use_w4a8_for_t(lm, false);
+    const U64 seq_id = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+    Encoder e(context, libraries, lm,
+              "qwen.blend.cold." + std::to_string(seq_id) + plan_key_suffix());
+    if (use_w4a8) {
+      e.profile.used_w4a8 = true;
+    }
+
+    e.begin_stage("embedding");
+    embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
+
+    const U64 attn_layer_kv_bytes =
+        U64(lm) * U64(kvh) * geom.attn_vec_bytes();
+    const U64 attn_layer_rot_bytes =
+        U64(lm) * U64(kvh) * U64(rot_dim) * 2ULL;
+    const U64 gdn_layer_tail_bytes =
+        U64(config.linear_conv_kernel_dim - 1) * U64(conv) * 2ULL;
+    const U64 gdn_layer_op_bytes = U64(hv) * 128ULL * 128ULL * 2ULL;
+    const U64 gdn_layer_sc_bytes = U64(hv) * 128ULL * 2ULL;
+    const U64 gdn_layer_cum_bytes = U64(lm) * U64(hv) * 2ULL;
+    const U32 l_int = (lm > eff_bnd) ? (lm - eff_bnd) : 0U;
+
+    U32 attn_idx = 0U;
+    U32 gdn_idx = 0U;
+    for (U32 li = 0; li < blocks.size(); ++li) {
+      const auto &block = blocks[li];
+      e.begin_stage("blend_cold.L" + std::to_string(li));
+      if (li == probe_idx) {
+        // Capture pre-Layer-3 residual hidden H3_res in int8_g128.
+        detail::BlendInt8QuantParams qp{.tokens = lm, .width = h};
+        auto &qh3 = e.emit(
+            "cache_blend", "omlx_m5_blend_quantize_int8_g128_bf16",
+            {.width = 32U, .height = U64(lm) * (h / 128U)}, {.width = 32U},
+            {hidden, Ref{&entry->payload.h3_res_i8, 0, geom.h3_res_i8_bytes()},
+             Ref{&entry->payload.h3_res_scales, 0, geom.h3_res_scale_bytes()}});
+        e.dynamic(qh3, 3, pod_bytes(qp));
+      }
+
+      if (use_w4a8) {
+        emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h), norm,
+                            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                            normalization_weight_offset, /*write_bf16=*/true);
+        e.set_a8_quant(make_a8_key(e, norm, h));
+      } else {
+        normalize(e, block.get("input_norm"), hidden, norm);
+      }
+
+      if (block.type == LayerType::full_attention) {
+        const std::array<MaterializedWeightView, 3> parts{
+            block.get("attention_q"), block.get("attention_k"),
+            block.get("attention_v")};
+        const std::array<U32, 3> part_ns{2 * q, kv, kv};
+        if (use_w4a8 &&
+            try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h, norm,
+                                concat_out)) {
+          emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+        } else if (use_w4a8) {
+          if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
+            linear_base(e, parts[0], norm, query, 2 * q, h);
+          if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
+            linear_base(e, parts[1], norm, key, kv, h);
+          if (!try_linear_w4a8_base(e, parts[2], norm, value, kv, h))
+            linear_base(e, parts[2], norm, value, kv, h);
+        } else if (try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h,
+                                  false, norm, concat_out)) {
+          emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+        } else {
+          linear_base(e, parts[0], norm, query, 2 * q, h);
+          linear_base(e, parts[1], norm, key, kv, h);
+          linear_base(e, parts[2], norm, value, kv, h);
+        }
+
+        // Capture pre-RoPE K (post k_norm) + V BEFORE emit_attention_state_step mutates key!
+        detail::BlendExtractPreRopeKvParams ep{};
+        ep.key_value_heads = kvh;
+        ep.head_dim = U32(config.head_dim);
+        ep.rotary_dim = rot_dim;
+        ep.tokens = lm;
+        ep.key_token_stride = kv;
+        ep.value_token_stride = kv;
+        ep.apply_k_norm = 1U;
+        ep.write_rotary_bf16 = 1U;
+        ep.epsilon = float(config.rms_norm_eps);
+        ep.weight_offset = normalization_weight_offset;
+        const Ref dst_k_pre{&entry->payload.attn_k_pre,
+                            U64(attn_idx) * attn_layer_kv_bytes,
+                            attn_layer_kv_bytes};
+        const Ref dst_k_rot{&entry->payload.attn_k_rotary_bf16,
+                            U64(attn_idx) * attn_layer_rot_bytes,
+                            attn_layer_rot_bytes};
+        const Ref dst_v{&entry->payload.attn_v,
+                        U64(attn_idx) * attn_layer_kv_bytes,
+                        attn_layer_kv_bytes};
+        auto &ext = e.emit(
+            "cache_blend", "omlx_m5_blend_extract_kv_prerope_affine4_g128",
+            {.width = 32U, .height = U64(lm) * kvh}, {.width = 32U},
+            {key, value, direct(block.get("k_norm"), config.head_dim),
+             dst_k_pre, dst_k_rot, dst_v});
+        e.dynamic(ext, 6, pod_bytes(ep));
+
+        // Run live attention (populates KvPagePool & produces mixer).
+        emit_attention_state_step(
+            e, block, block, *page_pool, max_context, kv_format_, query, key,
+            value, mixer, attention_positions, lm, /*split=*/false, ctx_env,
+            /*dynamic_tokens=*/true);
+
+        if (li == probe_idx) {
+          detail::BlendInt8QuantParams qm{.tokens = lm, .width = q};
+          auto &qmix = e.emit(
+              "cache_blend", "omlx_m5_blend_quantize_int8_g128_bf16",
+              {.width = 32U, .height = U64(lm) * (q / 128U)}, {.width = 32U},
+              {mixer,
+               Ref{&entry->payload.mix3_cached_i8, 0,
+                   geom.mix3_cached_i8_bytes()},
+               Ref{&entry->payload.mix3_cached_scales, 0,
+                   geom.mix3_cached_scale_bytes()}});
+          e.dynamic(qmix, 3, pod_bytes(qm));
+        }
+        if (!(use_w4a8 && try_linear_w4a8_base(e, block.get("attention_o"),
+                                               mixer, delta, h, q))) {
+          linear(e, block.get("attention_o"), mixer, delta, h, q);
+        }
+        ++attn_idx;
+      } else {
+        const std::array<MaterializedWeightView, 2> qkvz_parts{
+            block.get("gdn_qkv"), block.get("gdn_z")};
+        const std::array<U32, 2> qkvz_ns{conv, gv};
+        const std::array<MaterializedWeightView, 2> ab_parts{
+            block.get("gdn_a"), block.get("gdn_b")};
+        const std::array<U32, 2> ab_ns{hv, hv};
+        if (use_w4a8 &&
+            try_concat_w4a8_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
+                                qkvz_ns, h, norm, concat_out)) {
+          emit_split2(e, concat_out, qkv, z, conv, gv);
+        } else if (use_w4a8) {
+          if (!try_linear_w4a8_base(e, qkvz_parts[0], norm, qkv, conv, h))
+            linear_base(e, qkvz_parts[0], norm, qkv, conv, h);
+          if (!try_linear_w4a8_base(e, qkvz_parts[1], norm, z, gv, h))
+            linear_base(e, qkvz_parts[1], norm, z, gv, h);
+        } else if (try_concat_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
+                                  qkvz_ns, h, false, norm, concat_out)) {
+          emit_split2(e, concat_out, qkv, z, conv, gv);
+        } else {
+          linear_base(e, qkvz_parts[0], norm, qkv, conv, h);
+          linear_base(e, qkvz_parts[1], norm, z, gv, h);
+        }
+        if (use_w4a8 &&
+            try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                norm, concat_out)) {
+          emit_split2(e, concat_out, a, b, hv, hv);
+        } else if (use_w4a8) {
+          if (!try_linear_w4a8_base(e, ab_parts[0], norm, a, hv, h))
+            linear_base(e, ab_parts[0], norm, a, hv, h);
+          if (!try_linear_w4a8_base(e, ab_parts[1], norm, b, hv, h))
+            linear_base(e, ab_parts[1], norm, b, hv, h);
+        } else if (try_concat_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                  false, norm, concat_out)) {
+          emit_split2(e, concat_out, a, b, hv, hv);
+        } else {
+          linear_base(e, ab_parts[0], norm, a, hv, h);
+          linear_base(e, ab_parts[1], norm, b, hv, h);
+        }
+
+        // Capture tail_qkv (final conv_kernel-1 rows of qkv).
+        const U32 tail_rows = U32(config.linear_conv_kernel_dim - 1);
+        const U32 tail_start_row = (lm >= tail_rows) ? (lm - tail_rows) : 0U;
+        const Ref qkv_tail_src{qkv.buffer,
+                               qkv.offset + mul(tail_start_row, mul(conv, 2)),
+                               gdn_layer_tail_bytes};
+        const Ref tail_dst{&entry->payload.gdn_tail_qkv,
+                           U64(gdn_idx) * gdn_layer_tail_bytes,
+                           gdn_layer_tail_bytes};
+        copy(e, qkv_tail_src, tail_dst, gdn_layer_tail_bytes);
+
+        // Capture cumulative log-decay G_t[lm, Hv].
+        const Ref a_log = direct(block.get("gdn_a_log"), hv);
+        const Ref dt_bias = direct(block.get("gdn_dt_bias"), hv);
+        const Ref cum_dst{&entry->payload.gdn_cum_decay_f16,
+                          U64(gdn_idx) * gdn_layer_cum_bytes,
+                          gdn_layer_cum_bytes};
+        detail::BlendGdnCumDecayParams cdp{.value_heads = hv, .tokens = lm};
+        auto &cd = e.emit(
+            "cache_blend", "omlx_m5_gdn_compute_cum_decay_f16",
+            {.width = std::max<U64>(32ULL, ((U64(hv) + 31ULL) / 32ULL) * 32ULL)},
+            {.width = 32U}, {a, a_log, dt_bias, cum_dst});
+        e.dynamic(cd, 4, pod_bytes(cdp));
+
+        // Live GDN conv + recurrence + norm_gate -> live state0, state1, mixer.
+        emit_blend_gdn_slice(e, block, block.state0, block.state1, 0U, lm);
+
+        // Extract exact interior [eff_bnd, lm) transition (M_C, B_C) via NAX!
+        if (l_int > 0U) {
+          const Ref conv_int{convolved.buffer,
+                             convolved.offset + mul(eff_bnd, mul(conv, 2)),
+                             mul(l_int, mul(conv, 2))};
+          const Ref a_int{a.buffer, a.offset + mul(eff_bnd, mul(hv, 2)),
+                          mul(l_int, mul(hv, 2))};
+          const Ref b_int{b.buffer, b.offset + mul(eff_bnd, mul(hv, 2)),
+                          mul(l_int, mul(hv, 2))};
+          const auto ws = gdn_chunk_nax_workspace_layout(l_int, kh, hv);
+          const Ref qk_ref{gdn_chunk_ws.buffer, gdn_chunk_ws.offset,
+                           ws.qk_bytes};
+          const Ref ctrl_ref{gdn_chunk_ws.buffer,
+                             gdn_chunk_ws.offset + ws.qk_bytes, ws.ctrl_bytes};
+          auto int_params = words({kh, hv, 128U, 128U, conv,
+                                   U32(config.linear_conv_kernel_dim), l_int,
+                                   word(float(config.rms_norm_eps))});
+          auto &prep = e.emit(
+              "gdn_chunk_nax", "omlx_m5_gdn_chunk_prepare_c64",
+              {.width = U64(kh) * 128U, .height = ws.max_chunks},
+              {.width = 128U},
+              {conv_int, a_int, b_int, a_log, dt_bias, qk_ref, ctrl_ref});
+          e.dynamic(prep, 7, int_params);
+
+          // Extract M_C (S_init = I_128, V = 0) and pack into payload.gdn_m_*.
+          detail::BlendGdnExtractMParams emp{
+              .key_heads = kh, .value_heads = hv, .key_dim = 128U,
+              .value_dim = 128U, .tokens = l_int};
+          auto &em = e.emit("cache_blend",
+                            "omlx_m5_gdn_extract_transition_m_c64",
+                            {.width = 128U, .height = hv, .depth = 2U},
+                            {.width = 128U}, {qk_ref, ctrl_ref, m_tmp_ref});
+          e.dynamic(em, 3, pod_bytes(emp));
+
+          detail::BlendGdnPackOpParams pop{
+              .value_heads = hv,
+              .dim = 128U,
+              .op_format = static_cast<U32>(geom.gdn_op_format)};
+          const Ref m_dst{&entry->payload.gdn_m_data,
+                          U64(gdn_idx) * gdn_layer_op_bytes,
+                          gdn_layer_op_bytes};
+          const Ref m_sc{&entry->payload.gdn_m_row_scales,
+                         U64(gdn_idx) * gdn_layer_sc_bytes, gdn_layer_sc_bytes};
+          auto &pm = e.emit("cache_blend", "omlx_m5_gdn_pack_operator",
+                            {.width = 32U, .height = U64(hv) * 128U},
+                            {.width = 32U}, {m_tmp_ref, m_dst, m_sc});
+          e.dynamic(pm, 3, pod_bytes(pop));
+
+          // Extract B_C (S_init = 0, V = V_int) via recurrence into zeroed b_tmp_ref.
+          copy(e, zero_state_ref, b_tmp_ref, gdn_op_f32_bytes);
+          auto &rec_b = e.emit(
+              "gdn_chunk_nax", "omlx_m5_gdn_chunk_recurrence_c64",
+              {.width = U64(hv) * 128U, .height = 4U}, {.width = 128U},
+              {conv_int, qk_ref, ctrl_ref, b_tmp_ref, recurrent});
+          e.dynamic(rec_b, 5, int_params);
+          const Ref b_dst{&entry->payload.gdn_b_data,
+                          U64(gdn_idx) * gdn_layer_op_bytes,
+                          gdn_layer_op_bytes};
+          const Ref b_sc{&entry->payload.gdn_b_row_scales,
+                         U64(gdn_idx) * gdn_layer_sc_bytes, gdn_layer_sc_bytes};
+          auto &pb = e.emit("cache_blend", "omlx_m5_gdn_pack_operator",
+                            {.width = 32U, .height = U64(hv) * 128U},
+                            {.width = 32U}, {b_tmp_ref, b_dst, b_sc});
+          e.dynamic(pb, 3, pod_bytes(pop));
+        }
+
+        if (!(use_w4a8 && try_linear_w4a8_base(e, block.get("gdn_out"), mixer,
+                                               delta, h, gv))) {
+          linear(e, block.get("gdn_out"), mixer, delta, h, gv);
+        }
+        ++gdn_idx;
+      }
+
+      if (use_w4a8) {
+        emit_add_rmsnorm_a8_g64(
+            e, hidden, delta, direct(block.get("post_attention_norm"), h), norm,
+            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+            normalization_weight_offset,
+            /*write_bf16=*/(config.num_experts > 0));
+        e.set_a8_quant(make_a8_key(e, norm, h));
+      } else {
+        add_normalize(e, block.get("post_attention_norm"), hidden, delta, norm);
+      }
+      mlp(e, block, li, false, {}, nullptr, std::nullopt, false, use_w4a8,
+          /*verify=*/false);
+      add(e);
+    }
+
+    auto prof = e.finish();
+    for (const auto &patch : prof.patches) {
+      const U32 val = patch.position ? start_pos : lm * patch.multiplier;
+      std::memcpy(prof.parameter_data.data() + patch.offset + patch.word * 4,
+                  &val, 4);
+    }
+    prof.parameters.write("step", prof.parameter_data);
+    run_blend_exec_profile(prof);
+
+    page_pool->commit(lm);
+    page_guard.active = false;
+    next_position += lm;
+    has_last_logits = false;
+
+    QwenPrefillTelemetry seg_delta;
+    record_prefill_telemetry(lm, start_pos, prof.used_w4a8, prof.used_sage2,
+                             prof.used_minference, lm, prof.minf_context_envelope,
+                             /*used_ane=*/false, &seg_delta);
+    accum_delta.prefill_w4a8_tokens += seg_delta.prefill_w4a8_tokens;
+    accum_delta.prefill_sage2_tokens += seg_delta.prefill_sage2_tokens;
+    accum_delta.prefill_minference_blocks_total +=
+        seg_delta.prefill_minference_blocks_total;
+    accum_delta.prefill_minference_blocks_skipped +=
+        seg_delta.prefill_minference_blocks_skipped;
+    accum_delta.prefill_ane_fallback_tokens +=
+        seg_delta.prefill_ane_fallback_tokens;
+
+    (void)blend_cache.insert(std::move(entry));
+  }
+
+  QwenForwardResult run_blend_prefill_impl(
+      QwenForward &owner, std::span<const U32> prompt, U32 prefix_tokens,
+      detail::ChunkBlendCache &blend_cache, U64 model_exec_hash,
+      const GpuSamplingOptions &sampling, bool inspect_tensors,
+      const detail::BlendSegmentConfig *seg_cfg) {
+    require_no_async_in_flight("run_blend_prefill");
+    execution_started = true;
+    if (pending_verify)
+      throw std::logic_error("Qwen verification must commit or abort first");
+    if (prefix_tokens != next_position || prompt.size() <= prefix_tokens ||
+        prompt.size() > max_context)
+      throw std::invalid_argument("Qwen blend prefill frontier/length invalid");
+    if (std::any_of(prompt.begin(), prompt.end(),
+                    [&](U32 id) { return id >= v; }))
+      throw std::invalid_argument("Qwen blend prefill token outside vocabulary");
+
+    const U32 total_tokens = U32(prompt.size());
+    const U32 suffix_len = total_tokens - prefix_tokens;
+
+    auto run_standard_chunked =
+        [&](U32 start_pos, U32 end_pos, bool sample_last,
+            QwenPrefillTelemetry &accum) -> QwenForwardResult {
+      QwenForwardResult last_res{};
+      U32 cur = start_pos;
+      while (cur < end_pos) {
+        const U32 rem = end_pos - cur;
+        const U32 chunk = std::min<U32>(rem, workspace_rows_);
+        const bool is_final = (cur + chunk == end_pos);
+        if (is_final && sample_last) {
+          last_res = owner.run(prompt.subspan(cur, chunk), sampling,
+                               inspect_tensors, /*use_icb=*/true);
+        } else {
+          last_res = owner.run_trunk(prompt.subspan(cur, chunk), true);
+        }
+        accum.prefill_w4a8_tokens += last_res.prefill_delta.prefill_w4a8_tokens;
+        accum.prefill_sage2_tokens +=
+            last_res.prefill_delta.prefill_sage2_tokens;
+        accum.prefill_minference_blocks_total +=
+            last_res.prefill_delta.prefill_minference_blocks_total;
+        accum.prefill_minference_blocks_skipped +=
+            last_res.prefill_delta.prefill_minference_blocks_skipped;
+        accum.prefill_ane_offload_tokens +=
+            last_res.prefill_delta.prefill_ane_offload_tokens;
+        accum.prefill_ane_fallback_tokens +=
+            last_res.prefill_delta.prefill_ane_fallback_tokens;
+        cur += chunk;
+      }
+      return last_res;
+    };
+
+    if (!cache_blend_eligible() || !blend_cache.enabled()) {
+      QwenPrefillTelemetry accum;
+      accum.prefill_ane_active = ane_active_;
+      accum.prefill_ane_split_alpha = ane_split_alpha_;
+      auto res = run_standard_chunked(prefix_tokens, total_tokens, true, accum);
+      res.tokens = suffix_len;
+      res.prefill_delta = accum;
+      return res;
+    }
+
+    const detail::BlendSegmentConfig eff_cfg =
+        seg_cfg ? *seg_cfg : detail::BlendSegmentConfig{};
+    const auto plan =
+        blend_cache.plan_prompt(model_exec_hash, prompt, prefix_tokens, eff_cfg);
+
+    // ======================================================================
+    // Case 1: Cold miss (populate cacheable segments while advancing state!)
+    // ======================================================================
+    if (plan.hit_tokens == 0U || suffix_len > workspace_rows_) {
+      QwenPrefillTelemetry accum;
+      accum.prefill_ane_active = ane_active_;
+      accum.prefill_ane_split_alpha = ane_split_alpha_;
+      QwenForwardResult final_res{};
+      for (std::size_t si = 0; si < plan.segments.size(); ++si) {
+        const auto &ps = plan.segments[si];
+        const bool is_last_seg = (si + 1U == plan.segments.size());
+        if (!is_last_seg && !ps.is_cache_hit() &&
+            ps.segment.kind == detail::BlendSegmentKind::CacheableChunk &&
+            ps.segment.length <= workspace_rows_) {
+          capture_and_insert_blend_chunk(
+              prompt.subspan(ps.segment.start, ps.segment.length),
+              ps.segment.start, eff_cfg.boundary_window, blend_cache,
+              model_exec_hash, accum);
+        } else {
+          final_res = run_standard_chunked(
+              ps.segment.start, ps.segment.start + ps.segment.length,
+              is_last_seg, accum);
+        }
+      }
+      final_res.tokens = suffix_len;
+      final_res.prefill_delta = accum;
+      return final_res;
+    }
+
+    // ======================================================================
+    // Case 2: Warm Stitched CacheBlend Hit (suffix_len <= workspace_rows_)!
+    // ======================================================================
+    const U32 probe_idx = blend_probe_layer_index();
+    const U32 kvh = U32(config.num_key_value_heads);
+    const U32 qh = U32(config.num_attention_heads);
+    const U32 rot_dim =
+        U32(std::llround(config.head_dim * config.partial_rotary_factor));
+    const U32 kh = U32(config.linear_num_key_heads);
+    const U32 hv = U32(config.linear_num_value_heads);
+    const U32 ctx_env =
+        (minference_enabled_ && total_tokens >= kMInferenceMinContextTokens)
+            ? select_long_ctx_envelope(total_tokens)
+            : total_tokens;
+
+    const auto page_copies = page_pool->begin_append(suffix_len);
+    struct PageGuard {
+      KvPagePool *pool;
+      bool active;
+      ~PageGuard() {
+        if (active)
+          try {
+            pool->abort();
+          } catch (...) {
+          }
+      }
+    } page_guard{page_pool.get(), true};
+    execute_cow_copies(page_copies);
+
+    // Scratch buffers for stitched hidden/mixer and HKVD selection.
+    MetalBuffer full_hidden_buf =
+        context.make_private_buffer(mul(suffix_len, mul(h, 2ULL)));
+    MetalBuffer full_mixer_buf =
+        context.make_private_buffer(mul(suffix_len, mul(q, 2ULL)));
+    MetalBuffer mix3_cached_i8_buf =
+        context.make_private_buffer(mul(suffix_len, U64(q)));
+    MetalBuffer mix3_cached_sc_buf =
+        context.make_private_buffer(mul(suffix_len, mul(q / 128U, 2ULL)));
+    MetalBuffer flags_buf = context.make_buffer(mul(suffix_len, 4ULL));
+    MetalBuffer prompt_pos_buf = context.make_buffer(mul(suffix_len, 4ULL));
+    MetalBuffer l2_scores_buf = context.make_buffer(mul(suffix_len, 4ULL));
+    MetalBuffer active_idx_buf = context.make_buffer(mul(suffix_len, 4ULL));
+    MetalBuffer active_pos_buf = context.make_buffer(mul(suffix_len, 4ULL));
+    MetalBuffer active_cnt_buf = context.make_buffer(16ULL);
+    flags_buf.write(std::as_bytes(std::span(plan.suffix_token_flags)));
+    prompt_pos_buf.write(std::as_bytes(std::span(plan.suffix_prompt_positions)));
+
+    std::vector<U32> mand_idx;
+    std::vector<U32> mand_pos;
+    mand_idx.reserve(suffix_len);
+    mand_pos.reserve(suffix_len);
+    for (U32 i = 0; i < suffix_len; ++i) {
+      if (plan.suffix_token_flags[i] == detail::kBlendTokenMandatory) {
+        mand_idx.push_back(i);
+        mand_pos.push_back(plan.suffix_prompt_positions[i]);
+      }
+    }
+    const U32 m_mand = U32(mand_idx.size());
+    MetalBuffer mand_idx_buf =
+        context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
+    MetalBuffer mand_pos_buf =
+        context.make_buffer(std::max<U64>(16ULL, mul(m_mand, 4ULL)));
+    if (m_mand > 0U) {
+      mand_idx_buf.write(std::as_bytes(std::span(mand_idx)));
+      mand_pos_buf.write(std::as_bytes(std::span(mand_pos)));
+    }
+
+    const Ref full_hidden_ref{&full_hidden_buf, 0, full_hidden_buf.size()};
+    const Ref full_mixer_ref{&full_mixer_buf, 0, full_mixer_buf.size()};
+    const Ref mix3_i8_ref{&mix3_cached_i8_buf, 0, mix3_cached_i8_buf.size()};
+    const Ref mix3_sc_ref{&mix3_cached_sc_buf, 0, mix3_cached_sc_buf.size()};
+    const Ref flags_ref{&flags_buf, 0, flags_buf.size()};
+    const Ref prompt_pos_ref{&prompt_pos_buf, 0, prompt_pos_buf.size()};
+    const Ref l2_ref{&l2_scores_buf, 0, l2_scores_buf.size()};
+    const Ref act_idx_ref{&active_idx_buf, 0, active_idx_buf.size()};
+    const Ref act_pos_ref{&active_pos_buf, 0, active_pos_buf.size()};
+    const Ref act_cnt_ref{&active_cnt_buf, 0, active_cnt_buf.size()};
+    const Ref mand_idx_ref{&mand_idx_buf, 0, mand_idx_buf.size()};
+    const Ref mand_pos_ref{&mand_pos_buf, 0, mand_pos_buf.size()};
+    const Ref table_ref{&page_pool->table_buffer(), 0,
+                        page_pool->table_buffer().size()};
+
+    const U32 first_page = prefix_tokens / 64U;
+    const U32 last_page = (total_tokens - 1U) / 64U;
+    const U32 num_touched_pages = last_page - first_page + 1U;
+    const U64 gdn_tail_bytes =
+        U64(config.linear_conv_kernel_dim - 1) * U64(conv) * 2ULL;
+
+    const auto emit_refresh_pages = [&](Encoder &e, const Block &blk) {
+      detail::BlendRefreshPageSummaryParams rp{};
+      rp.key_value_heads = kvh;
+      rp.head_dim = U32(config.head_dim);
+      rp.page_tokens = 64U;
+      rp.first_logical_page = first_page;
+      rp.num_logical_pages = num_touched_pages;
+      rp.total_valid_tokens = total_tokens;
+      auto &rf = e.emit(
+          "cache_blend", "omlx_m5_blend_refresh_kv_page_summary_affine4_g128",
+          {.width = 32U, .height = U64(num_touched_pages) * kvh},
+          {.width = 32U}, {blk.state0, blk.state1, table_ref});
+      e.dynamic(rf, 3, pod_bytes(rp));
+    };
+
+    const auto emit_gdn_jump = [&](Encoder &e, const Block &blk, U32 gdn_idx,
+                                   const detail::BlendChunkEntry &he) {
+      const auto &g = he.geometry;
+      const U64 elem_b =
+          (g.gdn_op_format == detail::BlendGdnOperatorFormat::Fp8E4M3RowScale)
+              ? 1ULL
+              : 2ULL;
+      const U64 op_bytes = U64(hv) * 128ULL * 128ULL * elem_b;
+      const U64 sc_bytes = U64(hv) * 128ULL * 2ULL;
+      const U64 cum_bytes = U64(g.token_length) * U64(hv) * 2ULL;
+      detail::BlendGdnStateComposeParams cp{};
+      cp.key_heads = kh;
+      cp.value_heads = hv;
+      cp.dim = 128U;
+      cp.op_format = static_cast<U32>(g.gdn_op_format);
+      cp.chunk_tokens = g.token_length;
+      cp.num_hkvd_perturb = 0U;
+      cp.apply_bias = 1U;
+      auto &sc = e.emit(
+          "cache_blend", "omlx_m5_gdn_state_compose_nax",
+          {.width = 128U, .height = hv, .depth = 4U}, {.width = 128U},
+          {blk.state0,
+           Ref{&he.payload.gdn_m_data, U64(gdn_idx) * op_bytes, op_bytes},
+           Ref{&he.payload.gdn_m_row_scales, U64(gdn_idx) * sc_bytes, sc_bytes},
+           Ref{&he.payload.gdn_b_data, U64(gdn_idx) * op_bytes, op_bytes},
+           Ref{&he.payload.gdn_b_row_scales, U64(gdn_idx) * sc_bytes, sc_bytes},
+           Ref{&he.payload.gdn_cum_decay_f16, U64(gdn_idx) * cum_bytes,
+               cum_bytes},
+           zero, zero, zero, zero, zero, zero, zero, blk.state0});
+      e.dynamic(sc, 14, pod_bytes(cp));
+      copy(e,
+           Ref{&he.payload.gdn_tail_qkv, U64(gdn_idx) * gdn_tail_bytes,
+               gdn_tail_bytes},
+           blk.state1, gdn_tail_bytes);
+    };
+
+    // Upload all suffix tokens once to token_ids.
+    std::fill_n(token_staging.begin(), suffix_len, 0U);
+    std::copy(prompt.begin() + prefix_tokens, prompt.end(),
+              token_staging.begin());
+    const_cast<MetalBuffer *>(token_ids.buffer)
+        ->write(std::as_bytes(std::span(token_staging).first(suffix_len)));
+    const_cast<MetalBuffer *>(attention_positions.buffer)
+        ->write(std::as_bytes(std::span(plan.suffix_prompt_positions)));
+
+    // ======================================================================
+    // Stage 1: KV Instantiation + Pre-Probe Layers + Layer-3 Cross-Chunk Probe + HKVD Select
+    // ======================================================================
+    const bool use_w4a8_suffix = use_w4a8_for_t(suffix_len, false);
+    const U64 seq1 = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+    Encoder e1(context, libraries, suffix_len,
+               "qwen.blend.warm1." + std::to_string(seq1) + plan_key_suffix());
+    if (use_w4a8_suffix) {
+      e1.profile.used_w4a8 = true;
+    }
+
+    // 1A. Instantiate cached KV for all hit segments across all full-attention layers.
+    e1.begin_stage("blend_instantiate_kv");
+    {
+      U32 attn_idx = 0U;
+      for (const auto &blk : blocks) {
+        if (blk.type != LayerType::full_attention)
+          continue;
+        for (const auto &ps : plan.segments) {
+          if (!ps.is_cache_hit())
+            continue;
+          const auto &he = *ps.hit_entry;
+          const U64 lkv = U64(he.geometry.token_length) * U64(kvh) *
+                          he.geometry.attn_vec_bytes();
+          const U64 lrot =
+              U64(he.geometry.token_length) * U64(kvh) * U64(rot_dim) * 2ULL;
+          detail::BlendInstantiateKvParams ip{};
+          ip.key_value_heads = kvh;
+          ip.head_dim = U32(config.head_dim);
+          ip.rotary_dim = rot_dim;
+          ip.chunk_tokens = ps.segment.length;
+          ip.dst_start_pos = ps.segment.start;
+          ip.page_tokens = 64U;
+          ip.theta = float(config.rope_theta);
+          ip.src_token_offset = 0U;
+          ip.use_rotary_bf16 = 1U;
+          auto &inst = e1.emit(
+              "cache_blend", "omlx_m5_blend_instantiate_kv_affine4_g128",
+              {.width = 32U, .height = U64(ps.segment.length) * kvh},
+              {.width = 32U},
+              {Ref{&he.payload.attn_k_pre, U64(attn_idx) * lkv, lkv},
+               Ref{&he.payload.attn_k_rotary_bf16, U64(attn_idx) * lrot, lrot},
+               Ref{&he.payload.attn_v, U64(attn_idx) * lkv, lkv}, blk.state0,
+               blk.state1, table_ref});
+          e1.dynamic(inst, 6, pod_bytes(ip));
+        }
+        emit_refresh_pages(e1, blk);
+        ++attn_idx;
+      }
+    }
+
+    // 1B. Populate full_hidden from cached H3_res for hit segments, and assemble mix3_cached.
+    e1.begin_stage("blend_dequant_h3");
+    for (const auto &ps : plan.segments) {
+      if (!ps.is_cache_hit())
+        continue;
+      const auto &he = *ps.hit_entry;
+      const U32 rel_start = ps.segment.start - prefix_tokens;
+      const U32 lm = ps.segment.length;
+      detail::BlendInt8QuantParams dq{.tokens = lm, .width = h};
+      const Ref dst_h3{full_hidden_ref.buffer,
+                       full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
+                       mul(lm, mul(h, 2ULL))};
+      auto &dh = e1.emit(
+          "cache_blend", "omlx_m5_blend_dequantize_int8_g128_bf16",
+          {.width = 32U, .height = U64(lm) * (h / 128U)}, {.width = 32U},
+          {Ref{&he.payload.h3_res_i8, 0, he.geometry.h3_res_i8_bytes()},
+           Ref{&he.payload.h3_res_scales, 0, he.geometry.h3_res_scale_bytes()},
+           dst_h3});
+      e1.dynamic(dh, 3, pod_bytes(dq));
+      copy(e1,
+           Ref{&he.payload.mix3_cached_i8, 0, he.geometry.mix3_cached_i8_bytes()},
+           Ref{mix3_i8_ref.buffer, mix3_i8_ref.offset + mul(rel_start, U64(q)),
+               he.geometry.mix3_cached_i8_bytes()},
+           he.geometry.mix3_cached_i8_bytes());
+      copy(e1,
+           Ref{&he.payload.mix3_cached_scales, 0,
+               he.geometry.mix3_cached_scale_bytes()},
+           Ref{mix3_sc_ref.buffer,
+               mix3_sc_ref.offset + mul(rel_start, mul(q / 128U, 2ULL)),
+               he.geometry.mix3_cached_scale_bytes()},
+           he.geometry.mix3_cached_scale_bytes());
+    }
+
+    // 1C. Pre-probe layers (0 .. probe_idx - 1): dense on boundary/miss + GDN state jump on hit interior!
+    for (const auto &ps : plan.segments) {
+      const U32 rel_start = ps.segment.start - prefix_tokens;
+      const U32 run_len = ps.is_cache_hit()
+                              ? std::min<U32>(ps.segment.boundary_window,
+                                              ps.segment.length)
+                              : ps.segment.length;
+      if (run_len > 0U) {
+        e1.begin_stage("blend_pre_probe.seg" + std::to_string(rel_start));
+        e1.delegated_prefill = (run_len >= 16U);
+        const Ref seg_tok{token_ids.buffer,
+                          token_ids.offset + mul(rel_start, 4ULL),
+                          mul(run_len, 4ULL)};
+        // Embed segment tokens into hidden[0..run_len).
+        embedding_lookup(e1, embedding, seg_tok, hidden, zero, v, h, run_len);
+        const bool seg_w4a8 = use_w4a8_for_t(run_len, false);
+        for (U32 li = 0; li < probe_idx; ++li) {
+          const auto &blk = blocks[li];
+          if (seg_w4a8) {
+            emit_rmsnorm_a8_g64(e1, hidden, direct(blk.get("input_norm"), h),
+                                norm, a8_qa, a8_sa, a8_ra, h,
+                                float(config.rms_norm_eps),
+                                normalization_weight_offset, true, run_len);
+            e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+          } else {
+            normalize(e1, blk.get("input_norm"), hidden, norm, run_len);
+          }
+          // Pre-probe layers are GDN (probe_idx is the first full_attention layer).
+          const std::array<MaterializedWeightView, 2> qkvz_parts{
+              blk.get("gdn_qkv"), blk.get("gdn_z")};
+          const std::array<U32, 2> qkvz_ns{conv, gv};
+          const std::array<MaterializedWeightView, 2> ab_parts{
+              blk.get("gdn_a"), blk.get("gdn_b")};
+          const std::array<U32, 2> ab_ns{hv, hv};
+          if (seg_w4a8 &&
+              try_concat_w4a8_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                  qkvz_ns, h, norm, concat_out, run_len)) {
+            emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+          } else if (seg_w4a8) {
+            if (!try_linear_w4a8_base(e1, qkvz_parts[0], norm, qkv, conv, h,
+                                      run_len))
+              linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
+            if (!try_linear_w4a8_base(e1, qkvz_parts[1], norm, z, gv, h,
+                                      run_len))
+              linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+          } else if (try_concat_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                    qkvz_ns, h, false, norm, concat_out,
+                                    run_len)) {
+            emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+          } else {
+            linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
+            linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+          }
+          if (seg_w4a8 &&
+              try_concat_w4a8_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                  norm, concat_out, run_len)) {
+            emit_split2(e1, concat_out, a, b, hv, hv, run_len);
+          } else if (seg_w4a8) {
+            if (!try_linear_w4a8_base(e1, ab_parts[0], norm, a, hv, h, run_len))
+              linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
+            if (!try_linear_w4a8_base(e1, ab_parts[1], norm, b, hv, h, run_len))
+              linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
+          } else if (try_concat_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, false, norm, concat_out, run_len)) {
+            emit_split2(e1, concat_out, a, b, hv, hv, run_len);
+          } else {
+            linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
+            linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
+          }
+          emit_blend_gdn_slice(e1, blk, blk.state0, blk.state1, 0U, run_len);
+          if (!(seg_w4a8 && try_linear_w4a8_base(e1, blk.get("gdn_out"), mixer,
+                                                 delta, h, gv, run_len))) {
+            linear(e1, blk.get("gdn_out"), mixer, delta, h, gv, run_len);
+          }
+          if (seg_w4a8) {
+            emit_add_rmsnorm_a8_g64(
+                e1, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                normalization_weight_offset, (config.num_experts > 0), run_len);
+            e1.set_a8_quant(make_a8_key(e1, norm, h, run_len));
+          } else {
+            add_normalize(e1, blk.get("post_attention_norm"), hidden, delta,
+                          norm, run_len);
+          }
+          mlp(e1, blk, li, false, run_len, nullptr, std::nullopt, false,
+              seg_w4a8, /*verify=*/false);
+          add(e1, run_len);
+        }
+        // Write fresh boundary/miss hidden into full_hidden[rel_start..+run_len).
+        copy(e1, hidden,
+             Ref{full_hidden_ref.buffer,
+                 full_hidden_ref.offset + mul(rel_start, mul(h, 2ULL)),
+                 mul(run_len, mul(h, 2ULL))},
+             mul(run_len, mul(h, 2ULL)));
+      }
+      // For hit segments, jump pre-probe GDN states across interior [W_bnd, L_m).
+      if (ps.is_cache_hit() && ps.segment.length > run_len) {
+        U32 gdn_i = 0U;
+        for (U32 li = 0; li < probe_idx; ++li) {
+          if (blocks[li].type != LayerType::full_attention) {
+            emit_gdn_jump(e1, blocks[li], gdn_i, *ps.hit_entry);
+            ++gdn_i;
+          }
+        }
+      }
+    }
+
+    // 1D. Layer probe_idx (Layer 3): scatter mandatory K/V, run cross-chunk Attention, HKVD select!
+    {
+      const auto &pblk = blocks[probe_idx];
+      e1.begin_stage("blend_probe_layer");
+      e1.delegated_prefill = false;
+      if (use_w4a8_suffix) {
+        emit_rmsnorm_a8_g64(
+            e1, full_hidden_ref, direct(pblk.get("input_norm"), h), norm, a8_qa,
+            a8_sa, a8_ra, h, float(config.rms_norm_eps),
+            normalization_weight_offset, /*write_bf16=*/true);
+        e1.set_a8_quant(make_a8_key(e1, norm, h));
+      } else {
+        normalize(e1, pblk.get("input_norm"), full_hidden_ref, norm);
+      }
+
+      // Scatter mandatory K, V into Layer-3 KvPagePool.
+      if (m_mand > 0U) {
+        e1.delegated_prefill = (m_mand >= 16U);
+        detail::BlendGatherScatterParams gp{
+            .max_active_tokens = m_mand, .width = h, .use_device_count = 0U,
+            .residual_add = 0U};
+        const U32 gx = (h % 4U == 0U) ? (h / 4U) : h;
+        auto &gm = e1.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                           {.width = gx, .height = m_mand},
+                           {.width = std::min<U32>(128U, gx)},
+                           {norm, mand_idx_ref, zero, delta});
+        e1.dynamic(gm, 4, pod_bytes(gp));
+        const bool mand_w4a8 = use_w4a8_for_t(m_mand, false);
+        if (!(mand_w4a8 &&
+              try_linear_w4a8_base(e1, pblk.get("attention_k"), delta, key, kv,
+                                   h, m_mand))) {
+          linear_base(e1, pblk.get("attention_k"), delta, key, kv, h, m_mand);
+        }
+        if (!(mand_w4a8 &&
+              try_linear_w4a8_base(e1, pblk.get("attention_v"), delta, value,
+                                   kv, h, m_mand))) {
+          linear_base(e1, pblk.get("attention_v"), delta, value, kv, h, m_mand);
+        }
+        e1.delegated_prefill = false;
+        detail::BlendQkNormRopeScatterParams sp{};
+        sp.query_heads = 0U; // K/V scatter only!
+        sp.key_value_heads = kvh;
+        sp.head_dim = U32(config.head_dim);
+        sp.rotary_dim = rot_dim;
+        sp.max_active_tokens = m_mand;
+        sp.query_token_stride = q * 2U;
+        sp.query_head_stride = U32(config.head_dim * 2);
+        sp.key_token_stride = kv;
+        sp.key_head_stride = U32(config.head_dim);
+        sp.value_token_stride = kv;
+        sp.page_tokens = 64U;
+        sp.use_device_count = 0U;
+        sp.epsilon = float(config.rms_norm_eps);
+        sp.theta = float(config.rope_theta);
+        sp.weight_offset = normalization_weight_offset;
+        auto &skv = e1.emit(
+            "cache_blend",
+            "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
+            {.width = 32U, .height = U64(m_mand) * kvh}, {.width = 32U},
+            {query, key, value, direct(pblk.get("q_norm"), config.head_dim),
+             direct(pblk.get("k_norm"), config.head_dim), pblk.state0,
+             pblk.state1, table_ref, mand_pos_ref, zero});
+        e1.dynamic(skv, 10, pod_bytes(sp));
+        emit_refresh_pages(e1, pblk);
+      }
+
+      // Compute Q for all suffix_len rows, apply q_norm + RoPE, run Route B cross-chunk Attention!
+      if (!(use_w4a8_suffix &&
+            try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
+                                 2 * q, h))) {
+        linear_base(e1, pblk.get("attention_q"), norm, query, 2 * q, h);
+      }
+      {
+        auto &post = e1.emit(
+            "attention_exact", "omlx_m5_attention_qk_norm_rope_exact",
+            {.width = 32U, .height = U64(suffix_len) * (qh + kvh)},
+            {.width = 32U},
+            {query, key, direct(pblk.get("q_norm"), config.head_dim),
+             direct(pblk.get("k_norm"), config.head_dim), prompt_pos_ref});
+        e1.dynamic(post, 5,
+                   words({qh, kvh, U32(config.head_dim), rot_dim, suffix_len,
+                          q * 2, U32(config.head_dim * 2), kv,
+                          U32(config.head_dim), prefix_tokens,
+                          word(float(config.rms_norm_eps)),
+                          word(float(config.rope_theta)),
+                          word(normalization_weight_offset)}));
+      }
+      emit_blend_attn_route_b(e1, pblk, suffix_len, prefix_tokens, ctx_env,
+                              prompt_pos_ref);
+      // Save full_mixer_ref before gathering active rows.
+      copy(e1, mixer, full_mixer_ref, mul(suffix_len, mul(q, 2ULL)));
+
+      // HKVD L2 scoring + Top-K selection (~15% interior + 100% mandatory).
+      detail::BlendHkvdSelectParams hp{};
+      hp.total_tokens = suffix_len;
+      hp.mix_width = q;
+      hp.cached_is_int8 = 1U;
+      hp.compute_l2_inline = 0U;
+      hp.explicit_hkvd_k = 0U;
+      hp.hkvd_ratio = detail::kBlendDefaultHkvdRatio;
+      auto &l2 = e1.emit("cache_blend", "omlx_m5_blend_hkvd_l2_score",
+                         {.width = 128U, .height = suffix_len},
+                         {.width = 128U},
+                         {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
+                          l2_ref});
+      e1.dynamic(l2, 5, pod_bytes(hp));
+      auto &tk = e1.emit("cache_blend", "omlx_m5_blend_hkvd_topk_select",
+                         {.width = 256U}, {.width = 256U},
+                         {full_mixer_ref, mix3_i8_ref, mix3_sc_ref, flags_ref,
+                          prompt_pos_ref, l2_ref, act_idx_ref, act_pos_ref,
+                          act_cnt_ref});
+      e1.dynamic(tk, 9, pod_bytes(hp));
+    }
+
+    auto prof1 = e1.finish();
+    // Single-use plan: all run_len / m_mand / suffix_len & prefix_tokens are baked in.
+    prof1.parameters.write("step", prof1.parameter_data);
+    run_blend_exec_profile(prof1);
+
+    // Read M_active and active_idx / active_pos (strictly ascending).
+    U32 m_active = 0U;
+    {
+      const auto cnt_b = active_cnt_buf.read(0, 4);
+      std::memcpy(&m_active, cnt_b.data(), 4);
+    }
+    if (m_active == 0U || m_active > suffix_len) {
+      throw std::runtime_error("CacheBlend HKVD produced invalid M_active");
+    }
+    std::vector<U32> active_idx_host(m_active);
+    std::vector<U32> active_pos_host(m_active);
+    {
+      const auto ib = active_idx_buf.read(0, mul(m_active, 4ULL));
+      const auto pb = active_pos_buf.read(0, mul(m_active, 4ULL));
+      std::memcpy(active_idx_host.data(), ib.data(), ib.size());
+      std::memcpy(active_pos_host.data(), pb.data(), pb.size());
+    }
+    const_cast<MetalBuffer *>(attention_positions.buffer)
+        ->write(std::as_bytes(std::span(active_pos_host)));
+
+    // Count how many recomputed active tokens belong to cache-hit segments.
+    U32 recomputed_hit_tokens = 0U;
+    for (const U32 rel_i : active_idx_host) {
+      const U32 abs_p = prefix_tokens + rel_i;
+      for (const auto &ps : plan.segments) {
+        if (ps.is_cache_hit() && abs_p >= ps.segment.start &&
+            abs_p < ps.segment.start + ps.segment.length) {
+          ++recomputed_hit_tokens;
+          break;
+        }
+      }
+    }
+
+    // ======================================================================
+    // Stage 2: Deep Layers (Layer 3 post-attn + Layers 4..L-1) on Packed [M_active, H]
+    // ======================================================================
+    const bool use_w4a8_active = use_w4a8_for_t(m_active, false);
+    const U64 gdn_state_bytes =
+        (config.linear_attention_layers() > 0)
+            ? mul(mul(U64(hv), 128ULL * 128ULL), 4ULL)
+            : 256ULL;
+    const U64 gdn_hist_bytes =
+        (config.linear_attention_layers() > 0) ? gdn_tail_bytes : 256ULL;
+    MetalBuffer gdn_tmp_state = context.make_private_buffer(gdn_state_bytes);
+    MetalBuffer gdn_tmp_hist = context.make_private_buffer(gdn_hist_bytes);
+    const Ref gdn_tmp_s_ref{&gdn_tmp_state, 0, gdn_state_bytes};
+    const Ref gdn_tmp_h_ref{&gdn_tmp_hist, 0, gdn_hist_bytes};
+
+    const U64 seq2 = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
+    Encoder e2(context, libraries, m_active,
+               "qwen.blend.warm2." + std::to_string(seq2) + plan_key_suffix());
+    if (use_w4a8_active) {
+      e2.profile.used_w4a8 = true;
+    }
+
+    // Gather hidden[0..M_active, H] and mixer[0..M_active, q] for Layer probe_idx finish!
+    e2.begin_stage("blend_gather_active");
+    {
+      detail::BlendGatherScatterParams gh{
+          .max_active_tokens = m_active, .width = h, .use_device_count = 0U,
+          .residual_add = 0U};
+      const U32 gxh = (h % 4U == 0U) ? (h / 4U) : h;
+      auto &g1 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                         {.width = gxh, .height = m_active},
+                         {.width = std::min<U32>(128U, gxh)},
+                         {full_hidden_ref, act_idx_ref, act_cnt_ref, hidden});
+      e2.dynamic(g1, 4, pod_bytes(gh));
+
+      detail::BlendGatherScatterParams gm{
+          .max_active_tokens = m_active, .width = q, .use_device_count = 0U,
+          .residual_add = 0U};
+      const U32 gxq = (q % 4U == 0U) ? (q / 4U) : q;
+      auto &g2 = e2.emit("cache_blend", "omlx_m5_blend_gather_rows_bf16",
+                         {.width = gxq, .height = m_active},
+                         {.width = std::min<U32>(128U, gxq)},
+                         {full_mixer_ref, act_idx_ref, act_cnt_ref, mixer});
+      e2.dynamic(g2, 4, pod_bytes(gm));
+    }
+
+    // Finish Layer probe_idx (o_proj + post_attention_norm + mlp + residual add) on [M_active, H].
+    {
+      const auto &pblk = blocks[probe_idx];
+      e2.begin_stage("blend_probe_finish");
+      if (!(use_w4a8_active &&
+            try_linear_w4a8_base(e2, pblk.get("attention_o"), mixer, delta, h,
+                                 q))) {
+        linear(e2, pblk.get("attention_o"), mixer, delta, h, q);
+      }
+      if (use_w4a8_active) {
+        emit_add_rmsnorm_a8_g64(
+            e2, hidden, delta, direct(pblk.get("post_attention_norm"), h), norm,
+            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+            normalization_weight_offset, (config.num_experts > 0));
+        e2.set_a8_quant(make_a8_key(e2, norm, h));
+      } else {
+        add_normalize(e2, pblk.get("post_attention_norm"), hidden, delta, norm);
+      }
+      mlp(e2, pblk, probe_idx, false, {}, nullptr, std::nullopt, false,
+          use_w4a8_active, /*verify=*/false);
+      add(e2);
+    }
+
+    // Count pre-existing GDN layers up through probe_idx.
+    U32 gdn_idx = 0U;
+    for (U32 li = 0; li <= probe_idx; ++li) {
+      if (blocks[li].type != LayerType::full_attention) {
+        ++gdn_idx;
+      }
+    }
+
+    // Precompute active_idx partitions per segment for GDN layers > probe_idx.
+    struct ActiveSegSlice {
+      const detail::BlendPlannedSegment *planned = nullptr;
+      U32 a_begin = 0U;
+      U32 w_bnd_count = 0U;
+      U32 a_end = 0U;
+    };
+    std::vector<ActiveSegSlice> seg_slices;
+    seg_slices.reserve(plan.segments.size());
+    {
+      U32 cursor = 0U;
+      for (const auto &ps : plan.segments) {
+        const U32 seg_rel_start = ps.segment.start - prefix_tokens;
+        const U32 seg_rel_end = seg_rel_start + ps.segment.length;
+        const U32 a_begin = cursor;
+        U32 w_bnd_cnt = 0U;
+        const U32 bnd_end =
+            seg_rel_start +
+            (ps.is_cache_hit()
+                 ? std::min<U32>(ps.segment.boundary_window, ps.segment.length)
+                 : 0U);
+        while (cursor < m_active && active_idx_host[cursor] < seg_rel_end) {
+          if (active_idx_host[cursor] < bnd_end) {
+            ++w_bnd_cnt;
+          }
+          ++cursor;
+        }
+        seg_slices.push_back({&ps, a_begin, w_bnd_cnt, cursor});
+      }
+    }
+
+    // Deep layers probe_idx + 1 .. blocks.size() - 1 on packed [M_active, H].
+    for (U32 li = probe_idx + 1U; li < blocks.size(); ++li) {
+      const auto &blk = blocks[li];
+      e2.begin_stage("blend_deep.L" + std::to_string(li));
+      if (use_w4a8_active) {
+        emit_rmsnorm_a8_g64(e2, hidden, direct(blk.get("input_norm"), h), norm,
+                            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                            normalization_weight_offset, true);
+        e2.set_a8_quant(make_a8_key(e2, norm, h));
+      } else {
+        normalize(e2, blk.get("input_norm"), hidden, norm);
+      }
+
+      if (blk.type == LayerType::full_attention) {
+        const std::array<MaterializedWeightView, 3> parts{
+            blk.get("attention_q"), blk.get("attention_k"),
+            blk.get("attention_v")};
+        const std::array<U32, 3> part_ns{2 * q, kv, kv};
+        if (use_w4a8_active &&
+            try_concat_w4a8_nax(e2, blk.concat_qkv_id, parts, part_ns, h, norm,
+                                concat_out)) {
+          emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+        } else if (use_w4a8_active) {
+          if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h))
+            linear_base(e2, parts[0], norm, query, 2 * q, h);
+          if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h))
+            linear_base(e2, parts[1], norm, key, kv, h);
+          if (!try_linear_w4a8_base(e2, parts[2], norm, value, kv, h))
+            linear_base(e2, parts[2], norm, value, kv, h);
+        } else if (try_concat_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
+                                  false, norm, concat_out)) {
+          emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+        } else {
+          linear_base(e2, parts[0], norm, query, 2 * q, h);
+          linear_base(e2, parts[1], norm, key, kv, h);
+          linear_base(e2, parts[2], norm, value, kv, h);
+        }
+
+        // Scattered QK-Norm + RoPE(active_pos) + KV scatter into KvPagePool!
+        detail::BlendQkNormRopeScatterParams sp{};
+        sp.query_heads = qh;
+        sp.key_value_heads = kvh;
+        sp.head_dim = U32(config.head_dim);
+        sp.rotary_dim = rot_dim;
+        sp.max_active_tokens = m_active;
+        sp.query_token_stride = q * 2U;
+        sp.query_head_stride = U32(config.head_dim * 2);
+        sp.key_token_stride = kv;
+        sp.key_head_stride = U32(config.head_dim);
+        sp.value_token_stride = kv;
+        sp.page_tokens = 64U;
+        sp.use_device_count = 0U;
+        sp.epsilon = float(config.rms_norm_eps);
+        sp.theta = float(config.rope_theta);
+        sp.weight_offset = normalization_weight_offset;
+        auto &sc = e2.emit(
+            "cache_blend",
+            "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
+            {.width = 32U, .height = U64(m_active) * (qh + kvh)},
+            {.width = 32U},
+            {query, key, value, direct(blk.get("q_norm"), config.head_dim),
+             direct(blk.get("k_norm"), config.head_dim), blk.state0, blk.state1,
+             table_ref, attention_positions, zero});
+        e2.dynamic(sc, 10, pod_bytes(sp));
+        emit_refresh_pages(e2, blk);
+
+        // Cross-chunk Attention over packed M_active queries via active Route B!
+        emit_blend_attn_route_b(e2, blk, m_active, active_pos_host.front(),
+                                ctx_env, attention_positions);
+        if (!(use_w4a8_active &&
+              try_linear_w4a8_base(e2, blk.get("attention_o"), mixer, delta, h,
+                                   q))) {
+          linear(e2, blk.get("attention_o"), mixer, delta, h, q);
+        }
+      } else {
+        const std::array<MaterializedWeightView, 2> qkvz_parts{
+            blk.get("gdn_qkv"), blk.get("gdn_z")};
+        const std::array<U32, 2> qkvz_ns{conv, gv};
+        const std::array<MaterializedWeightView, 2> ab_parts{
+            blk.get("gdn_a"), blk.get("gdn_b")};
+        const std::array<U32, 2> ab_ns{hv, hv};
+        if (use_w4a8_active &&
+            try_concat_w4a8_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts, qkvz_ns,
+                                h, norm, concat_out)) {
+          emit_split2(e2, concat_out, qkv, z, conv, gv);
+        } else if (use_w4a8_active) {
+          if (!try_linear_w4a8_base(e2, qkvz_parts[0], norm, qkv, conv, h))
+            linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
+          if (!try_linear_w4a8_base(e2, qkvz_parts[1], norm, z, gv, h))
+            linear_base(e2, qkvz_parts[1], norm, z, gv, h);
+        } else if (try_concat_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                  qkvz_ns, h, false, norm, concat_out)) {
+          emit_split2(e2, concat_out, qkv, z, conv, gv);
+        } else {
+          linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
+          linear_base(e2, qkvz_parts[1], norm, z, gv, h);
+        }
+        if (use_w4a8_active &&
+            try_concat_w4a8_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                norm, concat_out)) {
+          emit_split2(e2, concat_out, a, b, hv, hv);
+        } else if (use_w4a8_active) {
+          if (!try_linear_w4a8_base(e2, ab_parts[0], norm, a, hv, h))
+            linear_base(e2, ab_parts[0], norm, a, hv, h);
+          if (!try_linear_w4a8_base(e2, ab_parts[1], norm, b, hv, h))
+            linear_base(e2, ab_parts[1], norm, b, hv, h);
+        } else if (try_concat_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                  false, norm, concat_out)) {
+          emit_split2(e2, concat_out, a, b, hv, hv);
+        } else {
+          linear_base(e2, ab_parts[0], norm, a, hv, h);
+          linear_base(e2, ab_parts[1], norm, b, hv, h);
+        }
+
+        // Advance GDN per segment: boundary dense -> HKVD scratch -> NAX state jump -> dense tail!
+        for (const auto &ss : seg_slices) {
+          const auto &ps = *ss.planned;
+          const U32 seg_m = ss.a_end - ss.a_begin;
+          if (ps.is_cache_hit()) {
+            if (ss.w_bnd_count > 0U) {
+              emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1, ss.a_begin,
+                                   ss.w_bnd_count);
+            }
+            const U32 hkvd_m = seg_m - ss.w_bnd_count;
+            if (hkvd_m > 0U) {
+              copy(e2, blk.state0, gdn_tmp_s_ref, gdn_state_bytes);
+              copy(e2, blk.state1, gdn_tmp_h_ref, gdn_hist_bytes);
+              emit_blend_gdn_slice(e2, blk, gdn_tmp_s_ref, gdn_tmp_h_ref,
+                                   ss.a_begin + ss.w_bnd_count, hkvd_m);
+            }
+            if (ps.segment.length > ss.w_bnd_count) {
+              emit_gdn_jump(e2, blk, gdn_idx, *ps.hit_entry);
+            }
+          } else if (seg_m > 0U) {
+            emit_blend_gdn_slice(e2, blk, blk.state0, blk.state1, ss.a_begin,
+                                 seg_m);
+          }
+        }
+
+        if (!(use_w4a8_active &&
+              try_linear_w4a8_base(e2, blk.get("gdn_out"), mixer, delta, h, gv))) {
+          linear(e2, blk.get("gdn_out"), mixer, delta, h, gv);
+        }
+        ++gdn_idx;
+      }
+
+      if (use_w4a8_active) {
+        emit_add_rmsnorm_a8_g64(
+            e2, hidden, delta, direct(blk.get("post_attention_norm"), h), norm,
+            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+            normalization_weight_offset, (config.num_experts > 0));
+        e2.set_a8_quant(make_a8_key(e2, norm, h));
+      } else {
+        add_normalize(e2, blk.get("post_attention_norm"), hidden, delta, norm);
+      }
+      mlp(e2, blk, li, false, {}, nullptr, std::nullopt, false,
+          use_w4a8_active, /*verify=*/false);
+      add(e2);
+    }
+
+    // Final norm + lm_head + sample on last active row (M_active - 1 == prompt end!).
+    e2.begin_stage("blend_head");
+    Ref last_hidden{delta.buffer, 0, mul(h, 2)};
+    Ref last_norm{norm.buffer, 0, mul(h, 2)};
+    Ref row0_logits{logits.buffer, 0, mul(v, 2)};
+    {
+      auto &extract =
+          e2.emit("qwen_forward", "omlx_m5_forward_last_row", {.width = h},
+                  {.width = 256}, {hidden, last_hidden});
+      e2.dynamic(extract, 2, words({m_active, h}));
+    }
+    normalize(e2, final_norm, last_hidden, last_norm, 1U);
+    linear(e2, head, last_norm, row0_logits, v, h, 1U);
+    e2.begin_stage("blend_sample");
+    const bool use_64tg_argmax =
+        (v >= 256U) && (argmax_scratch.buffer != nullptr) &&
+        !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_64TG_ARGMAX");
+    if (sampling_contract == SamplingContract::PositionCoupledV1) {
+      if (use_64tg_argmax) {
+        auto &st1 = e2.emit("position_sampling",
+                            "omlx_m5_position_argmax_stage1_64tg",
+                            {.width = 64U * 256U, .height = 1U},
+                            {.width = 256U}, {row0_logits, argmax_scratch});
+        e2.constant(st1, 2, words({v, 1, 1, 0}));
+        auto &sample = e2.emit(
+            "position_sampling", "omlx_m5_position_sample_logits_stage2",
+            {.width = 256U}, {.width = 256U},
+            {row0_logits, argmax_scratch, sampled, position_ids,
+             position_scores});
+        e2.profile.sampling_offset = e2.dynamic(
+            sample, 5, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+        e2.constant(sample, 6, words({v, 1, 1, 0}));
+      } else {
+        auto &sample =
+            e2.emit("position_sampling", "omlx_m5_position_sample_logits",
+                    {.width = 256}, {.width = 256},
+                    {row0_logits, sampled, position_ids, position_scores});
+        e2.profile.sampling_offset = e2.dynamic(
+            sample, 4, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+        e2.constant(sample, 5, words({v, 1, 1, 0}));
+      }
+    } else if (use_64tg_argmax) {
+      Ref vocab_parts{argmax_scratch.buffer, 0, 512U};
+      auto &st1 =
+          e2.emit("vocab", "omlx_m5_vocab_argmax_stage1_64tg",
+                  {.width = 64U * 256U}, {.width = 256U},
+                  {row0_logits, vocab_parts});
+      e2.constant(st1, 2, words({v}));
+      auto &sample =
+          e2.emit("vocab", "omlx_m5_sample_logits_stage2", {.width = 256U},
+                  {.width = 256U}, {row0_logits, vocab_parts, sampled});
+      e2.profile.sampling_offset =
+          e2.dynamic(sample, 3, std::vector<std::byte>(sizeof(SampleParams)));
+    } else {
+      auto &sample = e2.emit("vocab", "omlx_m5_sample_logits", {.width = 256},
+                             {.width = 256}, {row0_logits, sampled});
+      e2.profile.sampling_offset =
+          e2.dynamic(sample, 2, std::vector<std::byte>(sizeof(SampleParams)));
+    }
+
+    auto prof2 = e2.finish();
+    // Single-use plan: all m_active / 1U / active_pos_host values are baked in;
+    // only sampling parameters need updating.
+    if (sampling_contract == SamplingContract::PositionCoupledV1) {
+      const PositionSamplingRow row{.seed = sampling.seed,
+                                    .position = total_tokens,
+                                    .top_k = sampling.top_k,
+                                    .temperature = sampling.temperature,
+                                    .top_p = sampling.top_p};
+      std::memcpy(prof2.parameter_data.data() + prof2.sampling_offset, &row,
+                  sizeof(row));
+    } else {
+      const SampleParams sp{v,
+                            sampling.top_k,
+                            sampling.temperature,
+                            sampling.top_p,
+                            sampling.seed,
+                            sampling.stream,
+                            total_tokens - 1U};
+      std::memcpy(prof2.parameter_data.data() + prof2.sampling_offset, &sp,
+                  sizeof(sp));
+    }
+    prof2.parameters.write("step", prof2.parameter_data);
+    run_blend_exec_profile(prof2);
+
+    QwenForwardResult result{
+        .tokens = suffix_len,
+        .executed_layers = U32(blocks.size()),
+    };
+    const auto tok_bytes = sampled.buffer->read(
+        0, sampling_contract == SamplingContract::PositionCoupledV1 ? 8 : 4);
+    std::memcpy(&result.token, tok_bytes.data(), 4);
+    result.host_read_bytes = tok_bytes.size();
+    if (sampling_contract == SamplingContract::PositionCoupledV1) {
+      U32 flag = 0;
+      std::memcpy(&flag, tok_bytes.data() + 4, 4);
+      if (flag & 2U)
+        throw std::runtime_error("nonfinite position target logits");
+      if (flag & 1U) {
+        auto ib = position_ids.buffer->read(0, U64(sampling.top_k) * 4);
+        auto sb = position_scores.buffer->read(0, U64(sampling.top_k) * 4);
+        std::vector<U32> ids(sampling.top_k);
+        std::vector<float> scores(sampling.top_k);
+        std::memcpy(ids.data(), ib.data(), ib.size());
+        std::memcpy(scores.data(), sb.data(), sb.size());
+        result.token = position_sample_candidates(
+            ids, scores,
+            {.seed = sampling.seed,
+             .position = total_tokens,
+             .top_k = sampling.top_k,
+             .temperature = sampling.temperature,
+             .top_p = sampling.top_p});
+        result.host_read_bytes += ib.size() + sb.size();
+      }
+    } else if (result.token >= v) {
+      throw std::runtime_error("nonfinite or invalid legacy sampled token");
+    }
+
+    if (inspect_tensors) {
+      result.hidden = bf16_values(*norm.buffer, h);
+      result.logits = bf16_values(*logits.buffer, v);
+      result.host_read_bytes += mul(U64(h) + U64(v), 2ULL);
+    }
+
+    page_pool->commit(suffix_len);
+    page_guard.active = false;
+    next_position += suffix_len;
+    last_logits_row = 0U;
+    has_last_logits = true;
+
+    const bool any_w4a8 = prof1.used_w4a8 || prof2.used_w4a8;
+    const bool any_sage2 = prof1.used_sage2 || prof2.used_sage2;
+    const bool any_minf = prof2.used_minference || prof1.used_minference;
+    const U32 minf_cap = prof2.used_minference ? m_active : suffix_len;
+    const U32 minf_env = prof2.used_minference ? prof2.minf_context_envelope
+                                               : prof1.minf_context_envelope;
+    record_prefill_telemetry(m_active, active_pos_host.front(), any_w4a8,
+                             any_sage2, any_minf, minf_cap, minf_env,
+                             /*used_ane=*/false, &result.prefill_delta);
+    prefill_telemetry_.prefill_cache_blend_hit_tokens += plan.hit_tokens;
+    prefill_telemetry_.prefill_cache_blend_recomputed_tokens +=
+        recomputed_hit_tokens;
+    result.prefill_delta.prefill_cache_blend_hit_tokens += plan.hit_tokens;
+    result.prefill_delta.prefill_cache_blend_recomputed_tokens +=
+        recomputed_hit_tokens;
+    return result;
+  }
+
   const MetalContext &context;
   const MaterializedModel &weights;
   QwenModelConfig config;
@@ -7534,6 +10690,24 @@ public:
   U32 split_kv_partition_cap_override_ = 0U;
   Ref gdn_chunk_ws;
   bool gdn_chunk_nax_enabled_ = false;
+  QwenPrefillOptions prefill_options_{};
+  U32 w4a8_min_tokens_ = kW4A8DefaultMinTokens;
+  bool w4a8_nax_enabled_ = false;
+  bool w4a8_down_proj_ = false;
+  Ref a8_qa, a8_sa, a8_ra;
+  U32 a8_workspace_mp_ = 0U;
+  bool sage2_enabled_ = false;
+  bool minference_enabled_ = false;
+  Ref minference_scratch;
+  std::unique_ptr<ane::AneDualOffloadEngine> ane_engine_;
+  U32 ane_chunk_tokens_ = 0U;
+  bool ane_active_ = false;
+  double ane_split_alpha_ = 0.0;
+  bool cache_blend_kernels_ready_ = false;
+  std::map<LongCtxProfileKey, Profile> long_ctx_profiles_;
+  std::map<std::pair<U32, bool>, AneChunkPlan> ane_layer_plans_;
+  QwenPrefillTelemetry prefill_telemetry_{};
+  std::atomic<U64> blend_plan_seq_{1ULL};
   std::shared_ptr<const QwenMergedLoraOverrides> merged_lora_;
   std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora_;
   std::unique_ptr<MetalBuffer> lora_bypass_tmp_buf_;
@@ -7754,7 +10928,8 @@ QwenForward::QwenForward(
     QwenForward *shared_primary, bool enable_flash_nax_prefill,
     U32 kv_pool_pages,
     std::shared_ptr<const QwenMergedLoraOverrides> merged_lora,
-    std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora)
+    std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora,
+    QwenPrefillOptions prefill_options)
     : impl_(std::make_unique<Impl>(
           context, weights, layers, std::move(config), max_context, libraries,
           feature_layers, inspect_routes, speculative, enable_m4_short_routes,
@@ -7762,7 +10937,8 @@ QwenForward::QwenForward(
           std::move(moe_override), linear_policy, sampling_contract,
           attention_policy, inspect_tensors_workspace, kv_dtype,
           shared_primary, enable_flash_nax_prefill, kv_pool_pages,
-          std::move(merged_lora), std::move(bypass_lora))) {}
+          std::move(merged_lora), std::move(bypass_lora),
+          std::move(prefill_options))) {}
 QwenForward::~QwenForward() = default;
 QwenForward::QwenForward(QwenForward &&) noexcept = default;
 QwenForward &QwenForward::operator=(QwenForward &&) noexcept = default;
@@ -7965,6 +11141,9 @@ bool QwenForward::can_pipeline_prefill(std::size_t count) const noexcept {
     return false;
   if ((p.next_position % 64U) != 0U)
     return false;
+  if (p.can_run_ane_chunk(U32(count), false, false, false) ||
+      p.needs_long_ctx_prefill_profile(U32(count), p.next_position))
+    return false;
   if (p.prefill_pipe_[0].profiles.empty() ||
       p.prefill_pipe_[1].profiles.empty() ||
       !p.prefill_pipe_[0].profiles.front().icb.has_value() ||
@@ -8067,7 +11246,7 @@ QwenForward::finish_prefill_step(QwenAsyncPrefillStep &&step) {
   if (p.prefill_in_flight_count_ == 0U)
     throw std::logic_error("Qwen async prefill finish underflow");
   --p.prefill_in_flight_count_;
-  return QwenForwardResult{
+  QwenForwardResult res{
       .token = 0U,
       .tokens = st.count,
       .executed_layers = U32(p.blocks.size()),
@@ -8076,6 +11255,12 @@ QwenForward::finish_prefill_step(QwenAsyncPrefillStep &&step) {
       .short_lane_calls = st.profile->short_lane_calls,
       .submission = std::move(sub),
   };
+  p.record_prefill_telemetry(st.count, p.next_position - st.count,
+                             st.profile->used_w4a8, st.profile->used_sage2,
+                             st.profile->used_minference, st.profile->capacity,
+                             st.profile->minf_context_envelope,
+                             /*used_ane=*/false, &res.prefill_delta);
+  return res;
 }
 
 void QwenForward::drain_prefill_step(QwenAsyncPrefillStep &&step) {
@@ -8114,16 +11299,28 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
                   [&](U32 id) { return id >= p.v; }))
     throw std::invalid_argument("Qwen trunk prefill token/context invalid");
 
-  auto &pp = p.prefill_pipe_[0];
-  auto found = std::find_if(pp.profiles.begin(), pp.profiles.end(),
-                            [&](const Profile &prof) {
-                              return tokens.size() <= prof.capacity;
-                            });
-  if (found == pp.profiles.end())
-    throw std::out_of_range("Qwen trunk prefill capacity unavailable");
-  auto &profile = *found;
-
   const U32 count = U32(tokens.size());
+  if (p.can_run_ane_chunk(count, false, false, false)) {
+    GpuSamplingOptions unused_samp{.contract = p.sampling_contract};
+    return p.execute_ane_chunk(tokens, unused_samp, /*trunk_only=*/true);
+  }
+
+  auto &pp = p.prefill_pipe_[0];
+  Profile *lc_prof =
+      p.select_long_ctx_prefill_profile(count, p.next_position, true, true);
+  Profile *selected = lc_prof;
+  if (selected == nullptr) {
+    auto found = std::find_if(pp.profiles.begin(), pp.profiles.end(),
+                              [&](const Profile &prof) {
+                                return tokens.size() <= prof.capacity;
+                              });
+    if (found == pp.profiles.end())
+      throw std::out_of_range("Qwen trunk prefill capacity unavailable");
+    selected = &(*found);
+  }
+  auto &profile = *selected;
+
+  const U32 start_pos = p.next_position;
   p.last_trace_tokens = 0U;
   std::fill_n(p.token_staging.begin(), profile.capacity, 0U);
   std::copy(tokens.begin(), tokens.end(), p.token_staging.begin());
@@ -8177,7 +11374,7 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
   page_guard.active = false;
   p.next_position += count;
   p.has_last_logits = false;
-  return QwenForwardResult{
+  QwenForwardResult res{
       .token = 0U,
       .tokens = count,
       .executed_layers = U32(p.blocks.size()),
@@ -8186,6 +11383,41 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
       .short_lane_calls = profile.short_lane_calls,
       .submission = std::move(sub),
   };
+  p.record_prefill_telemetry(count, start_pos, profile.used_w4a8,
+                             profile.used_sage2, profile.used_minference,
+                             profile.capacity, profile.minf_context_envelope,
+                             /*used_ane=*/false, &res.prefill_delta);
+  return res;
+}
+
+QwenForwardResult QwenForward::run_blend_prefill(
+    std::span<const U32> prompt, U32 prefix_tokens,
+    detail::ChunkBlendCache &blend_cache, U64 model_exec_hash,
+    const GpuSamplingOptions &sampling, bool inspect_tensors,
+    const detail::BlendSegmentConfig *seg_cfg) {
+  return impl_->run_blend_prefill_impl(*this, prompt, prefix_tokens, blend_cache,
+                                       model_exec_hash, sampling,
+                                       inspect_tensors, seg_cfg);
+}
+
+QwenPrefillTelemetry QwenForward::prefill_telemetry() const noexcept {
+  return impl_->prefill_telemetry_;
+}
+
+bool QwenForward::ane_offload_active() const noexcept {
+  return impl_->ane_active_;
+}
+
+double QwenForward::ane_split_alpha() const noexcept {
+  return impl_->ane_split_alpha_;
+}
+
+U32 QwenForward::ane_chunk_tokens() const noexcept {
+  return impl_->ane_chunk_tokens_;
+}
+
+bool QwenForward::cache_blend_eligible() const noexcept {
+  return impl_->cache_blend_eligible();
 }
 const QwenForwardMemoryPlan &QwenForward::memory_plan() const {
   return impl_->allocation_plan;
@@ -8578,19 +11810,34 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
         *this, tokens, sampling, use_icb);
   }
 
-  auto &profiles = p.split_attention_enabled && tokens.size() <= 8
-                       ? (verify ? p.split_verify_profiles : p.split_profiles)
-                       : (verify ? p.verify_profiles : p.profiles);
-  auto found = std::find_if(
-      profiles.begin(), profiles.end(), [&](const Profile &profile) {
-        return tokens.size() <= profile.capacity &&
-               (!profile.split_attention ||
-                p.next_position + tokens.size() <= profile.context_envelope);
-      });
-  if (found == profiles.end())
-    throw std::out_of_range("Qwen forward capacity");
+  // Module 4b: Dual-ANE streaming co-execution for fixed T_chunk prefill steps.
+  if (p.can_run_ane_chunk(U32(tokens.size()), verify, inspect_tensors,
+                          profile_stages)) {
+    return p.execute_ane_chunk(tokens, sampling, /*trunk_only=*/false);
+  }
+
+  Profile *selected_profile = nullptr;
+  if (!verify && tokens.size() > 8U) {
+    selected_profile = p.select_long_ctx_prefill_profile(
+        U32(tokens.size()), p.next_position, false, false);
+  }
+  if (selected_profile == nullptr) {
+    auto &profiles = p.split_attention_enabled && tokens.size() <= 8
+                         ? (verify ? p.split_verify_profiles : p.split_profiles)
+                         : (verify ? p.verify_profiles : p.profiles);
+    auto found = std::find_if(
+        profiles.begin(), profiles.end(), [&](const Profile &profile) {
+          return tokens.size() <= profile.capacity &&
+                 (!profile.split_attention ||
+                  p.next_position + tokens.size() <= profile.context_envelope);
+        });
+    if (found == profiles.end())
+      throw std::out_of_range("Qwen forward capacity");
+    selected_profile = &(*found);
+  }
+  const U32 start_pos = p.next_position;
   p.last_trace_tokens = 0;
-  auto &profile = *found;
+  auto &profile = *selected_profile;
   std::fill_n(p.token_staging.begin(), profile.capacity, 0);
   std::copy(tokens.begin(), tokens.end(), p.token_staging.begin());
   const_cast<MetalBuffer *>(p.token_ids.buffer)
@@ -8830,6 +12077,10 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
     }
     p.has_last_logits = true;
     page_guard.active = false;
+    p.record_prefill_telemetry(U32(tokens.size()), start_pos, profile.used_w4a8,
+                               profile.used_sage2, profile.used_minference,
+                               profile.capacity, profile.minf_context_envelope,
+                               /*used_ane=*/false, &result.prefill_delta);
   }
   return result;
 }

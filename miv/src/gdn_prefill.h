@@ -197,7 +197,8 @@ inline void emit_gdn_recurrent_verify(
     Ref norm_weight, Ref dst_out, bool out_f16, Ref gdn_chunk_ws,
     bool allow_chunk_nax, const std::vector<std::byte> &params_8w,
     const std::vector<std::byte> &mega_params_9w, bool dynamic_tokens,
-    U32 gpu_cores = 80U) {
+    U32 gpu_cores = 80U, Ref a8_qa = {}, Ref a8_sa = {}, Ref a8_ra = {},
+    U32 a8_mp = 0U, bool a8_write_bf16 = false, float norm_eps = 1.0e-6f) {
   if (!allow_chunk_nax || gdn_chunk_ws.buffer == nullptr ||
       !gdn_chunk_nax_enabled() || capacity < gdn_chunk_nax_min_tokens() ||
       key_dim != 128U || value_dim != 128U || key_heads == 0U ||
@@ -233,16 +234,32 @@ inline void emit_gdn_recurrent_verify(
       {qkv, conv_weight, history, qk_ref, ctrl_ref, state0, dst_out});
   e.dynamic(rec, 7, mega_params_9w, tok_word);
 
-  const U64 ng_rows =
-      out_f16 ? U64(((capacity + 63U) / 64U) * 64U) : U64(capacity);
-  const U64 ng_heads = ng_rows * U64(value_heads);
-  auto &ng = e.emit(
-      "gdn_chunk_nax",
-      out_f16 ? "omlx_m5_gdn_chunk_norm_gate_inplace_f16_c64"
-              : "omlx_m5_gdn_chunk_norm_gate_inplace_bf16_c64",
-      {.width = 128U, .height = (ng_heads + 3U) / 4U}, {.width = 128U},
-      {dst_out, z, norm_weight});
-  e.dynamic(ng, 3, mega_params_9w, tok_word);
+  const bool use_w4a8_stage3 =
+      (!out_f16 && a8_qa.buffer != nullptr && a8_sa.buffer != nullptr &&
+       a8_ra.buffer != nullptr);
+  if (use_w4a8_stage3) {
+    const U32 mp = a8_mp ? a8_mp : (((capacity + 63U) / 64U) * 64U);
+    const U64 ng_heads = U64(mp) * U64(value_heads);
+    auto &ng = e.emit(
+        "w4a8_nax", "omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64",
+        {.width = 128U, .height = (ng_heads + 3U) / 4U}, {.width = 128U},
+        {dst_out, z, norm_weight, a8_qa, a8_sa, a8_ra});
+    e.dynamic(ng, 6,
+              words({key_heads, value_heads, 128U, 128U, conv_width, 4U,
+                     capacity, word(norm_eps), mp, a8_write_bf16 ? 1U : 0U}),
+              tok_word);
+  } else {
+    const U64 ng_rows =
+        out_f16 ? U64(((capacity + 63U) / 64U) * 64U) : U64(capacity);
+    const U64 ng_heads = ng_rows * U64(value_heads);
+    auto &ng = e.emit(
+        "gdn_chunk_nax",
+        out_f16 ? "omlx_m5_gdn_chunk_norm_gate_inplace_f16_c64"
+                : "omlx_m5_gdn_chunk_norm_gate_inplace_bf16_c64",
+        {.width = 128U, .height = (ng_heads + 3U) / 4U}, {.width = 128U},
+        {dst_out, z, norm_weight});
+    e.dynamic(ng, 3, mega_params_9w, tok_word);
+  }
 
   auto &commit_hist =
       e.emit("gdn_layer", "omlx_m5_gdn_commit_history", {.width = conv_width},
@@ -250,7 +267,8 @@ inline void emit_gdn_recurrent_verify(
   e.dynamic(commit_hist, 2, params_8w, tok_word);
 
   e.profile.gdn_numeric_contract_id =
-      "gdn.chunk64_bf16_nax.f32_state.mega_v1";
+      use_w4a8_stage3 ? "gdn.chunk64_bf16_nax.f32_state.mega_a8_v1"
+                      : "gdn.chunk64_bf16_nax.f32_state.mega_v1";
   return true;
 }
 

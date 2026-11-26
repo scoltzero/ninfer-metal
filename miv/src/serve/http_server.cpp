@@ -833,6 +833,22 @@ struct ServeHttpServer::Impl {
           snap.engine_stats.spec_proposal_tokens;
       agg.engine_stats.spec_accepted_tokens +=
           snap.engine_stats.spec_accepted_tokens;
+      agg.engine_stats.prefill_w4a8_tokens +=
+          snap.engine_stats.prefill_w4a8_tokens;
+      agg.engine_stats.prefill_sage2_tokens +=
+          snap.engine_stats.prefill_sage2_tokens;
+      agg.engine_stats.prefill_minference_blocks_skipped +=
+          snap.engine_stats.prefill_minference_blocks_skipped;
+      agg.engine_stats.prefill_minference_blocks_total +=
+          snap.engine_stats.prefill_minference_blocks_total;
+      agg.engine_stats.prefill_cache_blend_hit_tokens +=
+          snap.engine_stats.prefill_cache_blend_hit_tokens;
+      agg.engine_stats.prefill_cache_blend_recomputed_tokens +=
+          snap.engine_stats.prefill_cache_blend_recomputed_tokens;
+      agg.engine_stats.prefill_ane_offload_tokens +=
+          snap.engine_stats.prefill_ane_offload_tokens;
+      agg.engine_stats.prefill_ane_fallback_tokens +=
+          snap.engine_stats.prefill_ane_fallback_tokens;
       per_model.push_back(PerModelSnapshot{
           .model = m,
           .snap = std::move(snap),
@@ -926,6 +942,38 @@ struct ServeHttpServer::Impl {
         << "# TYPE ninfer_metal_spec_accepted_tokens_total counter\n"
         << "ninfer_metal_spec_accepted_tokens_total "
         << agg.engine_stats.spec_accepted_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_w4a8_tokens_total Prefill tokens executed with W4A8.\n"
+        << "# TYPE ninfer_metal_prefill_w4a8_tokens_total counter\n"
+        << "ninfer_metal_prefill_w4a8_tokens_total "
+        << agg.engine_stats.prefill_w4a8_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_sage2_tokens_total Prefill tokens executed with Sage2.\n"
+        << "# TYPE ninfer_metal_prefill_sage2_tokens_total counter\n"
+        << "ninfer_metal_prefill_sage2_tokens_total "
+        << agg.engine_stats.prefill_sage2_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_minference_blocks_skipped_total KV blocks skipped by MInference.\n"
+        << "# TYPE ninfer_metal_prefill_minference_blocks_skipped_total counter\n"
+        << "ninfer_metal_prefill_minference_blocks_skipped_total "
+        << agg.engine_stats.prefill_minference_blocks_skipped << "\n"
+        << "# HELP ninfer_metal_prefill_minference_blocks_total Total MInference candidate KV blocks.\n"
+        << "# TYPE ninfer_metal_prefill_minference_blocks_total counter\n"
+        << "ninfer_metal_prefill_minference_blocks_total "
+        << agg.engine_stats.prefill_minference_blocks_total << "\n"
+        << "# HELP ninfer_metal_prefill_cache_blend_hit_tokens_total Tokens matched by CacheBlend.\n"
+        << "# TYPE ninfer_metal_prefill_cache_blend_hit_tokens_total counter\n"
+        << "ninfer_metal_prefill_cache_blend_hit_tokens_total "
+        << agg.engine_stats.prefill_cache_blend_hit_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_cache_blend_recomputed_tokens_total Tokens recomputed by CacheBlend.\n"
+        << "# TYPE ninfer_metal_prefill_cache_blend_recomputed_tokens_total counter\n"
+        << "ninfer_metal_prefill_cache_blend_recomputed_tokens_total "
+        << agg.engine_stats.prefill_cache_blend_recomputed_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_ane_offload_tokens_total Tokens co-executed with Dual-ANE.\n"
+        << "# TYPE ninfer_metal_prefill_ane_offload_tokens_total counter\n"
+        << "ninfer_metal_prefill_ane_offload_tokens_total "
+        << agg.engine_stats.prefill_ane_offload_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_ane_fallback_tokens_total Tokens executed on GPU fallback while ANE offload enabled.\n"
+        << "# TYPE ninfer_metal_prefill_ane_fallback_tokens_total counter\n"
+        << "ninfer_metal_prefill_ane_fallback_tokens_total "
+        << agg.engine_stats.prefill_ane_fallback_tokens << "\n"
         << "# HELP ninfer_metal_phys_footprint_bytes Process physical memory "
            "footprint in bytes.\n"
         << "# TYPE ninfer_metal_phys_footprint_bytes gauge\n"

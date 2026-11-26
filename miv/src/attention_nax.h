@@ -101,8 +101,13 @@ inline bool affine4_kv_runtime_eligible(
     return false;
   const auto &c = ctx.capabilities();
   const auto &p = c.profile.probe;
-  return (c.device_name.starts_with("Apple M5") || p.apple_gpu_family >= 10) &&
-         p.runtime_os_major >= 27 && p.metal4_compiler && p.tensor_api &&
+  // Planar attention_affine4.metal append/FOSCAR/causal kernels use portable
+  // Metal 4 matmul2d + get_multidimensional_index (Apple9 M4 & Apple10 M5),
+  // matching Sage2/MInference/CacheBlend planar KV layout. Apple10-only
+  // Frag16x16 Flash-Prefill kernels remain gated by
+  // flash_nax_prefill_runtime_eligible().
+  (void)c;
+  return p.runtime_os_major >= 27 && p.metal4_compiler && p.tensor_api &&
          std::filesystem::is_regular_file(
              libs / "omlx_m5_attention_affine4.metallib");
 }
@@ -811,6 +816,30 @@ inline void emit_paged_kv_append_affine4_g128(
   }
 }
 
+inline U32 affine4_short_tail_split_tokens(
+    U32 t, U32 qh, U32 kvh, U32 context_envelope, U64 split_max_bytes,
+    U64 split_sum_bytes, U64 split_output_bytes) {
+  if (t == 0u || qh == 0u || kvh == 0u || context_envelope == 0u) {
+    return 0u;
+  }
+  for (U32 split_tokens : {512u, 1024u, 2048u, 4096u, 8192u}) {
+    if (t <= 8u && split_tokens != 512u) {
+      break;
+    }
+    const U32 splits = (context_envelope + split_tokens - 1u) / split_tokens;
+    if (splits < 2u && t > 8u) {
+      continue;
+    }
+    const auto lo =
+        affine4_split_scratch_layout(t, qh, kvh, splits, split_output_bytes);
+    if (splits && lo.fits && U64(t) * qh * splits * 4u <= split_max_bytes &&
+        U64(t) * qh * splits * 4u <= split_sum_bytes) {
+      return split_tokens;
+    }
+  }
+  return 0u;
+}
+
 inline void emit_paged_attention_affine4_g128(
     Encoder &e, const QwenModelConfig &c, U32 t, bool split,
     U32 context_envelope, U32 max_context, U32 physical_pages, Ref query,
@@ -862,8 +891,17 @@ inline void emit_paged_attention_affine4_g128(
   };
 
   if (split && hd == 256u) {
-    // Unified 512-token splits for BOTH T=1 and T=2..8 -> 0-ULP AR == DFlash2!
-    const U32 splits = (context_envelope + 511u) / 512u;
+    // Unified 512-token splits for T=1..8 (0-ULP AR == DFlash2); Base 2.2 short
+    // tails (T>8) pick the smallest split_tokens in {512..8192} fitting scratch.
+    const U32 split_tokens =
+        (t <= 8u)
+            ? 512u
+            : affine4_short_tail_split_tokens(t, qh, kvh, context_envelope,
+                                              split_max.bytes, split_sum.bytes,
+                                              split_output.bytes);
+    const U32 eff_split_tokens = split_tokens ? split_tokens : 512u;
+    const U32 splits =
+        (context_envelope + eff_split_tokens - 1u) / eff_split_tokens;
     const auto lo =
         affine4_split_scratch_layout(t, qh, kvh, splits, split_output.bytes);
     if (!splits || !lo.fits || U64(t) * qh * splits * 4u > split_max.bytes ||
@@ -881,7 +919,7 @@ inline void emit_paged_attention_affine4_g128(
     e.profile.split_count = splits;
     e.profile.split_workspace_bytes =
         U64(t) * qh * splits * 8u + lo.q_sum_offset + lo.q_sum_bytes;
-    auto split_params = make_split_params(splits, 512u);
+    auto split_params = make_split_params(splits, eff_split_tokens);
 
     if (!q_prepacked) {
       auto &pack_q = e.emit(

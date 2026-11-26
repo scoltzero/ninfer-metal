@@ -1,3 +1,4 @@
+#include "chunk_blend_cache.h"
 #include "native_backend.h"
 #include "round_cost.h"
 #include "shared_prefix_cache.h"
@@ -953,11 +954,18 @@ public:
           *loaded_lora, effective_lora_mode, primary_ws_rows,
           std::uint32_t(options.max_concurrency));
     }
+    const bool enable_w4a8_ws =
+        (options.prefill_linear_mode == PrefillLinearMode::W4A8);
+    const bool enable_minf_ws =
+        (options.prefill_attention_mode == PrefillAttentionMode::Sage2 &&
+         options.prefill_sparse_minference &&
+         config.full_attention_layers() > 0 && config.head_dim == 256);
     auto memory = plan_qwen_forward_memory(
         config, max_context,
         std::uint32_t(draft_config.target_layer_ids.size()), false,
         any_speculative, enable_attention_split, coupled, coupled, false, 0u,
-        primary_ws_rows, affine4_kv, 0u, enable_flash_nax_prefill);
+        primary_ws_rows, affine4_kv, 0u, enable_flash_nax_prefill,
+        enable_w4a8_ws, enable_minf_ws);
     std::uint64_t per_slot_extra_ws = 0;
     std::uint64_t per_slot_extra_state = 0;
     std::uint64_t companion_weights = 0;
@@ -1253,13 +1261,24 @@ public:
     const auto attn_policy =
         coupled ? AttentionNumericPolicy::RowExactV1
                 : AttentionNumericPolicy::Legacy;
+    QwenPrefillOptions primary_prefill_opts{
+        .linear_mode = options.prefill_linear_mode,
+        .attention_mode = options.prefill_attention_mode,
+        .sparse_minference = options.prefill_sparse_minference,
+        .cache_blend = options.prefill_cache_blend,
+        .ane_offload = options.prefill_ane_offload,
+        .artifact_digest = model_digest,
+    };
+    QwenPrefillOptions secondary_prefill_opts = primary_prefill_opts;
+    secondary_prefill_opts.cache_blend = false;
+    secondary_prefill_opts.ane_offload = false;
     program = std::make_unique<QwenForward>(
         context, weights, layers, config, max_context, libraries,
         draft_config.target_layer_ids, false, any_speculative,
         enable_m4_short_routes, diagnostic_route, enable_attention_split,
         slot_batch_enabled, moe_route, lin_policy, sampling_contract,
         attn_policy, false, slot_kv_dtype, nullptr, enable_flash_nax_prefill,
-        shared_kv_pages, merged_lora, bypass_lora);
+        shared_kv_pages, merged_lora, bypass_lora, primary_prefill_opts);
 
     std::string draft_digest = "none";
     std::string ext_mtp_digest;
@@ -1356,7 +1375,8 @@ public:
           slot_short_routes, slot_route_override, slot_attention_split,
           slot_batch_enabled, slot_moe_override, lin_policy, sampling_contract,
           attn_policy, false, slot_kv_dtype, program.get(),
-          enable_flash_nax_prefill, 0U, merged_lora, bypass_lora);
+          enable_flash_nax_prefill, 0U, merged_lora, bypass_lora,
+          secondary_prefill_opts);
       if (slot_speculative) {
         if (slot_gpu_verify)
           slot.verifier = std::make_unique<TargetGpuVerifier>(
@@ -1452,6 +1472,18 @@ public:
     execution_identity = execution_identity_digest(execution_fields);
     for (std::size_t index = 0; index < occupied.size(); ++index)
       program_at(index).bind_execution_identity(execution_identity);
+
+    if (options.prefill_cache_blend) {
+      const std::uint64_t blend_budget = std::min<std::uint64_t>(
+          cache_budget_bytes > 0ULL ? cache_budget_bytes : (2ULL << 30),
+          4ULL << 30);
+      blend_cache = std::make_unique<detail::ChunkBlendCache>(blend_budget);
+      blend_model_exec_hash = detail::compute_blend_model_exec_hash(
+          model_digest, slot_kv_dtype,
+          prefill_linear_mode_to_string(options.prefill_linear_mode),
+          prefill_attention_mode_to_string(options.prefill_attention_mode),
+          options.prefill_sparse_minference, options.prefill_ane_offload);
+    }
 
     if (cache_budget_bytes) {
       anchor_logits.emplace(
@@ -1620,6 +1652,8 @@ public:
   std::uint64_t cache_budget_bytes = 0;
   std::size_t pin_prefix_min_tokens = 0;
   SharedPrefixCache<SamplingKey> prefix_cache;
+  std::unique_ptr<detail::ChunkBlendCache> blend_cache;
+  std::uint64_t blend_model_exec_hash = 0;
   std::string companion_id;
   MetalContext context;
   QwenModelConfig config;
@@ -2864,6 +2898,47 @@ public:
       flush_in_flight_commit();
     }
     if (offset_ < prompt_.size()) {
+      if (!blend_attempted_ && owner_.blend_cache &&
+          owner_.blend_cache->enabled() && program().cache_blend_eligible() &&
+          (prompt_.size() - offset_) >= detail::kBlendDefaultMinSuffixTokens &&
+          !had_active_decodes && owner_.active_occupied_count() == 1U &&
+          !mtp_active() && !in_flight_prefill_.has_value()) {
+        blend_attempted_ = true;
+        const auto pf_begin = RoundCostRecorder::Clock::now();
+        step_ = with_page_pressure([&] {
+          return program().run_blend_prefill(
+              prompt_, static_cast<std::uint32_t>(offset_), *owner_.blend_cache,
+              owner_.blend_model_exec_hash, sampling_, false);
+        });
+        const std::size_t consumed = prompt_.size() - offset_;
+        const double pf_wall = RoundCostRecorder::milliseconds(pf_begin);
+        const double pf_ms =
+            step_.submission.timing.gpu_ms > 0.0 ? step_.submission.timing.gpu_ms
+                                                 : pf_wall;
+        owner_.scheduler.observe_prefill_chunk(consumed, pf_ms,
+                                               had_active_decodes);
+        committed_tokens_.insert(
+            committed_tokens_.end(),
+            prompt_.begin() + static_cast<std::ptrdiff_t>(offset_),
+            prompt_.end());
+        offset_ = prompt_.size();
+        save_prefix();
+        std::scoped_lock lock(backend_.stats_mutex_);
+        auto &stats = backend_.backend_stats_;
+        ++stats.ar_steps;
+        stats.actual_t = stats.actual_m = step_.tokens;
+        stats.actual_k = 0;
+        stats.ar_layer_calls += step_.executed_layers;
+        stats.short_matrix_calls += step_.short_matrix_calls;
+        stats.short_lane_calls += step_.short_lane_calls;
+        stats.ar_host_read_bytes += step_.host_read_bytes;
+        accumulate_prefill_telemetry_locked(stats, step_.prefill_delta);
+        if (step_.submission.timing.gpu_ms > 0) {
+          ++stats.ar_gpu_timed_steps;
+          stats.ar_prefill_gpu_ms += step_.submission.timing.gpu_ms;
+        }
+        return std::nullopt;
+      }
       const bool was_first_chunk = (offset_ == 0);
       const auto pf_contract = owner_.effective_prefill_contract();
       const auto canonical =
@@ -2951,6 +3026,7 @@ public:
       stats.short_matrix_calls += step_.short_matrix_calls;
       stats.short_lane_calls += step_.short_lane_calls;
       stats.ar_host_read_bytes += step_.host_read_bytes;
+      accumulate_prefill_telemetry_locked(stats, step_.prefill_delta);
       if (step_.submission.timing.gpu_ms > 0) {
         ++stats.ar_gpu_timed_steps;
         stats.ar_prefill_gpu_ms +=
@@ -3039,6 +3115,7 @@ private:
     stats.short_matrix_calls += done.short_matrix_calls;
     stats.short_lane_calls += done.short_lane_calls;
     stats.ar_host_read_bytes += done.host_read_bytes;
+    accumulate_prefill_telemetry_locked(stats, done.prefill_delta);
     if (done.submission.timing.gpu_ms > 0.0) {
       ++stats.ar_gpu_timed_steps;
       stats.ar_prefill_gpu_ms += done.submission.timing.gpu_ms;
@@ -3561,6 +3638,7 @@ private:
       stats.short_matrix_calls += step_.short_matrix_calls;
       stats.short_lane_calls += step_.short_lane_calls;
       stats.ar_host_read_bytes += step_.host_read_bytes;
+      accumulate_prefill_telemetry_locked(stats, step_.prefill_delta);
       if (step_.submission.timing.gpu_ms > 0) {
         ++stats.ar_gpu_timed_steps;
         stats.ar_decode_gpu_ms += step_.submission.timing.gpu_ms;
@@ -3859,6 +3937,20 @@ private:
     return std::nullopt;
   }
 
+  static void accumulate_prefill_telemetry_locked(
+      StatsReport &stats, const QwenPrefillTelemetry &d) noexcept {
+    stats.prefill_w4a8_tokens += d.prefill_w4a8_tokens;
+    stats.prefill_sage2_tokens += d.prefill_sage2_tokens;
+    stats.prefill_minference_blocks_skipped +=
+        d.prefill_minference_blocks_skipped;
+    stats.prefill_minference_blocks_total += d.prefill_minference_blocks_total;
+    stats.prefill_cache_blend_hit_tokens += d.prefill_cache_blend_hit_tokens;
+    stats.prefill_cache_blend_recomputed_tokens +=
+        d.prefill_cache_blend_recomputed_tokens;
+    stats.prefill_ane_offload_tokens += d.prefill_ane_offload_tokens;
+    stats.prefill_ane_fallback_tokens += d.prefill_ane_fallback_tokens;
+  }
+
   NativeBackend &backend_;
   NativeQwenState &owner_;
   std::size_t slot_;
@@ -3876,7 +3968,8 @@ private:
        pending_verify_ = false, pending_mtp_verify_ = false,
        pending_mtp_probe_ = false, needs_anchor_resample_ = false,
        mtp_primed_ = false, mtp_exited_ = false, matched_pinned_prefix_ = false,
-       pre_tail_pinned_ = false, post_decode_saved_ = false;
+       pre_tail_pinned_ = false, post_decode_saved_ = false,
+       blend_attempted_ = false;
   std::uint32_t pending_k_ = 0, pending_max_k_ = 0;
   DFlash2DraftResult pending_proposal_;
   std::unique_ptr<RoundCostRecorder> pending_cost_;
@@ -3965,6 +4058,10 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
   backend_stats_.lora_buffer_bytes = ar_program_->lora_buffer_bytes;
   backend_stats_.lora_adapted_layers = ar_program_->lora_adapted_layers;
   populate_prefill_config_stats(options_, backend_stats_);
+  backend_stats_.prefill_ane_active =
+      ar_program_->program->ane_offload_active();
+  backend_stats_.prefill_ane_split_alpha =
+      ar_program_->program->ane_split_alpha();
 }
 
 NativeBackend::~NativeBackend() = default;
@@ -5537,10 +5634,20 @@ TrimCacheReport NativeBackend::trim_cache(std::uint64_t target_free_bytes) {
   }
   const std::uint64_t before_alloc =
       ar_program_->context.current_allocated_bytes();
-  const auto [evicted, freed_cached] = ar_program_->prefix_cache.trim_unpinned(
+  auto [evicted, freed_cached] = ar_program_->prefix_cache.trim_unpinned(
       target_free_bytes, [this](std::size_t s) -> QwenForward & {
         return ar_program_->program_at(s);
       });
+  if (ar_program_->blend_cache && ar_program_->blend_cache->enabled() &&
+      freed_cached < target_free_bytes) {
+    const std::uint64_t blend_now = ar_program_->blend_cache->cached_bytes();
+    const std::uint64_t need = target_free_bytes - freed_cached;
+    const std::uint64_t target_blend =
+        blend_now > need ? (blend_now - need) : 0ULL;
+    const std::uint64_t blend_freed =
+        ar_program_->blend_cache->trim_to_bytes(target_blend);
+    freed_cached += blend_freed;
+  }
   const std::uint64_t after_alloc =
       ar_program_->context.current_allocated_bytes();
   const std::uint64_t freed_alloc =
