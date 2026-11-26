@@ -12,6 +12,8 @@
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -616,6 +618,65 @@ private:
   }
 };
 
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+resolve_think_token_ids(const std::filesystem::path &model_dir,
+                        const QwenModelConfig &config,
+                        const LoadOptions &options) {
+  auto parse_u32 = [](std::string_view sv) -> std::optional<std::uint32_t> {
+    std::uint32_t val = 0;
+    const auto *beg = sv.data();
+    const auto *end = beg + sv.size();
+    const auto [ptr, ec] = std::from_chars(beg, end, val);
+    if (ec == std::errc{} && ptr == end)
+      return val;
+    return std::nullopt;
+  };
+  const auto it_open = options.path_overrides.find("think_open_token_id");
+  const auto it_close = options.path_overrides.find("think_close_token_id");
+  if (it_open != options.path_overrides.end() &&
+      it_close != options.path_overrides.end()) {
+    const auto o = parse_u32(it_open->second);
+    const auto c = parse_u32(it_close->second);
+    if (o.has_value() && c.has_value() && *o != *c)
+      return std::make_pair(*o, *c);
+  }
+  const auto tok_cfg_path = model_dir / "tokenizer_config.json";
+  if (std::filesystem::is_regular_file(tok_cfg_path)) {
+    try {
+      std::ifstream in(tok_cfg_path);
+      if (in.good()) {
+        const auto j = nlohmann::json::parse(in, nullptr, false);
+        if (j.is_object() && j.contains("added_tokens_decoder") &&
+            j["added_tokens_decoder"].is_object()) {
+          std::optional<std::uint32_t> open_id, close_id;
+          for (const auto &[k, v] : j["added_tokens_decoder"].items()) {
+            if (!v.is_object() || !v.contains("content") ||
+                !v["content"].is_string())
+              continue;
+            const auto &content = v["content"].get_ref<const std::string &>();
+            if (content == "<think>")
+              open_id = parse_u32(k);
+            else if (content == "</think>")
+              close_id = parse_u32(k);
+          }
+          if (open_id.has_value() && close_id.has_value() &&
+              *open_id != *close_id &&
+              *open_id < std::uint32_t(config.vocab_size) &&
+              *close_id < std::uint32_t(config.vocab_size)) {
+            return std::make_pair(*open_id, *close_id);
+          }
+        }
+      }
+    } catch (...) {
+    }
+  }
+  if (config.vocab_size >= 248070)
+    return std::make_pair(248068U, 248069U);
+  if (config.vocab_size >= 151669 && config.vocab_size < 160000)
+    return std::make_pair(151667U, 151668U);
+  return std::nullopt;
+}
+
 class NativeQwenState {
 public:
   NativeQwenState(const std::filesystem::path &model_dir,
@@ -634,13 +695,20 @@ public:
       throw std::invalid_argument("lora_mode must be merge or bypass");
     }
     rolling_prefix_cache = resolve_rolling_prefix_cache(options);
+    think_token_ids = resolve_think_token_ids(model_dir, config, options);
     if (options.max_concurrency < 1 || options.max_concurrency > 8)
       throw std::invalid_argument("max_concurrency must be in [1, 8]");
     if (rolling_prefix_cache) {
-      prefix_cache.set_max_unpinned_entries(
-          std::max<std::size_t>(8U, 2U * std::size_t(options.max_concurrency)));
+      const std::size_t per_slot_mult = think_token_ids.has_value() ? 4U : 2U;
+      const std::size_t min_cap = think_token_ids.has_value() ? 16U : 8U;
+      prefix_cache.set_max_unpinned_entries(std::max<std::size_t>(
+          min_cap, per_slot_mult * std::size_t(options.max_concurrency)));
     }
     occupied.assign(std::size_t(options.max_concurrency), false);
+    slot_dflash_prefix.assign(std::size_t(options.max_concurrency), {});
+    slot_rolling_think_anchor_ids.assign(std::size_t(options.max_concurrency),
+                                         0ULL);
+    slot_rolling_post_ids.assign(std::size_t(options.max_concurrency), 0ULL);
     if (const auto it = options.path_overrides.find("batch_mode");
         it != options.path_overrides.end()) {
       if (it->second != "on" && it->second != "off")
@@ -678,7 +746,9 @@ public:
     }
     const auto diagnostic_route = parse_linear_route_ab(options, capabilities);
     const auto moe_route = parse_moe_route_ab(options, capabilities);
-    bool enable_attention_split = false;
+    bool enable_attention_split =
+        apple9_or_newer && config.hidden_size >= 1024 &&
+        config.full_attention_layers() > 0;
     if (const auto it = options.path_overrides.find("attention_split_kv");
         it != options.path_overrides.end()) {
       if (it->second != "on" && it->second != "off")
@@ -805,13 +875,46 @@ public:
         sampling_contract == SamplingContract::PositionCoupledV1;
     const auto flash_nax_override =
         options.path_overrides.find("flash_nax_prefill");
+    const bool apple10_nax =
+        (capabilities.device_name.starts_with("Apple M5") ||
+         capabilities.profile.probe.apple_gpu_family >= 10) &&
+        capabilities.profile.probe.runtime_os_major >= 27 &&
+        capabilities.profile.probe.metal4_compiler &&
+        capabilities.profile.probe.tensor_api;
+    const bool real_model_prefill_eligible =
+        config.hidden_size >= 1024 && config.full_attention_layers() > 0 &&
+        (affine4_kv
+             ? (config.head_dim == 256 &&
+                std::filesystem::is_regular_file(
+                    libraries / "omlx_m5_attention_affine4.metallib"))
+             : ((config.head_dim == 256 || config.head_dim == 128 ||
+                 config.head_dim == 64) &&
+                std::filesystem::is_regular_file(
+                    libraries / "omlx_m5_attention_nax_prefill.metallib")));
+    const bool flash_nax_env_off = [&] {
+      const char *v = std::getenv("OMLX_M5_DISABLE_FLASH_NAX_PREFILL");
+      if (!v)
+        return false;
+      const std::string_view sv(v);
+      return sv == "1" || sv == "true" || sv == "TRUE" || sv == "on" ||
+             sv == "ON";
+    }();
+    const bool flash_nax_explicit_off =
+        flash_nax_env_off ||
+        (flash_nax_override != options.path_overrides.end() &&
+         (flash_nax_override->second == "0" ||
+          flash_nax_override->second == "off" ||
+          flash_nax_override->second == "false"));
+    const bool flash_nax_explicit_on =
+        options.prefill_engine == "flash_nax" ||
+        (flash_nax_override != options.path_overrides.end() &&
+         !flash_nax_explicit_off);
     const bool enable_flash_nax_prefill =
-        !coupled &&
-        (options.prefill_engine == "flash_nax" ||
-         (flash_nax_override != options.path_overrides.end() &&
-          flash_nax_override->second != "0" &&
-          flash_nax_override->second != "off" &&
-          flash_nax_override->second != "false"));
+        !flash_nax_explicit_off &&
+        (config.hidden_size >= 1024
+             ? (real_model_prefill_eligible &&
+                (apple10_nax || flash_nax_explicit_on))
+             : (!coupled && flash_nax_explicit_on));
     const auto primary_ws_rows = resolve_qwen_primary_workspace_rows(
         max_context, false, config.num_experts > 1);
     this->primary_ws_rows = primary_ws_rows;
@@ -1473,6 +1576,10 @@ public:
   std::atomic<bool> external_gpu_contended{false};
   std::vector<ExtraSlot> extra_slots;
   std::vector<bool> occupied;
+  std::vector<std::vector<std::uint32_t>> slot_dflash_prefix;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> think_token_ids;
+  std::vector<std::uint64_t> slot_rolling_think_anchor_ids;
+  std::vector<std::uint64_t> slot_rolling_post_ids;
   std::unique_ptr<NativeBatchSampler> batch_sampler;
   std::unique_ptr<CoupledBatchSampler> coupled_batch_sampler;
   std::unique_ptr<SharedHeadProjection> shared_head;
@@ -1628,6 +1735,7 @@ public:
     for (auto token : request_.prompt_tokens)
       prompt_.push_back(std::uint32_t(token));
 
+    bool prefix_same_slot = false;
     if (owner_.prefix_cache.enabled()) {
       const auto match = owner_.prefix_cache.find_best(
           owner_.execution_identity, prompt_,
@@ -1638,6 +1746,7 @@ public:
             match->entry_index, slot_,
             [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
             cross_slot);
+        prefix_same_slot = !cross_slot;
         offset_ = hit.tokens.size();
         matched_tokens_ = offset_;
         matched_entry_id_ = hit.id;
@@ -1672,8 +1781,23 @@ public:
       committed_tokens_.clear();
     }
     if (draft()) {
-      draft()->reset();
       sync_draft_target_ring(*draft(), program().feature_ring_rows());
+      bool reused_draft_kv = false;
+      if (prefix_same_slot && offset_ > 0U &&
+          slot_ < owner_.slot_dflash_prefix.size()) {
+        const auto &cached_df = owner_.slot_dflash_prefix[slot_];
+        if (!cached_df.empty() && cached_df.size() <= offset_ &&
+            std::equal(cached_df.begin(), cached_df.end(), prompt_.begin())) {
+          draft()->retain_frontier(std::uint32_t(cached_df.size()),
+                                   program().feature_epoch());
+          reused_draft_kv = true;
+        }
+      }
+      if (!reused_draft_kv) {
+        if (slot_ < owner_.slot_dflash_prefix.size())
+          owner_.slot_dflash_prefix[slot_].clear();
+        draft()->reset();
+      }
     }
     if (mtp()) {
       mtp()->reset();
@@ -1686,14 +1810,31 @@ public:
   }
 
   ~NativeTask() override {
+    const bool unwinding = std::uncaught_exceptions() > 0;
     try {
       drain_in_flight_prefill();
       drain_in_flight_ar();
       drain_in_flight_commit();
       program().abort_verify();
+      if (draft()) {
+        const bool keep_draft =
+            !unwinding && !cancelled_->load(std::memory_order_acquire) &&
+            owner_.prefix_cache.enabled() &&
+            slot_ < owner_.slot_dflash_prefix.size();
+        const std::size_t df_front =
+            keep_draft ? std::size_t(draft()->cached_context()) : 0U;
+        if (keep_draft && df_front > 0U &&
+            df_front <= committed_tokens_.size()) {
+          owner_.slot_dflash_prefix[slot_].assign(
+              committed_tokens_.begin(),
+              committed_tokens_.begin() + std::ptrdiff_t(df_front));
+        } else {
+          if (slot_ < owner_.slot_dflash_prefix.size())
+            owner_.slot_dflash_prefix[slot_].clear();
+          draft()->reset();
+        }
+      }
       program().reset();
-      if (draft())
-        draft()->reset();
       if (mtp())
         mtp()->reset();
     } catch (...) {
@@ -1787,6 +1928,13 @@ public:
   }
 
   void maybe_save_sparse_anchor() {
+    const std::size_t think_anchor = open_thinking_anchor_offset();
+    if (think_anchor > 0U && offset_ == think_anchor &&
+        saved_think_anchor_id_ == 0ULL &&
+        !cancelled_->load(std::memory_order_acquire)) {
+      save_rolling_thinking_anchor(think_anchor);
+      return;
+    }
     // Snapshot ONLY the single pre-tail 1024-aligned boundary so 0 -> pre_tail
     // runs at full 2048/4096-chunk async pipelined speed with zero intermediate
     // stalls or pin explosion.
@@ -1810,9 +1958,106 @@ public:
     }
   }
 
-  void save_prefix() {
-    if (!should_save_prefix() || offset_ != prompt_.size())
+  // Returns the exact prompt index immediately BEFORE an unclosed trailing
+  // `<think>` tag (e.g. `<|im_start|>assistant\n` before `<think>\n`).
+  // Saving at `open_pos` rather than `prompt_.size()` guarantees an exact match
+  // on the next turn whether the chat template strips `<think>...</think>`
+  // completely OR renders `<think>\n\n</think>\n\n` (where BPE merges `\n\n`
+  // into token 271 instead of single `\n` 198).
+  [[nodiscard]] std::size_t open_thinking_anchor_offset() const noexcept {
+    if (!owner_.rolling_prefix_cache || !owner_.prefix_cache.enabled() ||
+        request_.pin_prefix || request_.max_new_tokens <= 1 ||
+        !owner_.think_token_ids.has_value() || prompt_.size() < 2U) {
+      return 0U;
+    }
+    const auto [open_id, close_id] = *owner_.think_token_ids;
+    const std::size_t tail = std::min<std::size_t>(8U, prompt_.size());
+    std::size_t open_pos = 0U;
+    bool saw_open = false;
+    for (std::size_t i = prompt_.size() - tail; i < prompt_.size(); ++i) {
+      if (prompt_[i] == open_id) {
+        open_pos = i;
+        saw_open = true;
+      } else if (prompt_[i] == close_id) {
+        saw_open = false;
+      }
+    }
+    return (saw_open && open_pos > matched_tokens_ && open_pos < prompt_.size())
+               ? open_pos
+               : 0U;
+  }
+
+  void save_rolling_thinking_anchor(std::size_t prefix_len) {
+    release_prior_slot_rolling_pair_if_matched();
+    const auto sub = std::span<const std::uint32_t>(prompt_).first(prefix_len);
+    bool inserted = false;
+    const auto evicted = owner_.prefix_cache.insert_checkpoint(
+        slot_, owner_.execution_identity, sub, SamplingKey{}, 0u,
+        /*include_anchor_logits=*/false, /*pin_entry=*/false,
+        [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
+        &inserted, /*supersede_entry_id=*/matched_entry_id_);
+    if (inserted && slot_ < owner_.slot_rolling_think_anchor_ids.size()) {
+      saved_think_anchor_id_ = owner_.prefix_cache.last_inserted_id();
+      owner_.slot_rolling_think_anchor_ids[slot_] = saved_think_anchor_id_;
+    }
+    std::scoped_lock lock(backend_.stats_mutex_);
+    backend_.backend_stats_.prefix_evictions += evicted;
+    backend_.backend_stats_.prefix_pinned_entries =
+        owner_.prefix_cache.pinned_count();
+  }
+
+  [[nodiscard]] bool has_open_thinking_turn() const noexcept {
+    if (!owner_.think_token_ids.has_value())
+      return false;
+    const auto [open_id, close_id] = *owner_.think_token_ids;
+    if (step_.token == open_id)
+      return true;
+    const std::size_t tail = std::min<std::size_t>(8U, prompt_.size());
+    bool saw_open = false;
+    for (std::size_t i = prompt_.size() - tail; i < prompt_.size(); ++i) {
+      if (prompt_[i] == open_id)
+        saw_open = true;
+      else if (prompt_[i] == close_id)
+        saw_open = false;
+    }
+    return saw_open;
+  }
+
+  void release_prior_slot_rolling_pair_if_matched() {
+    if (matched_entry_id_ == 0ULL ||
+        slot_ >= owner_.slot_rolling_think_anchor_ids.size())
       return;
+    const std::uint64_t prev_think =
+        owner_.slot_rolling_think_anchor_ids[slot_];
+    const std::uint64_t prev_post = owner_.slot_rolling_post_ids[slot_];
+    if (matched_entry_id_ != prev_think && matched_entry_id_ != prev_post)
+      return;
+    auto prog_fn = [&](std::size_t s) -> QwenForward & {
+      return owner_.program_at(s);
+    };
+    (void)owner_.prefix_cache.release_unpinned_slot_entry_by_id(
+        prev_think, slot_, owner_.execution_identity, prog_fn);
+    if (prev_post != prev_think) {
+      (void)owner_.prefix_cache.release_unpinned_slot_entry_by_id(
+          prev_post, slot_, owner_.execution_identity, prog_fn);
+    }
+    owner_.slot_rolling_think_anchor_ids[slot_] = 0ULL;
+    owner_.slot_rolling_post_ids[slot_] = 0ULL;
+  }
+
+  void save_prefix() {
+    if (offset_ != prompt_.size())
+      return;
+    if (!should_save_prefix()) {
+      if (saved_think_anchor_id_ == 0ULL && owner_.rolling_prefix_cache &&
+          owner_.prefix_cache.enabled() &&
+          !cancelled_->load(std::memory_order_acquire) &&
+          !request_.pin_prefix && request_.max_new_tokens > 1 &&
+          has_open_thinking_turn()) {
+        save_rolling_thinking_anchor(prompt_.size());
+      }
+      return;
+    }
     // If pre_tail was already pinned as the shared prefix target on this seed
     // request, save the full prompt (+tail) unpinned so only the shared prefix
     // consumes pinned budget.
@@ -1842,11 +2087,24 @@ public:
     const auto pos = std::size_t(program().position());
     if (pos <= matched_tokens_ || committed_tokens_.size() != pos)
       return;
+    if (saved_think_anchor_id_ == 0ULL) {
+      release_prior_slot_rolling_pair_if_matched();
+    }
+    const std::uint64_t supersede_id =
+        (saved_think_anchor_id_ != 0ULL) ? 0ULL : matched_entry_id_;
+    bool inserted = false;
     const auto evicted = owner_.prefix_cache.insert_checkpoint(
         slot_, owner_.execution_identity, committed_tokens_, SamplingKey{}, 0u,
         /*include_anchor_logits=*/false, /*pin_entry=*/false,
         [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
-        nullptr, /*supersede_entry_id=*/matched_entry_id_);
+        &inserted, /*supersede_entry_id=*/supersede_id);
+    if (inserted && slot_ < owner_.slot_rolling_post_ids.size()) {
+      owner_.slot_rolling_post_ids[slot_] =
+          owner_.prefix_cache.last_inserted_id();
+      if (saved_think_anchor_id_ == 0ULL) {
+        owner_.slot_rolling_think_anchor_ids[slot_] = 0ULL;
+      }
+    }
     {
       std::scoped_lock lock(backend_.stats_mutex_);
       backend_.backend_stats_.prefix_evictions += evicted;
@@ -1867,8 +2125,11 @@ public:
         in_flight_ar_.has_value() || in_flight_prefill_.has_value() ||
         in_flight_commit_.has_value())
       return false;
-    if (offset_ < prompt_.size())
+    if (offset_ < prompt_.size()) {
+      if (const std::size_t ta = open_thinking_anchor_offset(); ta > offset_)
+        return false;
       return prompt_.size() - offset_ <= 8;
+    }
     if (mtp_active()) {
       if (const auto *mc = owner_.mtp_controller_at(slot_);
           mc && mc->should_exit())
@@ -2239,7 +2500,7 @@ public:
           (pending_cost_->phase_ms(RoundCostRecorder::sampling) +
            pending_cost_->phase_ms(RoundCostRecorder::replay)) *
               commit_scale,
-          batch_total_m);
+          batch_total_m, pending_proposal_.context_rows_projected > 16U);
     }
 
     if (cancelled_->load(std::memory_order_acquire))
@@ -2305,9 +2566,15 @@ public:
           will_save_sparse_anchor(pre_tail)) {
         count = pre_tail - offset_;
       }
+      const std::size_t think_anchor = open_thinking_anchor_offset();
+      if (think_anchor > offset_ && offset_ + count > think_anchor) {
+        count = think_anchor - offset_;
+      }
       const auto chunk_span = std::span(prompt_).subspan(offset_, count);
       const bool is_last_chunk = (offset_ + count == prompt_.size());
-      const bool need_sync_anchor = will_save_sparse_anchor(offset_ + count);
+      const bool need_sync_anchor =
+          will_save_sparse_anchor(offset_ + count) ||
+          (think_anchor > 0U && offset_ + count == think_anchor);
 
       if (!is_last_chunk && !had_active_decodes &&
           owner_.active_occupied_count() == 1U && !mtp_active() &&
@@ -2808,7 +3075,7 @@ private:
         cost.phase_ms(RoundCostRecorder::verify),
         cost.phase_ms(RoundCostRecorder::sampling) +
             cost.phase_ms(RoundCostRecorder::replay),
-        std::uint32_t(input.size()));
+        std::uint32_t(input.size()), proposal.context_rows_projected > 16U);
 
     if (cancelled_->load(std::memory_order_acquire)) {
       drain_in_flight_commit();
@@ -3177,7 +3444,7 @@ private:
   DFlash2DraftResult pending_proposal_;
   std::unique_ptr<RoundCostRecorder> pending_cost_;
   std::size_t offset_ = 0, matched_tokens_ = 0;
-  std::uint64_t matched_entry_id_ = 0;
+  std::uint64_t matched_entry_id_ = 0, saved_think_anchor_id_ = 0;
   std::uint32_t produced_ = 0, anchor_ = 0, in_flight_ar_token_ = 0;
   double last_commit_gpu_ms_ = 0.25;
   std::optional<QwenAsyncPrefillStep> in_flight_prefill_;
@@ -3550,7 +3817,8 @@ NativeBackend::advance_batch(std::span<BackendTask *const> tasks) {
       if (rem == 0 || rem > 512U ||
           rem != prefill_next_chunk(task->offset_, task->prompt_.size(),
                                     owner.effective_prefill_contract()) ||
-          task->will_save_sparse_anchor(task->prompt_.size())) {
+          task->will_save_sparse_anchor(task->prompt_.size()) ||
+          task->open_thinking_anchor_offset() > task->offset_) {
         continue;
       }
       cands.push_back({i, task, task->offset_, rem});
@@ -4786,6 +5054,17 @@ TrimCacheReport NativeBackend::trim_cache(std::uint64_t target_free_bytes) {
   const std::uint64_t freed_alloc =
       (before_alloc > after_alloc) ? (before_alloc - after_alloc) : 0ULL;
   if (evicted > 0) {
+    for (std::size_t s = 0; s < ar_program_->slot_dflash_prefix.size(); ++s) {
+      if (s < ar_program_->occupied.size() && !ar_program_->occupied[s]) {
+        ar_program_->slot_dflash_prefix[s].clear();
+        if (s < ar_program_->slot_rolling_think_anchor_ids.size()) {
+          ar_program_->slot_rolling_think_anchor_ids[s] = 0ULL;
+          ar_program_->slot_rolling_post_ids[s] = 0ULL;
+        }
+        if (auto *df = ar_program_->draft_at(s))
+          df->reset();
+      }
+    }
     std::scoped_lock lock(stats_mutex_);
     backend_stats_.prefix_evictions += evicted;
     backend_stats_.prefix_pinned_entries =

@@ -9,17 +9,17 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Display version tag (e.g. miv-v0.01)"
+        description: "Display version tag (e.g. miv-v0.02)"
         required: true
-        default: "miv-v0.01"
+        default: "miv-v0.02"
       codename:
         description: "Core codename (e.g. miv)"
         required: true
         default: "miv"
       semver:
-        description: "SemVer string (e.g. 0.0.1)"
+        description: "SemVer string (e.g. 0.0.2)"
         required: true
-        default: "0.0.1"
+        default: "0.0.2"
       draft_release:
         description: "Publish as draft GitHub Release"
         type: boolean

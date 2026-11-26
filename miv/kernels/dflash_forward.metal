@@ -527,6 +527,7 @@ inline void draft_online_softmax_weights(float score, thread float &maximum,
   }
 }
 
+[[max_total_threads_per_threadgroup(256)]]
 kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
                                     device const bfloat *nk [[buffer(1)]],
                                     device const bfloat *nv [[buffer(2)]],
@@ -535,8 +536,15 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
                                     device bfloat *output [[buffer(5)]],
                                     constant Attention &p [[buffer(6)]],
                                     uint lane [[thread_index_in_simdgroup]],
+                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                    uint num_sgs [[simdgroups_per_threadgroup]],
                                     uint3 group
                                     [[threadgroup_position_in_grid]]) {
+  threadgroup float tg_max[8];
+  threadgroup float tg_den[8];
+  threadgroup float4 tg_acc0[8 * 32];
+  threadgroup float4 tg_acc1[8 * 32];
+
   uint t = group.y / p.query_heads, head = group.y % p.query_heads;
   if (t >= p.tokens)
     return;
@@ -547,10 +555,23 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
   const float scale = rsqrt(float(p.dim));
   const uint first = min(
       p.context, p.context + t >= p.window ? p.context + t - p.window + 1 : 0);
+  const uint end_idx = p.context + p.tokens;
+  const uint total_keys = (end_idx > first) ? (end_idx - first) : 0u;
+  const uint active_sgs =
+      (num_sgs > 1u && total_keys > 64u && (p.dim == 128u || p.dim == 256u))
+          ? min(num_sgs, 8u)
+          : 1u;
   const ulong q_src_offset = ulong(t) * q_row_stride + ulong(head) * p.dim;
   const ulong out_offset = ulong(t) * qw + ulong(head) * p.dim;
 
   if (p.dim == 256u) {
+    if (active_sgs == 1u && sg_id > 0u)
+      return;
+    const uint chunk = (total_keys + active_sgs - 1u) / active_sgs;
+    const uint c_beg =
+        (sg_id < active_sgs) ? min(end_idx, first + sg_id * chunk) : end_idx;
+    const uint c_end =
+        (sg_id < active_sgs) ? min(end_idx, c_beg + chunk) : end_idx;
     device const bfloat4 *qv =
         reinterpret_cast<device const bfloat4 *>(q + q_src_offset + lane * 8u);
     const float4 q0 = float4(qv[0]);
@@ -559,7 +580,7 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
     float4 acc1 = float4(0.0f);
     float maximum = -INFINITY;
     float denominator = 0.0f;
-    for (uint index = first; index < p.context + p.tokens; ++index) {
+    for (uint index = c_beg; index < c_end; ++index) {
       const bool noise = index >= p.context;
       const uint row =
           noise ? index - p.context : (p.capacity ? index % p.capacity : 0u);
@@ -589,6 +610,42 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
         acc1 = acc1 * old_scale + weight * float4(val4[1]);
       }
     }
+    if (active_sgs > 1u) {
+      if (sg_id < active_sgs) {
+        if (lane == 0u) {
+          tg_max[sg_id] = maximum;
+          tg_den[sg_id] = denominator;
+        }
+        tg_acc0[sg_id * 32u + lane] = acc0;
+        tg_acc1[sg_id * 32u + lane] = acc1;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_id > 0u)
+        return;
+      for (uint s = 1u; s < active_sgs; ++s) {
+        const float d_s = tg_den[s];
+        if (d_s <= 0.0f)
+          continue;
+        const float m_s = tg_max[s];
+        const float4 a0_s = tg_acc0[s * 32u + lane];
+        const float4 a1_s = tg_acc1[s * 32u + lane];
+        if (denominator <= 0.0f) {
+          maximum = m_s;
+          denominator = d_s;
+          acc0 = a0_s;
+          acc1 = a1_s;
+        } else {
+          const float m_new = max(maximum, m_s);
+          const float sc_cur =
+              (maximum == m_new) ? 1.0f : exp(maximum - m_new);
+          const float sc_s = (m_s == m_new) ? 1.0f : exp(m_s - m_new);
+          denominator = denominator * sc_cur + d_s * sc_s;
+          acc0 = acc0 * sc_cur + a0_s * sc_s;
+          acc1 = acc1 * sc_cur + a1_s * sc_s;
+          maximum = m_new;
+        }
+      }
+    }
     device bfloat4 *ov =
         reinterpret_cast<device bfloat4 *>(output + out_offset + lane * 8u);
     if (denominator > 0.0f) {
@@ -603,13 +660,20 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
   }
 
   if (p.dim == 128u) {
+    if (active_sgs == 1u && sg_id > 0u)
+      return;
+    const uint chunk = (total_keys + active_sgs - 1u) / active_sgs;
+    const uint c_beg =
+        (sg_id < active_sgs) ? min(end_idx, first + sg_id * chunk) : end_idx;
+    const uint c_end =
+        (sg_id < active_sgs) ? min(end_idx, c_beg + chunk) : end_idx;
     device const bfloat4 *qv =
         reinterpret_cast<device const bfloat4 *>(q + q_src_offset + lane * 4u);
     const float4 q0 = float4(qv[0]);
     float4 acc0 = float4(0.0f);
     float maximum = -INFINITY;
     float denominator = 0.0f;
-    for (uint index = first; index < p.context + p.tokens; ++index) {
+    for (uint index = c_beg; index < c_end; ++index) {
       const bool noise = index >= p.context;
       const uint row =
           noise ? index - p.context : (p.capacity ? index % p.capacity : 0u);
@@ -633,6 +697,38 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
         acc0 = acc0 * old_scale + weight * float4(val4[0]);
       }
     }
+    if (active_sgs > 1u) {
+      if (sg_id < active_sgs) {
+        if (lane == 0u) {
+          tg_max[sg_id] = maximum;
+          tg_den[sg_id] = denominator;
+        }
+        tg_acc0[sg_id * 32u + lane] = acc0;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_id > 0u)
+        return;
+      for (uint s = 1u; s < active_sgs; ++s) {
+        const float d_s = tg_den[s];
+        if (d_s <= 0.0f)
+          continue;
+        const float m_s = tg_max[s];
+        const float4 a0_s = tg_acc0[s * 32u + lane];
+        if (denominator <= 0.0f) {
+          maximum = m_s;
+          denominator = d_s;
+          acc0 = a0_s;
+        } else {
+          const float m_new = max(maximum, m_s);
+          const float sc_cur =
+              (maximum == m_new) ? 1.0f : exp(maximum - m_new);
+          const float sc_s = (m_s == m_new) ? 1.0f : exp(m_s - m_new);
+          denominator = denominator * sc_cur + d_s * sc_s;
+          acc0 = acc0 * sc_cur + a0_s * sc_s;
+          maximum = m_new;
+        }
+      }
+    }
     device bfloat4 *ov =
         reinterpret_cast<device bfloat4 *>(output + out_offset + lane * 4u);
     if (denominator > 0.0f) {
@@ -642,6 +738,9 @@ kernel void omlx_m5_draft_attention(device const bfloat *q [[buffer(0)]],
     }
     return;
   }
+
+  if (sg_id > 0u)
+    return;
 
   const auto load_q = [&](uint idx) -> float {
     const uint f = lane + idx * 32u;

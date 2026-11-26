@@ -77,6 +77,8 @@ public:
   [[nodiscard]] std::uint64_t target_feature_epoch() const noexcept;
   void set_target_feature_ring(std::uint32_t ring_rows);
   [[nodiscard]] std::uint32_t target_feature_ring() const noexcept;
+  void retain_frontier(std::uint32_t frontier_rows,
+                       std::uint64_t epoch) noexcept;
   void reset();
   [[nodiscard]] std::uint32_t cached_context() const;
   [[nodiscard]] const DFlash2ModelConfig &config() const;

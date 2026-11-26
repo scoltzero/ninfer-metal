@@ -39,13 +39,13 @@
 #include "omlx_m5/engine.h"
 
 #ifndef NINFER_METAL_DISPLAY_VERSION
-#define NINFER_METAL_DISPLAY_VERSION "miv-v0.01"
+#define NINFER_METAL_DISPLAY_VERSION "miv-v0.02"
 #endif
 #ifndef NINFER_METAL_CODENAME
 #define NINFER_METAL_CODENAME "miv"
 #endif
 #ifndef NINFER_METAL_SEMVER
-#define NINFER_METAL_SEMVER "0.0.1"
+#define NINFER_METAL_SEMVER "0.0.2"
 #endif
 #ifndef NINFER_METAL_CORE_ABI
 #define NINFER_METAL_CORE_ABI 1

@@ -28,7 +28,7 @@
 #include <vector>
 
 #ifndef NINFER_METAL_DISPLAY_VERSION
-#define NINFER_METAL_DISPLAY_VERSION "miv-v0.01"
+#define NINFER_METAL_DISPLAY_VERSION "miv-v0.02"
 #endif
 
 namespace omlx::m5::serve {

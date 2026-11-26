@@ -1020,6 +1020,103 @@ void multiturn_engine_tests(const std::filesystem::path &fixtures,
     cold->shutdown();
   }
 
+  // (a2) Thinking-mode multi-turn chat where prior assistant <think>...</think>
+  //      reasoning tokens are stripped by ChatML on subsequent user turns,
+  //      plus same-turn tool-call continuation keeping <think> (AR & DFlash2).
+  for (bool dflash_mode : {false, true}) {
+    auto think_opts = make_opts(true, true, dflash_mode, 1);
+    think_opts.path_overrides["think_open_token_id"] = "248";
+    think_opts.path_overrides["think_close_token_id"] = "249";
+    auto rolling = Engine::create(think_opts);
+    auto cold = Engine::create(make_opts(false, false, dflash_mode, 1));
+
+    const auto sys = prompt(128, dflash_mode ? 613 : 607);
+    {
+      SubmitRequest seed;
+      seed.prompt_tokens.assign(sys.begin(), sys.end());
+      seed.max_new_tokens = 2;
+      seed.pin_prefix = true;
+      require(run(*rolling, seed) == run(*cold, seed),
+              "P08 thinking multiturn system seed diverged");
+    }
+
+    std::vector<std::int32_t> stripped_history(sys.begin(), sys.end());
+    std::vector<std::int32_t> turn1_think_probe;
+    std::size_t expected_restored = sys.size();
+
+    for (std::size_t turn = 1; turn <= 4; ++turn) {
+      auto u_q = prompt(48, 2100 + turn * 43);
+      for (auto &t : u_q)
+        if (t == 248 || t == 249)
+          t = 240;
+      stripped_history.insert(stripped_history.end(), u_q.begin(), u_q.end());
+      const std::size_t pre_think_len = stripped_history.size();
+      // Open <think>\n header at end of prompt (e.g. <|im_start|>assistant\n<think>\n)
+      stripped_history.push_back(248);
+      stripped_history.push_back(10);
+
+      SubmitRequest req;
+      req.prompt_tokens = stripped_history;
+      req.max_new_tokens = 24;
+      req.sampling = {.temperature = 0.0F, .top_p = 1.0F, .top_k = 1, .seed = 19};
+      req.pin_prefix = false;
+
+      const auto before = rolling->stats();
+      const auto actual = run(*rolling, req);
+      const auto expected = run(*cold, req);
+      require(actual == expected && actual.size() == 24,
+              "P08 thinking multiturn greedy output diverged");
+      const auto after = rolling->stats();
+      require(after.prefix_partial_hits == before.prefix_partial_hits + 1,
+              "P08 thinking multiturn missed partial hit");
+      require(after.prefix_restored_tokens ==
+                  before.prefix_restored_tokens + expected_restored,
+              "P08 thinking multiturn restored token count mismatch");
+      require(after.prefix_evictions == 0,
+              "P08 thinking multiturn triggered unexpected eviction");
+
+      if (turn == 1) {
+        turn1_think_probe.assign(stripped_history.begin(),
+                                 stripped_history.begin() +
+                                     std::ptrdiff_t(pre_think_len));
+        turn1_think_probe.push_back(245);
+        turn1_think_probe.push_back(246);
+      }
+
+      // Simulate exact Qwen3.8 ChatML BPE merge when <think>...</think> is
+      // stripped: trailing [248, 10] (`<think>\n`) becomes [248, 250, 249, 250]
+      // (`<think>\n\n</think>\n\n`, where `\n\n` merges into token 250 != 10)!
+      stripped_history.resize(pre_think_len);
+      expected_restored = pre_think_len;
+      stripped_history.push_back(248);
+      stripped_history.push_back(250);
+      stripped_history.push_back(249);
+      stripped_history.push_back(250);
+      stripped_history.insert(stripped_history.end(), actual.begin() + 16,
+                              actual.end());
+    }
+
+    // Prove Turn 1's unpinned <think> prompt anchor was superseded by Turn 4:
+    // probing Turn 1's prompt + divergent suffix must fall back to System(128).
+    {
+      SubmitRequest probe_req;
+      probe_req.prompt_tokens = turn1_think_probe;
+      probe_req.max_new_tokens = 2;
+      probe_req.sampling = {
+          .temperature = 0.0F, .top_p = 1.0F, .top_k = 1, .seed = 19};
+      const auto before = rolling->stats();
+      require(run(*rolling, probe_req) == run(*cold, probe_req),
+              "P08 thinking multiturn supersede probe diverged");
+      const auto after = rolling->stats();
+      require(after.prefix_restored_tokens ==
+                  before.prefix_restored_tokens + sys.size(),
+              "P08 thinking multiturn stale Turn 1 anchor was not superseded");
+    }
+
+    rolling->shutdown();
+    cold->shutdown();
+  }
+
   // (b) B=4 concurrent 4-session x 4-turn multi-turn chat sharing 1 pinned
   //     System Prompt (crossing 1024 on Wave 4 so packed prefill boundary fix
   //     is exercised end-to-end for BOTH AR and DFlash2!).

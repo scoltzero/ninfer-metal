@@ -419,7 +419,8 @@ public:
         strict_two_pass_attn_(
             detail::forward::strict_two_pass_attention_enabled()),
         flash_nax_prefill_(
-            attention_policy != omlx::m5::AttentionNumericPolicy::RowExactV1 &&
+            (attention_policy != omlx::m5::AttentionNumericPolicy::RowExactV1 ||
+             this->config.hidden_size >= 1024) &&
             !detail::forward::env_flag_enabled(
                 "OMLX_M5_DISABLE_FLASH_NAX_PREFILL") &&
             (enable_flash_nax_prefill ||
@@ -794,7 +795,7 @@ public:
     if (mxfp4_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          mxfp4_w4a4_prefill_enabled() || has_pretiled_mxfp4 ||
-         (t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled()))) {
+         (t_domain_active() && pretiled_qmv_t1_enabled()))) {
       mxfp4_nax_cache = Mxfp4NaxCache::acquire(
           cache_owner_key, context, libraries, candidates,
           silicon_tuning.linear_split_k_target_slices);
@@ -878,7 +879,7 @@ public:
     if (affine_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          has_pretiled_affine ||
-         (t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled()))) {
+         (t_domain_active() && pretiled_qmv_t1_enabled()))) {
       affine_nax_cache = AffineNaxCache::acquire(
           cache_owner_key, context, libraries, zero, candidates,
           silicon_tuning.linear_split_k_target_slices);
@@ -926,7 +927,7 @@ public:
     }
 
     if (!speculative_enabled && h >= 512U &&
-        has_row_exact_metallib_ && t_domain_dispatch_enabled() &&
+        has_row_exact_metallib_ && t_domain_active() &&
         pretiled_qmv_t1_enabled()) {
       q5_high1_cache = acquire_q5_high1_cache(
           cache_owner_key, context, libraries, candidates, affine_nax_cache.get());
@@ -1041,6 +1042,9 @@ public:
     if (kv_format_ != KvStorageFormat::BFloat16) {
       base_fields.emplace("kv_dtype",
                           std::string(kv_storage_format_name(kv_format_)));
+    }
+    if (flash_nax_prefill_ && this->config.hidden_size >= 1024) {
+      base_fields.emplace("prefill_attn", "flash_nax_v1");
     }
     if (merged_lora_ && !merged_lora_->fingerprint.empty()) {
       base_fields.emplace("merged_lora", merged_lora_->fingerprint);
@@ -1422,11 +1426,19 @@ public:
     return !batch_enabled || tdom_batch_override_;
   }
 
+  bool t_domain_active() const noexcept {
+    const bool apple10 =
+        context.capabilities().device_name.starts_with("Apple M5") ||
+        context.capabilities().profile.probe.apple_gpu_family >= 10;
+    return t_domain_dispatch_enabled(!speculative_enabled && h >= 1024U &&
+                                     apple10);
+  }
+
   bool resolve_pretiled_mxfp4_t1(const MaterializedWeightView &w, U32 t,
                                  Ref *out_codes = nullptr,
                                  Ref *out_scales = nullptr) const {
     if (!(t == 1U && !speculative_enabled && allow_tdom_t1() &&
-          t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
+          t_domain_active() && pretiled_qmv_t1_enabled() &&
           !is_overridden(w) && w.format == "mxfp4_e2m1_g32_e8m0_v1" &&
           w.parent_shape.size() == 2 && w.row_count > 0 && h >= 512U &&
           w.in_features >= 512U && (w.in_features % 128U) == 0U)) {
@@ -1460,7 +1472,7 @@ public:
                                   Ref *out_sb = nullptr) const {
     const U32 bits = affine_nax_bits(w.format);
     if (!(t == 1U && !speculative_enabled && allow_tdom_t1() &&
-          t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
+          t_domain_active() && pretiled_qmv_t1_enabled() &&
           !is_overridden(w) && bits != 0U && w.parent_shape.size() == 2 &&
           w.row_count > 0 && h >= 512U && w.in_features >= 512U &&
           (w.in_features % 64U) == 0U)) {
@@ -1618,7 +1630,7 @@ public:
       return true;
     if (linear_policy != LinearNumericPolicy::RowExactPortableV1)
       return false;
-    if (t == 1u && t_domain_dispatch_enabled())
+    if (t == 1u && t_domain_active())
       return false;
     return true;
   }
@@ -1633,7 +1645,7 @@ public:
       return true;
     if (linear_policy != LinearNumericPolicy::RowExactPortableV1)
       return false;
-    if (t == 1u && t_domain_dispatch_enabled())
+    if (t == 1u && t_domain_active())
       return false;
     return true;
   }
@@ -1936,7 +1948,7 @@ public:
   bool resolve_pretiled_mxfp4_m2(const MaterializedWeightView &w,
                                  Ref *out_codes = nullptr,
                                  Ref *out_scales = nullptr) const {
-    if (!(!speculative_enabled && t_domain_dispatch_enabled() &&
+    if (!(!speculative_enabled && t_domain_active() &&
           pretiled_qmv_t1_enabled() && has_row_exact_metallib_ &&
           !is_overridden(w) && h >= 512U)) {
       return false;
@@ -1948,7 +1960,7 @@ public:
                                   Ref *out_codes = nullptr,
                                   Ref *out_high = nullptr,
                                   Ref *out_sb = nullptr) const {
-    if (!(!speculative_enabled && t_domain_dispatch_enabled() &&
+    if (!(!speculative_enabled && t_domain_active() &&
           pretiled_qmv_t1_enabled() && has_row_exact_metallib_ &&
           !is_overridden(w) && h >= 512U)) {
       return false;
@@ -3036,9 +3048,10 @@ public:
               e, c, t, k_ref, v_ref, state_block.state0, state_block.state1,
               table_ref, params, tok_word_attn, pos_word_attn, pos_patches);
         }
-        if (!split && !exact_attention && !pos_placeholder.has_value() &&
-            dynamic_tokens && flash_nax_prefill_ &&
-            t >= kFlashNaxPrefillMinTokens && c.head_dim == 256) {
+        if (!split && (!exact_attention || c.hidden_size >= 1024) &&
+            !pos_placeholder.has_value() && dynamic_tokens &&
+            flash_nax_prefill_ && t >= kFlashNaxPrefillMinTokens &&
+            c.head_dim == 256) {
           emit_paged_flash_prefill_affine4_g128(
               e, c, t, q_ref, gate_ref, state_block.state0, state_block.state1,
               mix_ref, table_ref, attn_pos_ref, std::move(params));
@@ -3093,8 +3106,8 @@ public:
     }
 
     if (!pos_placeholder.has_value() && dynamic_tokens) {
-      if (!split && !exact_attention && flash_nax_prefill_ &&
-          t >= kFlashNaxPrefillMinTokens &&
+      if (!split && (!exact_attention || c.hidden_size >= 1024) &&
+          flash_nax_prefill_ && t >= kFlashNaxPrefillMinTokens &&
           attn_pos_ref.buffer != nullptr &&
           flash_nax_prefill_runtime_eligible(context, libraries,
                                              U32(c.head_dim))) {
@@ -4142,7 +4155,7 @@ public:
       return false;
     const bool force_t1_moe_qmv =
         !speculative_enabled && allow_tdom_t1() &&
-        explicit_t.value_or(0U) < 2U && t_domain_dispatch_enabled() &&
+        explicit_t.value_or(0U) < 2U && t_domain_active() &&
         std::getenv("OMLX_M5_MOE_NAX_MIN_T") == nullptr;
     const bool unlock_moe_nax =
         !force_t1_moe_qmv &&
@@ -4176,7 +4189,7 @@ public:
     const U32 t = explicit_t.value_or(e.profile.capacity);
     const bool force_t1_moe_qmv =
         !speculative_enabled && allow_tdom_t1() &&
-        explicit_t.value_or(0U) < 2U && t_domain_dispatch_enabled() &&
+        explicit_t.value_or(0U) < 2U && t_domain_active() &&
         std::getenv("OMLX_M5_MOE_NAX_MIN_T") == nullptr;
     const bool unlock_moe_nax =
         !force_t1_moe_qmv &&
@@ -4388,7 +4401,7 @@ public:
                 "moe_shared_mlp_down", "moe_shared_gate", "moe_router"});
 
     if (!moe_has_bypass && e.profile.capacity == 1U && t == 1U &&
-        !speculative_enabled && allow_tdom_t1() && t_domain_dispatch_enabled() &&
+        !speculative_enabled && allow_tdom_t1() && t_domain_active() &&
         !moe_override) {
       const U32 shared_f_t1 = U32(config.shared_expert_intermediate_size);
       const auto &gw = block.get("moe_expert_gate");
@@ -4484,7 +4497,7 @@ public:
     }
 
     if (!moe_has_bypass && allow_moe9_bt && explicit_t.has_value() && t >= 2U &&
-        t <= 8U && !speculative_enabled && t_domain_dispatch_enabled() &&
+        t <= 8U && !speculative_enabled && t_domain_active() &&
         !moe_override) {
       const U32 shared_f_bt = U32(config.shared_expert_intermediate_size);
       const auto &gw = block.get("moe_expert_gate");
@@ -4733,7 +4746,7 @@ public:
         (detail::forward::env_flag_enabled("OMLX_M5_DISABLE_GDN_SPEC_FUSION")
              ? ".gdnf2.td"
              : ".gdnf3.td") +
-        (t_domain_dispatch_enabled() ? "1" : "0") + ".be" +
+        (t_domain_active() ? "1" : "0") + ".be" +
         (batch_enabled ? "1" : "0") + ".m4sr" +
         (m4_short_routes ? "1" : "0") + ".spec" +
         (speculative_enabled ? "1" : "0") + ".ir" +
@@ -4807,7 +4820,7 @@ public:
         }();
     const bool allow_t1_fused_norms =
         (t == 1U && !verify && !defer_sample && !trunk_only &&
-         !speculative_enabled && allow_tdom_t1() && t_domain_dispatch_enabled() &&
+         !speculative_enabled && allow_tdom_t1() && t_domain_active() &&
          pretiled_qmv_t1_enabled() && !inspect_tensors_workspace &&
          rms_sq_buf.buffer != nullptr && moe_tg_done_buf.buffer != nullptr &&
          h < 65536U);
@@ -5294,11 +5307,11 @@ public:
 
     const bool single_t1_tdom =
         (!skey.verify && B == 1U && total_m == 1U && !speculative_enabled &&
-         t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
+         t_domain_active() && pretiled_qmv_t1_enabled() &&
          !inspect_tensors_workspace);
     const bool use_m2 =
         (!skey.verify && total_m == 2U && !speculative_enabled &&
-         t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
+         t_domain_active() && pretiled_qmv_t1_enabled() &&
          !inspect_tensors_workspace && has_row_exact_metallib_);
     const bool allow_t1_fused =
         (single_t1_tdom && rms_sq_buf.buffer != nullptr &&
@@ -5309,7 +5322,7 @@ public:
     const U32 m2_sq_mul = config.num_experts ? 4U : 1U;
     const bool allow_moe9_bt =
         (config.num_experts > 0 && !skey.verify && !speculative_enabled &&
-         t_domain_dispatch_enabled() && total_m >= 2U && total_m <= 8U);
+         t_domain_active() && total_m >= 2U && total_m <= 8U);
 
     ScopedTdomOverride tdom_guard{tdom_batch_override_, single_t1_tdom};
 
@@ -6644,7 +6657,7 @@ public:
         }
         const bool ar_head_m2 =
             (b_count == 2U && !speculative_enabled &&
-             t_domain_dispatch_enabled() && pretiled_qmv_t1_enabled() &&
+             t_domain_active() && pretiled_qmv_t1_enabled() &&
              !inspect_tensors_workspace && has_row_exact_metallib_);
         const bool ar_head_f16 =
             (!ar_head_m2 && !single_t1_tdom && !has_bypass_lora(head) &&

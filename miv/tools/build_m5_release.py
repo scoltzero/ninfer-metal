@@ -402,8 +402,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--version",
-        default="miv-v0.01",
-        help="Release display version tag (default: miv-v0.01).",
+        default="miv-v0.02",
+        help="Release display version tag (default: miv-v0.02).",
     )
     parser.add_argument(
         "--codename",
@@ -412,8 +412,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--semver",
-        default="0.0.1",
-        help="Core semantic version (default: 0.0.1).",
+        default="0.0.2",
+        help="Core semantic version (default: 0.0.2).",
     )
     parser.add_argument(
         "--core-abi",

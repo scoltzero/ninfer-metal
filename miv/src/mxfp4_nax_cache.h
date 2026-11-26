@@ -69,12 +69,18 @@ inline U32 mxfp4_nax_split_k(U32 n, U32 k, U32 target_slices = 8u) {
   return sk;
 }
 
-inline bool t_domain_dispatch_enabled() {
-  if (const char *env = std::getenv("OMLX_M5_T_DOMAIN_DISPATCH");
-      env != nullptr && std::string_view(env) == "1") {
-    return true;
+inline bool t_domain_dispatch_enabled(bool default_on = false) {
+  if (const char *env = std::getenv("OMLX_M5_T_DOMAIN_DISPATCH")) {
+    const std::string_view sv(env);
+    if (sv == "1" || sv == "on" || sv == "ON" || sv == "true" || sv == "TRUE") {
+      return true;
+    }
+    if (sv == "0" || sv == "off" || sv == "OFF" || sv == "false" ||
+        sv == "FALSE") {
+      return false;
+    }
   }
-  return false;
+  return default_on;
 }
 
 inline bool mxfp4_w4a4_prefill_enabled() {

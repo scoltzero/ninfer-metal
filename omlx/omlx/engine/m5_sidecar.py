@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 EXTERNAL_ENGINE_ENTRY_POINTS_GROUP = "omlx.external_engines"
 M5RT_ENGINE_ID = "m5rt"
 M5RT_ENGINE_LABEL = "miv Core Backend"
-M5RT_DEFAULT_VERSION = "miv-v0.01"
+M5RT_DEFAULT_VERSION = "miv-v0.02"
 M5RT_PROVIDER_ID = "io.ninfer.metal"
 M5RT_LEGACY_PROVIDER_ID = "com.omlx.mseries"
 M5RT_BUILTIN_PROVIDER_IDS = frozenset({M5RT_PROVIDER_ID, M5RT_LEGACY_PROVIDER_ID})
@@ -1168,12 +1168,41 @@ def sync_m5rt_ui_kv_setting(
         opts_copy = dict(getattr(current_settings, "m5rt_options", None) or {})
         opts_copy["kv_dtype"] = "bf16"
         current_settings.m5rt_options = opts_copy
+        existing_ext = getattr(current_settings, "external_engine_options", None)
+        if isinstance(existing_ext, dict):
+            ext_copy = dict(existing_ext)
+            updated_ext = False
+            for eng_key in M5RT_OPTION_KEYS:
+                nested = ext_copy.get(eng_key)
+                if isinstance(nested, dict):
+                    nested_copy = dict(nested)
+                    nested_copy["kv_dtype"] = "bf16"
+                    ext_copy[eng_key] = nested_copy
+                    updated_ext = True
+            if updated_ext:
+                current_settings.external_engine_options = ext_copy
     else:
         existing_opts = getattr(current_settings, "m5rt_options", None)
         if isinstance(existing_opts, dict) and existing_opts.get("kv_dtype") == "bf16":
             opts_copy = dict(existing_opts)
             opts_copy.pop("kv_dtype", None)
             current_settings.m5rt_options = opts_copy or None
+        existing_ext = getattr(current_settings, "external_engine_options", None)
+        if isinstance(existing_ext, dict):
+            ext_copy = dict(existing_ext)
+            updated_ext = False
+            for eng_key in M5RT_OPTION_KEYS:
+                nested = ext_copy.get(eng_key)
+                if isinstance(nested, dict) and nested.get("kv_dtype") == "bf16":
+                    nested_copy = dict(nested)
+                    nested_copy.pop("kv_dtype", None)
+                    if nested_copy:
+                        ext_copy[eng_key] = nested_copy
+                    else:
+                        ext_copy.pop(eng_key, None)
+                    updated_ext = True
+            if updated_ext:
+                current_settings.external_engine_options = ext_copy or None
 
 
 def apply_m5rt_model_settings_update(

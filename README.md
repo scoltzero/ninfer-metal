@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://github.com/scoltzero/ninfer-metal/stargazers"><img src="https://img.shields.io/github/stars/scoltzero/ninfer-metal?style=flat-square&logo=github" alt="GitHub Stars" /></a>
   <a href="https://github.com/scoltzero/ninfer-metal/releases"><img src="https://img.shields.io/github/downloads/scoltzero/ninfer-metal/total?style=flat-square" alt="GitHub Downloads" /></a>
-  <a href="docs/releases/miv-v0.01-changelog.md"><img src="https://img.shields.io/badge/release-miv--v0.01-0969da?style=flat-square" alt="Latest Release miv-v0.01" /></a>
+  <a href="docs/releases/miv-v0.02-changelog.md"><img src="https://img.shields.io/badge/release-miv--v0.02-0969da?style=flat-square" alt="Latest Release miv-v0.02" /></a>
   <img src="https://img.shields.io/badge/platform-Apple%20M5%2B%20%C2%B7%20macOS%2027%2B-111827?style=flat-square" alt="Platform Apple M5+ macOS 27+" />
   <img src="https://img.shields.io/badge/backend-Metal%204%20NAX-10b981?style=flat-square" alt="Backend Metal 4 NAX" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg?style=flat-square" alt="License GPL-3.0" /></a>
@@ -87,7 +87,7 @@ Full build flags, `.miv` weight conversion, multi-microkernel `ninfer-metal-serv
 | **[Getting Started & Config](docs/getting-started.md)** | Prerequisites, zero-MLX CMake build, 1-click `start_ninfer_serve.sh`, `ninfer-metal-serve` standalone server, `oMLX-extend` sidecar setup, `ninfer-metal.toml`, and low-level CLI/daemon usage |
 | **[Architecture & Coexistence](docs/architecture.md)** | Dual-mode `miv/` core (`ninfer-metal-serve` + `mseries_backendd`), Provider SPI v2, O(1) auto-routing, UMA memory coordination, and atomic symlink hot-update |
 | **[Microkernel Foundry](docs/microkernel-foundry.md)** | Open call for new M5+ model-family microkernels (Llama, DeepSeek, Gemma, GLM, MiniMax) using the Silicon-Squeeze Skill |
-| **[Release Notes (`miv-v0.01`)](docs/releases/miv-v0.01-changelog.md)** | Visual Dim A–F benchmark charts, `ninfer-metal-serve` & `oMLX-extend` changes, test & `otool -L` audit results, and supported scope |
+| **[Release Notes (`miv-v0.02`)](docs/releases/miv-v0.02-changelog.md)** | `miv-v0.02` & `mix4` Apple10 defaults, 8-SG DFlash2 attention, `<think>` rolling prefix reuse, LoRA, `affine8` NAX, and [M5 Ultra Dim A–F baseline](docs/releases/miv-v0.01-changelog.md) |
 | **[Roadmap](docs/roadmap/README.md)** | Planned milestones beyond `miv-v0.01` |
 | **[Documentation Index](docs/README.md)** | Full 8-language doc mirror, hardware guides, SKU calibrations (`64-GPU` / `80-GPU`), backend specs, and certification standards |
 

@@ -675,6 +675,23 @@ class TestResolutionAndPrimitives:
             ms_off, None
         )
 
+    def test_sync_m5rt_ui_kv_setting_updates_external_engine_options(self):
+        ms = ModelSettings(
+            external_engine=M5RT_ENGINE_ID,
+            turboquant_kv_enabled=False,
+            m5rt_options={"kv_dtype": "bf16", "max_context": 65536},
+            external_engine_options={"m5rt": {"kv_dtype": "bf16", "max_context": 65536}},
+        )
+        req_enable = SimpleNamespace(turboquant_kv_enabled=True)
+        m5_mod.sync_m5rt_ui_kv_setting(ms, req_enable, {"turboquant_kv_enabled"})
+        assert ms.m5rt_options == {"max_context": 65536}
+        assert ms.external_engine_options == {"m5rt": {"max_context": 65536}}
+
+        req_disable = SimpleNamespace(turboquant_kv_enabled=False)
+        m5_mod.sync_m5rt_ui_kv_setting(ms, req_disable, {"turboquant_kv_enabled"})
+        assert ms.m5rt_options["kv_dtype"] == "bf16"
+        assert ms.external_engine_options["m5rt"]["kv_dtype"] == "bf16"
+
     def test_incremental_detokenizer_holds_back_incomplete_utf8(self, tmp_path):
         tok = _build_bpe_chat_tokenizer(tmp_path / "tok")
         text = "Hello 世界 🚀!"

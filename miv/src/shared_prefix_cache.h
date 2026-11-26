@@ -135,6 +135,10 @@ public:
     return max_unpinned_entries_;
   }
 
+  [[nodiscard]] std::uint64_t last_inserted_id() const noexcept {
+    return last_inserted_id_;
+  }
+
   // ninfer 3b76b98c recovery cost: linear MLP/GDN O(L) + quadratic attention O(L^2).
   [[nodiscard]] static double compute_recovery_cost(std::size_t token_len) noexcept {
     const double l = double(token_len);
@@ -271,6 +275,7 @@ public:
                                   SlotProgramFn &&program_at,
                                   bool *out_inserted = nullptr,
                                   std::uint64_t supersede_entry_id = 0) {
+    last_inserted_id_ = 0;
     if (out_inserted)
       *out_inserted = false;
     if (budget_bytes_ == 0 || tokens.empty())
@@ -305,6 +310,7 @@ public:
         if (!include_anchor_logits && entries_[i].has_anchor_logits) {
           // Already have a richer full-prompt checkpoint at this exact prefix.
           entries_[i].pinned = entries_[i].pinned || pin_entry;
+          last_inserted_id_ = entries_[i].id;
           if (out_inserted)
             *out_inserted = true;
           return 0;
@@ -425,10 +431,32 @@ public:
     }
 
     observe_mattson_stack(ph);
+    last_inserted_id_ = entry.id;
     entries_.push_back(std::move(entry));
     if (out_inserted)
       *out_inserted = true;
     return evicted;
+  }
+
+  template <class SlotProgramFn>
+  bool release_unpinned_slot_entry_by_id(std::uint64_t entry_id,
+                                         std::size_t source_slot,
+                                         std::string_view execution_identity,
+                                         SlotProgramFn &&program_at) {
+    if (entry_id == 0ULL)
+      return false;
+    for (std::size_t i = entries_.size(); i-- > 0;) {
+      const auto &prev = entries_[i];
+      if (prev.id != entry_id)
+        continue;
+      if (!prev.pinned && prev.source_slot == source_slot &&
+          prev.identity == execution_identity) {
+        release_entry(i, program_at, false);
+        return true;
+      }
+      break;
+    }
+    return false;
   }
 
   template <class SlotProgramFn>
@@ -715,6 +743,7 @@ private:
   std::uint64_t budget_bytes_ = 0;
   std::size_t max_unpinned_entries_ = 0;
   std::uint64_t next_id_ = 0;
+  std::uint64_t last_inserted_id_ = 0;
   std::uint64_t clock_tick_ = 0;
   double clock_aging_ = 0.0;
   std::uint64_t total_non_kv_bytes_ = 0;

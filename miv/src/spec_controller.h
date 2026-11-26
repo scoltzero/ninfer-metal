@@ -236,18 +236,23 @@ public:
     if (queries.empty())
       return out;
 
-    // Off mode or tiny unit-test fixtures in Auto mode: deterministic fixed max_k
-    // so short golden CTests (hidden_size=128) run fixed draft_tokens unchanged.
+    // Off mode, tiny unit-test fixtures, or single-slot dense DFlash2 in Auto
+    // mode: deterministic fixed max_k. On dense B=1 NAX (nax_band_factor(8) ==
+    // 1.07), M=8 target verification streams weights once, whereas gating to
+    // K=0 drops into non-T-domain verify(M=1)+commit and hurts goodput.
     const bool small_fixture = cfg_.hidden_size < 512;
+    const bool is_moe = cfg_.num_experts > 0 && cfg_.experts_per_token > 0;
+    const bool auto_dense_solo =
+        (cfg_.mode == SpecSearchMode::Auto && !is_moe && queries.size() == 1);
     if (cfg_.mode == SpecSearchMode::Off ||
-        (cfg_.mode == SpecSearchMode::Auto && small_fixture)) {
+        (cfg_.mode == SpecSearchMode::Auto && small_fixture) ||
+        auto_dense_solo) {
       for (std::size_t i = 0; i < queries.size(); ++i)
         out[i].k = std::min<std::uint32_t>(queries[i].max_k, kMaxDepth);
       return out;
     }
 
     const std::uint32_t B = std::uint32_t(queries.size());
-    const bool is_moe = cfg_.num_experts > 0 && cfg_.experts_per_token > 0;
 
     // Check if all active slots with max_k > 0 are still in initial warmup.
     // Exception: under MoE concurrency (B >= 3), apply bandwidth-aware allocation
@@ -372,7 +377,8 @@ public:
   void observe_round(std::size_t slot_idx, std::uint32_t depth_k,
                      std::uint32_t accepted_proposals, bool unclipped_by_budget,
                      double draft_ms, double verify_ms, double commit_ms,
-                     std::uint32_t batch_total_m = 0) noexcept {
+                     std::uint32_t batch_total_m = 0,
+                     bool cold_context_projection = false) noexcept {
     auto &st = slots_[std::min(slot_idx, slots_.size() - 1)];
     if (depth_k > 0) {
       ++st.observed_rounds;
@@ -394,7 +400,8 @@ public:
           st.survival[j] = std::min(st.survival[j], prev * 0.85);
         }
       }
-      if (draft_ms > 0.01 && std::isfinite(draft_ms)) {
+      if (!cold_context_projection && draft_ms > 0.01 &&
+          std::isfinite(draft_ms)) {
         const double est_base = std::max(0.05, draft_ms - ema_draft_tok_ms_ * double(depth_k));
         ema_draft_base_ms_ = 0.80 * ema_draft_base_ms_ + 0.20 * est_base;
       }

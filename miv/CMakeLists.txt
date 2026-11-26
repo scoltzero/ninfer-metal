@@ -12,7 +12,7 @@ option(OMLX_M5_BUILD_MLX_FIXTURES "Build Python MLX/dflash-mlx oracle fixtures a
 
 set(
   NINFER_METAL_DISPLAY_VERSION
-  "miv-v0.01"
+  "miv-v0.02"
   CACHE STRING
   "Display version string reported by mseries_backendd")
 set(
@@ -22,7 +22,7 @@ set(
   "Codename reported by mseries_backendd")
 set(
   NINFER_METAL_SEMVER
-  "0.0.1"
+  "0.0.2"
   CACHE STRING
   "Semantic version reported by mseries_backendd")
 set(

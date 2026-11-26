@@ -869,11 +869,17 @@ public:
                          config.head_dim, qkv_stride, 0, word(config.epsilon),
                          word(config.rope_theta)}),
                   0, 5);
+        const U64 attn_tg_w =
+            (config.sliding_window > 64U &&
+             (config.head_dim == 128U || config.head_dim == 256U))
+                ? 256ULL
+                : 32ULL;
         const Ref nk_strided = sub(qkv_buf, mul(q, 2ULL));
         const Ref nv_strided = sub(qkv_buf, mul(q + kv, 2ULL));
         auto &a = e.emit(
             "dflash_forward", "omlx_m5_draft_attention",
-            {.width = 32, .height = U64(8) * config.query_heads}, {.width = 32},
+            {.width = attn_tg_w, .height = U64(8) * config.query_heads},
+            {.width = attn_tg_w},
             {qkv_buf, nk_strided, nv_strided,
              get("cache_key." + std::to_string(layer)),
              get("cache_value." + std::to_string(layer)), get("attention")});
@@ -884,6 +890,11 @@ public:
                          qkv_stride, qkv_stride}),
                   0, 1);
       } else {
+        const U64 attn_tg_w =
+            (config.sliding_window > 64U &&
+             (config.head_dim == 128U || config.head_dim == 256U))
+                ? 256ULL
+                : 32ULL;
         linear(e, p + "self_attn.q_proj.weight", get("prepared"), q_fallback, q,
                h);
         linear(e, p + "self_attn.k_proj.weight", get("prepared"), nk_fallback,
@@ -895,7 +906,8 @@ public:
              config.key_value_heads);
         auto &a = e.emit(
             "dflash_forward", "omlx_m5_draft_attention",
-            {.width = 32, .height = U64(8) * config.query_heads}, {.width = 32},
+            {.width = attn_tg_w, .height = U64(8) * config.query_heads},
+            {.width = attn_tg_w},
             {q_fallback, nk_fallback, nv_fallback,
              get("cache_key." + std::to_string(layer)),
              get("cache_value." + std::to_string(layer)), get("attention")});
@@ -1489,6 +1501,11 @@ public:
              data(p + "self_attn.k_norm.weight")});
         push_unique_offset(out.qk_rope_offsets,
                            e.dynamic(qk_rope, 3, pod_bytes(qkr_init)));
+        const U64 attn_tg_w =
+            (config.sliding_window > 64U &&
+             (config.head_dim == 128U || config.head_dim == 256U))
+                ? 256ULL
+                : 32ULL;
         for (U32 b = 0; b < B; ++b) {
           const auto &sp = *skey.slots[b];
           const Ref slot_q = df_row_slice_ref(qkv_buf, 8U * b, 8U, qkv_stride);
@@ -1498,8 +1515,8 @@ public:
               df_row_slice_ref(pb_get("pb_attention"), 8U * b, 8U, q);
           auto &a = e.emit(
               "dflash_forward", "omlx_m5_draft_attention",
-              {.width = 32, .height = U64(8U) * config.query_heads},
-              {.width = 32},
+              {.width = attn_tg_w, .height = U64(8U) * config.query_heads},
+              {.width = attn_tg_w},
               {slot_q, slot_nk, slot_nv,
                sp.get("cache_key." + std::to_string(layer)),
                sp.get("cache_value." + std::to_string(layer)), slot_out});
@@ -1541,12 +1558,17 @@ public:
             {.width = 32}, {nk_fallback, data(p + "self_attn.k_norm.weight")});
         push_unique_offset(out.rope_k_offsets,
                            e.dynamic(rk, 2, pod_bytes(rk_init)));
+        const U64 attn_tg_w =
+            (config.sliding_window > 64U &&
+             (config.head_dim == 128U || config.head_dim == 256U))
+                ? 256ULL
+                : 32ULL;
         for (U32 b = 0; b < B; ++b) {
           const auto &sp = *skey.slots[b];
           auto &a = e.emit(
               "dflash_forward", "omlx_m5_draft_attention",
-              {.width = 32, .height = U64(8U) * config.query_heads},
-              {.width = 32},
+              {.width = attn_tg_w, .height = U64(8U) * config.query_heads},
+              {.width = attn_tg_w},
               {df_row_slice_ref(q_fallback, 8U * b, 8U, q),
                df_row_slice_ref(nk_fallback, 8U * b, 8U, kv),
                df_row_slice_ref(nv_fallback, 8U * b, 8U, kv),
@@ -2789,6 +2811,11 @@ DFlashPackedBatchResult DFlashForward::propose_packed_batch(
     res.conditional_selector = true;
   }
   return batch_out;
+}
+void DFlashForward::retain_frontier(U32 frontier_rows, U64 epoch) noexcept {
+  impl_->frontier = frontier_rows;
+  impl_->target_epoch = epoch;
+  impl_->cached_epoch = epoch;
 }
 void DFlashForward::reset() {
   impl_->frontier = 0;
