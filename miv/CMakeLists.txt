@@ -2725,3 +2725,27 @@ add_test(
     $<TARGET_FILE:omlx_m5_serve_e2e>
     "${CMAKE_SOURCE_DIR}/models"
     $<TARGET_FILE:omlx_m5_mock_spi_provider>)
+
+# Module 5: Full-Matrix Prefill / PPL / Logits Benchmark Helper
+add_executable(
+  omlx_m5_prefill_matrix_bench
+  apps/prefill_matrix_bench.cpp)
+target_include_directories(
+  omlx_m5_prefill_matrix_bench
+  SYSTEM PRIVATE
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(
+  omlx_m5_prefill_matrix_bench
+  PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror)
+target_link_libraries(
+  omlx_m5_prefill_matrix_bench
+  PRIVATE
+  omlx_m5_serve_lib
+  omlx_m5_core_runtime)
+add_dependencies(
+  omlx_m5_prefill_matrix_bench
+  omlx_m5_qwen_forward_resources)
