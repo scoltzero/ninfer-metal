@@ -1393,7 +1393,7 @@ def parse_cli() -> argparse.Namespace:
         help="Comma-separated context tiers",
     )
     ap.add_argument("--gen-tokens", type=int, default=128)
-    ap.add_argument("--depths", default="10,50,90", help="Comma-separated NIAH depths (%)")
+    ap.add_argument("--depths", default="10,50,90", help="Comma-separated NIAH depths (%%)")
     ap.add_argument("--warmup-tokens", type=int, default=2048)
     ap.add_argument("--run-ppl", action="store_true", help="Run C++ teacher-forced PPL")
     ap.add_argument("--ppl-lengths", default="4096,16384")
