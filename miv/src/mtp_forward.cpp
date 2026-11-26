@@ -520,58 +520,113 @@ MtpDepthController::MtpDepthController(std::uint32_t max_depth,
   reset();
 }
 
-void MtpDepthController::reset() {
-  cur_ = max_depth_;
-  p_.fill(std::nullopt);
-  p_[0] = 0.6;
-  t_.fill(std::nullopt);
-  t_age_.fill(0.0);
-  cycles_ = 0;
-  probe_left_ = 0;
-  exit_streak_ = 0;
-  streak_spec_ = 0;
-  ms_probe_ = 0.0;
-  ms_explore_ = 0.0;
-  warmup_.clear();
+void MtpDepthController::reset_batch_state(BatchTimingState &bs) {
+  bs.cur = max_depth_;
+  bs.t.fill(std::nullopt);
+  bs.t_age.fill(0.0);
+  bs.probe_left = 0;
+  bs.ms_probe = 0.0;
+  bs.ms_explore = 0.0;
+  bs.warmup.clear();
   if (!fixed_depth_) {
     for (std::uint32_t d = max_depth_; d >= 1U; --d) {
-      warmup_.push_back(d);
-    }
-    if (max_depth_ > 1U) {
-      warmup_.push_back(0U);
-      warmup_.push_back(0U);
-      warmup_.push_back(0U);
+      bs.warmup.push_back(d);
     }
   }
 }
 
-void MtpDepthController::on_new_request() noexcept {
+void MtpDepthController::reset() {
+  p_.fill(std::nullopt);
+  p_[0] = 0.6;
+  cycles_ = 0;
+  exit_streak_ = 0;
+  streak_spec_ = 0;
+  active_batch_ = 1;
+  last_context_tokens_ = 0;
+  for (auto &bs : batch_) {
+    reset_batch_state(bs);
+  }
+}
+
+void MtpDepthController::on_new_request(std::uint32_t context_tokens) noexcept {
   if (fixed_depth_) {
     return;
   }
-  if (!warmup_.empty() || cycles_ == 0U) {
-    reset();
+  if (cycles_ == 0U) {
+    try {
+      reset();
+    } catch (...) {
+    }
+    last_context_tokens_ = context_tokens;
     return;
   }
   p_.fill(std::nullopt);
   p_[0] = 0.6;
-  probe_left_ = 0;
   exit_streak_ = 0;
   streak_spec_ = 0;
-  ms_probe_ = 0.0;
-  ms_explore_ = 0.0;
-  cur_ = best_depth();
+
+  const bool context_shifted =
+      context_tokens > 0U && last_context_tokens_ > 0U &&
+      (context_tokens > last_context_tokens_
+           ? (context_tokens - last_context_tokens_) >= 8192U
+           : (last_context_tokens_ - context_tokens) >= 8192U);
+  if (context_tokens > 0U) {
+    last_context_tokens_ = context_tokens;
+  }
+  if (context_shifted) {
+    try {
+      for (auto &bs : batch_) {
+        reset_batch_state(bs);
+      }
+    } catch (...) {
+    }
+    return;
+  }
+  for (auto &bs : batch_) {
+    bs.probe_left = 0;
+    bs.ms_probe = 0.0;
+    bs.ms_explore = 0.0;
+    if (!bs.warmup.empty()) {
+      bs.cur = bs.warmup.front();
+    } else {
+      bs.cur = best_depth(bs);
+    }
+  }
 }
 
 std::uint32_t
-MtpDepthController::select_depth(std::uint32_t max_allowed_k) const noexcept {
+MtpDepthController::select_depth(std::uint32_t max_allowed_k,
+                                 std::uint32_t batch_size) const noexcept {
   if (max_allowed_k == 0U) {
     return 0U;
   }
   if (fixed_depth_) {
     return std::min(max_allowed_k, max_depth_);
   }
-  return std::min(cur_, max_allowed_k);
+  const std::uint32_t b_idx =
+      std::clamp<std::uint32_t>(batch_size, 1U, kMaxBatchSize) - 1U;
+  const auto &bs = batch_[b_idx];
+  const std::uint32_t target =
+      !bs.warmup.empty() ? bs.warmup.front() : bs.cur;
+  return std::min(target, max_allowed_k);
+}
+
+bool MtpDepthController::is_probing(std::uint32_t batch_size) const noexcept {
+  if (fixed_depth_) {
+    return false;
+  }
+  const std::uint32_t b_idx =
+      std::clamp<std::uint32_t>(batch_size, 1U, kMaxBatchSize) - 1U;
+  const auto &bs = batch_[b_idx];
+  return !bs.warmup.empty() || bs.probe_left > 0U;
+}
+
+std::uint32_t
+MtpDepthController::current_depth(std::uint32_t batch_size) const noexcept {
+  const std::uint32_t b_idx =
+      std::clamp<std::uint32_t>(batch_size, 1U, kMaxBatchSize) - 1U;
+  const auto &bs = batch_[b_idx];
+  return !bs.warmup.empty() ? bs.warmup.front() : bs.cur;
 }
 
 double MtpDepthController::p_eff(std::uint32_t j) const noexcept {
@@ -582,10 +637,11 @@ double MtpDepthController::p_eff(std::uint32_t j) const noexcept {
   return p_[idx].value_or(0.6);
 }
 
-double MtpDepthController::marginal_est() const noexcept {
+double
+MtpDepthController::marginal_est(const BatchTimingState &bs) const noexcept {
   std::optional<std::uint32_t> lo, hi;
   for (std::uint32_t d = 0U; d <= max_depth_; ++d) {
-    if (t_[d].has_value()) {
+    if (bs.t[d].has_value()) {
       if (!lo.has_value()) {
         lo = d;
       }
@@ -593,7 +649,7 @@ double MtpDepthController::marginal_est() const noexcept {
     }
   }
   if (lo.has_value() && hi.has_value() && *hi > *lo) {
-    const double slope = (*t_[*hi] - *t_[*lo]) / double(*hi - *lo);
+    const double slope = (*bs.t[*hi] - *bs.t[*lo]) / double(*hi - *lo);
     if (slope > 0.0) {
       return slope;
     }
@@ -601,20 +657,21 @@ double MtpDepthController::marginal_est() const noexcept {
   return marginal_ms_;
 }
 
-double MtpDepthController::t_est(std::uint32_t d) const noexcept {
-  if (d <= max_depth_ && t_[d].has_value()) {
-    return *t_[d];
+double MtpDepthController::t_est(const BatchTimingState &bs,
+                                 std::uint32_t d) const noexcept {
+  if (d <= max_depth_ && bs.t[d].has_value()) {
+    return *bs.t[d];
   }
   bool any = false;
   double min_t = std::numeric_limits<double>::infinity();
   std::uint32_t closest_d = 0U;
   std::uint32_t best_dist = UINT32_MAX;
   for (std::uint32_t cand = 0U; cand <= max_depth_; ++cand) {
-    if (!t_[cand].has_value()) {
+    if (!bs.t[cand].has_value()) {
       continue;
     }
     any = true;
-    min_t = std::min(min_t, *t_[cand]);
+    min_t = std::min(min_t, *bs.t[cand]);
     const std::uint32_t dist = (cand > d) ? (cand - d) : (d - cand);
     if (dist < best_dist) {
       best_dist = dist;
@@ -628,31 +685,40 @@ double MtpDepthController::t_est(std::uint32_t d) const noexcept {
     return min_t;
   }
   return std::max(
-      1e-3, *t_[closest_d] +
-                marginal_est() * (double(d) - double(closest_d)));
+      1e-3, *bs.t[closest_d] +
+                marginal_est(bs) * (double(d) - double(closest_d)));
 }
 
-double MtpDepthController::score(std::uint32_t d) const noexcept {
+double MtpDepthController::score_for(const BatchTimingState &bs,
+                                     std::uint32_t d) const noexcept {
   double expected = 1.0;
   double run = 1.0;
   for (std::uint32_t j = 0U; j < d && j < max_depth_; ++j) {
     run *= p_eff(j);
     expected += run;
   }
-  return expected / std::max(1e-6, t_est(d));
+  return expected / std::max(1e-6, t_est(bs, d));
 }
 
-bool MtpDepthController::speculation_losing() const noexcept {
-  if (!warmup_.empty() || !t_[0].has_value()) {
+double MtpDepthController::score(std::uint32_t d,
+                                 std::uint32_t batch_size) const noexcept {
+  const std::uint32_t b_idx =
+      std::clamp<std::uint32_t>(batch_size, 1U, kMaxBatchSize) - 1U;
+  return score_for(batch_[b_idx], d);
+}
+
+bool MtpDepthController::speculation_losing(
+    const BatchTimingState &bs) const noexcept {
+  if (!bs.warmup.empty() || !bs.t[0].has_value()) {
     return false;
   }
-  const double base = score(0U);
+  const double base = score_for(bs, 0U);
   if (base <= 0.0) {
     return false;
   }
   double best = 0.0;
   for (std::uint32_t d = 1U; d <= max_depth_; ++d) {
-    best = std::max(best, score(d));
+    best = std::max(best, score_for(bs, d));
   }
   return best < base * exit_margin_;
 }
@@ -662,18 +728,19 @@ bool MtpDepthController::should_exit() const noexcept {
          streak_spec_ >= kExitConfirm;
 }
 
-std::uint32_t MtpDepthController::best_depth() const noexcept {
-  std::uint32_t best_d = (cur_ <= max_depth_ && (cur_ > 0U || t_[0].has_value()))
-                             ? cur_
-                             : 1U;
-  double best_s = score(best_d);
-  const std::uint32_t first_d = t_[0].has_value() ? 0U : 1U;
+std::uint32_t
+MtpDepthController::best_depth(const BatchTimingState &bs) const noexcept {
+  std::uint32_t best_d =
+      (bs.cur <= max_depth_ && (bs.cur > 0U || bs.t[0].has_value())) ? bs.cur
+                                                                     : 1U;
+  double best_s = score_for(bs, best_d);
+  const std::uint32_t first_d = bs.t[0].has_value() ? 0U : 1U;
   for (std::uint32_t d = first_d; d <= max_depth_; ++d) {
     if (d == best_d) {
       continue;
     }
-    const double s = score(d);
-    const double thresh = (d == cur_) ? best_s : (best_s * kHysteresis);
+    const double s = score_for(bs, d);
+    const double thresh = (d == bs.cur) ? best_s : (best_s * kHysteresis);
     if (s > thresh) {
       best_d = d;
       best_s = s;
@@ -682,19 +749,22 @@ std::uint32_t MtpDepthController::best_depth() const noexcept {
   return best_d;
 }
 
-std::optional<std::uint32_t> MtpDepthController::best_rival() const noexcept {
-  const double cur_s = score(cur_);
+std::optional<std::uint32_t>
+MtpDepthController::best_rival(const BatchTimingState &bs) const noexcept {
+  const double cur_s = score_for(bs, bs.cur);
   if (cur_s <= 0.0) {
-    return most_stale();
+    return most_stale(bs);
   }
+  const bool allow_zero = p_eff(0) < 0.45;
+  const std::uint32_t max_idx = allow_zero ? max_depth_ : (max_depth_ - 1U);
   std::optional<std::uint32_t> rival;
   double rival_s = 0.0;
-  for (std::uint32_t idx = 0U; idx <= max_depth_; ++idx) {
+  for (std::uint32_t idx = 0U; idx <= max_idx; ++idx) {
     const std::uint32_t d = (idx < max_depth_) ? (idx + 1U) : 0U;
-    if (d == cur_) {
+    if (d == bs.cur) {
       continue;
     }
-    const double s = score(d);
+    const double s = score_for(bs, d);
     if (s > rival_s) {
       rival = d;
       rival_s = s;
@@ -706,16 +776,20 @@ std::optional<std::uint32_t> MtpDepthController::best_rival() const noexcept {
   return std::nullopt;
 }
 
-std::optional<std::uint32_t> MtpDepthController::most_stale() const noexcept {
+std::optional<std::uint32_t>
+MtpDepthController::most_stale(const BatchTimingState &bs) const noexcept {
+  const bool allow_zero = p_eff(0) < 0.45;
+  const std::uint32_t max_idx = allow_zero ? max_depth_ : (max_depth_ - 1U);
   std::optional<std::uint32_t> target;
   double max_age = -1.0;
-  for (std::uint32_t idx = 0U; idx <= max_depth_; ++idx) {
+  for (std::uint32_t idx = 0U; idx <= max_idx; ++idx) {
     const std::uint32_t d = (idx < max_depth_) ? (idx + 1U) : 0U;
-    if (d == cur_) {
+    if (d == bs.cur) {
       continue;
     }
     const double age =
-        t_[d].has_value() ? t_age_[d] : std::numeric_limits<double>::infinity();
+        bs.t[d].has_value() ? bs.t_age[d]
+                            : std::numeric_limits<double>::infinity();
     if (age > max_age) {
       max_age = age;
       target = d;
@@ -724,27 +798,28 @@ std::optional<std::uint32_t> MtpDepthController::most_stale() const noexcept {
   return target;
 }
 
-void MtpDepthController::update_time(std::uint32_t used,
+void MtpDepthController::update_time(BatchTimingState &bs, std::uint32_t used,
                                      double cycle_ms) noexcept {
   cycle_ms = std::max(0.0, cycle_ms);
-  if (!t_[used].has_value()) {
-    t_[used] = cycle_ms;
+  if (!bs.t[used].has_value()) {
+    bs.t[used] = cycle_ms;
     return;
   }
-  const double prev = *t_[used];
-  if (!warmup_.empty()) {
-    t_[used] = std::min(prev, cycle_ms);
+  const double prev = *bs.t[used];
+  if (!bs.warmup.empty()) {
+    bs.t[used] = std::min(prev, cycle_ms);
     return;
   }
   double a = 1.0 - std::exp(-cycle_ms / kTauMs);
   if (cycle_ms > kSpikeRatio * prev) {
     a *= kSpikeDamp;
   }
-  t_[used] = (1.0 - a) * prev + a * cycle_ms;
+  bs.t[used] = (1.0 - a) * prev + a * cycle_ms;
 }
 
 void MtpDepthController::observe(std::uint32_t used, std::uint32_t accepted,
-                                 double cycle_ms, bool time_sample) noexcept {
+                                 double cycle_ms, bool time_sample,
+                                 std::uint32_t batch_size) noexcept {
   ++cycles_;
   used = std::min(used, max_depth_);
   accepted = std::min(accepted, used);
@@ -761,22 +836,26 @@ void MtpDepthController::observe(std::uint32_t used, std::uint32_t accepted,
   if (fixed_depth_) {
     return;
   }
+
+  active_batch_ = std::clamp<std::uint32_t>(batch_size, 1U, kMaxBatchSize);
+  auto &bs = batch_[active_batch_ - 1U];
+
   cycle_ms = std::max(0.0, cycle_ms);
   if (time_sample) {
-    update_time(used, cycle_ms);
+    update_time(bs, used, cycle_ms);
   }
   for (std::uint32_t d = 0U; d <= max_depth_; ++d) {
-    if (t_[d].has_value()) {
-      t_age_[d] += cycle_ms;
+    if (bs.t[d].has_value()) {
+      bs.t_age[d] += cycle_ms;
     }
   }
   if (time_sample && used <= max_depth_) {
-    t_age_[used] = 0.0;
+    bs.t_age[used] = 0.0;
   }
-  ms_probe_ += cycle_ms;
-  ms_explore_ += cycle_ms;
+  bs.ms_probe += cycle_ms;
+  bs.ms_explore += cycle_ms;
 
-  if (speculation_losing()) {
+  if (speculation_losing(bs)) {
     ++exit_streak_;
     if (used > 0U && time_sample) {
       ++streak_spec_;
@@ -786,60 +865,73 @@ void MtpDepthController::observe(std::uint32_t used, std::uint32_t accepted,
     streak_spec_ = 0;
   }
 
-  if (!warmup_.empty()) {
+  if (!bs.warmup.empty()) {
     if (!time_sample) {
       return;
     }
-    warmup_.erase(warmup_.begin());
-    if (!warmup_.empty()) {
-      cur_ = warmup_.front();
+    bs.warmup.erase(bs.warmup.begin());
+    if (bs.warmup.empty() && !bs.t[0].has_value() && p_eff(0) < 0.48) {
+      try {
+        bs.warmup.push_back(0U);
+      } catch (...) {
+      }
+    }
+    if (!bs.warmup.empty()) {
+      bs.cur = bs.warmup.front();
       return;
     }
-    cur_ = best_depth();
-    ms_probe_ = 0.0;
+    bs.cur = best_depth(bs);
+    bs.ms_probe = 0.0;
     return;
   }
 
-  if (probe_left_ == 0U && exit_streak_ >= kExitStreak &&
+  if (!bs.t[0].has_value() && p_eff(0) < 0.45 && bs.probe_left == 0U) {
+    bs.cur = 0U;
+    bs.probe_left = 1U;
+    bs.ms_probe = 0.0;
+    return;
+  }
+
+  if (bs.probe_left == 0U && exit_streak_ >= kExitStreak &&
       streak_spec_ < kExitConfirm) {
     std::uint32_t best_spec = 1U;
-    double best_s = score(1U);
+    double best_s = score_for(bs, 1U);
     for (std::uint32_t d = 2U; d <= max_depth_; ++d) {
-      const double s = score(d);
+      const double s = score_for(bs, d);
       if (s > best_s) {
         best_s = s;
         best_spec = d;
       }
     }
-    cur_ = best_spec;
-    probe_left_ = kExitConfirm - streak_spec_;
-    ms_probe_ = 0.0;
+    bs.cur = best_spec;
+    bs.probe_left = kExitConfirm - streak_spec_;
+    bs.ms_probe = 0.0;
     return;
   }
 
-  if (probe_left_ > 0U) {
-    --probe_left_;
-    if (probe_left_ == 0U) {
-      cur_ = best_depth();
-      ms_probe_ = 0.0;
+  if (bs.probe_left > 0U) {
+    --bs.probe_left;
+    if (bs.probe_left == 0U) {
+      bs.cur = best_depth(bs);
+      bs.ms_probe = 0.0;
     }
     return;
   }
 
-  cur_ = best_depth();
+  bs.cur = best_depth(bs);
   if (max_depth_ > 1U) {
     const double period =
         std::max(kProbePeriodMs, double(kProbeLen) * cycle_ms / kProbeDuty);
-    if (ms_probe_ >= period) {
+    if (bs.ms_probe >= period) {
       const bool explore_due =
-          ms_explore_ >= std::max(kProbePeriodMaxMs, 2.0 * period);
-      const auto target = explore_due ? most_stale() : best_rival();
+          bs.ms_explore >= std::max(kProbePeriodMaxMs, 2.0 * period);
+      const auto target = explore_due ? most_stale(bs) : best_rival(bs);
       if (target.has_value()) {
-        cur_ = *target;
-        probe_left_ = kProbeLen;
-        ms_probe_ = 0.0;
+        bs.cur = *target;
+        bs.probe_left = kProbeLen;
+        bs.ms_probe = 0.0;
         if (explore_due) {
-          ms_explore_ = 0.0;
+          bs.ms_explore = 0.0;
         }
       }
     }

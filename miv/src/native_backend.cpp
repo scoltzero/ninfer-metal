@@ -1119,7 +1119,7 @@ public:
       if (shared_kv_pages > logical_kv_pages + 1u && kv_page_b > 0ULL) {
         const auto max_safe =
             std::min<std::uint64_t>(context.capabilities().max_buffer_length,
-                                    2ULL << 30) /
+                                    8ULL << 30) /
             kv_page_b;
         if (max_safe >= logical_kv_pages + 1u) {
           shared_kv_pages = std::min<std::uint32_t>(
@@ -1151,7 +1151,7 @@ public:
               ? std::uint64_t(shared_kv_pages - (logical_kv_pages + 1u))
               : 0ULL;
       const auto buffer_limit = std::min<std::uint64_t>(
-          context.capabilities().max_buffer_length, 2ULL << 30);
+          context.capabilities().max_buffer_length, 8ULL << 30);
       if (mtp_page_bytes > 0ULL && min_shared_pages <= buffer_limit / mtp_page_bytes) {
         const std::uint64_t max_buf_pages = buffer_limit / mtp_page_bytes;
         const std::uint64_t target_added_bytes =
@@ -1888,7 +1888,7 @@ public:
     }
     if (mtp()) {
       if (auto *mc = mtp_controller())
-        mc->on_new_request();
+        mc->on_new_request(std::uint32_t(prompt_.size()));
       bool reused_mtp_kv = restored_mtp_prefix;
       if (owner_.mtp_shared_kv_pages == 0U && prefix_same_slot && offset_ > 0U &&
           slot_ < owner_.slot_mtp_post_frontier.size()) {
@@ -2430,7 +2430,8 @@ public:
   std::optional<ExecutionResult>
   prepare_batch_row(bool *out_wants_dflash_draft = nullptr,
                     bool *out_wants_mtp_draft = nullptr,
-                    std::optional<SpecSlotDecision> assigned_spec = std::nullopt) {
+                    std::optional<SpecSlotDecision> assigned_spec = std::nullopt,
+                    std::uint32_t batch_slots_hint = 1U) {
     if (out_wants_dflash_draft)
       *out_wants_dflash_draft = false;
     if (out_wants_mtp_draft)
@@ -2439,11 +2440,27 @@ public:
       return ExecutionResult{.kind = EventKind::aborted,
                              .finish_reason = "cancelled"};
     pending_input_.clear();
+    pending_mtp_probe_ = false;
     pending_prefill_ = offset_ < prompt_.size();
     pending_was_first_chunk_ = pending_prefill_ && (offset_ == 0);
     if (!pending_prefill_)
       resolve_anchor_if_needed();
     pending_mtp_verify_ = !pending_prefill_ && mtp_active();
+    if (pending_mtp_verify_) {
+      auto *ctrl = mtp_controller();
+      if (ctrl && ctrl->should_exit()) {
+        mtp_exited_ = true;
+        last_mtp_round_committed_.clear();
+        note_fallback("mtp_adaptive_exit");
+        pending_mtp_verify_ = false;
+        pending_verify_ = (draft() != nullptr);
+        step_.token = anchor_;
+        if (!pending_verify_) {
+          pending_input_.push_back(anchor_);
+          return std::nullopt;
+        }
+      }
+    }
     pending_verify_ = !pending_prefill_ && (draft() != nullptr || mtp_active());
     if (pending_prefill_) {
       const auto count = prompt_.size() - offset_;
@@ -2471,12 +2488,20 @@ public:
       const std::uint32_t max_allowed_k = std::min(
           {owner_.slot_mtp_draft_tokens, remaining - 1U, available - 1U});
       auto *ctrl = mtp_controller();
+      const bool was_probing = ctrl && ctrl->is_probing(batch_slots_hint);
       pending_max_k_ = max_allowed_k;
-      pending_k_ = ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
+      pending_k_ = ctrl ? ctrl->select_depth(max_allowed_k, batch_slots_hint)
+                        : max_allowed_k;
+      pending_mtp_probe_ =
+          (pending_k_ == 0U && max_allowed_k > 0U && was_probing);
       if (pending_k_ == 0U && max_allowed_k > 0U) {
-        note_fallback("adaptive_gate");
         std::scoped_lock lock(backend_.stats_mutex_);
-        ++backend_.backend_stats_.spec_search_gated_rounds;
+        if (pending_mtp_probe_) {
+          ++backend_.backend_stats_.spec_search_probe_rounds;
+        } else {
+          note_fallback("adaptive_gate");
+          ++backend_.backend_stats_.spec_search_gated_rounds;
+        }
       }
       pending_cost_ = std::make_unique<RoundCostRecorder>(
           backend_.backend_stats_, backend_.stats_mutex_, pending_k_);
@@ -2620,7 +2645,7 @@ public:
   record_batch_verify_result(QwenForwardResult &&res,
                              double verify_gpu_share_ms) {
     step_ = std::move(res);
-    record_spec_step(pending_k_, pending_max_k_);
+    record_spec_step(pending_k_, pending_mtp_probe_ ? 0U : pending_max_k_);
     {
       std::scoped_lock lock(backend_.stats_mutex_);
       auto &stats = backend_.backend_stats_;
@@ -2774,7 +2799,7 @@ public:
             pending_cost_->phase_ms(RoundCostRecorder::replay);
         ctrl->observe(pending_k_, std::uint32_t(pc.verified.accepted_proposals),
                       cycle_gpu_ms > 0.0 ? cycle_gpu_ms : cycle_wall_ms,
-                      unclipped);
+                      unclipped, batch_slots);
       }
     } else {
       const double draft_scale =
@@ -3544,15 +3569,21 @@ private:
 
     const std::uint32_t max_allowed_k =
         std::min({owner_.slot_mtp_draft_tokens, remaining - 1U, available - 1U});
+    const bool was_probing = ctrl && ctrl->is_probing(1U);
     const std::uint32_t k =
-        ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
+        ctrl ? ctrl->select_depth(max_allowed_k, 1U) : max_allowed_k;
 
     if (k == 0U) {
       if (max_allowed_k > 0U) {
-        record_ar_step();
-        note_fallback("adaptive_gate");
-        std::scoped_lock lock(backend_.stats_mutex_);
-        ++backend_.backend_stats_.spec_search_gated_rounds;
+        if (was_probing) {
+          std::scoped_lock lock(backend_.stats_mutex_);
+          ++backend_.backend_stats_.spec_search_probe_rounds;
+        } else {
+          record_ar_step();
+          note_fallback("adaptive_gate");
+          std::scoped_lock lock(backend_.stats_mutex_);
+          ++backend_.backend_stats_.spec_search_gated_rounds;
+        }
       }
       const auto k0_begin = RoundCostRecorder::Clock::now();
       MetalSubmission fold_sub{};
@@ -3842,8 +3873,8 @@ private:
   std::vector<std::byte> pending_anchor_logits_;
   bool pending_prefill_ = false, pending_was_first_chunk_ = false,
        pending_verify_ = false, pending_mtp_verify_ = false,
-       needs_anchor_resample_ = false, mtp_primed_ = false,
-       mtp_exited_ = false, matched_pinned_prefix_ = false,
+       pending_mtp_probe_ = false, needs_anchor_resample_ = false,
+       mtp_primed_ = false, mtp_exited_ = false, matched_pinned_prefix_ = false,
        pre_tail_pinned_ = false, post_decode_saved_ = false;
   std::uint32_t pending_k_ = 0, pending_max_k_ = 0;
   DFlash2DraftResult pending_proposal_;
@@ -4573,7 +4604,8 @@ NativeBackend::advance_batch(std::span<BackendTask *const> tasks) {
     try {
       bool wants_df = false;
       bool wants_mtp = false;
-      outcomes[i] = task->prepare_batch_row(&wants_df, &wants_mtp, assigned);
+      outcomes[i] = task->prepare_batch_row(&wants_df, &wants_mtp, assigned,
+                                            std::uint32_t(eligible.size()));
       if (outcomes[i])
         continue;
       staged.push_back({i, task, wants_df, wants_mtp});

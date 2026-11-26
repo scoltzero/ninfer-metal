@@ -756,18 +756,35 @@ Json test_depth_controller() {
   require(fixed.select_depth(4U) == 4U && !fixed.should_exit(),
           "fixed MtpDepthController must never mutate depth or exit");
 
-  // Adaptive controller: warmup sweeps 4, 3, 2, 1, 0, 0, 0
+  // Adaptive controller: warmup sweeps 4, 3, 2, 1 with zero wasted K=0 steps on
+  // healthy high-acceptance streams, and never probes K=0 during stale explore.
   MtpDepthController adaptive(4U, false);
-  const std::array<U32, 7> expected_warmup{4U, 3U, 2U, 1U, 0U, 0U, 0U};
+  const std::array<U32, 4> expected_warmup{4U, 3U, 2U, 1U};
   for (std::size_t i = 0; i < expected_warmup.size(); ++i) {
     const U32 d = adaptive.select_depth(4U);
     require(d == expected_warmup[i],
             "adaptive warmup sequence mismatch at step " + std::to_string(i));
     // High acceptance + flat cycle cost -> deep speculation wins!
-    adaptive.observe(d, d, d == 0U ? 10.0 : (11.0 + 0.5 * double(d)), true);
+    adaptive.observe(d, d, 11.0 + 0.5 * double(d), true);
   }
   require(adaptive.select_depth(4U) == 4U && !adaptive.should_exit(),
           "adaptive controller should pick K=4 when acceptance is 100%");
+  for (U32 step = 0U; step < 300U; ++step) {
+    const U32 d = adaptive.select_depth(4U);
+    require(d >= 1U, "high-acceptance stream unexpectedly dropped to K=0");
+    adaptive.observe(d, d, 11.0 + 0.5 * double(d), true);
+  }
+
+  // Batch-size isolation: solo B=1 timing (28.5ms) must never pollute B=4 timing (~10ms).
+  MtpDepthController batched(4U, false);
+  batched.observe(4U, 4U, 28.5, true, /*batch_size=*/1U);
+  for (U32 d : {4U, 3U, 2U, 1U}) {
+    const U32 sel = batched.select_depth(4U, /*batch_size=*/4U);
+    require(sel == d, "B=4 warmup polluted by prior B=1 step");
+    batched.observe(sel, sel, 8.5 + 0.4 * double(sel), true, /*batch_size=*/4U);
+  }
+  require(batched.select_depth(4U, /*batch_size=*/4U) == 4U,
+          "B=4 100%-acceptance failed to lock onto K=4 after B=1 seed");
 
   // Losing speculation controller: 0% acceptance and verify is 2x slower than AR!
   MtpDepthController losing(4U, false);

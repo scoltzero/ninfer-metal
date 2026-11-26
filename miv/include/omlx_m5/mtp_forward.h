@@ -51,6 +51,7 @@ class MtpDepthController final {
 public:
   static constexpr std::uint32_t kMaxSupportedDepth = 4;
   static constexpr std::uint32_t kDefaultMaxDepth = 4;
+  static constexpr std::uint32_t kMaxBatchSize = 8;
   static constexpr double kAlpha = 0.08;
   static constexpr double kTauMs = 400.0;
   static constexpr double kProbePeriodMs = 1000.0;
@@ -72,42 +73,60 @@ public:
                               double exit_margin = kDefaultExitMargin);
 
   void reset();
-  void on_new_request() noexcept;
-  [[nodiscard]] std::uint32_t select_depth(std::uint32_t max_allowed_k) const noexcept;
+  void on_new_request(std::uint32_t context_tokens = 0) noexcept;
+  [[nodiscard]] std::uint32_t
+  select_depth(std::uint32_t max_allowed_k,
+               std::uint32_t batch_size = 1U) const noexcept;
+  [[nodiscard]] bool is_probing(std::uint32_t batch_size = 1U) const noexcept;
   void observe(std::uint32_t used, std::uint32_t accepted, double cycle_ms,
-               bool time_sample = true) noexcept;
+               bool time_sample = true,
+               std::uint32_t batch_size = 1U) noexcept;
   [[nodiscard]] bool should_exit() const noexcept;
   [[nodiscard]] bool fixed_depth() const noexcept { return fixed_depth_; }
-  [[nodiscard]] std::uint32_t current_depth() const noexcept { return cur_; }
+  [[nodiscard]] std::uint32_t current_depth(std::uint32_t batch_size = 1U) const noexcept;
   [[nodiscard]] std::uint64_t cycles() const noexcept { return cycles_; }
-  [[nodiscard]] double score(std::uint32_t depth) const noexcept;
+  [[nodiscard]] double score(std::uint32_t depth,
+                             std::uint32_t batch_size = 1U) const noexcept;
 
 private:
+  struct BatchTimingState {
+    std::uint32_t cur = 4;
+    std::array<std::optional<double>, kMaxSupportedDepth + 1> t{};
+    std::array<double, kMaxSupportedDepth + 1> t_age{};
+    std::uint32_t probe_left = 0;
+    double ms_probe = 0.0;
+    double ms_explore = 0.0;
+    std::vector<std::uint32_t> warmup;
+  };
+
+  void reset_batch_state(BatchTimingState &bs);
   [[nodiscard]] double p_eff(std::uint32_t j) const noexcept;
-  [[nodiscard]] double marginal_est() const noexcept;
-  [[nodiscard]] double t_est(std::uint32_t d) const noexcept;
-  [[nodiscard]] bool speculation_losing() const noexcept;
-  [[nodiscard]] std::uint32_t best_depth() const noexcept;
-  [[nodiscard]] std::optional<std::uint32_t> best_rival() const noexcept;
-  [[nodiscard]] std::optional<std::uint32_t> most_stale() const noexcept;
-  void update_time(std::uint32_t used, double cycle_ms) noexcept;
+  [[nodiscard]] double marginal_est(const BatchTimingState &bs) const noexcept;
+  [[nodiscard]] double t_est(const BatchTimingState &bs,
+                             std::uint32_t d) const noexcept;
+  [[nodiscard]] double score_for(const BatchTimingState &bs,
+                                 std::uint32_t d) const noexcept;
+  [[nodiscard]] bool speculation_losing(const BatchTimingState &bs) const noexcept;
+  [[nodiscard]] std::uint32_t best_depth(const BatchTimingState &bs) const noexcept;
+  [[nodiscard]] std::optional<std::uint32_t>
+  best_rival(const BatchTimingState &bs) const noexcept;
+  [[nodiscard]] std::optional<std::uint32_t>
+  most_stale(const BatchTimingState &bs) const noexcept;
+  void update_time(BatchTimingState &bs, std::uint32_t used,
+                   double cycle_ms) noexcept;
 
   std::uint32_t max_depth_ = 4;
   bool fixed_depth_ = false;
   double marginal_ms_ = kDefaultMarginalMs;
   double exit_margin_ = kDefaultExitMargin;
 
-  std::uint32_t cur_ = 4;
   std::array<std::optional<double>, kMaxSupportedDepth> p_{};
-  std::array<std::optional<double>, kMaxSupportedDepth + 1> t_{};
-  std::array<double, kMaxSupportedDepth + 1> t_age_{};
+  std::array<BatchTimingState, kMaxBatchSize> batch_{};
+  std::uint32_t active_batch_ = 1;
+  std::uint32_t last_context_tokens_ = 0;
   std::uint64_t cycles_ = 0;
-  std::uint32_t probe_left_ = 0;
   std::uint32_t exit_streak_ = 0;
   std::uint32_t streak_spec_ = 0;
-  double ms_probe_ = 0.0;
-  double ms_explore_ = 0.0;
-  std::vector<std::uint32_t> warmup_;
 };
 
 [[nodiscard]] QwenForwardMemoryPlan
