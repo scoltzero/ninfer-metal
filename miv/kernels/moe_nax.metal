@@ -859,6 +859,18 @@ inline void moe_nax_mma_16x32x16(
   }
 }
 
+inline bool moe_has_apple10_nax_layout() {
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> gemm_op;
+  auto ct_a =
+      gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  const auto c0 = ct_a.get_multidimensional_index(ushort(0u));
+  const auto c2 = ct_a.get_multidimensional_index(ushort(2u));
+  return (int(c2[0]) - int(c0[0]) == 2) && (int(c2[1]) == int(c0[1]));
+}
+
 template <uint BKP>
 inline vec<bfloat, 8> moe_nax_load_frag_tg(
     const threadgroup bfloat *base,
@@ -1000,6 +1012,113 @@ inline void moe_mxfp4_nax_swiglu_wide_sk1_impl(
   device const uchar *sel_scales = is_up ? u_scales : g_scales;
   threadgroup vec<bfloat, 8> *w_dst8 =
       reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      uint4 raw;
+      float sc;
+      moe_nax_fetch_mxfp4_32(
+          sel_codes, sel_scales, expert_row, p.padded_k, k0 + w_col_sub, w_row_live, raw, sc);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      moe_nax_unpack_mxfp4_32(raw, sc, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            const uint rm = m_off + uint(ia[1]);
+            const uint tok = (rm < valid_rows) ? tg_tok[rm] : 0xFFFFFFFFu;
+            ct_a[i] = (tok != 0xFFFFFFFFu)
+                ? norm[ulong(tok) * p.k + k0 + kk + uint(ia[0])]
+                : bfloat(0.0f);
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (kTM > 1u && !compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              const uint rm = m_off + 16u + uint(ia[1]);
+              const uint tok = (rm < valid_rows) ? tg_tok[rm] : 0xFFFFFFFFu;
+              ct_a[i] = (tok != 0xFFFFFFFFu)
+                  ? norm[ulong(tok) * p.k + k0 + kk + uint(ia[0])]
+                  : bfloat(0.0f);
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_active) {
+      threadgroup bfloat *sg_buf = Ws + sg * 512u;
+      const uint col_base = tg_n0 + sg_n * 16u;
+      const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+      const uint r_out_base = (lane >> 2u) * 2u;
+      const uint c_out4 = (lane & 3u) * 4u;
+      const uint col = col_base + c_out4;
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < kTM; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              sg_buf[uint(idx[1]) * 32u + uint(idx[0])] =
+                  bfloat((mm == 0u) ? ct_c0[i] : ct_c1[i]);
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (col < p.n) {
+            #pragma clang loop unroll(full)
+            for (uint dr = 0u; dr < 2u; ++dr) {
+              const uint r = r_out_base + dr;
+              const uint rm = m_off + mm * 16u + r;
+              if (rm < valid_rows) {
+                const bfloat4 g4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + c_out4);
+                const bfloat4 u4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + 16u + c_out4);
+                bfloat4 out_b;
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) {
+                  out_b[j] = bfloat(nax_silu_f32(float(g4[j])) * float(u4[j]));
+                }
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = out_b;
+              } else if (rm < rb_8ceil) {
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = bfloat4(bfloat(0.0f));
+              }
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+    }
+    return;
+  }
+
   const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
 
   for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
@@ -1164,6 +1283,89 @@ inline void moe_mxfp4_nax_down_scatter_wide_sk1_impl(
   const ulong expert_row = ulong(expert) * p.n + out_col;
   threadgroup vec<bfloat, 8> *w_dst8 =
       reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      uint4 raw;
+      float sc;
+      moe_nax_fetch_mxfp4_32(
+          d_codes, d_scales, expert_row, p.padded_k, k0 + w_col_sub, w_row_live, raw, sc);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      moe_nax_unpack_mxfp4_32(raw, sc, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            const uint rm = m_off + uint(ia[1]);
+            ct_a[i] = (rm < valid_rows)
+                ? mid_bf16[ulong(rb + rm) * p.k + k0 + kk + uint(ia[0])]
+                : bfloat(0.0f);
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (kTM > 1u && !compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              const uint rm = m_off + 16u + uint(ia[1]);
+              ct_a[i] = (rm < valid_rows)
+                  ? mid_bf16[ulong(rb + rm) * p.k + k0 + kk + uint(ia[0])]
+                  : bfloat(0.0f);
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    if (sg_active) {
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < kTM; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              const uint col = tg_n0 + sg_n * 32u + uint(idx[0]);
+              const uint rm = m_off + mm * 16u + uint(idx[1]);
+              if (rm < valid_rows && col < p.n) {
+                const uint assign = tile_assign[rb + rm];
+                const float score = float(route_scores[assign]);
+                const float val = (mm == 0u) ? ct_c0[i] : ct_c1[i];
+                expert_output[ulong(assign) * p.n + col] = bfloat(val * score);
+              }
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
   const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
 
   for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
@@ -1322,6 +1524,303 @@ kernel void omlx_m5_moe_mxfp4_nax_swiglu_bm64_bn64_sk1(
       norm, tile_assign, tile_expert, tile_valid_rows, total_tiles,
       g_codes, g_scales, u_codes, u_scales, mid_bf16, p, Ws, tg_tok,
       tid, lane, sg, tg);
+}
+
+// Lossless Base 1.2: (BM=64, BN_out=64, BK=64) Cooperative As-Staged MoE MXFP4 SwiGLU
+// 8 SGs = 256 threads (WM=2, WN=4), SRAM = 9 KiB As + 18 KiB Ws + 256 B tg_tok = 27.25 KiB <= 32 KiB
+[[max_total_threads_per_threadgroup(256)]]
+kernel void omlx_m5_moe_mxfp4_nax_swiglu_bm64_out64_sk1(
+    device const bfloat *norm [[buffer(0)]],
+    device const uint *tile_assign [[buffer(1)]],
+    device const uint *tile_expert [[buffer(2)]],
+    device const uint *tile_valid_rows [[buffer(3)]],
+    device const uint *total_tiles [[buffer(4)]],
+    device const uchar *g_codes [[buffer(5)]],
+    device const uchar *g_scales [[buffer(6)]],
+    device const uchar *u_codes [[buffer(7)]],
+    device const uchar *u_scales [[buffer(8)]],
+    device bfloat *mid_bf16 [[buffer(9)]],
+    constant MoeNaxGemmParams &p [[buffer(10)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  constexpr uint kBK = 64u;
+  constexpr uint kBKP = 72u;
+  constexpr uint kOutColsPerTg = 64u;
+
+  alignas(16) threadgroup bfloat As[64u * 72u];
+  alignas(16) threadgroup bfloat Ws[128u * 72u];
+  threadgroup uint tg_tok[64u];
+
+  const uint n_cols = (p.n + kOutColsPerTg - 1u) / kOutColsPerTg;
+  const bool use_gx32 = (p.max_tiles >> 31u) != 0u;
+  const uint m_tile = use_gx32 ? ((tg.y / n_cols) * 32u + tg.x) : tg.y;
+  const uint col_tile = use_gx32 ? (tg.y % n_cols) : tg.x;
+  const uint tg_n0 = col_tile * kOutColsPerTg;
+  if (m_tile >= total_tiles[1] || col_tile >= n_cols || tg_n0 >= p.n) {
+    return;
+  }
+  const uint valid_rows = tile_valid_rows[m_tile];
+  if (valid_rows == 0u) {
+    return;
+  }
+  const uint packed = tile_expert[m_tile];
+  const uint expert = packed & 0xFFFFu;
+  const uint rb = (packed >> 16u) * 8u;
+
+  if (tid < 64u) {
+    uint tok = 0xFFFFFFFFu;
+    if (tid < valid_rows) {
+      const uint assign = tile_assign[rb + tid];
+      if (assign != 0xFFFFFFFFu) {
+        tok = assign >> 3u;
+      }
+    }
+    tg_tok[tid] = tok;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg_m = sg >> 2u;
+  const uint sg_n = sg & 3u;
+  const bool compact32 = (valid_rows <= 32u);
+  const uint m_off = sg_m * (compact32 ? 16u : 32u);
+  const uint col_base = tg_n0 + sg_n * 16u;
+  const bool sg_active = (m_off < valid_rows) && (col_base < p.n);
+
+  const uint w_tile_row = tid >> 1u;
+  const uint w_col_sub = (tid & 1u) * 32u;
+  const bool is_up = ((w_tile_row >> 4u) & 1u) != 0u;
+  const uint out_col = tg_n0 + ((w_tile_row >> 5u) * 16u) + (w_tile_row & 15u);
+  const bool w_row_live = (out_col < p.n);
+  const ulong expert_row = ulong(expert) * p.n + out_col;
+  device const uchar *sel_codes = is_up ? u_codes : g_codes;
+  device const uchar *sel_scales = is_up ? u_scales : g_scales;
+  threadgroup vec<bfloat, 8> *w_dst8 =
+      reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  const uint a_col4 = (tid & 15u) * 4u;
+  const uint a_r0 = tid >> 4u;
+  uint a_tok[4];
+  #pragma clang loop unroll(full)
+  for (uint s = 0u; s < 4u; ++s) {
+    a_tok[s] = tg_tok[a_r0 + s * 16u];
+  }
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      bfloat4 xa[4];
+      #pragma clang loop unroll(full)
+      for (uint s = 0u; s < 4u; ++s) {
+        xa[s] = (a_tok[s] != 0xFFFFFFFFu)
+            ? *reinterpret_cast<device const bfloat4 *>(norm + ulong(a_tok[s]) * p.k + k0 + a_col4)
+            : bfloat4(bfloat(0.0f));
+      }
+      uint4 raw;
+      float sc;
+      moe_nax_fetch_mxfp4_32(
+          sel_codes, sel_scales, expert_row, p.padded_k, k0 + w_col_sub, w_row_live, raw, sc);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      #pragma clang loop unroll(full)
+      for (uint s = 0u; s < 4u; ++s) {
+        *reinterpret_cast<threadgroup bfloat4 *>(As + (a_r0 + s * 16u) * kBKP + a_col4) = xa[s];
+      }
+      moe_nax_unpack_mxfp4_32(raw, sc, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *as_sub = As + m_off * kBKP + kk;
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            ct_a[i] = as_sub[uint(ia[1]) * kBKP + uint(ia[0])];
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (!compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              ct_a[i] = as_sub[(16u + uint(ia[1])) * kBKP + uint(ia[0])];
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_active) {
+      threadgroup bfloat *sg_buf = Ws + sg * 512u;
+      const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+      const uint r_out_base = (lane >> 2u) * 2u;
+      const uint c_out4 = (lane & 3u) * 4u;
+      const uint col = col_base + c_out4;
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < 2u; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              sg_buf[uint(idx[1]) * 32u + uint(idx[0])] =
+                  bfloat((mm == 0u) ? ct_c0[i] : ct_c1[i]);
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (col < p.n) {
+            #pragma clang loop unroll(full)
+            for (uint dr = 0u; dr < 2u; ++dr) {
+              const uint r = r_out_base + dr;
+              const uint rm = m_off + mm * 16u + r;
+              if (rm < valid_rows) {
+                const bfloat4 g4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + c_out4);
+                const bfloat4 u4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + 16u + c_out4);
+                bfloat4 out_b;
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) {
+                  out_b[j] = bfloat(nax_silu_f32(float(g4[j])) * float(u4[j]));
+                }
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = out_b;
+              } else if (rm < rb_8ceil) {
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = bfloat4(bfloat(0.0f));
+              }
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+    }
+    return;
+  }
+
+  const uint qid = lane >> 2u;
+  const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
+  const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
+  vec<float, 8> D[2][2];
+  #pragma clang loop unroll(full)
+  for (uint mm = 0u; mm < 2u; ++mm) {
+    D[mm][0] = vec<float, 8>(0.0f);
+    D[mm][1] = vec<float, 8>(0.0f);
+  }
+  const threadgroup bfloat *as_sg = As + (m_off + fm) * kBKP + fn;
+  const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
+
+  for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+    bfloat4 xa[4];
+    #pragma clang loop unroll(full)
+    for (uint s = 0u; s < 4u; ++s) {
+      xa[s] = (a_tok[s] != 0xFFFFFFFFu)
+          ? *reinterpret_cast<device const bfloat4 *>(norm + ulong(a_tok[s]) * p.k + k0 + a_col4)
+          : bfloat4(bfloat(0.0f));
+    }
+    uint4 raw;
+    float sc;
+    moe_nax_fetch_mxfp4_32(
+        sel_codes, sel_scales, expert_row, p.padded_k, k0 + w_col_sub, w_row_live, raw, sc);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (uint s = 0u; s < 4u; ++s) {
+      *reinterpret_cast<threadgroup bfloat4 *>(As + (a_r0 + s * 16u) * kBKP + a_col4) = xa[s];
+    }
+    moe_nax_unpack_mxfp4_32(raw, sc, w_dst8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_active) {
+      #pragma clang loop unroll(full)
+      for (uint kk = 0u; kk < kBK; kk += 32u) {
+        volatile int cbar;
+        vec<bfloat, 8> b00, b01, b10, b11;
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 2u; ++r) {
+          const bfloat4 vb0 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + r * 8u * kBKP + kk + 0u);
+          const bfloat4 vb1 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + r * 8u * kBKP + kk + 16u);
+          const bfloat4 vb2 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + (16u + r * 8u) * kBKP + kk + 0u);
+          const bfloat4 vb3 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + (16u + r * 8u) * kBKP + kk + 16u);
+          #pragma clang loop unroll(full)
+          for (uint c = 0u; c < 4u; ++c) {
+            b00[r * 4u + c] = vb0[c]; b01[r * 4u + c] = vb1[c];
+            b10[r * 4u + c] = vb2[c]; b11[r * 4u + c] = vb3[c];
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint mm = 0u; mm < 2u; ++mm) {
+          if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+            vec<bfloat, 8> a0, a1;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 2u; ++r) {
+              const bfloat4 va0 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  as_sg + (mm * 16u + r * 8u) * kBKP + kk + 0u);
+              const bfloat4 va1 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  as_sg + (mm * 16u + r * 8u) * kBKP + kk + 16u);
+              #pragma clang loop unroll(full)
+              for (uint c = 0u; c < 4u; ++c) {
+                a0[r * 4u + c] = va0[c];
+                a1[r * 4u + c] = va1[c];
+              }
+            }
+            moe_nax_mma_16x32x16(D[mm][0], D[mm][1], a0, b00, b10);
+            moe_nax_mma_16x32x16(D[mm][0], D[mm][1], a1, b01, b11);
+          }
+        }
+        (void)cbar;
+      }
+    }
+  }
+
+  if (sg_active) {
+    const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+    if (col_base + fn < p.n) {
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < 2u; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (uint h = 0u; h < 2u; ++h) {
+            const uint rm = m_off + mm * 16u + fm + h * 8u;
+            if (rm < valid_rows) {
+              bfloat4 out_v;
+              #pragma clang loop unroll(full)
+              for (uint j = 0u; j < 4u; ++j) {
+                const uint e = h * 4u + j;
+                const float gv = float(bfloat(D[mm][0][e]));
+                const float uv = float(bfloat(D[mm][1][e]));
+                out_v[j] = bfloat(nax_silu_f32(gv) * uv);
+              }
+              *reinterpret_cast<device bfloat4 *>(
+                  mid_bf16 + ulong(rb + rm) * p.n + col_base + fn) = out_v;
+            } else if (rm < rb_8ceil) {
+              *reinterpret_cast<device bfloat4 *>(
+                  mid_bf16 + ulong(rb + rm) * p.n + col_base + fn) = bfloat4(bfloat(0.0f));
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2182,6 +2681,112 @@ inline void moe_affine_nax_swiglu_wide_sk1_impl(
   device const bfloat *sel_biases = is_up ? u_biases : g_biases;
   threadgroup vec<bfloat, 8> *w_dst8 =
       reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      const MoeAffineRaw32 raw = moe_nax_fetch_affine_32<Bits, GroupSize>(
+          sel_codes, sel_high, sel_scales, sel_biases, expert_row, p.padded_k,
+          k0 + w_col_sub, w_row_live);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      moe_nax_unpack_affine_32<Bits>(raw, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            const uint rm = m_off + uint(ia[1]);
+            const uint tok = (rm < valid_rows) ? tg_tok[rm] : 0xFFFFFFFFu;
+            ct_a[i] = (tok != 0xFFFFFFFFu)
+                ? norm[ulong(tok) * p.k + k0 + kk + uint(ia[0])]
+                : bfloat(0.0f);
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (kTM > 1u && !compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              const uint rm = m_off + 16u + uint(ia[1]);
+              const uint tok = (rm < valid_rows) ? tg_tok[rm] : 0xFFFFFFFFu;
+              ct_a[i] = (tok != 0xFFFFFFFFu)
+                  ? norm[ulong(tok) * p.k + k0 + kk + uint(ia[0])]
+                  : bfloat(0.0f);
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_active) {
+      threadgroup bfloat *sg_buf = Ws + sg * 512u;
+      const uint col_base = tg_n0 + sg_n * 16u;
+      const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+      const uint r_out_base = (lane >> 2u) * 2u;
+      const uint c_out4 = (lane & 3u) * 4u;
+      const uint col = col_base + c_out4;
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < kTM; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              sg_buf[uint(idx[1]) * 32u + uint(idx[0])] =
+                  bfloat((mm == 0u) ? ct_c0[i] : ct_c1[i]);
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (col < p.n) {
+            #pragma clang loop unroll(full)
+            for (uint dr = 0u; dr < 2u; ++dr) {
+              const uint r = r_out_base + dr;
+              const uint rm = m_off + mm * 16u + r;
+              if (rm < valid_rows) {
+                const bfloat4 g4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + c_out4);
+                const bfloat4 u4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + 16u + c_out4);
+                bfloat4 out_b;
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) {
+                  out_b[j] = bfloat(nax_silu_f32(float(g4[j])) * float(u4[j]));
+                }
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = out_b;
+              } else if (rm < rb_8ceil) {
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = bfloat4(bfloat(0.0f));
+              }
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+    }
+    return;
+  }
+
   const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
 
   for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
@@ -2347,6 +2952,88 @@ inline void moe_affine_nax_down_scatter_wide_sk1_impl(
   const ulong expert_row = ulong(expert) * p.n + out_col;
   threadgroup vec<bfloat, 8> *w_dst8 =
       reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      const MoeAffineRaw32 raw = moe_nax_fetch_affine_32<Bits, GroupSize>(
+          d_codes, d_high, d_scales, d_biases, expert_row, p.padded_k,
+          k0 + w_col_sub, w_row_live);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      moe_nax_unpack_affine_32<Bits>(raw, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            const uint rm = m_off + uint(ia[1]);
+            ct_a[i] = (rm < valid_rows)
+                ? mid_bf16[ulong(rb + rm) * p.k + k0 + kk + uint(ia[0])]
+                : bfloat(0.0f);
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (kTM > 1u && !compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              const uint rm = m_off + 16u + uint(ia[1]);
+              ct_a[i] = (rm < valid_rows)
+                  ? mid_bf16[ulong(rb + rm) * p.k + k0 + kk + uint(ia[0])]
+                  : bfloat(0.0f);
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    if (sg_active) {
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < kTM; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              const uint col = tg_n0 + sg_n * 32u + uint(idx[0]);
+              const uint rm = m_off + mm * 16u + uint(idx[1]);
+              if (rm < valid_rows && col < p.n) {
+                const uint assign = tile_assign[rb + rm];
+                const float score = float(route_scores[assign]);
+                const float val = (mm == 0u) ? ct_c0[i] : ct_c1[i];
+                expert_output[ulong(assign) * p.n + col] = bfloat(val * score);
+              }
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
   const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
 
   for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
@@ -2433,7 +3120,332 @@ inline void moe_affine_nax_down_scatter_wide_sk1_impl(
   }
 }
 
+template <uint Bits, uint GroupSize>
+inline void moe_affine_nax_swiglu_bm64_out64_impl(
+    device const bfloat *norm,
+    device const uint *tile_assign,
+    device const uint *tile_expert,
+    device const uint *tile_valid_rows,
+    device const uint *total_tiles,
+    device const uchar *g_codes,
+    device const uchar *g_high,
+    device const bfloat *g_scales,
+    device const bfloat *g_biases,
+    device const uchar *u_codes,
+    device const uchar *u_high,
+    device const bfloat *u_scales,
+    device const bfloat *u_biases,
+    device bfloat *mid_bf16,
+    constant MoeNaxGemmParams &p,
+    threadgroup bfloat *As,
+    threadgroup bfloat *Ws,
+    threadgroup uint *tg_tok,
+    uint tid,
+    uint lane,
+    uint sg,
+    uint3 tg) {
+  constexpr uint kBK = 64u;
+  constexpr uint kBKP = 72u;
+  constexpr uint kOutColsPerTg = 64u;
+
+  const uint n_cols = (p.n + kOutColsPerTg - 1u) / kOutColsPerTg;
+  const bool use_gx32 = (p.max_tiles >> 31u) != 0u;
+  const uint m_tile = use_gx32 ? ((tg.y / n_cols) * 32u + tg.x) : tg.y;
+  const uint col_tile = use_gx32 ? (tg.y % n_cols) : tg.x;
+  const uint tg_n0 = col_tile * kOutColsPerTg;
+  if (m_tile >= total_tiles[1] || col_tile >= n_cols || tg_n0 >= p.n) {
+    return;
+  }
+  const uint valid_rows = tile_valid_rows[m_tile];
+  if (valid_rows == 0u) {
+    return;
+  }
+  const uint packed = tile_expert[m_tile];
+  const uint expert = packed & 0xFFFFu;
+  const uint rb = (packed >> 16u) * 8u;
+
+  if (tid < 64u) {
+    uint tok = 0xFFFFFFFFu;
+    if (tid < valid_rows) {
+      const uint assign = tile_assign[rb + tid];
+      if (assign != 0xFFFFFFFFu) {
+        tok = assign >> 3u;
+      }
+    }
+    tg_tok[tid] = tok;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg_m = sg >> 2u;
+  const uint sg_n = sg & 3u;
+  const bool compact32 = (valid_rows <= 32u);
+  const uint m_off = sg_m * (compact32 ? 16u : 32u);
+  const uint col_base = tg_n0 + sg_n * 16u;
+  const bool sg_active = (m_off < valid_rows) && (col_base < p.n);
+
+  const uint w_tile_row = tid >> 1u;
+  const uint w_col_sub = (tid & 1u) * 32u;
+  const bool is_up = ((w_tile_row >> 4u) & 1u) != 0u;
+  const uint out_col = tg_n0 + ((w_tile_row >> 5u) * 16u) + (w_tile_row & 15u);
+  const bool w_row_live = (out_col < p.n);
+  const ulong expert_row = ulong(expert) * p.n + out_col;
+  device const uchar *sel_codes = is_up ? u_codes : g_codes;
+  device const uchar *sel_high = is_up ? u_high : g_high;
+  device const bfloat *sel_scales = is_up ? u_scales : g_scales;
+  device const bfloat *sel_biases = is_up ? u_biases : g_biases;
+  threadgroup vec<bfloat, 8> *w_dst8 =
+      reinterpret_cast<threadgroup vec<bfloat, 8> *>(Ws + w_tile_row * kBKP + w_col_sub);
+
+  const uint a_col4 = (tid & 15u) * 4u;
+  const uint a_r0 = tid >> 4u;
+  uint a_tok[4];
+  #pragma clang loop unroll(full)
+  for (uint s = 0u; s < 4u; ++s) {
+    a_tok[s] = tg_tok[a_r0 + s * 16u];
+  }
+
+  if (!moe_has_apple10_nax_layout()) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c0 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    auto ct_c1 = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0u; i < 16u; ++i) {
+      ct_c0[i] = 0.0f;
+      ct_c1[i] = 0.0f;
+    }
+    for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+      bfloat4 xa[4];
+      #pragma clang loop unroll(full)
+      for (uint s = 0u; s < 4u; ++s) {
+        xa[s] = (a_tok[s] != 0xFFFFFFFFu)
+            ? *reinterpret_cast<device const bfloat4 *>(norm + ulong(a_tok[s]) * p.k + k0 + a_col4)
+            : bfloat4(bfloat(0.0f));
+      }
+      const MoeAffineRaw32 raw = moe_nax_fetch_affine_32<Bits, GroupSize>(
+          sel_codes, sel_high, sel_scales, sel_biases, expert_row, p.padded_k,
+          k0 + w_col_sub, w_row_live);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      #pragma clang loop unroll(full)
+      for (uint s = 0u; s < 4u; ++s) {
+        *reinterpret_cast<threadgroup bfloat4 *>(As + (a_r0 + s * 16u) * kBKP + a_col4) = xa[s];
+      }
+      moe_nax_unpack_affine_32<Bits>(raw, w_dst8);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < kBK; kk += 16u) {
+          const threadgroup bfloat *as_sub = As + m_off * kBKP + kk;
+          const threadgroup bfloat *ws_sub = Ws + (sg_n * 32u) * kBKP + kk;
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            const auto ib = ct_b.get_multidimensional_index(i);
+            ct_b[i] = ws_sub[uint(ib[1]) * kBKP + uint(ib[0])];
+          }
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 8u; ++i) {
+            const auto ia = ct_a.get_multidimensional_index(i);
+            ct_a[i] = as_sub[uint(ia[1]) * kBKP + uint(ia[0])];
+          }
+          gemm_op.run(ct_a, ct_b, ct_c0);
+          if (!compact32 && m_off + 16u < valid_rows) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0u; i < 8u; ++i) {
+              const auto ia = ct_a.get_multidimensional_index(i);
+              ct_a[i] = as_sub[(16u + uint(ia[1])) * kBKP + uint(ia[0])];
+            }
+            gemm_op.run(ct_a, ct_b, ct_c1);
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_active) {
+      threadgroup bfloat *sg_buf = Ws + sg * 512u;
+      const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+      const uint r_out_base = (lane >> 2u) * 2u;
+      const uint c_out4 = (lane & 3u) * 4u;
+      const uint col = col_base + c_out4;
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < 2u; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (ushort i = 0u; i < 16u; ++i) {
+            if (ct_c0.is_valid_element(i)) {
+              const auto idx = ct_c0.get_multidimensional_index(i);
+              sg_buf[uint(idx[1]) * 32u + uint(idx[0])] =
+                  bfloat((mm == 0u) ? ct_c0[i] : ct_c1[i]);
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          if (col < p.n) {
+            #pragma clang loop unroll(full)
+            for (uint dr = 0u; dr < 2u; ++dr) {
+              const uint r = r_out_base + dr;
+              const uint rm = m_off + mm * 16u + r;
+              if (rm < valid_rows) {
+                const bfloat4 g4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + c_out4);
+                const bfloat4 u4 = *reinterpret_cast<const threadgroup bfloat4 *>(sg_buf + r * 32u + 16u + c_out4);
+                bfloat4 out_b;
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) {
+                  out_b[j] = bfloat(nax_silu_f32(float(g4[j])) * float(u4[j]));
+                }
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = out_b;
+              } else if (rm < rb_8ceil) {
+                *reinterpret_cast<device bfloat4 *>(mid_bf16 + ulong(rb + rm) * p.n + col) = bfloat4(bfloat(0.0f));
+              }
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+    }
+    return;
+  }
+
+  const uint qid = lane >> 2u;
+  const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
+  const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
+  vec<float, 8> D[2][2];
+  #pragma clang loop unroll(full)
+  for (uint mm = 0u; mm < 2u; ++mm) {
+    D[mm][0] = vec<float, 8>(0.0f);
+    D[mm][1] = vec<float, 8>(0.0f);
+  }
+  const threadgroup bfloat *as_sg = As + (m_off + fm) * kBKP + fn;
+  const threadgroup bfloat *ws_sg = Ws + (sg_n * 32u + fm) * kBKP + fn;
+
+  for (uint k0 = 0u; k0 < p.k; k0 += kBK) {
+    bfloat4 xa[4];
+    #pragma clang loop unroll(full)
+    for (uint s = 0u; s < 4u; ++s) {
+      xa[s] = (a_tok[s] != 0xFFFFFFFFu)
+          ? *reinterpret_cast<device const bfloat4 *>(norm + ulong(a_tok[s]) * p.k + k0 + a_col4)
+          : bfloat4(bfloat(0.0f));
+    }
+    const MoeAffineRaw32 raw = moe_nax_fetch_affine_32<Bits, GroupSize>(
+        sel_codes, sel_high, sel_scales, sel_biases, expert_row, p.padded_k,
+        k0 + w_col_sub, w_row_live);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (uint s = 0u; s < 4u; ++s) {
+      *reinterpret_cast<threadgroup bfloat4 *>(As + (a_r0 + s * 16u) * kBKP + a_col4) = xa[s];
+    }
+    moe_nax_unpack_affine_32<Bits>(raw, w_dst8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_active) {
+      #pragma clang loop unroll(full)
+      for (uint kk = 0u; kk < kBK; kk += 32u) {
+        volatile int cbar;
+        vec<bfloat, 8> b00, b01, b10, b11;
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 2u; ++r) {
+          const bfloat4 vb0 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + r * 8u * kBKP + kk + 0u);
+          const bfloat4 vb1 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + r * 8u * kBKP + kk + 16u);
+          const bfloat4 vb2 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + (16u + r * 8u) * kBKP + kk + 0u);
+          const bfloat4 vb3 = *reinterpret_cast<const threadgroup bfloat4 *>(ws_sg + (16u + r * 8u) * kBKP + kk + 16u);
+          #pragma clang loop unroll(full)
+          for (uint c = 0u; c < 4u; ++c) {
+            b00[r * 4u + c] = vb0[c]; b01[r * 4u + c] = vb1[c];
+            b10[r * 4u + c] = vb2[c]; b11[r * 4u + c] = vb3[c];
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint mm = 0u; mm < 2u; ++mm) {
+          if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+            vec<bfloat, 8> a0, a1;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 2u; ++r) {
+              const bfloat4 va0 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  as_sg + (mm * 16u + r * 8u) * kBKP + kk + 0u);
+              const bfloat4 va1 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  as_sg + (mm * 16u + r * 8u) * kBKP + kk + 16u);
+              #pragma clang loop unroll(full)
+              for (uint c = 0u; c < 4u; ++c) {
+                a0[r * 4u + c] = va0[c];
+                a1[r * 4u + c] = va1[c];
+              }
+            }
+            moe_nax_mma_16x32x16(D[mm][0], D[mm][1], a0, b00, b10);
+            moe_nax_mma_16x32x16(D[mm][0], D[mm][1], a1, b01, b11);
+          }
+        }
+        (void)cbar;
+      }
+    }
+  }
+
+  if (sg_active) {
+    const uint rb_8ceil = (valid_rows + 7u) & ~7u;
+    if (col_base + fn < p.n) {
+      #pragma clang loop unroll(full)
+      for (uint mm = 0u; mm < 2u; ++mm) {
+        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+          #pragma clang loop unroll(full)
+          for (uint h = 0u; h < 2u; ++h) {
+            const uint rm = m_off + mm * 16u + fm + h * 8u;
+            if (rm < valid_rows) {
+              bfloat4 out_v;
+              #pragma clang loop unroll(full)
+              for (uint j = 0u; j < 4u; ++j) {
+                const uint e = h * 4u + j;
+                const float gv = float(bfloat(D[mm][0][e]));
+                const float uv = float(bfloat(D[mm][1][e]));
+                out_v[j] = bfloat(nax_silu_f32(gv) * uv);
+              }
+              *reinterpret_cast<device bfloat4 *>(
+                  mid_bf16 + ulong(rb + rm) * p.n + col_base + fn) = out_v;
+            } else if (rm < rb_8ceil) {
+              *reinterpret_cast<device bfloat4 *>(
+                  mid_bf16 + ulong(rb + rm) * p.n + col_base + fn) = bfloat4(bfloat(0.0f));
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 #define OMLX_M5_MOE_AFFINE_NO_HIGH(BITS, GS)                                   \
+  [[max_total_threads_per_threadgroup(256)]]                                   \
+  kernel void omlx_m5_moe_affine_nax_swiglu_q##BITS##_g##GS##_bm64_out64_sk1(  \
+      device const bfloat *norm [[buffer(0)]],                                 \
+      device const uint *tile_assign [[buffer(1)]],                            \
+      device const uint *tile_expert [[buffer(2)]],                            \
+      device const uint *tile_valid_rows [[buffer(3)]],                        \
+      device const uint *total_tiles [[buffer(4)]],                            \
+      device const uchar *g_codes [[buffer(5)]],                               \
+      device const bfloat *g_scales [[buffer(6)]],                             \
+      device const bfloat *g_biases [[buffer(7)]],                             \
+      device const uchar *u_codes [[buffer(8)]],                               \
+      device const bfloat *u_scales [[buffer(9)]],                             \
+      device const bfloat *u_biases [[buffer(10)]],                            \
+      device bfloat *mid_bf16 [[buffer(11)]],                                  \
+      constant MoeNaxGemmParams &p [[buffer(12)]],                             \
+      uint tid [[thread_index_in_threadgroup]],                                \
+      uint lane [[thread_index_in_simdgroup]],                                 \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+    alignas(16) threadgroup bfloat As[64u * 72u];                              \
+    alignas(16) threadgroup bfloat Ws[128u * 72u];                             \
+    threadgroup uint tg_tok[64u];                                              \
+    moe_affine_nax_swiglu_bm64_out64_impl<BITS, GS>(                           \
+        norm, tile_assign, tile_expert, tile_valid_rows, total_tiles, g_codes, \
+        nullptr, g_scales, g_biases, u_codes, nullptr, u_scales, u_biases,     \
+        mid_bf16, p, As, Ws, tg_tok, tid, lane, sg, tg);                       \
+  }                                                                            \
   kernel void omlx_m5_moe_affine_nax_swiglu_q##BITS##_g##GS##_n16_sk4(         \
       device const bfloat *x_bf16 [[buffer(0)]],                               \
       device const float *xsum [[buffer(1)]],                                  \
@@ -2703,6 +3715,35 @@ inline void moe_affine_nax_down_scatter_wide_sk1_impl(
         norm, tile_assign, tile_expert, tile_valid_rows, total_tiles, g_codes, \
         g_high, g_scales, g_biases, u_codes, u_high, u_scales, u_biases,       \
         mid_bf16, p, Ws, tg_tok, tid, lane, sg, tg);                           \
+  }                                                                            \
+  [[max_total_threads_per_threadgroup(256)]]                                   \
+  kernel void omlx_m5_moe_affine_nax_swiglu_q##BITS##_g##GS##_bm64_out64_sk1(  \
+      device const bfloat *norm [[buffer(0)]],                                 \
+      device const uint *tile_assign [[buffer(1)]],                            \
+      device const uint *tile_expert [[buffer(2)]],                            \
+      device const uint *tile_valid_rows [[buffer(3)]],                        \
+      device const uint *total_tiles [[buffer(4)]],                            \
+      device const uchar *g_codes [[buffer(5)]],                               \
+      device const uchar *g_high [[buffer(6)]],                                \
+      device const bfloat *g_scales [[buffer(7)]],                             \
+      device const bfloat *g_biases [[buffer(8)]],                             \
+      device const uchar *u_codes [[buffer(9)]],                               \
+      device const uchar *u_high [[buffer(10)]],                               \
+      device const bfloat *u_scales [[buffer(11)]],                            \
+      device const bfloat *u_biases [[buffer(12)]],                            \
+      device bfloat *mid_bf16 [[buffer(13)]],                                  \
+      constant MoeNaxGemmParams &p [[buffer(14)]],                             \
+      uint tid [[thread_index_in_threadgroup]],                                \
+      uint lane [[thread_index_in_simdgroup]],                                 \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+    alignas(16) threadgroup bfloat As[64u * 72u];                              \
+    alignas(16) threadgroup bfloat Ws[128u * 72u];                             \
+    threadgroup uint tg_tok[64u];                                              \
+    moe_affine_nax_swiglu_bm64_out64_impl<BITS, GS>(                           \
+        norm, tile_assign, tile_expert, tile_valid_rows, total_tiles, g_codes, \
+        g_high, g_scales, g_biases, u_codes, u_high, u_scales, u_biases,       \
+        mid_bf16, p, As, Ws, tg_tok, tid, lane, sg, tg);                       \
   }                                                                            \
   [[max_total_threads_per_threadgroup(128)]]                                   \
   kernel void omlx_m5_moe_affine_nax_swiglu_q##BITS##_g##GS##_bm64_bn64_sk1(   \

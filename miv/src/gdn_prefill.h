@@ -51,6 +51,26 @@ inline constexpr U32 kGdnChunkNaxDefaultMinTokens = 64U;
   return kGdnChunkNaxDefaultMinTokens;
 }
 
+// Selects Lossless Base 1.1 Stage 2 slice width (`dv64` vs `dv32`):
+//   - `OMLX_M5_GDN_STAGE2_SLICE=64|32` overrides the heuristic.
+//   - Default heuristic: `(Hv * 2 >= gpu_cores) ? dv64 : dv32` (default gpu_cores=80).
+//     * 27B (Hv=48): 96 >= 80 -> dv64 (96 TGs <= 160 slots = 1 single wave on 80-core!)
+//     * 35B (Hv=32): 64 >= 64 -> dv64 on 64-core; 64 < 80 -> dv32 (128 TGs) on 80-core.
+[[nodiscard]] inline bool gdn_stage2_use_dv64(U32 value_heads,
+                                              U32 gpu_cores = 80U) noexcept {
+  if (const char *env = std::getenv("OMLX_M5_GDN_STAGE2_SLICE")) {
+    const std::string_view sv(env);
+    if (sv == "64") {
+      return true;
+    }
+    if (sv == "32") {
+      return false;
+    }
+  }
+  const U32 cores = gpu_cores == 0U ? 80U : gpu_cores;
+  return U64(value_heads) * 2ULL >= U64(cores);
+}
+
 struct GdnChunkWorkspaceLayout {
   U64 qk_bytes = 0;
   U64 ctrl_bytes = 0;
@@ -176,7 +196,8 @@ inline void emit_gdn_recurrent_verify(
     Ref history, Ref a, Ref b, Ref a_log, Ref dt_bias, Ref state0, Ref z,
     Ref norm_weight, Ref dst_out, bool out_f16, Ref gdn_chunk_ws,
     bool allow_chunk_nax, const std::vector<std::byte> &params_8w,
-    const std::vector<std::byte> &mega_params_9w, bool dynamic_tokens) {
+    const std::vector<std::byte> &mega_params_9w, bool dynamic_tokens,
+    U32 gpu_cores = 80U) {
   if (!allow_chunk_nax || gdn_chunk_ws.buffer == nullptr ||
       !gdn_chunk_nax_enabled() || capacity < gdn_chunk_nax_min_tokens() ||
       key_dim != 128U || value_dim != 128U || key_heads == 0U ||
@@ -202,9 +223,13 @@ inline void emit_gdn_recurrent_verify(
       {qkv, conv_weight, history, a, b, a_log, dt_bias, qk_ref, ctrl_ref});
   e.dynamic(prep, 9, mega_params_9w, tok_word);
 
+  const bool use_dv64 = gdn_stage2_use_dv64(value_heads, gpu_cores);
   auto &rec = e.emit(
-      "gdn_chunk_nax", "omlx_m5_gdn_chunk_recurrence_conv_dv32_c64",
-      {.width = U64(value_heads) * 128U, .height = 4U}, {.width = 128U},
+      "gdn_chunk_nax",
+      use_dv64 ? "omlx_m5_gdn_chunk_recurrence_conv_dv64_c64"
+               : "omlx_m5_gdn_chunk_recurrence_conv_dv32_c64",
+      {.width = U64(value_heads) * 128U, .height = use_dv64 ? 2U : 4U},
+      {.width = 128U},
       {qkv, conv_weight, history, qk_ref, ctrl_ref, state0, dst_out});
   e.dynamic(rec, 7, mega_params_9w, tok_word);
 

@@ -831,10 +831,21 @@ inline std::string affine_nax_group(const Encoder &e,
          std::to_string(tw.split_k) + ".v1";
 }
 
+inline bool affine_nax_swiglu_out64_enabled() noexcept {
+  if (const char *dis = std::getenv("OMLX_M5_DISABLE_SWIGLU_OUT64");
+      dis != nullptr && std::string_view(dis) == "1") {
+    return false;
+  }
+  return true;
+}
+
 inline void linear_affine_nax(Encoder &e, const TiledAffineWeight &tw, Ref x,
                               Ref xs, Ref y,
                               std::optional<U32> explicit_t = {},
-                              U32 gpu_cores = 64u) {
+                              U32 gpu_cores = 64u,
+                              U32 row_offset = 0u,
+                              U32 out_stride = 0u,
+                              U32 slice_n = 0u) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = affine_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
@@ -842,6 +853,45 @@ inline void linear_affine_nax(Encoder &e, const TiledAffineWeight &tw, Ref x,
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
   const std::string tag = affine_nax_mode_tag(tw.bits);
+  if (row_offset > 0u || (out_stride > 0u && out_stride != tw.n) ||
+      (slice_n > 0u && slice_n != tw.n)) {
+    if ((row_offset % 64u) != 0u || row_offset >= tw.n) {
+      throw std::invalid_argument(
+          "linear_affine_nax slice requires row_offset % 64 == 0 && row_offset < n");
+    }
+    const U32 eff_n = (slice_n > 0u) ? slice_n : (tw.n - row_offset);
+    if (row_offset + eff_n > tw.n) {
+      throw std::invalid_argument("linear_affine_nax slice exceeds weight n");
+    }
+    const U32 eff_stride = (out_stride > 0u) ? out_stride : tw.n;
+    const U32 eff_gs =
+        (tw.group_size == 128u && (tw.k % 128u) == 0u) ? 128u : 64u;
+    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 y_tiles = (t + 63u) / 64u;
+    const std::string fn = "omlx_m5_affine_nax_" + tag + "_g" +
+                           std::to_string(eff_gs) + "_bm64_bn64_bns" +
+                           std::to_string(tw.bn) + "_slice_sk1";
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 128u,
+                                 .height = y_tiles};
+    const MetalDispatchSize threads{.width = 128u};
+    e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+    if (!affine_nax_has_high_plane(tw.bits)) {
+      auto &d = e.emit("affine_nax", fn, grid, threads,
+                       {x, tw.codes, tw.sb, y});
+      e.dynamic(d, 4,
+                words({eff_n, tw.k, mp, t, tw.padded_n, 1u, row_offset,
+                       eff_stride}),
+                tokens_patch);
+    } else {
+      auto &d = e.emit("affine_nax", fn, grid, threads,
+                       {x, tw.codes, tw.high2, tw.sb, y});
+      e.dynamic(d, 5,
+                words({eff_n, tw.k, mp, t, tw.padded_n, 1u, row_offset,
+                       eff_stride}),
+                tokens_patch);
+    }
+    return;
+  }
   const auto wide = affine_nax_select_wide(tw, sel_t, sel_exp, gpu_cores);
   if (wide != NaxWidePrefillTile::none) {
     const bool is_64 = (wide == NaxWidePrefillTile::bm64_bn64);
@@ -962,15 +1012,71 @@ inline void linear_affine_nax(Encoder &e, const TiledAffineWeight &tw, Ref x,
 inline void linear_affine_nax_swiglu(Encoder &e, const TiledAffineWeight &gw,
                                      const TiledAffineWeight &uw, Ref x,
                                      Ref xs, Ref y, U32 gpu_cores = 64u,
-                                     std::optional<U32> explicit_t = {}) {
+                                     std::optional<U32> explicit_t = {},
+                                     U32 row_offset = 0u,
+                                     U32 out_stride = 0u,
+                                     U32 slice_n = 0u) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = affine_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
   const auto sel_exp = nax_effective_select_explicit_t(e, explicit_t);
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
-  const std::string tag = affine_nax_mode_tag(gw.bits);
+  const std::string tag_g = affine_nax_mode_tag(gw.bits);
+  const std::string tag_u = affine_nax_mode_tag(uw.bits);
+  const bool mixed_q4_q56 = (tag_g == "q4" && tag_u == "q56") ||
+                            (tag_g == "q56" && tag_u == "q4");
+  const bool is_slice = (row_offset > 0u) ||
+                        (out_stride > 0u && out_stride != gw.n) ||
+                        (slice_n > 0u && slice_n != gw.n);
   const auto wide = affine_nax_select_wide(gw, sel_t, sel_exp, gpu_cores);
+  if (is_slice || mixed_q4_q56 ||
+      (wide == NaxWidePrefillTile::bm64_bn64 && affine_nax_swiglu_out64_enabled())) {
+    if ((row_offset % 64u) != 0u || row_offset >= gw.n) {
+      throw std::invalid_argument(
+          "linear_affine_nax_swiglu out64 requires row_offset % 64 == 0 && row_offset < n");
+    }
+    const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+    if (row_offset + eff_n > gw.n) {
+      throw std::invalid_argument("linear_affine_nax_swiglu slice exceeds weight n");
+    }
+    const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 y_tiles = (t + 63u) / 64u;
+    const U32 eff_gs = (gw.group_size == 128u && uw.group_size == 128u &&
+                        (gw.k % 128u) == 0u)
+                           ? 128u
+                           : 64u;
+    const std::string mode_tag =
+        (tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u);
+    const std::string fn = "omlx_m5_affine_nax_" + mode_tag + "_g" +
+                           std::to_string(eff_gs) +
+                           "_swiglu_bm64_bn64_out64_sk1";
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 256u,
+                                 .height = y_tiles};
+    const MetalDispatchSize threads{.width = 256u};
+    e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+    if (!affine_nax_has_high_plane(gw.bits) &&
+        !affine_nax_has_high_plane(uw.bits)) {
+      auto &d = e.emit("affine_nax", fn, grid, threads,
+                       {x, gw.codes, gw.sb, uw.codes, uw.sb, y});
+      e.dynamic(d, 6,
+                words({eff_n, gw.k, mp, t, gw.padded_n, 1u, row_offset,
+                       eff_stride}),
+                tokens_patch);
+    } else {
+      const Ref g_hi = gw.high2.buffer != nullptr ? gw.high2 : gw.codes;
+      const Ref u_hi = uw.high2.buffer != nullptr ? uw.high2 : uw.codes;
+      auto &d = e.emit("affine_nax", fn, grid, threads,
+                       {x, gw.codes, g_hi, gw.sb, uw.codes, u_hi, uw.sb, y});
+      e.dynamic(d, 8,
+                words({eff_n, gw.k, mp, t, gw.padded_n, 1u, row_offset,
+                       eff_stride}),
+                tokens_patch);
+    }
+    return;
+  }
+  const std::string tag = tag_g;
   if (wide != NaxWidePrefillTile::none) {
     const bool is_64 = (wide == NaxWidePrefillTile::bm64_bn64);
     const U32 tile_m = is_64 ? 64u : 32u;
