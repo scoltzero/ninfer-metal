@@ -2321,7 +2321,8 @@ kernel void omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1(
     constant Mxfp4NaxSliceParams &p [[buffer(6)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   constexpr uint kBK = 64u;
   constexpr uint kBKP = 72u;
   constexpr uint SM = 32u;
@@ -2332,10 +2333,7 @@ kernel void omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1(
   alignas(16) threadgroup bfloat As[64u * 72u];
   alignas(16) threadgroup bfloat Ws[128u * 72u];
 
-  const uint mp_eff = p.mp & 0x7FFFFFFFu;
-  const uint num_pid_n = (p.n + OUT_N_TG - 1u) / OUT_N_TG;
-  const uint num_pid_m = (mp_eff + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = mxfp4_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = mxfp4_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * OUT_N_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
@@ -2561,7 +2559,8 @@ inline void mxfp4_nax_bf16_wide_sk1_linear_slice_impl(
     threadgroup bfloat *Ws,
     uint lane,
     uint sg,
-    uint3 tg) {
+    uint3 tg,
+    uint3 grid_tgs) {
   constexpr uint kBK = 64u;
   constexpr uint kBKP = 72u;
   constexpr uint SM = 32u;
@@ -2569,11 +2568,8 @@ inline void mxfp4_nax_bf16_wide_sk1_linear_slice_impl(
   constexpr uint BM_TG = 64u;
   constexpr uint BN_TG = 64u;
 
-  const uint mp_eff = p.mp & 0x7FFFFFFFu;
   const uint out_stride = (p.out_stride == 0u) ? (p.row_offset + p.n) : p.out_stride;
-  const uint num_pid_n = (p.n + BN_TG - 1u) / BN_TG;
-  const uint num_pid_m = (mp_eff + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = mxfp4_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = mxfp4_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * BN_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
@@ -2777,9 +2773,10 @@ kernel void omlx_m5_mxfp4_nax_bf16_bm64_bn64_bns16_slice_sk1(
     constant Mxfp4NaxSliceParams &p [[buffer(4)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   alignas(16) threadgroup bfloat Ws[64u * 72u];
-  mxfp4_nax_bf16_wide_sk1_linear_slice_impl<16u>(x, codes, scales, y, p, Ws, lane, sg, tg);
+  mxfp4_nax_bf16_wide_sk1_linear_slice_impl<16u>(x, codes, scales, y, p, Ws, lane, sg, tg, grid_tgs);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2791,9 +2788,10 @@ kernel void omlx_m5_mxfp4_nax_bf16_bm64_bn64_bns32_slice_sk1(
     constant Mxfp4NaxSliceParams &p [[buffer(4)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   alignas(16) threadgroup bfloat Ws[64u * 72u];
-  mxfp4_nax_bf16_wide_sk1_linear_slice_impl<32u>(x, codes, scales, y, p, Ws, lane, sg, tg);
+  mxfp4_nax_bf16_wide_sk1_linear_slice_impl<32u>(x, codes, scales, y, p, Ws, lane, sg, tg, grid_tgs);
 }
 
 // ============================================================================

@@ -1620,6 +1620,145 @@ Json test_dense_w4a8_accuracy_and_slicing(const MetalContext &ctx,
     }
   }
 
+  // 4d. Regression: explicit_t = 128 < mp_override = 2048 with N = 512
+  //     (8 N-tiles x 2 M-tiles; exercises GROUP_M=8 swizzle bijection via grid_tgs)
+  {
+    constexpr U32 kExplicitT = 128u;
+    constexpr U32 kMpBig = 2048u;
+    constexpr U32 kKReg = 512u;
+    constexpr U32 kNReg = 512u;
+    const U64 elems = U64(kExplicitT) * kNReg;
+
+    std::vector<std::uint16_t> x_u16;
+    const auto x_f32 = make_activations(kExplicitT, kKReg, 991u, x_u16);
+    auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+    Ref x_ref{&x_buf, 0, x_buf.size()};
+
+    const auto lay_big = w4a8_nax_workspace_layout(kMpBig, kKReg);
+    auto qa_big = ctx.make_buffer(lay_big.qa_bytes);
+    auto sa_big = ctx.make_buffer(lay_big.sa_bytes);
+    auto ra_big = ctx.make_buffer(lay_big.ra_bytes);
+    Ref qab_ref{&qa_big, 0, qa_big.size()};
+    Ref sab_ref{&sa_big, 0, sa_big.size()};
+    Ref rab_ref{&ra_big, 0, ra_big.size()};
+
+    const auto lay_fit = w4a8_nax_workspace_layout(kExplicitT, kKReg);
+    auto qa_fit = ctx.make_buffer(lay_fit.qa_bytes);
+    auto sa_fit = ctx.make_buffer(lay_fit.sa_bytes);
+    auto ra_fit = ctx.make_buffer(lay_fit.ra_bytes);
+    Ref qaf_ref{&qa_fit, 0, qa_fit.size()};
+    Ref saf_ref{&sa_fit, 0, sa_fit.size()};
+    Ref raf_ref{&ra_fit, 0, ra_fit.size()};
+
+    auto y_big = ctx.make_buffer(elems * 2ULL);
+    auto y_fit = ctx.make_buffer(elems * 2ULL);
+    Ref yb_ref{&y_big, 0, y_big.size()};
+    Ref yf_ref{&y_fit, 0, y_fit.size()};
+
+    {
+      Encoder eq(ctx, libs, kMpBig, "w4a8.mp_ovr.q_big");
+      eq.begin_stage("q");
+      emit_quantize_a8_g64(eq, x_ref, qab_ref, sab_ref, rab_ref, kKReg,
+                           kExplicitT, kMpBig);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, kExplicitT);
+    }
+    {
+      Encoder eq(ctx, libs, kExplicitT, "w4a8.mp_ovr.q_fit");
+      eq.begin_stage("q");
+      emit_quantize_a8_g64(eq, x_ref, qaf_ref, saf_ref, raf_ref, kKReg,
+                           kExplicitT, kExplicitT);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, kExplicitT);
+    }
+
+    auto wg_a = make_affine_weight(ctx, 4201u, kNReg, kKReg, 4u, 64u, 21u, true, 16u);
+    auto wu_a = make_affine_weight(ctx, 4202u, kNReg, kKReg, 4u, 64u, 22u, true, 16u);
+    AffineNaxCache ac;
+    ac.register_weight(wg_a.view, zero_ref);
+    ac.register_weight(wu_a.view, zero_ref);
+    ac.build(ctx, libs, zero_ref);
+    const auto *tw_ag = ac.find(4201u);
+    const auto *tw_au = ac.find(4202u);
+
+    auto mg_m = make_mxfp4_weight(ctx, 4203u, kNReg, kKReg, 23u, true, 16u);
+    auto mu_m = make_mxfp4_weight(ctx, 4204u, kNReg, kKReg, 24u, true, 16u);
+    Mxfp4NaxCache mc;
+    mc.register_weight(mg_m.view);
+    mc.register_weight(mu_m.view);
+    mc.build(ctx, libs);
+    const auto *tw_mg = mc.find(4203u);
+    const auto *tw_mu = mc.find(4204u);
+
+    auto fill_alt_sentinel = [](MetalBuffer &buf, U64 count, std::uint16_t pat) {
+      std::vector<std::uint16_t> s(count, pat);
+      buf.write(std::as_bytes(std::span(s)));
+    };
+
+    auto verify_mp_override = [&](const char *lbl,
+                                  std::span<const float> ref_f32,
+                                  auto emit_fn) {
+      // Pre-fill with distinct sentinels so 0-ULP equality guarantees 100% of
+      // [0, explicit_t * N) elements were actively written in both dispatches.
+      fill_alt_sentinel(y_big, elems, 0xA5A5u);
+      fill_alt_sentinel(y_fit, elems, 0x5A5Au);
+      {
+        Encoder e(ctx, libs, kMpBig, std::string("w4a8.mp_ovr.big.") + lbl);
+        e.begin_stage("run");
+        emit_fn(e, qab_ref, sab_ref, rab_ref, yb_ref, kMpBig);
+        auto p = e.finish(true);
+        submit_profile(ctx, p, kExplicitT, true);
+      }
+      {
+        Encoder e(ctx, libs, kExplicitT, std::string("w4a8.mp_ovr.fit.") + lbl);
+        e.begin_stage("run");
+        emit_fn(e, qaf_ref, saf_ref, raf_ref, yf_ref, kExplicitT);
+        auto p = e.finish();
+        submit_profile(ctx, p, kExplicitT, false);
+      }
+      const auto got_big = read_u16(y_big, elems);
+      const auto got_fit = read_u16(y_fit, elems);
+      require(got_big == got_fit,
+              std::string("mp_override=2048 vs 128 mismatch (swizzle bijection) for ") +
+                  lbl);
+      const double cs = cosine_similarity_bf16(got_big, ref_f32, lbl);
+      min_cos_seen = std::min(min_cos_seen, cs);
+      require(cs >= kMinCos,
+              std::string("mp_override=2048 cos_sim < 0.9995 for ") + lbl);
+      ++checks;
+    };
+
+    const auto ref_a_lin = cpu_linear_ref(x_f32, wg_a.ref_w, kExplicitT, kNReg, kKReg);
+    const auto ref_a_swi = cpu_swiglu_ref(x_f32, wg_a.ref_w, wu_a.ref_w, kExplicitT, kNReg, kKReg);
+    const auto ref_m_lin = cpu_linear_ref(x_f32, mg_m.ref_w, kExplicitT, kNReg, kKReg);
+    const auto ref_m_swi = cpu_swiglu_ref(x_f32, mg_m.ref_w, mu_m.ref_w, kExplicitT, kNReg, kKReg);
+
+    verify_mp_override(
+        "aff_q4_lin_mp2048", ref_a_lin,
+        [&](Encoder &e, Ref qa, Ref sa, Ref ra, Ref y, U32 mp_ovr) {
+          linear_affine_w4a8_nax(e, *tw_ag, qa, sa, ra, y, kExplicitT, 0u, 0u,
+                                 0u, mp_ovr);
+        });
+    verify_mp_override(
+        "aff_q4_swi_mp2048", ref_a_swi,
+        [&](Encoder &e, Ref qa, Ref sa, Ref ra, Ref y, U32 mp_ovr) {
+          linear_affine_w4a8_nax_swiglu(e, *tw_ag, *tw_au, qa, sa, ra, y,
+                                        kExplicitT, 0u, 0u, 0u, mp_ovr);
+        });
+    verify_mp_override(
+        "mx_lin_mp2048", ref_m_lin,
+        [&](Encoder &e, Ref qa, Ref sa, Ref /*ra*/, Ref y, U32 mp_ovr) {
+          linear_mxfp4_w4a8_nax(e, *tw_mg, qa, sa, y, kExplicitT, 0u, 0u, 0u,
+                                mp_ovr);
+        });
+    verify_mp_override(
+        "mx_swi_mp2048", ref_m_swi,
+        [&](Encoder &e, Ref qa, Ref sa, Ref /*ra*/, Ref y, U32 mp_ovr) {
+          linear_mxfp4_w4a8_nax_swiglu(e, *tw_mg, *tw_mu, qa, sa, y, kExplicitT,
+                                       0u, 0u, 0u, mp_ovr);
+        });
+  }
+
   return {{"checks", checks}, {"min_cos_sim", min_cos_seen}, {"passed", true}};
 }
 

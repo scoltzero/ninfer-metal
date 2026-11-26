@@ -316,16 +316,15 @@ inline void affine_w4a8_nax_linear_impl(
     threadgroup float *Bw_s,
     uint lane,
     uint sg,
-    uint3 tg) {
+    uint3 tg,
+    uint3 grid_tgs) {
   constexpr uint BM_TG = 64u;
   constexpr uint BN_TG = 64u;
   constexpr uint SM = 32u;
   constexpr uint SN = 32u;
 
   const uint out_stride = (p.out_stride == 0u) ? (p.row_offset + p.n) : p.out_stride;
-  const uint num_pid_n = (p.n + BN_TG - 1u) / BN_TG;
-  const uint num_pid_m = (p.mp + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * BN_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
@@ -565,7 +564,8 @@ inline void affine_w4a8_nax_swiglu_out64_impl(
     threadgroup float *Bw_s,
     uint lane,
     uint sg,
-    uint3 tg) {
+    uint3 tg,
+    uint3 grid_tgs) {
   constexpr uint BM_TG = 64u;
   constexpr uint OUT_N_TG = 64u;
   constexpr uint WS_ROWS = 128u;
@@ -573,9 +573,7 @@ inline void affine_w4a8_nax_swiglu_out64_impl(
   constexpr uint OUT_SN = 16u;
 
   const uint out_stride = (p.out_stride == 0u) ? (p.row_offset + p.n) : p.out_stride;
-  const uint num_pid_n = (p.n + OUT_N_TG - 1u) / OUT_N_TG;
-  const uint num_pid_m = (p.mp + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * OUT_N_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
@@ -837,16 +835,15 @@ inline void mxfp4_w4a8_nax_linear_impl(
     threadgroup float *Sw1_s,
     uint lane,
     uint sg,
-    uint3 tg) {
+    uint3 tg,
+    uint3 grid_tgs) {
   constexpr uint BM_TG = 64u;
   constexpr uint BN_TG = 64u;
   constexpr uint SM = 32u;
   constexpr uint SN = 32u;
 
   const uint out_stride = (p.out_stride == 0u) ? (p.row_offset + p.n) : p.out_stride;
-  const uint num_pid_n = (p.n + BN_TG - 1u) / BN_TG;
-  const uint num_pid_m = (p.mp + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * BN_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
@@ -1412,7 +1409,8 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
       constant W4A8LinearParams &p [[buffer(6)]],                              \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
-      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+      uint3 tg [[threadgroup_position_in_grid]],                               \
+      uint3 grid_tgs [[threadgroups_per_grid]]) {                              \
     alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];                 \
     alignas(16) threadgroup int8_t Ws_i8[64u * kW4A8StrideI8];                 \
     threadgroup float Sa_s[64u];                                               \
@@ -1422,7 +1420,7 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
     threadgroup float Bw_s[64u];                                               \
     affine_w4a8_nax_linear_impl<MODE, GS, BNS>(                                \
         qa, sa, ra, codes, nullptr, sb, y, p,                                  \
-        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg);           \
+        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg, grid_tgs); \
   }
 
 #define OMLX_M5_W4A8_AFFINE_WITH_HIGH_LINEAR(NAME, MODE, GS, BNS)              \
@@ -1438,7 +1436,8 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
       constant W4A8LinearParams &p [[buffer(7)]],                              \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
-      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+      uint3 tg [[threadgroup_position_in_grid]],                               \
+      uint3 grid_tgs [[threadgroups_per_grid]]) {                              \
     alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];                 \
     alignas(16) threadgroup int8_t Ws_i8[64u * kW4A8StrideI8];                 \
     threadgroup float Sa_s[64u];                                               \
@@ -1448,7 +1447,7 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
     threadgroup float Bw_s[64u];                                               \
     affine_w4a8_nax_linear_impl<MODE, GS, BNS>(                                \
         qa, sa, ra, codes, high_p, sb, y, p,                                   \
-        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg);           \
+        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg, grid_tgs); \
   }
 
 #define OMLX_M5_W4A8_AFFINE_NO_HIGH_SWIGLU(NAME, MODE, GS)                     \
@@ -1465,7 +1464,8 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
       constant W4A8LinearParams &p [[buffer(8)]],                              \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
-      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+      uint3 tg [[threadgroup_position_in_grid]],                               \
+      uint3 grid_tgs [[threadgroups_per_grid]]) {                              \
     alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];                 \
     alignas(16) threadgroup int8_t Ws_i8[128u * kW4A8StrideI8];                \
     threadgroup float Sa_s[64u];                                               \
@@ -1475,7 +1475,7 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
     threadgroup float Bw_s[128u];                                              \
     affine_w4a8_nax_swiglu_out64_impl<MODE, MODE, GS>(                         \
         qa, sa, ra, g_codes, nullptr, g_sb, u_codes, nullptr, u_sb, y, p,      \
-        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg);           \
+        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg, grid_tgs); \
   }
 
 #define OMLX_M5_W4A8_AFFINE_WITH_HIGH_SWIGLU(NAME, MODEG, MODEU, GS)           \
@@ -1494,7 +1494,8 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
       constant W4A8LinearParams &p [[buffer(10)]],                             \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
-      uint3 tg [[threadgroup_position_in_grid]]) {                             \
+      uint3 tg [[threadgroup_position_in_grid]],                               \
+      uint3 grid_tgs [[threadgroups_per_grid]]) {                              \
     alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];                 \
     alignas(16) threadgroup int8_t Ws_i8[128u * kW4A8StrideI8];                \
     threadgroup float Sa_s[64u];                                               \
@@ -1504,7 +1505,7 @@ kernel void omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64(
     threadgroup float Bw_s[128u];                                              \
     affine_w4a8_nax_swiglu_out64_impl<MODEG, MODEU, GS>(                       \
         qa, sa, ra, g_codes, g_high, g_sb, u_codes, u_high, u_sb, y, p,        \
-        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg);           \
+        As_i8, Ws_i8, Sa_s, Ra_s, R128_s, Sw_s, Bw_s, lane, sg, tg, grid_tgs); \
   }
 
 #define OMLX_M5_W4A8_AFFINE_INSTANTIATE_GS(GS)                                 \
@@ -1536,14 +1537,15 @@ kernel void omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1(
     constant W4A8LinearParams &p [[buffer(5)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];
   alignas(16) threadgroup int8_t Ws_i8[64u * kW4A8StrideI8];
   threadgroup float Sa_s[64u];
   threadgroup float Sw0_s[64u];
   threadgroup float Sw1_s[64u];
   mxfp4_w4a8_nax_linear_impl<16u>(
-      qa, sa, codes, scales, y, p, As_i8, Ws_i8, Sa_s, Sw0_s, Sw1_s, lane, sg, tg);
+      qa, sa, codes, scales, y, p, As_i8, Ws_i8, Sa_s, Sw0_s, Sw1_s, lane, sg, tg, grid_tgs);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -1556,14 +1558,15 @@ kernel void omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns32_sk1(
     constant W4A8LinearParams &p [[buffer(5)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   alignas(16) threadgroup int8_t As_i8[64u * kW4A8StrideI8];
   alignas(16) threadgroup int8_t Ws_i8[64u * kW4A8StrideI8];
   threadgroup float Sa_s[64u];
   threadgroup float Sw0_s[64u];
   threadgroup float Sw1_s[64u];
   mxfp4_w4a8_nax_linear_impl<32u>(
-      qa, sa, codes, scales, y, p, As_i8, Ws_i8, Sa_s, Sw0_s, Sw1_s, lane, sg, tg);
+      qa, sa, codes, scales, y, p, As_i8, Ws_i8, Sa_s, Sw0_s, Sw1_s, lane, sg, tg, grid_tgs);
 }
 
 // Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU (BM=64, BN_out=64, BK=64, k_sub=32, 8 SGs = 256 threads, 16.25 KiB SRAM)
@@ -1579,7 +1582,8 @@ kernel void omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1(
     constant W4A8LinearParams &p [[buffer(7)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 grid_tgs [[threadgroups_per_grid]]) {
   constexpr uint BM_TG = 64u;
   constexpr uint OUT_N_TG = 64u;
   constexpr uint WS_ROWS = 128u;
@@ -1593,9 +1597,7 @@ kernel void omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1(
   threadgroup float Sw1_s[WS_ROWS];
 
   const uint out_stride = (p.out_stride == 0u) ? (p.row_offset + p.n) : p.out_stride;
-  const uint num_pid_n = (p.n + OUT_N_TG - 1u) / OUT_N_TG;
-  const uint num_pid_m = (p.mp + BM_TG - 1u) / BM_TG;
-  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, num_pid_n, num_pid_m);
+  const uint2 pid_nm = w4a8_swizzle_tg_group_m8(tg.xy, grid_tgs.x, grid_tgs.y);
   const uint rb_tg = pid_nm.y * BM_TG;
   const uint n0_tg = pid_nm.x * OUT_N_TG;
   if (rb_tg >= p.rows || n0_tg >= p.n) {
