@@ -809,6 +809,24 @@ if(OMLX_M5_BUILD_NAX_METALLIB)
         EXTRA_FLAGS -std=metal4.0
         EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_sage2.metal")
+      omlx_m5_compile_metallib(
+        omlx_m5_attention_sage2_metallib
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_sage2.metal"
+        "omlx_m5_attention_sage2.metallib"
+        "27.0"
+        FAST_MATH
+        EXTRA_FLAGS -std=metal4.1)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_minference.metal")
+      omlx_m5_compile_metallib(
+        omlx_m5_attention_minference_metallib
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_minference.metal"
+        "omlx_m5_attention_minference.metallib"
+        "27.0"
+        FAST_MATH
+        EXTRA_FLAGS -std=metal4.1)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdn_chunk_nax.metal")
       omlx_m5_compile_metallib(
         omlx_m5_gdn_chunk_nax_metallib
@@ -2083,6 +2101,12 @@ endif()
 if(TARGET omlx_m5_attention_nax_prefill_metallib)
   add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_attention_nax_prefill_metallib)
 endif()
+if(TARGET omlx_m5_attention_sage2_metallib)
+  add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_attention_sage2_metallib)
+endif()
+if(TARGET omlx_m5_attention_minference_metallib)
+  add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_attention_minference_metallib)
+endif()
 if(TARGET omlx_m5_gdn_chunk_nax_metallib)
   add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_gdn_chunk_nax_metallib)
 endif()
@@ -2278,6 +2302,36 @@ target_link_libraries(omlx_m5_lora_dual_mode_tests PRIVATE omlx_m5_runtime)
 add_dependencies(omlx_m5_lora_dual_mode_tests omlx_m5_qwen_forward_resources)
 add_test(NAME omlx_m5_lora_dual_mode COMMAND $<TARGET_FILE:omlx_m5_lora_dual_mode_tests>
   "${OMLX_M5_METAL_OUTPUT_DIR}")
+
+if(TARGET omlx_m5_attention_nax_prefill_metallib AND TARGET omlx_m5_attention_affine4_metallib)
+  add_executable(omlx_m5_m2_gqa_flash_tests tests/m2_gqa_flash_tests.cpp)
+  target_include_directories(omlx_m5_m2_gqa_flash_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+  target_compile_options(omlx_m5_m2_gqa_flash_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_link_libraries(omlx_m5_m2_gqa_flash_tests PRIVATE omlx_m5_core_runtime)
+  add_dependencies(omlx_m5_m2_gqa_flash_tests
+    omlx_m5_attention_nax_prefill_metallib
+    omlx_m5_attention_affine4_metallib)
+  add_test(NAME omlx_m5_m2_gqa_flash COMMAND $<TARGET_FILE:omlx_m5_m2_gqa_flash_tests>
+    "${OMLX_M5_METAL_OUTPUT_DIR}")
+endif()
+
+if(TARGET omlx_m5_attention_sage2_metallib AND TARGET omlx_m5_attention_minference_metallib)
+  add_executable(omlx_m5_m2_sage2_minference_tests tests/m2_sage2_minference_tests.cpp)
+  target_include_directories(omlx_m5_m2_sage2_minference_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+  target_compile_options(omlx_m5_m2_sage2_minference_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_link_libraries(omlx_m5_m2_sage2_minference_tests PRIVATE omlx_m5_core_runtime)
+  add_dependencies(omlx_m5_m2_sage2_minference_tests
+    omlx_m5_attention_nax_prefill_metallib
+    omlx_m5_attention_affine4_metallib
+    omlx_m5_attention_sage2_metallib
+    omlx_m5_attention_minference_metallib)
+  add_test(NAME omlx_m5_m2_sage2_minference COMMAND $<TARGET_FILE:omlx_m5_m2_sage2_minference_tests>
+    "${OMLX_M5_METAL_OUTPUT_DIR}")
+endif()
 
 if(OMLX_M5_BUILD_MLX_FIXTURES)
   add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fixtures/qwen-execution/fixture.stamp"
