@@ -2914,3 +2914,51 @@ add_test(
   COMMAND
     $<TARGET_FILE:omlx_m5_ane_dual_offload_tests>
     "${OMLX_M5_METAL_OUTPUT_DIR}")
+# Module 3: Hybrid 48-GDN + 16-Full-Attn Cross-Chunk Reuse (`GDN-CacheBlend`).
+target_sources(
+  omlx_m5_core_runtime
+  PRIVATE
+  src/chunk_blend_cache.cpp)
+
+if(OMLX_M5_BUILD_NAX_METALLIB AND
+   OMLX_M5_MACOS_SDK_VERSION VERSION_GREATER_EQUAL 27.0)
+  omlx_m5_compile_metallib(
+    omlx_m5_cache_blend_metallib
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cache_blend.metal"
+    "omlx_m5_cache_blend.metallib"
+    "27.0"
+    EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+  add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_cache_blend_metallib)
+
+  add_executable(
+    omlx_m5_cache_blend_hybrid_tests
+    tests/cache_blend_hybrid_tests.cpp)
+  target_include_directories(
+    omlx_m5_cache_blend_hybrid_tests
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+  target_compile_options(
+    omlx_m5_cache_blend_hybrid_tests
+    PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror)
+  target_link_libraries(
+    omlx_m5_cache_blend_hybrid_tests
+    PRIVATE
+    omlx_m5_core_runtime)
+  add_dependencies(
+    omlx_m5_cache_blend_hybrid_tests
+    omlx_m5_cache_blend_metallib
+    omlx_m5_gdn_chunk_nax_metallib
+    omlx_m5_gdn_layer_metallib
+    omlx_m5_attention_affine4_metallib
+    omlx_m5_attention_postprocess_metallib)
+  add_test(
+    NAME omlx_m5_cache_blend_hybrid
+    COMMAND
+      $<TARGET_FILE:omlx_m5_cache_blend_hybrid_tests>
+      "${OMLX_M5_METAL_OUTPUT_DIR}")
+endif()
