@@ -74,11 +74,7 @@ resolve_mtp_depth_policy(const LoadOptions &options, std::uint32_t hidden_size,
     explicit_k = true;
   } else if (options.speculative.backend == SpeculativeBackend::mtp &&
              options.speculative.draft_tokens > 0U) {
-    if (options.speculative.draft_tokens > max_supported) {
-      throw std::invalid_argument("mtp_draft_tokens must be in [1, 4]");
-    }
-    k = options.speculative.draft_tokens;
-    explicit_k = true;
+    k = std::min(options.speculative.draft_tokens, max_supported);
   }
 
   auto is_off_flag = [](std::string_view s) noexcept {

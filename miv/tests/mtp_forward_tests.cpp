@@ -7,6 +7,7 @@
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/mtp_forward.h"
 #include "omlx_m5/qwen_forward.h"
+#include "../src/spec_controller.h"
 
 #include <algorithm>
 #include <array>
@@ -94,6 +95,7 @@ struct RunOutcome {
   std::vector<std::int32_t> tokens;
   std::string finish_reason;
   EventKind terminal_kind = EventKind::finished;
+  std::optional<RequestStats> request_stats;
 };
 
 RunOutcome collect_request(Engine &engine, U64 request_id) {
@@ -109,6 +111,7 @@ RunOutcome collect_request(Engine &engine, U64 request_id) {
       } else {
         out.terminal_kind = ev.kind;
         out.finish_reason = ev.finish_reason;
+        out.request_stats = std::move(ev.request_stats);
         if (ev.kind == EventKind::failed) {
           throw std::runtime_error("Engine request failed: " + ev.error);
         }
@@ -774,9 +777,35 @@ Json test_depth_controller() {
   require(losing.should_exit(),
           "adaptive controller failed to trigger should_exit on sustained 0% acceptance");
 
+  // UDS/Serve `speculative.draft_tokens` must act as adaptive ceiling (not
+  // fixed_depth lock) on real models (hidden_size >= 512), and clamp > 4 to 4.
+  {
+    LoadOptions sidecar_opts;
+    sidecar_opts.spec_search = "auto";
+    sidecar_opts.speculative.backend = SpeculativeBackend::mtp;
+    sidecar_opts.speculative.draft_tokens = 3U;
+    const auto pol3 =
+        detail::resolve_mtp_depth_policy(sidecar_opts, 5120U, 4U, 4U);
+    require(pol3.max_draft_tokens == 3U && !pol3.fixed_depth,
+            "sidecar draft_tokens=3 unexpectedly locked fixed_depth=true");
+    sidecar_opts.path_overrides["mtp_fixed_depth"] = "on";
+    const auto fixed3 =
+        detail::resolve_mtp_depth_policy(sidecar_opts, 5120U, 4U, 4U);
+    require(fixed3.max_draft_tokens == 3U && fixed3.fixed_depth,
+            "sidecar explicitly fixed MTP depth was ignored");
+    sidecar_opts.path_overrides.erase("mtp_fixed_depth");
+
+    sidecar_opts.speculative.draft_tokens = 7U;
+    const auto pol7 =
+        detail::resolve_mtp_depth_policy(sidecar_opts, 5120U, 4U, 4U);
+    require(pol7.max_draft_tokens == 4U && !pol7.fixed_depth,
+            "sidecar draft_tokens=7 failed to clamp to 4 with adaptive depth");
+  }
+
   return {{"warmup_verified", true},
           {"high_accept_k4_verified", true},
-          {"sustained_loss_exit_verified", true}};
+          {"sustained_loss_exit_verified", true},
+          {"sidecar_adaptive_policy_verified", true}};
 }
 
 Json test_end_to_end_engine_parity(const std::filesystem::path &qwen_fixtures,
@@ -1029,6 +1058,66 @@ Json test_end_to_end_engine_parity(const std::filesystem::path &qwen_fixtures,
             "LegacyRejectionV1 stochastic MTP output length != 20");
   }
 
+  // Rolling Prefix Cache multi-turn MTP KV frontier retention: Turn 2 must hit
+  // Rolling Prefix Cache AND keep executing speculative MTP verify rounds with
+  // 0-ULP greedy parity against pure AR!
+  {
+    LoadOptions roll_ar_opts;
+    roll_ar_opts.model_dir = (qwen_fixtures / "affine/source").string();
+    roll_ar_opts.max_context = 2048;
+    roll_ar_opts.sampling_contract = "position_coupled_v1";
+    roll_ar_opts.spec_search = "off";
+    roll_ar_opts.path_overrides = {
+        {"artifact", (work_dir / "qwen_affine_bundled_mtp.omlxm5").string()},
+        {"qwen_ar_metallib", qwen_metallib},
+        {"enable_mtp", "0"},
+        {"prefix_cache_bytes", "67108864"},
+        {"rolling_prefix_cache", "on"},
+    };
+    auto roll_ar = Engine::create(roll_ar_opts);
+
+    LoadOptions roll_mtp_opts = roll_ar_opts;
+    roll_mtp_opts.path_overrides.erase("enable_mtp");
+    auto roll_mtp = Engine::create(roll_mtp_opts);
+
+    SubmitRequest t1;
+    t1.prompt_tokens = make_prompt_i32(25U, 33U, 257U);
+    t1.max_new_tokens = 18;
+    const auto ar_t1 = collect_request(*roll_ar, roll_ar->submit(t1));
+    const auto mtp_t1 = collect_request(*roll_mtp, roll_mtp->submit(t1));
+    require(ar_t1.tokens == mtp_t1.tokens,
+            "Rolling MTP Turn 1 greedy parity mismatch");
+    const auto rounds_after_t1 = roll_mtp->stats().spec_rounds;
+    require(rounds_after_t1 > 0U, "Rolling MTP Turn 1 ran 0 spec rounds");
+
+    SubmitRequest t2;
+    t2.prompt_tokens = t1.prompt_tokens;
+    t2.prompt_tokens.insert(t2.prompt_tokens.end(), mtp_t1.tokens.begin(),
+                            mtp_t1.tokens.end());
+    const auto suffix = make_prompt_i32(9U, 88U, 257U);
+    t2.prompt_tokens.insert(t2.prompt_tokens.end(), suffix.begin(),
+                            suffix.end());
+    t2.max_new_tokens = 18;
+    const auto ar_t2 = collect_request(*roll_ar, roll_ar->submit(t2));
+    const auto mtp_t2 = collect_request(*roll_mtp, roll_mtp->submit(t2));
+    const auto st_after_t2 = roll_mtp->stats();
+    require(st_after_t2.prefix_hits >= 1U &&
+                st_after_t2.prefix_restored_tokens >= 42U,
+            "Rolling MTP Turn 2 did not hit Rolling Prefix Cache");
+    require(st_after_t2.spec_rounds > rounds_after_t1,
+            "Rolling MTP Turn 2 dropped out of MTP instead of retaining KV frontier");
+    require(ar_t2.tokens == mtp_t2.tokens,
+            "Rolling MTP Turn 2 greedy parity mismatch after restore_frontier");
+    require(mtp_t1.request_stats && mtp_t1.request_stats->prefix_restored_tokens == 0U,
+            "Rolling MTP cold request reported a prefix restore");
+    require(mtp_t2.request_stats &&
+                mtp_t2.request_stats->prefix_restored_tokens >= 42U &&
+                mtp_t2.request_stats->spec_rounds > 0U &&
+                mtp_t2.request_stats->fallback_reason.empty(),
+            "Rolling MTP warm request telemetry did not report continued speculation");
+    ++total_parity_checks;
+  }
+
   return {{"parity_checks_passed", total_parity_checks},
           {"zero_ulp_ar_eq_mtp", true}};
 }
@@ -1073,9 +1162,13 @@ Json test_mtp_pipelines_and_memory(const MetalContext &ctx,
   const auto p27 = plan_mtp_forward_memory(c27, 32768U, false);
   require(p27.largest_buffer_bytes <= (2ULL << 30),
           "27B MTP buffer exceeds 2 GiB ICB limit");
-  for (const auto &b : p27.buffers) {
+  const auto p27_aff4 = plan_mtp_forward_memory(c27, 65536U, true);
+  require(p27_aff4.largest_buffer_bytes <= (2ULL << 30),
+          "27B affine4_g128 64K MTP buffer exceeds 2 GiB ICB limit");
+  for (const auto &b : p27_aff4.buffers) {
     require(b.name.find(".scratch") == std::string::npos,
-            "MTP buffer contains forbidden .scratch substring: " + b.name);
+            "MTP affine4 buffer contains forbidden .scratch substring: " +
+                b.name);
   }
 
   QwenModelConfig c35 = c27;

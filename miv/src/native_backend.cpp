@@ -706,6 +706,8 @@ public:
     }
     occupied.assign(std::size_t(options.max_concurrency), false);
     slot_dflash_prefix.assign(std::size_t(options.max_concurrency), {});
+    slot_mtp_think_frontier.assign(std::size_t(options.max_concurrency), {});
+    slot_mtp_post_frontier.assign(std::size_t(options.max_concurrency), {});
     slot_rolling_think_anchor_ids.assign(std::size_t(options.max_concurrency),
                                          0ULL);
     slot_rolling_post_ids.assign(std::size_t(options.max_concurrency), 0ULL);
@@ -1575,8 +1577,18 @@ public:
        slot_attention_split = false, slot_batch_enabled = false;
   std::atomic<bool> external_gpu_contended{false};
   std::vector<ExtraSlot> extra_slots;
+  struct SlotMtpFrontierSnapshot {
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::byte> pending_trunk;
+    void clear() noexcept {
+      tokens.clear();
+      pending_trunk.clear();
+    }
+  };
   std::vector<bool> occupied;
   std::vector<std::vector<std::uint32_t>> slot_dflash_prefix;
+  std::vector<SlotMtpFrontierSnapshot> slot_mtp_think_frontier;
+  std::vector<SlotMtpFrontierSnapshot> slot_mtp_post_frontier;
   std::optional<std::pair<std::uint32_t, std::uint32_t>> think_token_ids;
   std::vector<std::uint64_t> slot_rolling_think_anchor_ids;
   std::vector<std::uint64_t> slot_rolling_post_ids;
@@ -1800,12 +1812,48 @@ public:
       }
     }
     if (mtp()) {
-      mtp()->reset();
       if (auto *mc = mtp_controller())
         mc->on_new_request();
-      mtp_primed_ = (offset_ == 0);
+      bool reused_mtp_kv = false;
+      if (prefix_same_slot && offset_ > 0U &&
+          slot_ < owner_.slot_mtp_post_frontier.size()) {
+        auto try_restore_mtp =
+            [&](const NativeQwenState::SlotMtpFrontierSnapshot &snap) {
+              if (snap.tokens.size() == offset_ &&
+                  !snap.pending_trunk.empty() &&
+                  std::equal(snap.tokens.begin(), snap.tokens.end(),
+                             prompt_.begin())) {
+                try {
+                  mtp()->restore_frontier(std::uint32_t(offset_ - 1U),
+                                          snap.pending_trunk);
+                  return true;
+                } catch (...) {
+                  return false;
+                }
+              }
+              return false;
+            };
+        reused_mtp_kv =
+            try_restore_mtp(owner_.slot_mtp_post_frontier[slot_]) ||
+            try_restore_mtp(owner_.slot_mtp_think_frontier[slot_]);
+        if (reused_mtp_kv) {
+          if (owner_.slot_mtp_post_frontier[slot_].tokens.size() > offset_)
+            owner_.slot_mtp_post_frontier[slot_].clear();
+          if (owner_.slot_mtp_think_frontier[slot_].tokens.size() > offset_)
+            owner_.slot_mtp_think_frontier[slot_].clear();
+        }
+      }
+      if (!reused_mtp_kv) {
+        if (slot_ < owner_.slot_mtp_post_frontier.size()) {
+          owner_.slot_mtp_think_frontier[slot_].clear();
+          owner_.slot_mtp_post_frontier[slot_].clear();
+        }
+        mtp()->reset();
+      }
+      mtp_primed_ = (offset_ == 0U) || reused_mtp_kv;
       mtp_exited_ = false;
       mtp_committed_tokens_.clear();
+      last_mtp_round_committed_.clear();
     }
   }
 
@@ -1835,8 +1883,21 @@ public:
         }
       }
       program().reset();
-      if (mtp())
-        mtp()->reset();
+      if (mtp()) {
+        const bool keep_mtp =
+            !unwinding && !cancelled_->load(std::memory_order_acquire) &&
+            owner_.prefix_cache.enabled() &&
+            slot_ < owner_.slot_mtp_post_frontier.size() &&
+            (!owner_.slot_mtp_post_frontier[slot_].tokens.empty() ||
+             !owner_.slot_mtp_think_frontier[slot_].tokens.empty());
+        if (!keep_mtp) {
+          if (slot_ < owner_.slot_mtp_post_frontier.size()) {
+            owner_.slot_mtp_think_frontier[slot_].clear();
+            owner_.slot_mtp_post_frontier[slot_].clear();
+          }
+          mtp()->reset();
+        }
+      }
     } catch (...) {
     }
     if (owner_.scheduler.progress_owner_slot == slot_)
@@ -1999,6 +2060,24 @@ public:
     if (inserted && slot_ < owner_.slot_rolling_think_anchor_ids.size()) {
       saved_think_anchor_id_ = owner_.prefix_cache.last_inserted_id();
       owner_.slot_rolling_think_anchor_ids[slot_] = saved_think_anchor_id_;
+      if (slot_ < owner_.slot_mtp_think_frontier.size()) {
+        owner_.slot_mtp_think_frontier[slot_].clear();
+        if (mtp_active() && prefix_len == offset_ && offset_ > 0U &&
+            mtp()->committed_tokens() + 1U == std::uint32_t(offset_) &&
+            mtp()->has_pending_trunk()) {
+          auto snap = mtp()->snapshot_pending_trunk();
+          if (!snap.empty()) {
+            owner_.slot_mtp_think_frontier[slot_].tokens.assign(
+                prompt_.begin(), prompt_.begin() + std::ptrdiff_t(prefix_len));
+            owner_.slot_mtp_think_frontier[slot_].pending_trunk =
+                std::move(snap);
+            if (owner_.slot_mtp_post_frontier[slot_].tokens.size() >
+                prefix_len) {
+              owner_.slot_mtp_post_frontier[slot_].clear();
+            }
+          }
+        }
+      }
     }
     std::scoped_lock lock(backend_.stats_mutex_);
     backend_.backend_stats_.prefix_evictions += evicted;
@@ -2103,6 +2182,34 @@ public:
           owner_.prefix_cache.last_inserted_id();
       if (saved_think_anchor_id_ == 0ULL) {
         owner_.slot_rolling_think_anchor_ids[slot_] = 0ULL;
+        if (slot_ < owner_.slot_mtp_think_frontier.size()) {
+          owner_.slot_mtp_think_frontier[slot_].clear();
+        }
+      }
+      if (slot_ < owner_.slot_mtp_post_frontier.size()) {
+        owner_.slot_mtp_post_frontier[slot_].clear();
+        if (mtp_active() && pos > 0U) {
+          if (!(mtp()->committed_tokens() + 1U == std::uint32_t(pos) &&
+                mtp()->has_pending_trunk()) &&
+              !last_mtp_round_committed_.empty() &&
+              mtp()->committed_tokens() + last_mtp_round_committed_.size() ==
+                  pos) {
+            try {
+              (void)mtp()->seal_post_verify_frontier(last_mtp_round_committed_,
+                                                     true);
+            } catch (...) {
+            }
+          }
+          if (mtp()->committed_tokens() + 1U == std::uint32_t(pos) &&
+              mtp()->has_pending_trunk()) {
+            auto snap = mtp()->snapshot_pending_trunk();
+            if (!snap.empty()) {
+              owner_.slot_mtp_post_frontier[slot_].tokens = committed_tokens_;
+              owner_.slot_mtp_post_frontier[slot_].pending_trunk =
+                  std::move(snap);
+            }
+          }
+        }
       }
     }
     {
@@ -2459,6 +2566,15 @@ public:
     if (count > 0) {
       committed_tokens_.insert(committed_tokens_.end(), pending_input_.begin(),
                                pending_input_.begin() + std::ptrdiff_t(count));
+    }
+    if (pending_mtp_verify_) {
+      if (!batched_executed && count > 0) {
+        last_mtp_round_committed_.assign(
+            pending_input_.begin(),
+            pending_input_.begin() + std::ptrdiff_t(count));
+      } else {
+        last_mtp_round_committed_.clear();
+      }
     }
     if (batched_executed) {
       commit.timing.gpu_ms = batched_gpu_ms;
@@ -3168,6 +3284,7 @@ private:
     auto *ctrl = mtp_controller();
     if (ctrl && ctrl->should_exit()) {
       mtp_exited_ = true;
+      last_mtp_round_committed_.clear();
       note_fallback("mtp_adaptive_exit");
       record_ar_step();
       step_.token = anchor_;
@@ -3211,12 +3328,19 @@ private:
       }
       const auto k0_begin = RoundCostRecorder::Clock::now();
       MetalSubmission fold_sub{};
-      if (remaining > 1U && available > 1U) {
+      const bool keep_rolling_mtp =
+          owner_.rolling_prefix_cache && owner_.prefix_cache.enabled();
+      if ((remaining > 1U || keep_rolling_mtp) && available > 1U) {
         fold_sub = mtp()->fold_committed_only(mtp_committed_tokens_, true);
       }
       const std::array<std::uint32_t, 1> input{anchor_};
       step_ = with_page_pressure([&] { return program().run(input, sampling_); });
       committed_tokens_.push_back(anchor_);
+      if ((remaining > 1U || keep_rolling_mtp) && available > 1U) {
+        last_mtp_round_committed_.assign(1U, anchor_);
+      } else {
+        last_mtp_round_committed_.clear();
+      }
       flush_in_flight_commit();
       const double k0_wall = RoundCostRecorder::milliseconds(k0_begin);
       const double k0_ms =
@@ -3416,6 +3540,12 @@ private:
           std::min(count, std::size_t(verified.accepted_proposals));
       stats.spec_commit_gpu_ms += commit.timing.gpu_ms;
     }
+    if (count > 0) {
+      last_mtp_round_committed_.assign(input.begin(),
+                                       input.begin() + std::ptrdiff_t(count));
+    } else {
+      last_mtp_round_committed_.clear();
+    }
     const bool unclipped =
         (count == verified.licensed_outputs.size()) &&
         (produced_ + count < std::uint32_t(request_.max_new_tokens));
@@ -3478,7 +3608,7 @@ private:
   GpuSamplingOptions sampling_;
   QwenForwardResult step_;
   std::vector<std::uint32_t> prompt_, pending_input_, mtp_committed_tokens_,
-      committed_tokens_;
+      last_mtp_round_committed_, committed_tokens_;
   std::vector<std::byte> pending_anchor_logits_;
   bool pending_prefill_ = false, pending_was_first_chunk_ = false,
        pending_verify_ = false, pending_mtp_verify_ = false,
@@ -5114,12 +5244,18 @@ TrimCacheReport NativeBackend::trim_cache(std::uint64_t target_free_bytes) {
     for (std::size_t s = 0; s < ar_program_->slot_dflash_prefix.size(); ++s) {
       if (s < ar_program_->occupied.size() && !ar_program_->occupied[s]) {
         ar_program_->slot_dflash_prefix[s].clear();
+        if (s < ar_program_->slot_mtp_post_frontier.size()) {
+          ar_program_->slot_mtp_think_frontier[s].clear();
+          ar_program_->slot_mtp_post_frontier[s].clear();
+        }
         if (s < ar_program_->slot_rolling_think_anchor_ids.size()) {
           ar_program_->slot_rolling_think_anchor_ids[s] = 0ULL;
           ar_program_->slot_rolling_post_ids[s] = 0ULL;
         }
         if (auto *df = ar_program_->draft_at(s))
           df->reset();
+        if (auto *mt = ar_program_->mtp_at(s))
+          mt->reset();
       }
     }
     std::scoped_lock lock(stats_mutex_);
@@ -5235,6 +5371,10 @@ bool NativeBackend::reload_lora(const std::string &lora_adapter,
       }
       if (auto *mt = owner.mtp_at(s)) {
         mt->reset();
+      }
+      if (s < owner.slot_mtp_post_frontier.size()) {
+        owner.slot_mtp_think_frontier[s].clear();
+        owner.slot_mtp_post_frontier[s].clear();
       }
       if (auto *mc = owner.mtp_controller_at(s)) {
         mc->on_new_request();

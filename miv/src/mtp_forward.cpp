@@ -1,6 +1,7 @@
 #include "omlx_m5/mtp_forward.h"
 
 #include "affine_nax_cache.h"
+#include "attention_nax.h"
 #include "bf16_nax.h"
 #include "forward_plan.h"
 #include "moe_nax.h"
@@ -858,7 +859,11 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
     throw std::invalid_argument("MTP execution geometry unsupported");
   }
   QwenForwardMemoryPlan plan;
-  const U32 priming_rows = std::min<U32>(max_context, 64U);
+  const bool is_moe = c.num_experts > 0;
+  const U32 priming_rows =
+      (!is_moe && c.hidden_size >= 1024)
+          ? std::min<U32>(max_context, 256U)
+          : std::min<U32>(max_context, 64U);
   plan.workspace_rows = priming_rows;
 
   const auto add_buf = [&](std::string name, U64 bytes, bool is_state = false,
@@ -883,7 +888,6 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
   const U64 q = U64(c.num_attention_heads) * U64(c.head_dim);
   const U64 kv = U64(c.num_key_value_heads) * U64(c.head_dim);
   const U64 shared_f = U64(std::max<std::int32_t>(0, c.shared_expert_intermediate_size));
-  const bool is_moe = c.num_experts > 0;
   const U64 mlp_rows = is_moe ? mul(priming_rows, 8ULL) : U64(priming_rows);
   const U64 max_ffn = std::max(f, shared_f);
 
@@ -926,6 +930,33 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
   add_buf("proposal_out", 8U * 4U);
   const U64 max_sum_k = std::max({2U * h, q, max_ffn});
   add_buf("sums", mul(mul(mlp_rows, (max_sum_k + 31U) / 32U), 4U));
+  add_buf("mtp_attn_pos",
+          std::max<U64>(mul(priming_rows, 4U),
+                        U64(MtpForward::kMaxDraftTokens) * 64ULL));
+  if (c.hidden_size >= 1024) {
+    constexpr U32 kMaxMtpSplitRows = 8U;
+    const U32 qh_u = U32(c.num_attention_heads);
+    const U32 kvh_u = U32(c.num_key_value_heads);
+    const U32 hd_u = U32(c.head_dim);
+    const U32 aff4_splits = (max_context + 511U) / 512U;
+    const U32 bf16_splits =
+        exact_attention_split_count(max_context, max_context, 32U);
+    const U32 max_splits = std::max(aff4_splits, bf16_splits);
+    const U64 split_meta_bytes =
+        mul(mul(mul(kMaxMtpSplitRows, qh_u), max_splits), 4U);
+    U64 split_out_bytes =
+        mul(mul(mul(mul(kMaxMtpSplitRows, qh_u), bf16_splits), hd_u), 4U);
+    if (affine4_kv && hd_u == 256U) {
+      const auto lo = affine4_split_scratch_layout(
+          kMaxMtpSplitRows, qh_u, kvh_u, aff4_splits,
+          std::numeric_limits<U64>::max());
+      split_out_bytes =
+          std::max(split_out_bytes, lo.q_sum_offset + lo.q_sum_bytes);
+    }
+    add_buf("mtp_split_max", split_meta_bytes);
+    add_buf("mtp_split_sum", split_meta_bytes);
+    add_buf("mtp_split_out", split_out_bytes);
+  }
   add_buf("zero", 256U);
 
   const KvStorageFormat kv_fmt =
@@ -945,9 +976,8 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
 class MtpForward::Impl {
 public:
   struct StepPatchOffsets {
-    U64 qk_rope_offset = 0; // word 9 = start_position
-    U64 append_offset = 0;  // word 4 = cache_start
-    U64 attn_offset = 0;    // word 4 = cache_start
+    U64 qk_rope_offset = 0; // word 4 = rows, word 9 = start_position
+    std::vector<U64> attn_param_offsets{}; // word 3 = rows, word 4 = cache_start
     U64 sample_offset = 0;  // PositionSamplingRow or SampleParams
   };
 
@@ -1111,6 +1141,7 @@ public:
     // Allocate workspace + 1-layer KvPagePool.
     const auto mem_plan = plan_mtp_forward_memory(
         config, max_context, kv_format == KvStorageFormat::Affine4Group128);
+    priming_cap = mem_plan.workspace_rows;
     for (const auto &item : mem_plan.buffers) {
       auto buf = std::make_unique<MetalBuffer>(context.make_buffer(item.bytes));
       refs.emplace(item.name, Ref{buf.get(), 0, item.bytes});
@@ -1125,6 +1156,23 @@ public:
     const U32 pages = (max_context + 63U) / 64U;
     mtp_kv_pool =
         std::make_unique<KvPagePool>(context, max_context, 64U, pages, kv_format);
+
+    affine4_nax_ok =
+        config.hidden_size >= 1024 &&
+        kv_format == KvStorageFormat::Affine4Group128 &&
+        affine4_kv_runtime_eligible(context, libraries,
+                                    U32(config.num_attention_heads),
+                                    U32(config.num_key_value_heads),
+                                    U32(config.head_dim));
+    flash_nax_prefill_ok =
+        config.hidden_size >= 1024 &&
+        flash_nax_prefill_runtime_eligible(context, libraries,
+                                           U32(config.head_dim));
+    split_attn_ok =
+        config.hidden_size >= 1024 &&
+        context.capabilities().profile.probe.apple_gpu_family >= 9 &&
+        std::filesystem::is_regular_file(
+            libraries / "omlx_m5_attention_split_kv.metallib");
 
     // Acquire NAX caches (reusing target's cache for shared head -> 0 B head duplication!).
     bf16_nax_enabled =
@@ -2053,13 +2101,192 @@ public:
               dynamic_rows ? std::optional<U32>(1U) : std::nullopt);
   }
 
+  StepPatchOffsets emit_mtp_attention_core(Encoder &e, const Impl &sp,
+                                           Ref slot_q, Ref slot_k, Ref slot_v,
+                                           Ref slot_mixer, Ref attn_pos_ref,
+                                           U32 rows, bool dynamic_rows,
+                                           U32 unique_tag) {
+    StepPatchOffsets patches{};
+    const U32 rotary_dim =
+        U32(std::llround(config.head_dim * config.partial_rotary_factor));
+    auto &post = e.emit(
+        "mtp_forward", "omlx_m5_mtp_qk_norm_rope",
+        {.width = 32U,
+         .height = U64(rows) *
+                   U64(config.num_attention_heads + config.num_key_value_heads)},
+        {.width = 32U},
+        {slot_q, slot_k, direct(q_norm, U64(config.head_dim)),
+         direct(k_norm, U64(config.head_dim))});
+    patches.qk_rope_offset = e.dynamic(
+        post, 4,
+        words({U32(config.num_attention_heads),
+               U32(config.num_key_value_heads), U32(config.head_dim),
+               rotary_dim, rows, q * 2U, U32(config.head_dim * 2), kv,
+               U32(config.head_dim), unique_tag,
+               word(float(config.rms_norm_eps)), word(float(config.rope_theta)),
+               word(norm_offsets.q_norm), word(norm_offsets.k_norm)}),
+        dynamic_rows ? std::optional<U32>(4U) : std::nullopt);
+
+    Ref table_ref{&sp.mtp_kv_pool->table_buffer(), 0,
+                  sp.mtp_kv_pool->table_buffer().size()};
+    Ref gate_ref = sub(slot_q, U64(config.head_dim) * 2U);
+    auto attn_params = words({U32(config.num_attention_heads),
+                              U32(config.num_key_value_heads),
+                              U32(config.head_dim),
+                              rows,
+                              unique_tag,
+                              sp.max_context,
+                              64U,
+                              sp.mtp_kv_pool->physical_pages(),
+                              q * 2U,
+                              U32(config.head_dim * 2),
+                              kv,
+                              kv,
+                              q * 2U,
+                              U32(config.head_dim * 2)});
+    const std::optional<U32> tok_w3 =
+        dynamic_rows ? std::optional<U32>(3U) : std::nullopt;
+    const std::optional<U32> pos_w4 =
+        dynamic_rows ? std::optional<U32>(4U) : std::nullopt;
+
+    std::vector<std::pair<U64, U32>> raw_pos_patches;
+    auto *pos_patch_ptr = dynamic_rows ? nullptr : &raw_pos_patches;
+
+    e.clear_dynamic_parameter_cache();
+    if (sp.kv_format == KvStorageFormat::Affine4Group128 && sp.affine4_nax_ok) {
+      emit_paged_kv_append_affine4_g128(
+          e, config, rows, slot_k, slot_v, sp.get("mtp_cache_key"),
+          sp.get("mtp_cache_value"), table_ref, attn_params, tok_w3, pos_w4,
+          pos_patch_ptr);
+      e.clear_dynamic_parameter_cache();
+      if (dynamic_rows && rows >= 16U && config.head_dim == 256 &&
+          sp.flash_nax_prefill_ok) {
+        emit_paged_flash_prefill_affine4_g128(
+            e, config, rows, slot_q, gate_ref, sp.get("mtp_cache_key"),
+            sp.get("mtp_cache_value"), slot_mixer, table_ref, attn_pos_ref,
+            std::move(attn_params));
+      } else {
+        const bool use_split = sp.split_attn_ok && rows <= 8U;
+        emit_paged_attention_affine4_g128(
+            e, config, rows, use_split, sp.max_context, sp.max_context,
+            sp.mtp_kv_pool->physical_pages(), slot_q, gate_ref,
+            sp.get("mtp_cache_key"), sp.get("mtp_cache_value"), slot_mixer,
+            table_ref, attn_pos_ref,
+            use_split ? sp.get("mtp_split_max") : Ref{},
+            use_split ? sp.get("mtp_split_sum") : Ref{},
+            use_split ? sp.get("mtp_split_out") : Ref{}, std::move(attn_params),
+            tok_w3, pos_w4, pos_patch_ptr, false);
+      }
+    } else if (sp.kv_format == KvStorageFormat::Affine4Group128) {
+      auto &app = e.emit(
+          "qwen_forward", "omlx_m5_forward_paged_kv_append_affine4",
+          {.width = 32U, .height = U64(rows) * U64(config.num_key_value_heads)},
+          {.width = 32U},
+          {slot_k, slot_v, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
+           table_ref});
+      const U64 off_app = e.dynamic(app, 5, attn_params, tok_w3, pos_w4);
+      if (!dynamic_rows) {
+        mtp_push_unique(patches.attn_param_offsets, off_app);
+      }
+      e.clear_dynamic_parameter_cache();
+      auto &att = e.emit(
+          "qwen_forward", "omlx_m5_forward_paged_causal_attention_affine4_exact",
+          {.width = 32U, .height = U64(rows) * U64(config.num_attention_heads)},
+          {.width = 32U},
+          {slot_q, gate_ref, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
+           slot_mixer, table_ref});
+      const U64 off_att =
+          e.dynamic(att, 6, std::move(attn_params), tok_w3, pos_w4);
+      if (!dynamic_rows) {
+        mtp_push_unique(patches.attn_param_offsets, off_att);
+      }
+    } else {
+      auto &app = e.emit("attention_postprocess", "omlx_m5_paged_kv_append",
+                         {.width = U64(rows) * kv}, {.width = 128U},
+                         {slot_k, slot_v, sp.get("mtp_cache_key"),
+                          sp.get("mtp_cache_value"), table_ref});
+      const U64 off_app = e.dynamic(app, 5, attn_params, tok_w3, pos_w4);
+      if (!dynamic_rows) {
+        mtp_push_unique(patches.attn_param_offsets, off_app);
+      }
+      e.clear_dynamic_parameter_cache();
+      if (dynamic_rows && rows >= 16U && sp.flash_nax_prefill_ok) {
+        emit_paged_flash_prefill_nax(
+            e, config, rows, slot_q, gate_ref, sp.get("mtp_cache_key"),
+            sp.get("mtp_cache_value"), slot_mixer, table_ref, attn_pos_ref,
+            std::move(attn_params));
+      } else if (sp.split_attn_ok && rows <= 8U) {
+        const U32 chunk_tokens =
+            exact_attention_split_chunk_tokens(sp.max_context, 32U);
+        const U32 splits =
+            exact_attention_split_count(sp.max_context, sp.max_context, 32U);
+        auto split_params = words({U32(config.num_attention_heads),
+                                   U32(config.num_key_value_heads),
+                                   U32(config.head_dim),
+                                   rows,
+                                   unique_tag,
+                                   sp.max_context,
+                                   64U,
+                                   sp.mtp_kv_pool->physical_pages(),
+                                   q * 2U,
+                                   U32(config.head_dim * 2),
+                                   kv,
+                                   kv,
+                                   q * 2U,
+                                   U32(config.head_dim * 2),
+                                   splits,
+                                   chunk_tokens});
+        auto &partial = e.emit(
+            "attention_split_kv", "omlx_m5_paged_attention_split_partial",
+            {.width = U64(splits) * 32U,
+             .height = U64(rows) * U64(config.num_attention_heads)},
+            {.width = 32U},
+            {slot_q, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
+             sp.get("mtp_split_max"), sp.get("mtp_split_sum"),
+             sp.get("mtp_split_out"), table_ref});
+        const U64 off_p = e.dynamic(partial, 7, split_params, tok_w3, pos_w4);
+        auto &merge = e.emit(
+            "attention_split_kv", "omlx_m5_paged_attention_split_merge",
+            {.width = 32U,
+             .height = U64(rows) * U64(config.num_attention_heads)},
+            {.width = 32U},
+            {gate_ref, sp.get("mtp_split_max"), sp.get("mtp_split_sum"),
+             sp.get("mtp_split_out"), slot_mixer});
+        const U64 off_m =
+            e.dynamic(merge, 5, std::move(split_params), tok_w3, pos_w4);
+        if (!dynamic_rows) {
+          mtp_push_unique(patches.attn_param_offsets, off_p);
+          mtp_push_unique(patches.attn_param_offsets, off_m);
+        }
+      } else {
+        auto &att = e.emit(
+            "attention_postprocess", "omlx_m5_paged_causal_attention",
+            {.width = 32U,
+             .height = U64(rows) * U64(config.num_attention_heads)},
+            {.width = 32U},
+            {slot_q, gate_ref, sp.get("mtp_cache_key"),
+             sp.get("mtp_cache_value"), slot_mixer, table_ref});
+        const U64 off_att =
+            e.dynamic(att, 6, std::move(attn_params), tok_w3, pos_w4);
+        if (!dynamic_rows) {
+          mtp_push_unique(patches.attn_param_offsets, off_att);
+        }
+      }
+    }
+
+    for (const auto &[off, _] : raw_pos_patches) {
+      mtp_push_unique(patches.attn_param_offsets, off);
+    }
+    return patches;
+  }
+
   StepPatchOffsets emit_mtp_layer0(Encoder &e, U32 rows, bool dynamic_rows,
                                    bool defer_final_norm = false,
-                                   bool *out_deferred_final_norm = nullptr) {
+                                   bool *out_deferred_final_norm = nullptr,
+                                   Ref custom_attn_pos = {}) {
     if (out_deferred_final_norm) {
       *out_deferred_final_norm = false;
     }
-    StepPatchOffsets patches{};
     const std::optional<U32> explicit_t =
         dynamic_rows ? std::nullopt : std::optional<U32>(rows);
 
@@ -2082,77 +2309,12 @@ public:
       emit_linear(e, v_proj, get("norm"), get("value"), kv, h, explicit_t);
     }
 
-    const U32 rotary_dim =
-        U32(std::llround(config.head_dim * config.partial_rotary_factor));
-    auto &post = e.emit(
-        "mtp_forward", "omlx_m5_mtp_qk_norm_rope",
-        {.width = 32U,
-         .height = U64(rows) *
-                   U64(config.num_attention_heads + config.num_key_value_heads)},
-        {.width = 32U},
-        {get("query"), get("key"), direct(q_norm, U64(config.head_dim)),
-         direct(k_norm, U64(config.head_dim))});
-    patches.qk_rope_offset = e.dynamic(
-        post, 4,
-        words({U32(config.num_attention_heads),
-               U32(config.num_key_value_heads), U32(config.head_dim),
-               rotary_dim, rows, q * 2U, U32(config.head_dim * 2), kv,
-               U32(config.head_dim), 0U, word(float(config.rms_norm_eps)),
-               word(float(config.rope_theta)), word(norm_offsets.q_norm),
-               word(norm_offsets.k_norm)}),
-        dynamic_rows ? std::optional<U32>(4U) : std::nullopt);
-
-    Ref table_ref{&mtp_kv_pool->table_buffer(), 0,
-                  mtp_kv_pool->table_buffer().size()};
-    Ref gate_ref = sub(get("query"), U64(config.head_dim) * 2U);
-    auto attn_params = words({U32(config.num_attention_heads),
-                              U32(config.num_key_value_heads),
-                              U32(config.head_dim),
-                              rows,
-                              0U,
-                              max_context,
-                              64U,
-                              mtp_kv_pool->physical_pages(),
-                              q * 2U,
-                              U32(config.head_dim * 2),
-                              kv,
-                              kv,
-                              q * 2U,
-                              U32(config.head_dim * 2)});
-    const std::optional<U32> tok_w3 =
-        dynamic_rows ? std::optional<U32>(3U) : std::nullopt;
-
-    if (kv_format == KvStorageFormat::Affine4Group128) {
-      auto &app = e.emit(
-          "qwen_forward", "omlx_m5_forward_paged_kv_append_affine4",
-          {.width = 32U, .height = U64(rows) * U64(config.num_key_value_heads)},
-          {.width = 32U},
-          {get("key"), get("value"), get("mtp_cache_key"),
-           get("mtp_cache_value"), table_ref});
-      patches.append_offset = e.dynamic(app, 5, attn_params, tok_w3);
-      e.clear_dynamic_parameter_cache();
-      auto &att = e.emit(
-          "qwen_forward", "omlx_m5_forward_paged_causal_attention_affine4_exact",
-          {.width = 32U, .height = U64(rows) * U64(config.num_attention_heads)},
-          {.width = 32U},
-          {get("query"), gate_ref, get("mtp_cache_key"), get("mtp_cache_value"),
-           get("mixer"), table_ref});
-      patches.attn_offset = e.dynamic(att, 6, std::move(attn_params), tok_w3);
-    } else {
-      auto &app = e.emit("attention_postprocess", "omlx_m5_paged_kv_append",
-                         {.width = U64(rows) * kv}, {.width = 128U},
-                         {get("key"), get("value"), get("mtp_cache_key"),
-                          get("mtp_cache_value"), table_ref});
-      patches.append_offset = e.dynamic(app, 5, attn_params, tok_w3);
-      e.clear_dynamic_parameter_cache();
-      auto &att = e.emit(
-          "attention_postprocess", "omlx_m5_paged_causal_attention",
-          {.width = 32U, .height = U64(rows) * U64(config.num_attention_heads)},
-          {.width = 32U},
-          {get("query"), gate_ref, get("mtp_cache_key"), get("mtp_cache_value"),
-           get("mixer"), table_ref});
-      patches.attn_offset = e.dynamic(att, 6, std::move(attn_params), tok_w3);
-    }
+    Ref attn_pos_ref =
+        custom_attn_pos.buffer ? custom_attn_pos : get("mtp_attn_pos");
+    StepPatchOffsets patches =
+        emit_mtp_attention_core(e, *this, get("query"), get("key"),
+                                get("value"), get("mixer"), attn_pos_ref, rows,
+                                dynamic_rows, 0U);
 
     if (!moe_layer && rows == 1U && !dynamic_rows &&
         can_linear_swiglu_norm_t1(mlp_gate, mlp_up, f, h) &&
@@ -2545,7 +2707,10 @@ public:
     sig.u64(U64(kv_format));
     sig.u64(U64(sampling_contract));
     sig.u64(U64(linear_policy));
-    return ".mtp.v2." + sig.hex();
+    sig.u64(affine4_nax_ok ? 1ULL : 0ULL);
+    sig.u64(flash_nax_prefill_ok ? 1ULL : 0ULL);
+    sig.u64(split_attn_ok ? 1ULL : 0ULL);
+    return ".mtp.v3." + sig.hex();
   }
 
   SaveTrunkProfile compile_save_trunk(Ref trunk_buf, std::string_view tag) {
@@ -2625,9 +2790,10 @@ public:
       e.begin_stage("chain.d" + std::to_string(d) + ".layer0");
       e.clear_dynamic_parameter_cache();
       bool deferred_final_norm = false;
+      Ref step_attn_pos{get("mtp_attn_pos").buffer, U64(d) * 64ULL, 64ULL};
       out.steps[d] = emit_mtp_layer0(e, step_rows, false,
                                      /*defer_final_norm=*/true,
-                                     &deferred_final_norm);
+                                     &deferred_final_norm, step_attn_pos);
 
       e.begin_stage("chain.d" + std::to_string(d) + ".head_sample");
       e.profile.capacity = 1U;
@@ -2710,8 +2876,20 @@ public:
   static void patch_step_position(Profile &prof, const StepPatchOffsets &sp,
                                   U32 start_pos) {
     patch_u32(prof, sp.qk_rope_offset, 9U, start_pos);
-    patch_u32(prof, sp.append_offset, 4U, start_pos);
-    patch_u32(prof, sp.attn_offset, 4U, start_pos);
+    for (const U64 off : sp.attn_param_offsets) {
+      patch_u32(prof, off, 4U, start_pos);
+    }
+  }
+
+  static void patch_step_tokens_and_pos(Profile &prof,
+                                        const StepPatchOffsets &sp, U32 rows,
+                                        U32 start_pos) {
+    patch_u32(prof, sp.qk_rope_offset, 4U, rows);
+    patch_u32(prof, sp.qk_rope_offset, 9U, start_pos);
+    for (const U64 off : sp.attn_param_offsets) {
+      patch_u32(prof, off, 3U, rows);
+      patch_u32(prof, off, 4U, start_pos);
+    }
   }
 
   void rewind_speculative_tail() {
@@ -2785,85 +2963,15 @@ public:
     add_pb("pb_compact_ids", U64(kMaxDraftTokens) * 8ULL * 64ULL * 4ULL);
     add_pb("pb_compact_scores", U64(kMaxDraftTokens) * 8ULL * 64ULL * 4ULL);
     add_pb("pb_proposal_out", 8ULL * 8ULL * 4ULL);
+    add_pb("pb_attn_pos", U64(kMaxDraftTokens) * 8ULL * 64ULL);
   }
 
   StepPatchOffsets emit_slot_attention_only(Encoder &e, const Impl &sp,
                                             Ref slot_q, Ref slot_k, Ref slot_v,
-                                            Ref slot_mixer, U32 max_rows,
-                                            U32 unique_tag) {
-    StepPatchOffsets patches{};
-    const U32 rotary_dim =
-        U32(std::llround(config.head_dim * config.partial_rotary_factor));
-    auto &post = e.emit(
-        "mtp_forward", "omlx_m5_mtp_qk_norm_rope",
-        {.width = 32U,
-         .height = U64(max_rows) *
-                   U64(config.num_attention_heads + config.num_key_value_heads)},
-        {.width = 32U},
-        {slot_q, slot_k, direct(q_norm, U64(config.head_dim)),
-         direct(k_norm, U64(config.head_dim))});
-    patches.qk_rope_offset = e.dynamic(
-        post, 4,
-        words({U32(config.num_attention_heads),
-               U32(config.num_key_value_heads), U32(config.head_dim),
-               rotary_dim, max_rows, q * 2U, U32(config.head_dim * 2), kv,
-               U32(config.head_dim), unique_tag,
-               word(float(config.rms_norm_eps)), word(float(config.rope_theta)),
-               word(norm_offsets.q_norm), word(norm_offsets.k_norm)}));
-
-    Ref table_ref{&sp.mtp_kv_pool->table_buffer(), 0,
-                  sp.mtp_kv_pool->table_buffer().size()};
-    Ref gate_ref = sub(slot_q, U64(config.head_dim) * 2U);
-    auto attn_params = words({U32(config.num_attention_heads),
-                              U32(config.num_key_value_heads),
-                              U32(config.head_dim),
-                              max_rows,
-                              unique_tag,
-                              sp.max_context,
-                              64U,
-                              sp.mtp_kv_pool->physical_pages(),
-                              q * 2U,
-                              U32(config.head_dim * 2),
-                              kv,
-                              kv,
-                              q * 2U,
-                              U32(config.head_dim * 2)});
-
-    if (kv_format == KvStorageFormat::Affine4Group128) {
-      auto &app = e.emit(
-          "qwen_forward", "omlx_m5_forward_paged_kv_append_affine4",
-          {.width = 32U,
-           .height = U64(max_rows) * U64(config.num_key_value_heads)},
-          {.width = 32U},
-          {slot_k, slot_v, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
-           table_ref});
-      patches.append_offset = e.dynamic(app, 5, attn_params);
-      e.clear_dynamic_parameter_cache();
-      auto &att = e.emit(
-          "qwen_forward", "omlx_m5_forward_paged_causal_attention_affine4_exact",
-          {.width = 32U,
-           .height = U64(max_rows) * U64(config.num_attention_heads)},
-          {.width = 32U},
-          {slot_q, gate_ref, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
-           slot_mixer, table_ref});
-      patches.attn_offset = e.dynamic(att, 6, std::move(attn_params));
-    } else {
-      auto &app = e.emit("attention_postprocess", "omlx_m5_paged_kv_append",
-                         {.width = U64(max_rows) * kv}, {.width = 128U},
-                         {slot_k, slot_v, sp.get("mtp_cache_key"),
-                          sp.get("mtp_cache_value"), table_ref});
-      patches.append_offset = e.dynamic(app, 5, attn_params);
-      e.clear_dynamic_parameter_cache();
-      auto &att = e.emit(
-          "attention_postprocess", "omlx_m5_paged_causal_attention",
-          {.width = 32U,
-           .height = U64(max_rows) * U64(config.num_attention_heads)},
-          {.width = 32U},
-          {slot_q, gate_ref, sp.get("mtp_cache_key"), sp.get("mtp_cache_value"),
-           slot_mixer, table_ref});
-      patches.attn_offset = e.dynamic(att, 6, std::move(attn_params));
-    }
-    return patches;
+                                            Ref slot_mixer, Ref slot_attn_pos,
+                                            U32 max_rows, U32 unique_tag) {
+    return emit_mtp_attention_core(e, sp, slot_q, slot_k, slot_v, slot_mixer,
+                                   slot_attn_pos, max_rows, false, unique_tag);
   }
 
   PackedBatchProfile compile_packed_batch(const PackedBatchKey &skey) {
@@ -2953,12 +3061,13 @@ public:
     }
     out.d0_slot_attn.resize(B);
     for (U32 b = 0U; b < B; ++b) {
+      Ref slot_pos{pb_get("pb_attn_pos").buffer, U64(b) * 64ULL, 64ULL};
       out.d0_slot_attn[b] = emit_slot_attention_only(
           e, *skey.slots[b],
           mtp_row_slice_ref(pb_get("pb_slot_query"), 5U * b, 5U, 2U * q),
           mtp_row_slice_ref(pb_get("pb_slot_key"), 5U * b, 5U, kv),
           mtp_row_slice_ref(pb_get("pb_slot_value"), 5U * b, 5U, kv),
-          mtp_row_slice_ref(pb_get("pb_slot_mixer"), 5U * b, 5U, q),
+          mtp_row_slice_ref(pb_get("pb_slot_mixer"), 5U * b, 5U, q), slot_pos,
           kMaxFoldTokens, 0xFF000000U | b);
     }
     {
@@ -3079,12 +3188,14 @@ public:
 
       out.chain_slot_attn[d].resize(B);
       for (U32 b = 0U; b < B; ++b) {
+        Ref slot_pos{pb_get("pb_attn_pos").buffer,
+                     U64(d * 8U + b) * 64ULL, 64ULL};
         out.chain_slot_attn[d][b] = emit_slot_attention_only(
             e, *skey.slots[b],
             mtp_row_slice_ref(get("query"), b, 1U, 2U * q),
             mtp_row_slice_ref(get("key"), b, 1U, kv),
             mtp_row_slice_ref(get("value"), b, 1U, kv),
-            mtp_row_slice_ref(get("mixer"), b, 1U, q), 1U,
+            mtp_row_slice_ref(get("mixer"), b, 1U, q), slot_pos, 1U,
             0xFF000000U | (d << 8U) | b);
       }
 
@@ -3171,6 +3282,9 @@ public:
   std::deque<PackedBatchProfile> packed_cache_;
   std::unique_ptr<KvPagePool> mtp_kv_pool;
 
+  bool affine4_nax_ok = false;
+  bool flash_nax_prefill_ok = false;
+  bool split_attn_ok = false;
   bool bf16_nax_enabled = false;
   bool kl32_enabled = false;
   MoeNaxWorkspace moe_nax_ws;
@@ -3222,6 +3336,109 @@ MtpForward::MtpForward(MtpForward &&) noexcept = default;
 MtpForward &MtpForward::operator=(MtpForward &&) noexcept = default;
 
 void MtpForward::reset() { impl_->reset(); }
+
+std::vector<std::byte> MtpForward::snapshot_pending_trunk() const {
+  const auto &p = *impl_;
+  if (!p.pending_trunk_valid || p.unprimed_broken) {
+    return {};
+  }
+  const auto ref = p.get("pending_trunk_normed");
+  return ref.buffer->read(ref.offset, mul(p.h, 2U));
+}
+
+void MtpForward::restore_frontier(
+    std::uint32_t committed_hist_tokens,
+    std::span<const std::byte> pending_trunk_bytes) {
+  auto &p = *impl_;
+  const U64 expected_bytes = mul(p.h, 2U);
+  if (committed_hist_tokens > p.mtp_kv_pool->tokens() ||
+      committed_hist_tokens > p.max_context ||
+      pending_trunk_bytes.size() != expected_bytes) {
+    throw std::invalid_argument("MtpForward::restore_frontier invalid snapshot");
+  }
+  p.mtp_kv_pool->truncate(committed_hist_tokens);
+  const_cast<MetalBuffer *>(p.get("pending_trunk_normed").buffer)
+      ->write(pending_trunk_bytes, 0U);
+  p.hist_offset = committed_hist_tokens;
+  p.pending_trunk_valid = true;
+  p.unprimed_broken = false;
+}
+
+MetalSubmission MtpForward::seal_post_verify_frontier(
+    std::span<const std::uint32_t> committed_round_tokens, bool use_icb) {
+  auto &p = *impl_;
+  if (committed_round_tokens.empty() ||
+      committed_round_tokens.size() > kMaxFoldTokens) {
+    throw std::invalid_argument(
+        "MtpForward::seal_post_verify_frontier requires 1..5 tokens");
+  }
+  if (p.unprimed_broken) {
+    return {};
+  }
+  const U32 chunk_len = U32(committed_round_tokens.size());
+  const U32 local_max_rows = U32(p.local_trunk_ref.bytes / mul(p.h, 2U));
+  if (chunk_len > local_max_rows) {
+    throw std::out_of_range(
+        "MtpForward::seal_post_verify_frontier exceeds local trunk capacity");
+  }
+  p.rewind_speculative_tail();
+
+  const std::span<const U32> fold_toks = committed_round_tokens.subspan(1U);
+  const U32 fold_total = U32(fold_toks.size());
+  if (p.hist_offset + fold_total > p.max_context) {
+    throw std::out_of_range(
+        "MtpForward::seal_post_verify_frontier exceeds max_context");
+  }
+
+  MetalSubmission total_sub{};
+  auto accumulate_sub = [&](const MetalSubmission &s) {
+    total_sub.dispatch_count += s.dispatch_count;
+    total_sub.timing.gpu_ms += s.timing.gpu_ms;
+    total_sub.timing.wall_ms += s.timing.wall_ms;
+  };
+
+  if (fold_total > 0U) {
+    const_cast<MetalBuffer *>(p.get("fold_tokens").buffer)
+        ->write(std::as_bytes(fold_toks), 0U);
+    std::array<U32, kMaxFoldTokens> pos_buf{};
+    for (U32 r = 0U; r < fold_total; ++r) {
+      pos_buf[r] = p.hist_offset + r;
+    }
+    const_cast<MetalBuffer *>(p.get("mtp_attn_pos").buffer)
+        ->write(std::as_bytes(std::span<const U32>(pos_buf).first(fold_total)),
+                0U);
+
+    auto &fp = p.fold_only_profiles[0][fold_total - 1U];
+    Impl::patch_step_position(fp.profile, fp.attn_patches, p.hist_offset);
+    fp.profile.parameters.write("step", fp.profile.parameter_data);
+    p.reserve_and_commit_kv(fold_total);
+    if (use_icb && fp.profile.icb) {
+      accumulate_sub(p.context.replay_icb(*fp.profile.icb));
+    } else {
+      const std::array calls{
+          MetalCommandInvocation{.plan = &fp.profile.plan,
+                                 .bindings = fp.profile.bindings,
+                                 .parameters = &fp.profile.parameters}};
+      accumulate_sub(p.context.execute_batch(calls));
+    }
+    p.hist_offset += fold_total;
+  }
+
+  auto &sv = p.save_local_trunk;
+  Impl::patch_u32(sv.profile, sv.save_params_offset, 1U, chunk_len - 1U);
+  sv.profile.parameters.write("step", sv.profile.parameter_data);
+  if (use_icb && sv.profile.icb) {
+    accumulate_sub(p.context.replay_icb(*sv.profile.icb));
+  } else {
+    const std::array calls{
+        MetalCommandInvocation{.plan = &sv.profile.plan,
+                               .bindings = sv.profile.bindings,
+                               .parameters = &sv.profile.parameters}};
+    accumulate_sub(p.context.execute_batch(calls));
+  }
+  p.pending_trunk_valid = true;
+  return total_sub;
+}
 
 std::uint32_t MtpForward::committed_tokens() const noexcept {
   return impl_->hist_offset;
@@ -3315,6 +3532,15 @@ MtpForward::prime_prefill_chunk(std::span<const std::uint32_t> chunk_tokens,
 
     const_cast<MetalBuffer *>(p.get("fold_tokens").buffer)
         ->write(std::as_bytes(sub_toks), 0U);
+    {
+      std::array<U32, 1024> pos_buf{};
+      for (U32 r = 0U; r < sub_len; ++r) {
+        pos_buf[r] = p.hist_offset + r;
+      }
+      const_cast<MetalBuffer *>(p.get("mtp_attn_pos").buffer)
+          ->write(std::as_bytes(std::span<const U32>(pos_buf).first(sub_len)),
+                  0U);
+    }
 
     auto &table = use_delegated ? p.delegated_priming_profiles[cond_mode]
                                 : p.local_priming_profiles[cond_mode];
@@ -3437,6 +3663,15 @@ std::optional<MtpPreparedPrime> MtpForward::prepare_prime_prefill_chunk(
   if (prime_entry) {
     const_cast<MetalBuffer *>(p.get("fold_tokens").buffer)
         ->write(std::as_bytes(fold_toks), 0U);
+    {
+      std::array<U32, 1024> pos_buf{};
+      for (U32 r = 0U; r < fold_total; ++r) {
+        pos_buf[r] = p.hist_offset + r;
+      }
+      const_cast<MetalBuffer *>(p.get("mtp_attn_pos").buffer)
+          ->write(std::as_bytes(std::span<const U32>(pos_buf).first(fold_total)),
+                  0U);
+    }
     auto &prof = prime_entry->profile;
     for (const auto &patch : prof.patches) {
       const U32 val =
@@ -3485,6 +3720,14 @@ MetalSubmission MtpForward::fold_committed_only(
   }
   const_cast<MetalBuffer *>(p.get("fold_tokens").buffer)
       ->write(std::as_bytes(committed_tokens), 0U);
+  {
+    std::array<U32, kMaxFoldTokens> pos_buf{};
+    for (U32 r = 0U; r < c; ++r) {
+      pos_buf[r] = p.hist_offset + r;
+    }
+    const_cast<MetalBuffer *>(p.get("mtp_attn_pos").buffer)
+        ->write(std::as_bytes(std::span<const U32>(pos_buf).first(c)), 0U);
+  }
 
   auto &fp = p.fold_only_profiles[cond_mode][c - 1U];
   Impl::patch_step_position(fp.profile, fp.attn_patches, p.hist_offset);
@@ -3550,6 +3793,19 @@ MtpForward::prepare_propose(std::span<const std::uint32_t> committed_tokens,
 
   const_cast<MetalBuffer *>(p.get("fold_tokens").buffer)
       ->write(std::as_bytes(committed_tokens), 0U);
+  {
+    std::array<U32, kMaxDraftTokens * 16U> pos_buf{};
+    for (U32 r = 0U; r < c; ++r) {
+      pos_buf[r] = p.hist_offset + r;
+    }
+    for (U32 d = 1U; d < draft_tokens; ++d) {
+      pos_buf[d * 16U] = p.hist_offset + c + (d - 1U);
+    }
+    const_cast<MetalBuffer *>(p.get("mtp_attn_pos").buffer)
+        ->write(std::as_bytes(
+                    std::span<const U32>(pos_buf).first(draft_tokens * 16U)),
+                0U);
+  }
 
   auto &cp = p.chain_profiles[cond_mode][c - 1U][draft_tokens - 1U];
   auto &prof = cp.profile;
@@ -3823,28 +4079,30 @@ MtpPackedBatchResult MtpForward::propose_packed_batch(
     std::memcpy(prof.parameter_data.data() + off, &layout_p, sizeof(layout_p));
   }
 
-  for (U32 b = 0U; b < B; ++b) {
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].qk_rope_offset, 4U, fold_counts[b]);
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].qk_rope_offset, 9U, hist_before[b]);
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].append_offset, 3U, fold_counts[b]);
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].append_offset, 4U, hist_before[b]);
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].attn_offset, 3U, fold_counts[b]);
-    Impl::patch_u32(prof, pb.d0_slot_attn[b].attn_offset, 4U, hist_before[b]);
-  }
-
-  for (U32 d = 1U; d < max_k; ++d) {
+  {
+    std::array<U32, kMaxDraftTokens * 8U * 16U> pb_pos{};
     for (U32 b = 0U; b < B; ++b) {
-      const bool active = (d < slices[b].draft_tokens);
-      const U32 tok_d = active ? 1U : 0U;
-      const U32 pos_d =
-          active ? (hist_before[b] + fold_counts[b] + (d - 1U)) : 0U;
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].qk_rope_offset, 4U, tok_d);
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].qk_rope_offset, 9U, pos_d);
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].append_offset, 3U, tok_d);
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].append_offset, 4U, pos_d);
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].attn_offset, 3U, tok_d);
-      Impl::patch_u32(prof, pb.chain_slot_attn[d][b].attn_offset, 4U, pos_d);
+      for (U32 r = 0U; r < fold_counts[b]; ++r) {
+        pb_pos[b * 16U + r] = hist_before[b] + r;
+      }
+      Impl::patch_step_tokens_and_pos(prof, pb.d0_slot_attn[b], fold_counts[b],
+                                      hist_before[b]);
     }
+    for (U32 d = 1U; d < max_k; ++d) {
+      for (U32 b = 0U; b < B; ++b) {
+        const bool active = (d < slices[b].draft_tokens);
+        const U32 tok_d = active ? 1U : 0U;
+        const U32 pos_d =
+            active ? (hist_before[b] + fold_counts[b] + (d - 1U)) : 0U;
+        pb_pos[(d * 8U + b) * 16U] = pos_d;
+        Impl::patch_step_tokens_and_pos(prof, pb.chain_slot_attn[d][b], tok_d,
+                                        pos_d);
+      }
+    }
+    const_cast<MetalBuffer *>(p.pb_get("pb_attn_pos").buffer)
+        ->write(
+            std::as_bytes(std::span<const U32>(pb_pos).first(max_k * 8U * 16U)),
+            0U);
   }
 
   std::vector<PositionSamplingRow> srows(B);
