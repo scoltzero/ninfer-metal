@@ -25,7 +25,7 @@ std::map<std::uint64_t,Result> collect(Engine&e,const std::vector<std::uint64_t>
 LoadOptions options(const std::filesystem::path&fixtures,const std::filesystem::path&draft,const std::filesystem::path&libs,const char*name,U32 b,U32 d,bool cache){
  LoadOptions o;o.model_dir=(fixtures/name/"source").string();o.max_context=2048;o.max_concurrency=b;o.sampling_contract="position_coupled_v1";
  o.path_overrides={{"artifact",(fixtures/name/"model.omlxm5").string()},{"kernel_directory",libs.string()}};
- if(b>1 && grouped_mode)o.path_overrides["batch_mode"]="on";
+ if(b>1)o.path_overrides["batch_mode"]=grouped_mode?"on":"off";
  if(b>1 && projection_mode)o.path_overrides["batch_projection_prototype"]="on";
  if(cache)o.path_overrides["prefix_cache_bytes"]="67108864";
  if(d){o.draft_dir=(draft/"source").string();o.path_overrides["draft_artifact"]=(draft/"model.omlxm5").string();o.speculative={.backend=SpeculativeBackend::dflash2,.draft_tokens=d};}

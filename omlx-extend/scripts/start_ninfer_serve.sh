@@ -283,6 +283,8 @@ discover_serve_binary() {
   fi
   candidates+=(
     "${PROVIDERS_DEFAULT_DIR}/io.ninfer.metal/current/bin/ninfer-metal-serve"
+    "${REPO_ROOT}/build/release/miv/ninfer-metal-serve"
+    "./build/release/miv/ninfer-metal-serve"
     "${REPO_ROOT}/build/miv-v001/miv/ninfer-metal-serve"
     "./build/miv-v001/miv/ninfer-metal-serve"
   )

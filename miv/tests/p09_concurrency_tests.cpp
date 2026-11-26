@@ -80,7 +80,10 @@ void check_native(const std::filesystem::path &fixtures,
                   bool sampled = false, bool batched = false,
                   int sample_top_k = 16) {
   auto o = options(fixtures, libraries, concurrency);
-  if (batched) o.path_overrides["batch_mode"] = "on";
+  if (batched)
+    o.path_overrides["batch_mode"] = "on";
+  else if (concurrency >= 2)
+    o.path_overrides["batch_mode"] = "off";
   if (speculative) {
     o.draft_dir = (draft_fixture / "source").string();
     o.path_overrides["draft_artifact"] =
@@ -214,7 +217,7 @@ void check_prefill_fairness(const std::filesystem::path &fixtures,
                             bool batched = false) {
   auto o = options(fixtures, libraries, 2);
   o.max_context = 2048;
-  if (batched) o.path_overrides["batch_mode"] = "on";
+  o.path_overrides["batch_mode"] = batched ? "on" : "off";
   auto serial_o = o;
   serial_o.max_concurrency = 1;
   serial_o.path_overrides.erase("batch_mode");

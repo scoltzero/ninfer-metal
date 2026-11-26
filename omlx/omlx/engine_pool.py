@@ -1692,14 +1692,26 @@ class EnginePool:
         if value <= 0:
             raise ValueError("max concurrent requests must be > 0")
 
+        external_to_reload: list[str] = []
+        target_external_concurrency = max(1, min(8, value))
         async with self._lock:
             _set_concurrency_limits(self._scheduler_config, value)
-            for entry in list(self._entries.values()):
+            for model_id, entry in list(self._entries.items()):
                 engine = entry.engine if entry is not None else None
                 # Cluster ranks build their schedulers from the deployment.
                 if engine is None or getattr(
                     engine, "_prefill_memory_guard_managed_externally", False
                 ):
+                    continue
+                if is_external_process_engine(engine):
+                    opts = getattr(engine, "_options", None)
+                    if (
+                        opts is not None
+                        and getattr(opts, "concurrency_source", None) in ("global", "default")
+                        and getattr(opts, "max_concurrency", None) != target_external_concurrency
+                        and not entry.is_loading
+                    ):
+                        external_to_reload.append(model_id)
                     continue
                 config = getattr(engine, "_scheduler_config", None)
                 if config is not None:
@@ -1715,6 +1727,21 @@ class EnginePool:
                 # A shut-down executor means the engine is stopping.
                 with suppress(RuntimeError):
                     executor.submit(_set_decode_cap, scheduler, value)
+
+        for model_id in external_to_reload:
+            try:
+                await self.request_unload(
+                    model_id,
+                    reason="max_concurrent_requests changed",
+                    abort_active=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to schedule external engine reload for '%s' after "
+                    "max_concurrent_requests change: %s",
+                    model_id,
+                    exc,
+                )
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None

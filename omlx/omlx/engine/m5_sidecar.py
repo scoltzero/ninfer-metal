@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 EXTERNAL_ENGINE_ENTRY_POINTS_GROUP = "omlx.external_engines"
 M5RT_ENGINE_ID = "m5rt"
 M5RT_ENGINE_LABEL = "miv Core Backend"
-M5RT_DEFAULT_VERSION = "miv-v0.02"
+M5RT_DEFAULT_VERSION = "miv-v0.03"
 M5RT_PROVIDER_ID = "io.ninfer.metal"
 M5RT_LEGACY_PROVIDER_ID = "com.omlx.mseries"
 M5RT_BUILTIN_PROVIDER_IDS = frozenset({M5RT_PROVIDER_ID, M5RT_LEGACY_PROVIDER_ID})
@@ -158,6 +158,7 @@ M5RT_DEFAULT_CAPABILITIES: tuple[str, ...] = (
     "mtp",
     "dflash2",
     "lora",
+    "reload_lora",
     "kv_affine4_g128",
     "rolling_prefix_cache",
     "trim_cache",
@@ -166,6 +167,8 @@ M5RT_DEFAULT_CAPABILITIES: tuple[str, ...] = (
     "cancel",
     "stats",
     "capacity",
+    "thinking_budget",
+    "sampling_penalties",
     "subscribe_events",
 )
 M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
@@ -187,7 +190,7 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "type": "int",
         "min": 1,
         "max": 8,
-        "default": 1,
+        "default": 4,
         "reload_required": True,
     },
     {
@@ -237,10 +240,11 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "options": ["position_coupled_v1", "legacy_rejection_v1"],
         "option_labels": {
             "position_coupled_v1": "Position Coupled v1 (GPU Fast Path)",
-            "legacy_rejection_v1": "Legacy Rejection v1",
+            "legacy_rejection_v1": "Legacy Rejection v1 (Debug / Slow)",
         },
         "description": (
-            "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback."
+            "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback. "
+            "Legacy Rejection v1 is for debug parity only and substantially slower."
         ),
         "default": "position_coupled_v1",
         "reload_required": True,
@@ -262,7 +266,7 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
 )
 M5RT_INSTALL_HINT = (
     "miv Core Backend (ninfer-metal) daemon (mseries_backendd) not found; set integrations.m5rt_path, "
-    "OMLX_M5RT_BIN, install provider io.ninfer.metal, or build build/miv-v001/miv/mseries_backendd"
+    "OMLX_M5RT_BIN, install provider io.ninfer.metal, or build build/release/miv/mseries_backendd"
 )
 
 _BREW_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -272,6 +276,7 @@ _PROVIDERS_BASE_DIR = _OMLX_APP_SUPPORT_DIR / "Providers"
 _PROVIDER_BIN_DIR = _PROVIDERS_BASE_DIR / M5RT_LEGACY_PROVIDER_ID / "bin"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DAEMON_RELPATHS = (
+    Path("build/release/miv/mseries_backendd"),
     Path("build/miv-v001/miv/mseries_backendd"),
     Path("build/b6-xcode27/miv/mseries_backendd"),
     Path("build/d0-m4/miv/mseries_backendd"),
@@ -638,7 +643,7 @@ class M5Options:
     max_concurrency: int = 1
     kv_dtype: str = "bf16"
     prefill_engine: str = "auto"
-    sampling_contract: str = "legacy_rejection_v1"
+    sampling_contract: str = M5RT_DEFAULT_SAMPLING_CONTRACT
     speculative_backend: str = "none"
     speculative_policy: str = "auto"
     spec_search: str | None = None
@@ -1183,6 +1188,20 @@ def sync_m5rt_ui_kv_setting(
         "external_engine" in sent
         and canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
     )
+    # Normalize leftover Stock MLX dflash_block_size values (> 8) when switching to
+    # or saving on m5rt without an explicit dflash_block_size field in the request.
+    if "dflash_block_size" not in sent and (
+        switched_to_m5rt or canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
+    ):
+        cur_block = getattr(current_settings, "dflash_block_size", None)
+        max_block = M5RT_MAX_DRAFT_TOKENS["dflash2"] + 1
+        if (
+            isinstance(cur_block, int)
+            and not isinstance(cur_block, bool)
+            and cur_block > max_block
+            and hasattr(current_settings, "dflash_block_size")
+        ):
+            current_settings.dflash_block_size = max_block
     if "turboquant_kv_enabled" not in sent and not switched_to_m5rt:
         return
     req_explicit_kv = False
@@ -2191,6 +2210,7 @@ def _resolve_metallib_dir(
         search.extend(
             (
                 binary.path.parent,
+                _REPO_ROOT / "build/release/miv/metallib",
                 _REPO_ROOT / "build/miv-v001/miv/metallib",
                 _REPO_ROOT / "build/b6-xcode27/miv/metallib",
                 _REPO_ROOT / "build/d0-m4/miv/metallib",
@@ -2926,19 +2946,32 @@ def _resolve_effective_speculative(
         return "none", 0
 
     raw_depth = (explicit_opts or {}).get("draft_tokens")
+    from_stock_dflash_block = False
     if raw_depth is None and spec_backend == "mtp":
         raw_depth = getattr(model_settings, "mtp_fixed_depth", None)
         if raw_depth is None:
             raw_depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
     if raw_depth is None and spec_backend == "dflash2":
         block = getattr(model_settings, "dflash_block_size", None)
-        raw_depth = int(block) - 1 if block is not None else None
+        if block is not None and int(block) > 0:
+            raw_depth = int(block) - 1
+            from_stock_dflash_block = True
     if raw_depth is None:
         raw_depth = (model_toml or {}).get("draft_tokens")
     if raw_depth is None:
         raw_depth = (shared_toml or {}).get("draft_tokens", 0)
     depth = int(raw_depth)
     maximum = M5RT_MAX_DRAFT_TOKENS[spec_backend]
+    if from_stock_dflash_block and depth > maximum:
+        logger.warning(
+            "miv Core Backend: Stock dflash_block_size=%d exceeds miv DFlash2 max "
+            "block size %d (draft_tokens=%d); clamping draft_tokens to %d",
+            depth + 1,
+            maximum + 1,
+            maximum,
+            maximum,
+        )
+        depth = maximum
     if not 0 <= depth <= maximum:
         raise ValueError(f"{spec_backend} draft_tokens must be in [0, {maximum}] (0 = auto)")
     return spec_backend, depth

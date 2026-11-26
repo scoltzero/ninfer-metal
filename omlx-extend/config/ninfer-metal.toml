@@ -1,4 +1,4 @@
-# ninfer-metal (miv-v0.01) — Default 1-Click Shared Configuration
+# ninfer-metal (miv-v0.03) — Default 1-Click Shared Configuration
 #
 # Shared automatically by BOTH:
 #   1. Standalone `ninfer-metal-serve` (and `./omlx-extend/scripts/start_ninfer_serve.sh`)
@@ -25,9 +25,9 @@ cors = true
 providers_dir = ["~/Library/Application Support/oMLX/Providers"]
 
 [engine]
-max_concurrency = 1
+max_concurrency = 4
 max_context = 65536
-kv_dtype = "bf16"
+kv_dtype = "affine4_g128"
 rolling_prefix_cache = true
 prefix_cache_gb = 4.0
 sampling_contract = "position_coupled_v1"

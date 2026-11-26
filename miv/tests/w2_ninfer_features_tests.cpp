@@ -718,6 +718,55 @@ Json test_spec_controller_and_native_e2e(
   require(gated_dec.k == 0 && gated_dec.gated,
           "AdaptiveSpecController failed to gate 0%-acceptance MoE stream");
 
+  // Dense 27B DFlash2 B=4 reasoning (~38% acceptance) must stay full K=7 in
+  // Auto mode (no false adaptive_gate cliff), and On mode joint lookahead must
+  // not get trapped below the M=16->32 NAX band cliff.
+  detail::AdaptiveSpecController dense_b4_auto(detail::SpecControllerConfig{
+      .mode = detail::SpecSearchMode::Auto,
+      .max_draft_tokens = 7,
+      .max_slots = 4,
+      .hidden_size = 5120,
+      .num_layers = 64,
+      .full_attn_layers = 16,
+      .warmup_rounds = 2,
+  });
+  for (U32 r = 0; r < 8; ++r) {
+    for (U32 s = 0; s < 4; ++s) {
+      dense_b4_auto.observe_round(s, 7, 2, true, 6.5, 32.0, 0.8, 32);
+    }
+  }
+  const std::array<detail::SpecSlotQuery, 4> b4_queries{{
+      {0, 7, 512},
+      {1, 7, 512},
+      {2, 7, 512},
+      {3, 7, 512},
+  }};
+  const auto b4_auto_decs = dense_b4_auto.select_batch_depths(b4_queries);
+  require(b4_auto_decs.size() == 4 &&
+              std::all_of(b4_auto_decs.begin(), b4_auto_decs.end(),
+                          [](const auto &d) { return d.k == 7 && !d.gated; }),
+          "Dense B=4 DFlash2 Auto mode falsely gated reasoning streams");
+
+  detail::AdaptiveSpecController dense_b4_on(detail::SpecControllerConfig{
+      .mode = detail::SpecSearchMode::On,
+      .max_draft_tokens = 7,
+      .max_slots = 4,
+      .hidden_size = 5120,
+      .num_layers = 64,
+      .full_attn_layers = 16,
+      .warmup_rounds = 2,
+  });
+  for (U32 r = 0; r < 8; ++r) {
+    for (U32 s = 0; s < 4; ++s) {
+      dense_b4_on.observe_round(s, 7, 5, true, 6.5, 24.0, 0.8, 32);
+    }
+  }
+  const auto b4_on_decs = dense_b4_on.select_batch_depths(b4_queries);
+  require(b4_on_decs.size() == 4 &&
+              std::all_of(b4_on_decs.begin(), b4_on_decs.end(),
+                          [](const auto &d) { return d.k >= 6 && !d.gated; }),
+          "Dense B=4 On mode joint lookahead got trapped below M=16->32 cliff");
+
   // 2. NativeBackend end-to-end test:
   //    (a) affine4_g128 KV cache AR == DFlash2 exact token parity!
   //    (b) B=3 concurrent batch + cross-slot SharedPrefixCache (`prefix_shared_hits >= 1`, `packed_batch_calls >= 1`)!

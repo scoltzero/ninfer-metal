@@ -1145,9 +1145,19 @@ class TestExt8SpiV2LoRAAndManifestContract:
         manifest = json.loads(rendered)
 
         assert "lora" in manifest["capabilities"]
+        assert "reload_lora" in manifest["capabilities"]
+        assert "thinking_budget" in manifest["capabilities"]
+        assert "sampling_penalties" in manifest["capabilities"]
         assert "lora_adapter" in manifest["supported_standard_settings"]
+        assert manifest["load_defaults"]["max_concurrency"] == 4
+        assert manifest["load_defaults"]["kv_dtype"] == "affine4_g128"
+        assert manifest["load_defaults"]["sampling_contract"] == "position_coupled_v1"
 
         by_key = {item["key"]: item for item in manifest["options_schema"]}
+        assert by_key["max_concurrency"]["default"] == 4
+        assert "speculative_backend" in by_key
+        assert by_key["speculative_backend"]["default"] == "auto"
+        assert "Debug / Slow" in by_key["sampling_contract"]["option_labels"]["legacy_rejection_v1"]
         assert "lora_mode" in by_key
         lora_mode_schema = by_key["lora_mode"]
         assert lora_mode_schema["type"] == "enum"

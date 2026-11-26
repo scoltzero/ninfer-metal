@@ -713,6 +713,7 @@ public:
                                          0ULL);
     slot_rolling_post_ids.assign(std::size_t(options.max_concurrency), 0ULL);
     slot_request_samplers.resize(std::size_t(options.max_concurrency));
+    slot_batch_enabled = (options.max_concurrency >= 2);
     if (const auto it = options.path_overrides.find("batch_mode");
         it != options.path_overrides.end()) {
       if (it->second != "on" && it->second != "off")
@@ -2470,6 +2471,7 @@ public:
       const std::uint32_t max_allowed_k = std::min(
           {owner_.slot_mtp_draft_tokens, remaining - 1U, available - 1U});
       auto *ctrl = mtp_controller();
+      pending_max_k_ = max_allowed_k;
       pending_k_ = ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
       if (pending_k_ == 0U && max_allowed_k > 0U) {
         note_fallback("adaptive_gate");
@@ -2505,10 +2507,12 @@ public:
                             pending_proposal_.selection.tokens.begin(),
                             pending_proposal_.selection.tokens.end());
     } else if (pending_verify_) {
+      const auto query = make_spec_query();
       const SpecSlotDecision decision =
           assigned_spec.has_value()
               ? *assigned_spec
-              : owner_.spec_controller.select_single_depth(make_spec_query());
+              : owner_.spec_controller.select_single_depth(query);
+      pending_max_k_ = query.max_k;
       pending_k_ = decision.k;
       if (decision.gated && pending_k_ == 0)
         note_fallback("adaptive_gate");
@@ -2616,7 +2620,7 @@ public:
   record_batch_verify_result(QwenForwardResult &&res,
                              double verify_gpu_share_ms) {
     step_ = std::move(res);
-    record_spec_step(pending_k_);
+    record_spec_step(pending_k_, pending_max_k_);
     {
       std::scoped_lock lock(backend_.stats_mutex_);
       auto &stats = backend_.backend_stats_;
@@ -2973,10 +2977,10 @@ private:
       note_fallback("mtp_prefix_not_restored");
   }
 
-  void record_spec_step(std::uint32_t depth) {
-    if (depth > 0)
+  void record_spec_step(std::uint32_t depth, std::uint32_t max_k = 1U) {
+    if (depth > 0U)
       ++request_stats_.spec_rounds;
-    else
+    else if (max_k > 0U)
       record_ar_step();
   }
 
@@ -3271,8 +3275,9 @@ private:
       }
       return std::nullopt;
     }
+    const auto spec_query = make_spec_query();
     const auto decision =
-        owner_.spec_controller.select_single_depth(make_spec_query());
+        owner_.spec_controller.select_single_depth(spec_query);
     const auto k = decision.k;
     if (decision.gated && k == 0)
       note_fallback("adaptive_gate");
@@ -3307,7 +3312,7 @@ private:
     TargetGpuVerifyDecision preselected{};
     const bool pipelined_vs = try_pipelined_verify_and_select(
         program(), input, proposal.selection.steps, cost, preselected);
-    record_spec_step(k);
+    record_spec_step(k, spec_query.max_k);
     if (!pipelined_vs) {
       step_ = cost.measure(RoundCostRecorder::verify, [&] {
         return with_page_pressure(
@@ -3543,8 +3548,8 @@ private:
         ctrl ? ctrl->select_depth(max_allowed_k) : max_allowed_k;
 
     if (k == 0U) {
-      record_ar_step();
       if (max_allowed_k > 0U) {
+        record_ar_step();
         note_fallback("adaptive_gate");
         std::scoped_lock lock(backend_.stats_mutex_);
         ++backend_.backend_stats_.spec_search_gated_rounds;
@@ -3625,7 +3630,7 @@ private:
     TargetGpuVerifyDecision preselected{};
     const bool pipelined_vs = try_pipelined_verify_and_select(
         program(), input, proposal.selection.steps, cost, preselected);
-    record_spec_step(k);
+    record_spec_step(k, max_allowed_k);
     if (!pipelined_vs) {
       step_ = cost.measure(RoundCostRecorder::verify, [&] {
         return with_page_pressure(
@@ -3840,7 +3845,7 @@ private:
        needs_anchor_resample_ = false, mtp_primed_ = false,
        mtp_exited_ = false, matched_pinned_prefix_ = false,
        pre_tail_pinned_ = false, post_decode_saved_ = false;
-  std::uint32_t pending_k_ = 0;
+  std::uint32_t pending_k_ = 0, pending_max_k_ = 0;
   DFlash2DraftResult pending_proposal_;
   std::unique_ptr<RoundCostRecorder> pending_cost_;
   RequestStats request_stats_;

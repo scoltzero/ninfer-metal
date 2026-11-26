@@ -232,17 +232,18 @@ public:
     if (queries.empty())
       return out;
 
-    // Off mode, tiny unit-test fixtures, or single-slot dense DFlash2 in Auto
-    // mode: deterministic fixed max_k. On dense B=1 NAX (nax_band_factor(8) ==
-    // 1.07), M=8 target verification streams weights once, whereas gating to
-    // K=0 drops into non-T-domain verify(M=1)+commit and hurts goodput.
+    // Off mode, tiny unit-test fixtures, or dense DFlash2 up to B=4 (M <= 32)
+    // in Auto mode: deterministic fixed max_k. On dense Apple10 NAX up to B=4
+    // (nax_band_factor(8..32) == 1.07..1.52), packed DFlash2 drafts all slots in
+    // one shared-weight pass and target verification streams weights once, whereas
+    // gating to K=0 drops into non-T-domain verify(M=1)+commit and hurts goodput.
     const bool small_fixture = cfg_.hidden_size < 512;
     const bool is_moe = cfg_.num_experts > 0 && cfg_.experts_per_token > 0;
-    const bool auto_dense_solo =
-        (cfg_.mode == SpecSearchMode::Auto && !is_moe && queries.size() == 1);
+    const bool auto_dense_bounded =
+        (cfg_.mode == SpecSearchMode::Auto && !is_moe && queries.size() <= 4U);
     if (cfg_.mode == SpecSearchMode::Off ||
         (cfg_.mode == SpecSearchMode::Auto && small_fixture) ||
-        auto_dense_solo) {
+        auto_dense_bounded) {
       for (std::size_t i = 0; i < queries.size(); ++i)
         out[i].k = std::min<std::uint32_t>(queries[i].max_k, kMaxDepth);
       return out;
@@ -314,6 +315,29 @@ public:
       total_m += (best_next_k - k_alloc[best_idx]);
       k_alloc[best_idx] = best_next_k;
       current_goodput = best_goodput;
+    }
+
+    // Joint uniform lookahead across all slots prevents 1-coordinate greedy
+    // search from getting trapped below a nax_band_factor step cliff (e.g. M=16->32).
+    if (queries.size() >= 2U) {
+      std::vector<std::uint32_t> uniform_k(queries.size(), 0u);
+      for (std::uint32_t cand_k = 1u; cand_k <= std::uint32_t(kMaxDepth); ++cand_k) {
+        std::uint32_t cand_m = B;
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+          const std::uint32_t limit =
+              std::min<std::uint32_t>(queries[i].max_k, std::uint32_t(kMaxDepth));
+          uniform_k[i] = std::min(cand_k, limit);
+          cand_m += uniform_k[i];
+        }
+        if (cand_m > cfg_.max_batch_verify_tokens)
+          break;
+        const double g = evaluate_batch_goodput(queries, uniform_k);
+        if (g > current_goodput + 1e-9) {
+          current_goodput = g;
+          k_alloc = uniform_k;
+          total_m = cand_m;
+        }
+      }
     }
 
     const bool wins_over_plain =

@@ -1158,7 +1158,8 @@ void test_multi_model_config_and_aliases(
     ServeConfig example_cfg;
     load_serve_toml_file(example_toml.string(), example_cfg);
     check(example_cfg.host == "127.0.0.1" && example_cfg.port == 8080 &&
-              example_cfg.max_concurrency == 1 && example_cfg.kv_dtype == "bf16" &&
+              example_cfg.max_concurrency == 4 &&
+              example_cfg.kv_dtype == "affine4_g128" &&
               example_cfg.spec_backend_auto && example_cfg.draft_tokens == 0,
           "ninfer-metal.toml.example failed validation");
   }
@@ -1794,9 +1795,9 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
           "expected repo omlx-extend/config/ninfer-metal.toml, got: " +
               auto_cfg.config_path);
     check(auto_cfg.host == "127.0.0.1" && auto_cfg.port == 8080 &&
-              auto_cfg.cors == true && auto_cfg.max_concurrency == 1 &&
+              auto_cfg.cors == true && auto_cfg.max_concurrency == 4 &&
               auto_cfg.max_context == 65536 &&
-              auto_cfg.kv_dtype == "bf16" &&
+              auto_cfg.kv_dtype == "affine4_g128" &&
               auto_cfg.rolling_prefix_cache.has_value() &&
               *auto_cfg.rolling_prefix_cache == true &&
               auto_cfg.prefix_cache_gb.has_value() &&
@@ -1822,7 +1823,7 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
         "--max-concurrency",
         "2",
         "--kv-dtype",
-        "affine4_g128",
+        "bf16",
         "--spec-backend",
         "none",
         "--rolling-prefix-cache",
@@ -1830,7 +1831,7 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
     });
     check(overridden.config_auto_discovered && overridden.port == 9099 &&
               overridden.max_concurrency == 2 &&
-              overridden.kv_dtype == "affine4_g128" &&
+              overridden.kv_dtype == "bf16" &&
               overridden.spec_backend == SpeculativeBackend::none &&
               !overridden.spec_backend_auto &&
               overridden.rolling_prefix_cache.has_value() &&

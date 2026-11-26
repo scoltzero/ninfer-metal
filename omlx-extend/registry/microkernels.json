@@ -14,7 +14,7 @@
       "channel": "stable",
       "status": "shipped",
       "codename": "miv",
-      "current_version": "miv-v0.02",
+      "current_version": "miv-v0.03",
       "repo": "https://github.com/scoltzero/ninfer-metal",
       "latest_manifest_url": "https://github.com/scoltzero/ninfer-metal/releases/latest/download/latest.json",
       "supported_topologies": [

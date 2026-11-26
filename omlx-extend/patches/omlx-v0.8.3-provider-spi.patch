@@ -8256,10 +8256,10 @@ index 7b0e787..e06e4de 100644
          """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..5bb7353
+index 0000000..86fa091
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7582 @@
+@@ -0,0 +1,7615 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -8323,7 +8323,7 @@ index 0000000..5bb7353
 +EXTERNAL_ENGINE_ENTRY_POINTS_GROUP = "omlx.external_engines"
 +M5RT_ENGINE_ID = "m5rt"
 +M5RT_ENGINE_LABEL = "miv Core Backend"
-+M5RT_DEFAULT_VERSION = "miv-v0.02"
++M5RT_DEFAULT_VERSION = "miv-v0.03"
 +M5RT_PROVIDER_ID = "io.ninfer.metal"
 +M5RT_LEGACY_PROVIDER_ID = "com.omlx.mseries"
 +M5RT_BUILTIN_PROVIDER_IDS = frozenset({M5RT_PROVIDER_ID, M5RT_LEGACY_PROVIDER_ID})
@@ -8420,6 +8420,7 @@ index 0000000..5bb7353
 +    "mtp",
 +    "dflash2",
 +    "lora",
++    "reload_lora",
 +    "kv_affine4_g128",
 +    "rolling_prefix_cache",
 +    "trim_cache",
@@ -8428,6 +8429,8 @@ index 0000000..5bb7353
 +    "cancel",
 +    "stats",
 +    "capacity",
++    "thinking_budget",
++    "sampling_penalties",
 +    "subscribe_events",
 +)
 +M5RT_SUPPORTED_STANDARD_SETTINGS: tuple[str, ...] = (
@@ -8449,7 +8452,7 @@ index 0000000..5bb7353
 +        "type": "int",
 +        "min": 1,
 +        "max": 8,
-+        "default": 1,
++        "default": 4,
 +        "reload_required": True,
 +    },
 +    {
@@ -8499,10 +8502,11 @@ index 0000000..5bb7353
 +        "options": ["position_coupled_v1", "legacy_rejection_v1"],
 +        "option_labels": {
 +            "position_coupled_v1": "Position Coupled v1 (GPU Fast Path)",
-+            "legacy_rejection_v1": "Legacy Rejection v1",
++            "legacy_rejection_v1": "Legacy Rejection v1 (Debug / Slow)",
 +        },
 +        "description": (
-+            "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback."
++            "Position Coupled v1 keeps speculative verification on GPU with zero host logit readback. "
++            "Legacy Rejection v1 is for debug parity only and substantially slower."
 +        ),
 +        "default": "position_coupled_v1",
 +        "reload_required": True,
@@ -8524,7 +8528,7 @@ index 0000000..5bb7353
 +)
 +M5RT_INSTALL_HINT = (
 +    "miv Core Backend (ninfer-metal) daemon (mseries_backendd) not found; set integrations.m5rt_path, "
-+    "OMLX_M5RT_BIN, install provider io.ninfer.metal, or build build/miv-v001/miv/mseries_backendd"
++    "OMLX_M5RT_BIN, install provider io.ninfer.metal, or build build/release/miv/mseries_backendd"
 +)
 +
 +_BREW_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -8534,6 +8538,7 @@ index 0000000..5bb7353
 +_PROVIDER_BIN_DIR = _PROVIDERS_BASE_DIR / M5RT_LEGACY_PROVIDER_ID / "bin"
 +_REPO_ROOT = Path(__file__).resolve().parents[3]
 +_DEFAULT_DAEMON_RELPATHS = (
++    Path("build/release/miv/mseries_backendd"),
 +    Path("build/miv-v001/miv/mseries_backendd"),
 +    Path("build/b6-xcode27/miv/mseries_backendd"),
 +    Path("build/d0-m4/miv/mseries_backendd"),
@@ -8900,7 +8905,7 @@ index 0000000..5bb7353
 +    max_concurrency: int = 1
 +    kv_dtype: str = "bf16"
 +    prefill_engine: str = "auto"
-+    sampling_contract: str = "legacy_rejection_v1"
++    sampling_contract: str = M5RT_DEFAULT_SAMPLING_CONTRACT
 +    speculative_backend: str = "none"
 +    speculative_policy: str = "auto"
 +    spec_search: str | None = None
@@ -9445,6 +9450,20 @@ index 0000000..5bb7353
 +        "external_engine" in sent
 +        and canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
 +    )
++    # Normalize leftover Stock MLX dflash_block_size values (> 8) when switching to
++    # or saving on m5rt without an explicit dflash_block_size field in the request.
++    if "dflash_block_size" not in sent and (
++        switched_to_m5rt or canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
++    ):
++        cur_block = getattr(current_settings, "dflash_block_size", None)
++        max_block = M5RT_MAX_DRAFT_TOKENS["dflash2"] + 1
++        if (
++            isinstance(cur_block, int)
++            and not isinstance(cur_block, bool)
++            and cur_block > max_block
++            and hasattr(current_settings, "dflash_block_size")
++        ):
++            current_settings.dflash_block_size = max_block
 +    if "turboquant_kv_enabled" not in sent and not switched_to_m5rt:
 +        return
 +    req_explicit_kv = False
@@ -10453,6 +10472,7 @@ index 0000000..5bb7353
 +        search.extend(
 +            (
 +                binary.path.parent,
++                _REPO_ROOT / "build/release/miv/metallib",
 +                _REPO_ROOT / "build/miv-v001/miv/metallib",
 +                _REPO_ROOT / "build/b6-xcode27/miv/metallib",
 +                _REPO_ROOT / "build/d0-m4/miv/metallib",
@@ -11188,19 +11208,32 @@ index 0000000..5bb7353
 +        return "none", 0
 +
 +    raw_depth = (explicit_opts or {}).get("draft_tokens")
++    from_stock_dflash_block = False
 +    if raw_depth is None and spec_backend == "mtp":
 +        raw_depth = getattr(model_settings, "mtp_fixed_depth", None)
 +        if raw_depth is None:
 +            raw_depth = getattr(model_settings, "mtp_adaptive_max_depth", None)
 +    if raw_depth is None and spec_backend == "dflash2":
 +        block = getattr(model_settings, "dflash_block_size", None)
-+        raw_depth = int(block) - 1 if block is not None else None
++        if block is not None and int(block) > 0:
++            raw_depth = int(block) - 1
++            from_stock_dflash_block = True
 +    if raw_depth is None:
 +        raw_depth = (model_toml or {}).get("draft_tokens")
 +    if raw_depth is None:
 +        raw_depth = (shared_toml or {}).get("draft_tokens", 0)
 +    depth = int(raw_depth)
 +    maximum = M5RT_MAX_DRAFT_TOKENS[spec_backend]
++    if from_stock_dflash_block and depth > maximum:
++        logger.warning(
++            "miv Core Backend: Stock dflash_block_size=%d exceeds miv DFlash2 max "
++            "block size %d (draft_tokens=%d); clamping draft_tokens to %d",
++            depth + 1,
++            maximum + 1,
++            maximum,
++            maximum,
++        )
++        depth = maximum
 +    if not 0 <= depth <= maximum:
 +        raise ValueError(f"{spec_backend} draft_tokens must be in [0, {maximum}] (0 = auto)")
 +    return spec_backend, depth
@@ -17085,7 +17118,7 @@ index 99df632..316d6f8 100644
      supports_native_response_format = True
  
 diff --git a/omlx/engine_pool.py b/omlx/engine_pool.py
-index 65312ce..04f4b2b 100644
+index 65312ce..e8845f0 100644
 --- a/omlx/engine_pool.py
 +++ b/omlx/engine_pool.py
 @@ -16,6 +16,7 @@ from __future__ import annotations
@@ -17321,7 +17354,58 @@ index 65312ce..04f4b2b 100644
          add("index_cache_freq", normalized_index_cache_freq())
          # Embedding audio tower residency is decided at load. The audio length
          # only matters while the tower is loaded.
-@@ -2233,6 +2380,61 @@ class EnginePool:
+@@ -1545,15 +1692,27 @@ class EnginePool:
+         if value <= 0:
+             raise ValueError("max concurrent requests must be > 0")
+ 
++        external_to_reload: list[str] = []
++        target_external_concurrency = max(1, min(8, value))
+         async with self._lock:
+             _set_concurrency_limits(self._scheduler_config, value)
+-            for entry in list(self._entries.values()):
++            for model_id, entry in list(self._entries.items()):
+                 engine = entry.engine if entry is not None else None
+                 # Cluster ranks build their schedulers from the deployment.
+                 if engine is None or getattr(
+                     engine, "_prefill_memory_guard_managed_externally", False
+                 ):
+                     continue
++                if is_external_process_engine(engine):
++                    opts = getattr(engine, "_options", None)
++                    if (
++                        opts is not None
++                        and getattr(opts, "concurrency_source", None) in ("global", "default")
++                        and getattr(opts, "max_concurrency", None) != target_external_concurrency
++                        and not entry.is_loading
++                    ):
++                        external_to_reload.append(model_id)
++                    continue
+                 config = getattr(engine, "_scheduler_config", None)
+                 if config is not None:
+                     _set_concurrency_limits(config, value)
+@@ -1569,6 +1728,21 @@ class EnginePool:
+                 with suppress(RuntimeError):
+                     executor.submit(_set_decode_cap, scheduler, value)
+ 
++        for model_id in external_to_reload:
++            try:
++                await self.request_unload(
++                    model_id,
++                    reason="max_concurrent_requests changed",
++                    abort_active=False,
++                )
++            except Exception as exc:  # noqa: BLE001
++                logger.warning(
++                    "Failed to schedule external engine reload for '%s' after "
++                    "max_concurrent_requests change: %s",
++                    model_id,
++                    exc,
++                )
++
+     def discover_models(
+         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
+     ) -> None:
+@@ -2233,6 +2407,61 @@ class EnginePool:
              self._splash_draft_candidates(model_settings),
          )
  
@@ -17383,7 +17467,7 @@ index 65312ce..04f4b2b 100644
      def _splash_sizing_context(
          self, entry: EngineEntry, model_settings: object | None
      ) -> int | None:
-@@ -2297,7 +2499,7 @@ class EnginePool:
+@@ -2297,7 +2526,7 @@ class EnginePool:
      async def _check_splash_launcher(
          self, model_id: str, runtime_settings: object | None
      ) -> None:
@@ -17392,21 +17476,21 @@ index 65312ce..04f4b2b 100644
  
          The first look at a launcher runs it to read its version.
          """
-@@ -2306,74 +2508,278 @@ class EnginePool:
+@@ -2306,74 +2535,278 @@ class EnginePool:
              get_settings = getattr(self._settings_manager, "get_settings", None)
              if callable(get_settings):
                  settings = get_settings(model_id)
 -        if self.external_engine_id(model_id, settings):
 +        engine_id = self.external_engine_id(model_id, settings)
 +        if engine_id == "splash":
-+            await asyncio.to_thread(
-+                find_splash_binary, _safe_global_settings().integrations.splash_path
-+            )
-+        elif engine_id == M5RT_ENGINE_ID:
              await asyncio.to_thread(
 -                find_splash_binary, get_global_settings().integrations.splash_path
-+                find_m5rt_binary, _safe_global_settings().integrations.m5rt_path
++                find_splash_binary, _safe_global_settings().integrations.splash_path
              )
++        elif engine_id == M5RT_ENGINE_ID:
++            await asyncio.to_thread(
++                find_m5rt_binary, _safe_global_settings().integrations.m5rt_path
++            )
 +        elif engine_id:
 +            plugin = get_external_engine_plugin(engine_id)
 +            entry = self._entries.get(model_id)
@@ -17567,7 +17651,9 @@ index 65312ce..04f4b2b 100644
              raise ModelLoadingError(
 -                entry.model_id, "Splash serves language models only"
 +                entry.model_id, f"{label} serves language models only"
-+            )
+             )
+-        target, reason = self.splash_target(entry.model_id, model_settings)
+-        if target is None:
 +        if engine_id == "splash":
 +            target, reason = self.splash_target(entry.model_id, model_settings)
 +            if target is None:
@@ -17585,21 +17671,19 @@ index 65312ce..04f4b2b 100644
 +            return engine_id, m5_target
 +        plugin = get_external_engine_plugin(engine_id)
 +        if plugin is None:
-+            raise ModelLoadingError(
+             raise ModelLoadingError(
+-                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
 +                entry.model_id, f"Unknown external engine '{engine_id}'"
              )
--        target, reason = self.splash_target(entry.model_id, model_settings)
--        if target is None:
+-        return target
 +        gs = _safe_global_settings()
 +        if not is_microkernel_enabled(
 +            gs, provider_id=plugin.provider_id, engine_id=plugin.id
 +        ):
-             raise ModelLoadingError(
--                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
++            raise ModelLoadingError(
 +                entry.model_id,
 +                f"{plugin.label} is disabled in Integrations",
-             )
--        return target
++            )
 +        if callable(plugin.validator):
 +            ok, reason = plugin.validator(entry.model_path, model_settings, gs)
 +            if not ok:
@@ -17695,7 +17779,7 @@ index 65312ce..04f4b2b 100644
          logger.info(
              "Serving %s through %s %s (%s)",
              entry.model_id,
-@@ -2381,7 +2787,6 @@ class EnginePool:
+@@ -2381,7 +2814,6 @@ class EnginePool:
              target.binary.version,
              target.binary.path,
          )
@@ -17703,7 +17787,7 @@ index 65312ce..04f4b2b 100644
          integrations = settings.integrations
          cfg = self._scheduler_config
          cache_disk_bytes = 0
-@@ -2436,12 +2841,12 @@ class EnginePool:
+@@ -2436,12 +2868,12 @@ class EnginePool:
          )
  
      def external_process_memory_bytes(self) -> int:
@@ -17718,7 +17802,7 @@ index 65312ce..04f4b2b 100644
                  continue
              try:
                  total += engine.process_memory_bytes()
-@@ -2449,6 +2854,68 @@ class EnginePool:
+@@ -2449,6 +2881,68 @@ class EnginePool:
                  logger.debug("external process memory read failed", exc_info=True)
          return total
  
@@ -17787,7 +17871,7 @@ index 65312ce..04f4b2b 100644
      def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
          """Start the chosen Prefill Accelerator while this Mac loads the model."""
          node_id = getattr(settings, "prefill_helper_node_id", None)
-@@ -2746,6 +3213,7 @@ class EnginePool:
+@@ -2746,6 +3240,7 @@ class EnginePool:
          entry.last_access = time.time()
          if lease:
              entry.in_use += 1
@@ -17795,7 +17879,7 @@ index 65312ce..04f4b2b 100644
          return entry.engine
  
      async def get_engine(
-@@ -2878,6 +3346,7 @@ class EnginePool:
+@@ -2878,6 +3373,7 @@ class EnginePool:
                      entry.last_access = time.time()
                      if _lease:
                          entry.in_use += 1
@@ -17803,7 +17887,7 @@ index 65312ce..04f4b2b 100644
                      return entry.engine
  
              self._raise_if_model_path_missing_locked(model_id, entry)
-@@ -2934,9 +3403,11 @@ class EnginePool:
+@@ -2934,9 +3430,11 @@ class EnginePool:
              runtime_load_settings = (
                  load_settings if ngram_admission_override else runtime_settings
              )
@@ -17818,7 +17902,7 @@ index 65312ce..04f4b2b 100644
              admission_size = self._entry_runtime_resident_size(
                  entry,
                  load_settings,
-@@ -3115,6 +3586,7 @@ class EnginePool:
+@@ -3115,6 +3613,7 @@ class EnginePool:
              self._validate_llm_engine_ready(model_id, loaded.engine)
              if _lease:
                  loaded.in_use += 1
@@ -17826,7 +17910,7 @@ index 65312ce..04f4b2b 100644
              return loaded.engine
  
      async def _release_engine_lease(self, model_id: str) -> None:
-@@ -3124,6 +3596,7 @@ class EnginePool:
+@@ -3124,6 +3623,7 @@ class EnginePool:
              if entry.in_use > 0:
                  entry.in_use -= 1
                  entry.last_access = time.time()
@@ -17834,7 +17918,7 @@ index 65312ce..04f4b2b 100644
              return
          async with self._lock:
              e = self._entries.get(model_id)
-@@ -3131,6 +3604,7 @@ class EnginePool:
+@@ -3131,6 +3631,7 @@ class EnginePool:
                  e.in_use -= 1
                  e.last_access = time.time()
              await self._unload_pending_if_idle_locked(model_id)
@@ -17842,7 +17926,7 @@ index 65312ce..04f4b2b 100644
  
      def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
          self._lease_release_tasks.discard(task)
-@@ -3832,8 +4306,9 @@ class EnginePool:
+@@ -3832,8 +4333,9 @@ class EnginePool:
  
          logger.info(f"Unloading model: {model_id} (immediate abort)")
          distributed = self._distributed_deployment_for_entry(entry) is not None
@@ -17854,7 +17938,7 @@ index 65312ce..04f4b2b 100644
          resident_size = self._entry_resident_size(entry)
          settle_size = (
              entry.runtime_settle_size
-@@ -3903,11 +4378,12 @@ class EnginePool:
+@@ -3903,11 +4405,12 @@ class EnginePool:
                  0,
                  self._current_model_memory - resident_size,
              )
@@ -17868,7 +17952,7 @@ index 65312ce..04f4b2b 100644
              self._wake_process_memory_enforcer()
              return
  
-@@ -4114,9 +4590,9 @@ class EnginePool:
+@@ -4114,9 +4617,9 @@ class EnginePool:
      @staticmethod
      async def _start_engine(engine) -> None:
          """Drain startup before stopping an engine whose acquisition was cancelled."""
@@ -17881,7 +17965,7 @@ index 65312ce..04f4b2b 100644
              await engine.start()
              return
          task = asyncio.create_task(engine.start())
-@@ -4389,7 +4865,7 @@ class EnginePool:
+@@ -4389,7 +4892,7 @@ class EnginePool:
                          prefill_eviction_callback=prefill_eviction_callback,
                      )
  
@@ -17890,7 +17974,7 @@ index 65312ce..04f4b2b 100644
                  self._starting_external[model_id] = engine
              early_helper = hasattr(
                  type(engine), "prefill_helper"
-@@ -4397,9 +4873,8 @@ class EnginePool:
+@@ -4397,9 +4900,8 @@ class EnginePool:
              try:
                  await self._start_engine(engine)
              except Exception as start_error:
@@ -17902,7 +17986,7 @@ index 65312ce..04f4b2b 100644
                      raise
                  if hy4_engram_on_ssd:
                      raise
-@@ -4506,10 +4981,13 @@ class EnginePool:
+@@ -4506,10 +5008,13 @@ class EnginePool:
                  )
  
              self._validate_llm_engine_ready(model_id, engine)
@@ -17920,7 +18004,7 @@ index 65312ce..04f4b2b 100644
                  entry.runtime_estimated_size = resident_size
                  entry.runtime_settle_size = resident_size
              entry.engine = engine
-@@ -4688,8 +5166,8 @@ class EnginePool:
+@@ -4688,8 +5193,8 @@ class EnginePool:
  
              post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
              observed_delta = max(0, post_load_memory - pre_load_memory)
@@ -17931,7 +18015,7 @@ index 65312ce..04f4b2b 100644
                  observed_delta = 0
              entry.actual_size = observed_delta or resident_size
  
-@@ -4864,10 +5342,11 @@ class EnginePool:
+@@ -4864,10 +5369,11 @@ class EnginePool:
              deployment = self._distributed_deployment_for_entry(e)
              actual_size = e.actual_size
              external_engine = None
@@ -19255,10 +19339,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..18769f0
+index 0000000..934e6d2
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4168 @@
+@@ -0,0 +1,4253 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -20188,6 +20272,9 @@ index 0000000..18769f0
 +                assert "warning" not in response.headers
 +
 +                engine._hello_info["capabilities"] += ["thinking_budget", "sampling_penalties"]
++                engine._options = replace(
++                    engine._options, sampling_contract="legacy_rejection_v1"
++                )
 +                # A daemon can announce the feature while this model uses the legacy contract.
 +                response = await client.post(
 +                    "/v1/completions",
@@ -22156,9 +22243,9 @@ index 0000000..18769f0
 +            memory_budget_bytes=8 << 30,
 +            model_id="Qwen3.8-SharedDefault",
 +        )
-+        assert opts.max_concurrency == 1
++        assert opts.max_concurrency == 4
 +        assert opts.max_context == 65536
-+        assert opts.kv_dtype == "bf16"
++        assert opts.kv_dtype == "affine4_g128"
 +        assert opts.rolling_prefix_cache is True
 +        assert opts.prefix_cache_bytes == 4 * (1 << 30)
 +        assert opts.sampling_contract == "position_coupled_v1"
@@ -23427,6 +23514,88 @@ index 0000000..18769f0
 +    assert final.finished is True
 +    assert final.finish_reason == "stop"
 +    assert final.cached_tokens == 5
++
++
++def test_stock_dflash_block_size_clamps_for_m5rt_and_m5options_default_contract(tmp_path):
++    assert M5Options().sampling_contract == "position_coupled_v1"
++
++    model_dir = _write_test_model(tmp_path / "models" / "Qwen3.8-DFlash-Clamp")
++    _write_test_model(model_dir / "dflash2")
++    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
++    metallib_dir = tmp_path / "bin" / "metallib"
++    metallib_dir.mkdir(exist_ok=True)
++    (metallib_dir / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
++    target, err = resolve_m5rt_target(model_dir, str(fake_bin), ModelSettings())
++    assert target is not None and err == ""
++
++    # Leftover Stock MLX dflash_block_size=16 must clamp cleanly to draft_tokens=7 (not crash).
++    opts = m5_mod.build_m5rt_options(
++        model_dir,
++        target,
++        ModelSettings(dflash_enabled=True, dflash_block_size=16),
++        default_context=32768,
++        memory_budget_bytes=0,
++    )
++    assert opts.speculative_backend == "dflash2"
++    assert opts.draft_tokens == 7
++
++    # Explicit m5rt_options.draft_tokens out of range must still raise ValueError.
++    with pytest.raises(ValueError, match="dflash2 draft_tokens must be in"):
++        m5_mod.build_m5rt_options(
++            model_dir,
++            target,
++            ModelSettings(dflash_enabled=True, m5rt_options={"draft_tokens": 8}),
++            default_context=32768,
++            memory_budget_bytes=0,
++        )
++
++    # Switching external_engine to m5rt without sending dflash_block_size normalizes 16 -> 8.
++    from omlx.admin.routes import ModelSettingsRequest
++
++    ms = ModelSettings(external_engine="stock", dflash_enabled=True, dflash_block_size=16)
++    req = ModelSettingsRequest(external_engine="m5rt")
++    m5_mod.sync_m5rt_ui_kv_setting(ms, req, req.model_fields_set)
++    assert ms.dflash_block_size == 8
++
++
++@pytest.mark.asyncio
++async def test_apply_max_concurrent_requests_reloads_only_global_sidecars(tmp_path):
++    from omlx.engine_pool import EngineEntry, EnginePool
++
++    class _FakeSidecar:
++        external_engine_id = "m5rt"
++
++        def __init__(self, opts: M5Options) -> None:
++            self._options = opts
++
++    pool = EnginePool()
++
++    def _make_entry(model_id: str, conc: int, source: str) -> EngineEntry:
++        eng = _FakeSidecar(M5Options(max_concurrency=conc, concurrency_source=source))
++        entry = EngineEntry(
++            model_id=model_id,
++            model_path=str(tmp_path / model_id),
++            model_type="llm",
++            engine_type="llm",
++            estimated_size=0,
++        )
++        entry.engine = eng  # type: ignore[assignment]
++        return entry
++
++    pool._entries["global-stale"] = _make_entry("global-stale", 2, "global")
++    pool._entries["global-same"] = _make_entry("global-same", 4, "global")
++    pool._entries["toml-pinned"] = _make_entry("toml-pinned", 1, "shared_toml")
++    pool._entries["model-override"] = _make_entry("model-override", 2, "model_options")
++
++    reloaded: list[tuple[str, bool, str]] = []
++
++    async def fake_request_unload(model_id: str, *, reason: str = "", abort_active: bool = True):
++        reloaded.append((model_id, abort_active, reason))
++        return True
++
++    pool.request_unload = fake_request_unload  # type: ignore[method-assign]
++    await pool.apply_max_concurrent_requests(4)
++    assert reloaded == [("global-stale", False, "max_concurrent_requests changed")]
 diff --git a/tests/test_microkernel_manager.py b/tests/test_microkernel_manager.py
 new file mode 100644
 index 0000000..b90774c

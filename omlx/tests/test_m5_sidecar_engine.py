@@ -927,6 +927,9 @@ class TestDualUdsTransportAndShowstoppers:
                 assert "warning" not in response.headers
 
                 engine._hello_info["capabilities"] += ["thinking_budget", "sampling_penalties"]
+                engine._options = replace(
+                    engine._options, sampling_contract="legacy_rejection_v1"
+                )
                 # A daemon can announce the feature while this model uses the legacy contract.
                 response = await client.post(
                     "/v1/completions",
@@ -2895,9 +2898,9 @@ class TestPathBMultiMicrokernelSidecars:
             memory_budget_bytes=8 << 30,
             model_id="Qwen3.8-SharedDefault",
         )
-        assert opts.max_concurrency == 1
+        assert opts.max_concurrency == 4
         assert opts.max_context == 65536
-        assert opts.kv_dtype == "bf16"
+        assert opts.kv_dtype == "affine4_g128"
         assert opts.rolling_prefix_cache is True
         assert opts.prefix_cache_bytes == 4 * (1 << 30)
         assert opts.sampling_contract == "position_coupled_v1"
@@ -4166,3 +4169,85 @@ async def test_sidecar_string_stop_cancel_waits_for_async_request_stats(tmp_path
     assert final.finished is True
     assert final.finish_reason == "stop"
     assert final.cached_tokens == 5
+
+
+def test_stock_dflash_block_size_clamps_for_m5rt_and_m5options_default_contract(tmp_path):
+    assert M5Options().sampling_contract == "position_coupled_v1"
+
+    model_dir = _write_test_model(tmp_path / "models" / "Qwen3.8-DFlash-Clamp")
+    _write_test_model(model_dir / "dflash2")
+    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
+    metallib_dir = tmp_path / "bin" / "metallib"
+    metallib_dir.mkdir(exist_ok=True)
+    (metallib_dir / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+    target, err = resolve_m5rt_target(model_dir, str(fake_bin), ModelSettings())
+    assert target is not None and err == ""
+
+    # Leftover Stock MLX dflash_block_size=16 must clamp cleanly to draft_tokens=7 (not crash).
+    opts = m5_mod.build_m5rt_options(
+        model_dir,
+        target,
+        ModelSettings(dflash_enabled=True, dflash_block_size=16),
+        default_context=32768,
+        memory_budget_bytes=0,
+    )
+    assert opts.speculative_backend == "dflash2"
+    assert opts.draft_tokens == 7
+
+    # Explicit m5rt_options.draft_tokens out of range must still raise ValueError.
+    with pytest.raises(ValueError, match="dflash2 draft_tokens must be in"):
+        m5_mod.build_m5rt_options(
+            model_dir,
+            target,
+            ModelSettings(dflash_enabled=True, m5rt_options={"draft_tokens": 8}),
+            default_context=32768,
+            memory_budget_bytes=0,
+        )
+
+    # Switching external_engine to m5rt without sending dflash_block_size normalizes 16 -> 8.
+    from omlx.admin.routes import ModelSettingsRequest
+
+    ms = ModelSettings(external_engine="stock", dflash_enabled=True, dflash_block_size=16)
+    req = ModelSettingsRequest(external_engine="m5rt")
+    m5_mod.sync_m5rt_ui_kv_setting(ms, req, req.model_fields_set)
+    assert ms.dflash_block_size == 8
+
+
+@pytest.mark.asyncio
+async def test_apply_max_concurrent_requests_reloads_only_global_sidecars(tmp_path):
+    from omlx.engine_pool import EngineEntry, EnginePool
+
+    class _FakeSidecar:
+        external_engine_id = "m5rt"
+
+        def __init__(self, opts: M5Options) -> None:
+            self._options = opts
+
+    pool = EnginePool()
+
+    def _make_entry(model_id: str, conc: int, source: str) -> EngineEntry:
+        eng = _FakeSidecar(M5Options(max_concurrency=conc, concurrency_source=source))
+        entry = EngineEntry(
+            model_id=model_id,
+            model_path=str(tmp_path / model_id),
+            model_type="llm",
+            engine_type="llm",
+            estimated_size=0,
+        )
+        entry.engine = eng  # type: ignore[assignment]
+        return entry
+
+    pool._entries["global-stale"] = _make_entry("global-stale", 2, "global")
+    pool._entries["global-same"] = _make_entry("global-same", 4, "global")
+    pool._entries["toml-pinned"] = _make_entry("toml-pinned", 1, "shared_toml")
+    pool._entries["model-override"] = _make_entry("model-override", 2, "model_options")
+
+    reloaded: list[tuple[str, bool, str]] = []
+
+    async def fake_request_unload(model_id: str, *, reason: str = "", abort_active: bool = True):
+        reloaded.append((model_id, abort_active, reason))
+        return True
+
+    pool.request_unload = fake_request_unload  # type: ignore[method-assign]
+    await pool.apply_max_concurrent_requests(4)
+    assert reloaded == [("global-stale", False, "max_concurrent_requests changed")]

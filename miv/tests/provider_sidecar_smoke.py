@@ -454,7 +454,11 @@ def run_session(
             assert load_result["pid"] == process.pid
             assert load_result["phys_footprint_bytes"] > 0
             assert load_result["max_context"] == load.get("max_context", 32768)
-            assert load_result["kv_dtype"] == load.get("kv_dtype", "bf16")
+            expected_kv = load.get(
+                "kv_dtype",
+                "bf16" if load.get("fake") else hello["load_defaults"]["kv_dtype"],
+            )
+            assert load_result["kv_dtype"] == expected_kv
             request = {
                 "prompt_tokens": [1, 7, 3, 9, 2],
                 "max_new_tokens": 8,
@@ -505,8 +509,12 @@ def run_session(
                 assert len(controlled_tokens) == controlled["max_new_tokens"]
                 if stats["speculative_backend"] == "dflash2":
                     assert controlled_terminal["request_stats"]["spec_rounds"] > 0
+            expected_conc = load.get(
+                "max_concurrency",
+                1 if load.get("fake") else hello["load_defaults"]["max_concurrency"],
+            )
             capacity = client.call("capacity")
-            assert capacity["max_concurrency"] == 1
+            assert capacity["max_concurrency"] == expected_conc
             assert capacity["pid"] == process.pid
             assert capacity["phys_footprint_bytes"] > 0
 
@@ -518,10 +526,13 @@ def run_session(
             assert trimmed["freed_bytes"] >= 0
             assert trimmed["resident_bytes"] > 0
 
-            blocker_id = client.call(
-                "submit",
-                {"prompt_tokens": [1, 2], "max_new_tokens": 512},
-            )["request_id"]
+            blocker_ids = [
+                client.call(
+                    "submit",
+                    {"prompt_tokens": [1, 2 + i], "max_new_tokens": 512},
+                )["request_id"]
+                for i in range(expected_conc)
+            ]
             cancel_id = client.call(
                 "submit",
                 {"prompt_tokens": [3, 4], "max_new_tokens": 8},
@@ -534,7 +545,7 @@ def run_session(
                     if event["request_id"] == cancel_id and event["kind"] != "tokens":
                         cancelled = event
             assert cancelled is not None and cancelled["kind"] == "aborted"
-            assert blocker_id != cancel_id
+            assert cancel_id not in blocker_ids
             client.call("shutdown")
         finally:
             client.close()

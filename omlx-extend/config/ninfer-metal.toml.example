@@ -1,4 +1,4 @@
-# ninfer-metal (codename: miv, miv-v0.01) configuration template
+# ninfer-metal (codename: miv, miv-v0.03) configuration template
 #
 # Used by BOTH:
 #   1. Standalone server / CLI mode (`ninfer-metal serve --config ninfer-metal.toml`)
@@ -44,17 +44,17 @@ trust_remote_code = false
 [engine]
 # Multi-user Concurrency (B/C): concurrent batch slots in [1..8].
 # In oMLX sidecar mode, omit or comment out to inherit Global Settings `max_concurrent_requests`.
-max_concurrency = 1
+max_concurrency = 4
 
 # Maximum context window (Context L, tokens). Honors up to model native max_position_embeddings (e.g. 262144).
 # In oMLX sidecar mode, stock Model Settings `max_context_window` maps here automatically.
 max_context = 65536
 
-# KV cache storage format implemented in miv-v0.01:
+# KV cache storage format implemented in miv:
 #   "bf16"         - full-precision BF16 KV cache (2.0 B/val)
-#   "affine4_g128" - 4-bit group-128 affine KV cache (0.5625 B/val, lossless 0-ULP verified on 64K+)
-# Note: "int8_g64" is NOT implemented in miv-v0.01 and must not be used.
-kv_dtype = "bf16"
+#   "affine4_g128" - 4-bit group-128 affine KV cache (0.5625 B/val, lossless 0-ULP verified on 64K+, Batched Split-KV)
+# Note: "int8_g64" is NOT implemented in miv and must not be used.
+kv_dtype = "affine4_g128"
 
 # Multi-turn UMA rolling prefix cache & checkpoint pool budget (GiB).
 rolling_prefix_cache = true

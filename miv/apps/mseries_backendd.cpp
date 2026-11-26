@@ -427,17 +427,17 @@ struct CliOptions {
 omlx::m5::LoadOptions load_options(const Json &value,
                                    const CliOptions &cli_defaults = {}) {
   omlx::m5::LoadOptions result;
+  const bool is_fake = value.value("fake", false);
   result.model_dir = expand_user_path(value.value("model_dir", ""));
   result.draft_dir = expand_user_path(value.value("draft_dir", ""));
-  result.max_concurrency = value.value("max_concurrency", 1);
+  result.max_concurrency = value.value("max_concurrency", is_fake ? 1 : 4);
   result.max_context = value.value("max_context", 32768);
-  result.kv_dtype = value.value("kv_dtype", "bf16");
+  result.kv_dtype = value.value("kv_dtype", is_fake ? "bf16" : "affine4_g128");
   result.prefill_engine = value.value("prefill_engine", "auto");
   result.spec_search = value.value("spec_search", "auto");
   result.sampling_contract = value.value(
-      "sampling_contract", value.value("fake", false)
-                               ? "legacy_rejection_v1"
-                               : omlx::m5::kDefaultServingSamplingContract);
+      "sampling_contract", is_fake ? "legacy_rejection_v1"
+                                   : omlx::m5::kDefaultServingSamplingContract);
   if (value.contains("memory_budget_bytes") &&
       !value.at("memory_budget_bytes").is_null()) {
     const auto &mb = value.at("memory_budget_bytes");
@@ -765,7 +765,7 @@ Json provider_contract() {
       {"kv_formats", {"bf16", "affine4_g128"}},
       {"speculative_limits", {{"mtp", omlx::m5::kMaxMtpDraftTokens},
                               {"dflash2", omlx::m5::kMaxDFlash2DraftTokens}}},
-      {"load_defaults", {{"max_concurrency", 1}, {"kv_dtype", "bf16"},
+      {"load_defaults", {{"max_concurrency", 4}, {"kv_dtype", "affine4_g128"},
                          {"sampling_contract", omlx::m5::kDefaultServingSamplingContract},
                          {"draft_tokens", 0}}},
       {"supported_standard_settings",
@@ -780,7 +780,7 @@ Json provider_contract() {
             {"type", "int"},
             {"min", 1},
             {"max", 8},
-            {"default", 1},
+            {"default", 4},
             {"reload_required", true}},
            {{"key", "rolling_prefix_cache"},
             {"label", "Rolling Prefix Cache"},
@@ -805,12 +805,26 @@ Json provider_contract() {
             {"type", "enum"},
             {"options",
              Json::array({"position_coupled_v1", "legacy_rejection_v1"})},
+            {"option_labels",
+             {{"position_coupled_v1", "Position Coupled v1 (GPU Fast Path)"},
+              {"legacy_rejection_v1", "Legacy Rejection v1 (Debug / Slow)"}}},
+            {"description",
+             "Position Coupled v1 keeps speculative verification on GPU with "
+             "zero host logit readback. Legacy Rejection v1 is for debug parity "
+             "only and substantially slower."},
             {"default", omlx::m5::kDefaultServingSamplingContract},
             {"reload_required", true}},
            {{"key", "lora_mode"},
             {"label", "LoRA Mode"},
             {"type", "enum"},
             {"options", Json::array({"merge", "bypass"})},
+            {"option_labels",
+             {{"merge", "Merge (Load-Time UMA Fusion)"},
+              {"bypass", "Bypass (Runtime BF16 Low-Rank)"}}},
+            {"description",
+             "Merge fuses LoRA into 8-bit NAX tiles at load time with zero "
+             "runtime overhead; Bypass injects low-rank BF16 projections at "
+             "runtime with fast hot-swap."},
             {"default", "merge"},
             {"reload_required", true}},
            {{"key", "artifact_path"},
