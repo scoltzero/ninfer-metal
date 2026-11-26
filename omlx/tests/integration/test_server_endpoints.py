@@ -1053,7 +1053,30 @@ class TestCompletionEndpoint:
 
         assert response.status_code == 200
         data = response.json()
-        assert "choices" in data
+        assert len(data["choices"]) == 2
+
+    @pytest.mark.parametrize("prompts", [[], ["First prompt", "Second prompt"]])
+    def test_streaming_requires_one_prompt_before_loading(
+        self, client, mock_engine_pool, prompts
+    ):
+        before = len(mock_engine_pool.get_engine_calls)
+        response = client.post(
+            "/v1/completions",
+            json={"model": "test-model", "prompt": prompts, "stream": True},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == "prompt"
+        assert len(mock_engine_pool.get_engine_calls) == before
+
+    def test_streaming_accepts_one_prompt_in_list(self, client):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "test-model", "prompt": ["Only prompt"], "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "data: [DONE]" in response.text
 
     @pytest.mark.parametrize(
         "prompt", ["Only prompt", ["First prompt", "Second prompt"]]

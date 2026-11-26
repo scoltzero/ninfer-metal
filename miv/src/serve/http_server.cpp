@@ -1066,6 +1066,9 @@ struct ServeHttpServer::Impl {
       sampling = parse_sampling_spec(body);
       stop_strings = parse_stop_strings(body);
 
+      const auto tool_choice = body.find("tool_choice");
+      const bool tools_enabled =
+          tool_choice == body.end() || *tool_choice != "none";
       Json tools = Json();
       if (body.contains("tools") && !body.at("tools").is_null()) {
         if (!body.at("tools").is_array()) {
@@ -1090,6 +1093,10 @@ struct ServeHttpServer::Impl {
           !body.at("reasoning_effort").is_null()) {
         extra_kwargs["reasoning_effort"] = body.at("reasoning_effort");
       }
+      if (!tools_enabled) {
+        tools = nullptr;
+        extra_kwargs.erase("tools");
+      }
 
       rendered = target->chat_template->render(body.at("messages"), tools,
                                                extra_kwargs, true);
@@ -1111,11 +1118,7 @@ struct ServeHttpServer::Impl {
 
       parser_opts.enable_thinking_split = true;
       parser_opts.initial_in_thinking = rendered.prompt_opens_think;
-      parser_opts.enable_tool_parsing = true;
-      if (body.contains("tool_choice") && body.at("tool_choice").is_string() &&
-          body.at("tool_choice").get<std::string>() == "none") {
-        parser_opts.enable_tool_parsing = false;
-      }
+      parser_opts.enable_tool_parsing = tools_enabled;
       parser_opts.stop_strings = std::move(stop_strings);
       parser_opts.tool_param_types = extract_tool_param_types(tools);
     } catch (const std::invalid_argument &err) {

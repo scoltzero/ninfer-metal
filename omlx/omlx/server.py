@@ -2449,9 +2449,20 @@ def _prepare_chat_prompt_for_request(
     tools: list | None = None,
     chat_template_kwargs: dict | None = None,
     is_partial: bool | None = None,
+    *,
+    system_messages_prepared: bool = False,
 ) -> tuple[int, tuple[str, list[int]] | None]:
+    if isinstance(engine, M5SidecarEngine):
+        prepared = engine.prepare_chat_prompt(
+            messages,
+            tools,
+            chat_template_kwargs,
+            is_partial,
+            system_messages_prepared=system_messages_prepared,
+        )
+        return len(prepared[1]), prepared
     # Subclasses (e.g. distributed) have their own prompt handling.
-    if type(engine) in (BatchedEngine, VLMBatchedEngine) or isinstance(engine, M5SidecarEngine):
+    if type(engine) in (BatchedEngine, VLMBatchedEngine):
         prepared = engine.prepare_chat_prompt(
             messages, tools, chat_template_kwargs, is_partial
         )
@@ -4671,6 +4682,11 @@ async def create_completion(
 ):
     """Create a text completion."""
     _reject_lone_surrogates(request)
+    prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+    if request.stream and len(prompts) != 1:
+        raise InvalidRequestError(
+            "Streaming completions require exactly one prompt.", field="prompt"
+        )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4686,11 +4702,6 @@ async def create_completion(
         generation_options = _completion_generation_options(request)
         control_warnings = _preflight_miv_request_controls(
             engine, request, generation_options
-        )
-
-        # Handle single prompt or list of prompts
-        prompts = (
-            request.prompt if isinstance(request.prompt, list) else [request.prompt]
         )
 
         # Validate context window for each prompt
@@ -5194,6 +5205,7 @@ async def create_chat_completion(
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 is_partial=is_partial,
+                system_messages_prepared=True,
             )
         except Exception as e:
             if _is_chat_template_error(e):
@@ -7965,6 +7977,7 @@ def _count_anthropic_prompt(
             prompt.tools,
             chat_template_kwargs=prompt.chat_template_kwargs or None,
             is_partial=prompt.is_partial,
+            system_messages_prepared=True,
         )
     except Exception as e:
         if _is_chat_template_error(e):
@@ -8442,6 +8455,9 @@ async def _tokenize_chat_messages(
     add_generation_prompt = (
         None if is_partial or request.add_generation_prompt else False
     )
+    renderer_options = (
+        {"system_messages_prepared": True} if isinstance(engine, M5SidecarEngine) else {}
+    )
     try:
         return await engine.tokenize_chat(
             messages,
@@ -8450,6 +8466,7 @@ async def _tokenize_chat_messages(
             is_partial=is_partial,
             add_generation_prompt=add_generation_prompt,
             add_special_tokens=request.add_special_tokens,
+            **renderer_options,
         )
     except NotImplementedError as e:
         raise InvalidRequestError(
@@ -8836,6 +8853,7 @@ async def create_response(
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
+                system_messages_prepared=True,
             )
         except Exception as e:
             err_name = type(e).__name__.lower()

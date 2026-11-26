@@ -742,7 +742,7 @@ class ResponseStore:
         return data.get("public_response")
 
     def resolve_chain_messages(self, response_id: str) -> List[Dict[str, Any]]:
-        """Resolve the full previous_response_id chain into message history."""
+        """Resolve the chain in conversation order for template preparation."""
         if response_id not in self._store:
             raise ResponseStateNotFoundError(f"Response state not found: {response_id}")
 
@@ -769,7 +769,7 @@ class ResponseStore:
         for record in chain:
             messages.extend(copy.deepcopy(record.get("input_messages", [])))
             messages.extend(copy.deepcopy(record.get("output_messages", [])))
-        return _consolidate_system_messages(messages)
+        return messages
 
     def delete(self, response_id: str) -> bool:
         """Delete a stored response. Returns True if found."""

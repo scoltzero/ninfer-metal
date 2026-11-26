@@ -995,6 +995,181 @@ class TestDualUdsTransportAndShowstoppers:
             await engine.stop()
             await mock_srv.close()
 
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "supports_mid_system, keep_prefix, expected_mid_role",
+        [(True, True, "system"), (False, True, "user"), (False, False, "merged_system")],
+    )
+    async def test_responses_replay_preserves_prepared_prompt(
+        self, tmp_path, monkeypatch, stream, supports_mid_system, keep_prefix, expected_mid_role
+    ):
+        sock = Path("/tmp") / f"m5-mock-{os.getpid()}-responses.sock"
+        mock_srv = _MockUdsSidecarServer(sock, support_push=True)
+        await mock_srv.start()
+        engine = await self._attach_mock_engine(tmp_path / "responses", mock_srv)
+        tokenizer = engine.tokenizer
+        tokenizer._omlx_supports_mid_system_messages = supports_mid_system
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ message['role'] }}: {{ message['content'] }}"
+            "{{ message.get('tool_call_id', '') }}"
+            "{{ message.get('tool_calls', []) | tojson }}\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}assistant: {% endif %}"
+        )
+
+        rendered = []
+        apply_template = tokenizer.apply_chat_template
+
+        def capture_template(messages, *args, **kwargs):
+            rendered.append(messages)
+            if not supports_mid_system:
+                assert all(m["role"] != "system" for m in messages[1:])
+            return apply_template(messages, *args, **kwargs)
+
+        monkeypatch.setattr(tokenizer, "apply_chat_template", capture_template)
+
+        async def get_engine(*args, **kwargs):
+            return engine
+
+        pool = MagicMock()
+        pool.get_entry.return_value = None
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.preserve_mid_system_cache = keep_prefix
+        state_dir = tmp_path / "response-state"
+        state = srv.ServerState(
+            default_model="test-model",
+            engine_pool=pool,
+            global_settings=settings,
+            responses_store=ResponseStore(state_dir=state_dir),
+        )
+        monkeypatch.setattr(srv, "_server_state", state)
+        monkeypatch.setattr(srv, "get_engine_for_model", get_engine)
+        common = {
+            "model": "test-model",
+            "max_output_tokens": 256,
+            "stream": stream,
+            "tools": [{"type": "function", "name": "lookup"}],
+        }
+
+        async def respond(client, **kwargs):
+            before = len(rendered)
+            response = await client.post("/v1/responses", json={**common, **kwargs})
+            assert response.status_code == 200, response.text
+            assert len(rendered) == before + 1
+            if not stream:
+                return response.json()
+            return next(
+                event["response"]
+                for line in response.text.splitlines()
+                if line.startswith("data: ")
+                for event in [json.loads(line[6:])]
+                if event["type"] == "response.completed"
+            )
+
+        try:
+            transport = httpx.ASGITransport(app=srv.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                first_input = [
+                    {"role": "system", "content": "Persistent system"},
+                    {"role": "user", "content": "Find the value"},
+                ]
+                mock_srv.token_plan = [
+                    tokenizer.encode('<tool_call>{"name":"lookup","arguments":{}}</tool_call>')
+                ]
+                first = await respond(
+                    client, input=first_input, instructions="First request only"
+                )
+                call = next(item for item in first["output"] if item["type"] == "function_call")
+                result = {
+                    "type": "function_call_output",
+                    "call_id": call["call_id"],
+                    "output": "Blue",
+                }
+                second_input = [
+                    result,
+                    {"role": "developer", "content": "Mid-turn marker"},
+                    {"role": "user", "content": "Summarize it"},
+                ]
+                mock_srv.token_plan = [tokenizer.encode("It is blue.")]
+                second = await respond(
+                    client, input=second_input, previous_response_id=first["id"]
+                )
+
+                state.responses_store = ResponseStore(state_dir=state_dir)
+                final = {"role": "user", "content": "Repeat the answer"}
+                await respond(
+                    client, input=[final], previous_response_id=second["id"],
+                    instructions="Current request only",
+                )
+                replay_tokens = mock_srv.submitted_requests[-1]["prompt_tokens"]
+                replay_messages = rendered[-1]
+                await respond(
+                    client,
+                    input=[
+                        *first_input,
+                        *first["output"],
+                        *second_input,
+                        *second["output"],
+                        final,
+                    ],
+                    instructions="Current request only",
+                )
+                assert mock_srv.submitted_requests[-1]["prompt_tokens"] == replay_tokens
+                assert rendered[-1] == replay_messages
+                assert "First request only" not in tokenizer.decode(replay_tokens)
+                assert "Current request only" in tokenizer.decode(replay_tokens)
+
+                tool_index = next(
+                    i for i, msg in enumerate(replay_messages) if msg["role"] == "tool"
+                )
+                assert replay_messages[tool_index]["tool_call_id"] == call["call_id"]
+                assert replay_messages[tool_index - 1]["tool_calls"][0]["id"] == call["call_id"]
+                mid_index = next(
+                    i
+                    for i, msg in enumerate(replay_messages)
+                    if "Mid-turn marker" in msg["content"]
+                )
+                if expected_mid_role == "merged_system":
+                    assert mid_index == 0
+                else:
+                    assert mid_index > tool_index
+                    assert replay_messages[mid_index]["role"] == expected_mid_role
+
+                if supports_mid_system and not stream:
+                    chat = {
+                        "model": "test-model",
+                        "messages": [
+                            *first_input,
+                            {"role": "system", "content": "Chat mid-turn marker"},
+                        ],
+                    }
+                    before = len(rendered)
+                    response = await client.post("/v1/chat/completions", json=chat)
+                    assert response.status_code == 200, response.text
+                    assert len(rendered) == before + 1
+                    assert rendered[-1][-1]["role"] == "system"
+                    chat_ids = mock_srv.submitted_requests[-1]["prompt_tokens"]
+                    response = await client.post(
+                        "/v1/tokenize", json={**chat, "add_generation_prompt": True}
+                    )
+                    assert response.status_code == 200, response.text
+                    assert len(rendered) == before + 2
+                    assert response.json()["tokens"] == chat_ids
+
+                # Calling the engine directly still applies its old strict preparation.
+                engine.prepare_chat_prompt(
+                    [*first_input, {"role": "system", "content": "Direct"}]
+                )
+                assert rendered[-1][0]["content"].endswith("Direct")
+                assert [m["role"] for m in rendered[-1]] == ["system", "user"]
+        finally:
+            engine._process = None
+            await engine.stop()
+            await mock_srv.close()
+
     async def test_push_stream_early_event_race_eos_and_utf8_streaming(self, tmp_path):
         model_dir = _write_test_model(tmp_path / "proto-model")
         tok = AutoTokenizer_or_fast = _build_bpe_chat_tokenizer(model_dir)

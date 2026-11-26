@@ -5580,9 +5580,13 @@ class M5SidecarEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
+        *,
+        system_messages_prepared: bool = False,
     ) -> str:
         self._ensure_tokenizer_loaded()
-        messages = _consolidate_system_messages([dict(m) for m in messages])
+        messages = [dict(m) for m in messages]
+        if not system_messages_prepared:
+            messages = _consolidate_system_messages(messages)
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
                 is_partial = detect_and_strip_partial(messages)
@@ -5632,6 +5636,8 @@ class M5SidecarEngine(BaseEngine):
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
         add_special_tokens: bool | None = None,
+        *,
+        system_messages_prepared: bool = False,
     ) -> tuple[str, list[int]]:
         self._ensure_tokenizer_loaded()
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -5641,6 +5647,7 @@ class M5SidecarEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
             add_generation_prompt=add_generation_prompt,
+            system_messages_prepared=system_messages_prepared,
         )
         if add_special_tokens is None:
             token_ids = list(self._tokenizer.encode(prompt))
@@ -5673,6 +5680,8 @@ class M5SidecarEngine(BaseEngine):
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
         add_special_tokens: bool | None = None,
+        *,
+        system_messages_prepared: bool = False,
     ) -> list[int]:
         if self._process is None:
             await self.start()
@@ -5684,6 +5693,7 @@ class M5SidecarEngine(BaseEngine):
             is_partial,
             add_generation_prompt,
             add_special_tokens,
+            system_messages_prepared=system_messages_prepared,
         )
         return token_ids
 

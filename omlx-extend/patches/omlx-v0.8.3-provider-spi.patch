@@ -6983,6 +6983,19 @@ index d0ed9da..429d76f 100644
 +    )
 +    assert result.returncode == 0, result.stdout + result.stderr
 +
+diff --git a/docs/admin-api.md b/docs/admin-api.md
+index 83b42a6..9b1ab47 100644
+--- a/docs/admin-api.md
++++ b/docs/admin-api.md
+@@ -45,7 +45,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
+ | `GET /admin/api/device-info` | Chip, GPU cores, and memory |
+ | `POST /admin/api/ssd-cache/clear`, `POST /admin/api/hot-cache/clear` | Clear the SSD or in-memory KV cache |
+ 
+-Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. A `/v1/completions` request with a list of prompts has no single id and gets no header.
++Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. Streaming `/v1/completions` requires exactly one prompt. Non-streaming requests with multiple prompts have no single engine request id and get no header.
+ 
+ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
+ 
 diff --git a/omlx/admin/routes.py b/omlx/admin/routes.py
 index 39132d8..beeea82 100644
 --- a/omlx/admin/routes.py
@@ -8206,12 +8219,34 @@ index 69e1c32..eb9bf27 100644
      max_output_tokens: Optional[int] = Field(default=None, gt=0)
      stream: bool = False
      tools: Optional[List[ResponsesTool]] = None
+diff --git a/omlx/api/responses_utils.py b/omlx/api/responses_utils.py
+index 7b0e787..e06e4de 100644
+--- a/omlx/api/responses_utils.py
++++ b/omlx/api/responses_utils.py
+@@ -742,7 +742,7 @@ class ResponseStore:
+         return data.get("public_response")
+ 
+     def resolve_chain_messages(self, response_id: str) -> List[Dict[str, Any]]:
+-        """Resolve the full previous_response_id chain into message history."""
++        """Resolve the chain in conversation order for template preparation."""
+         if response_id not in self._store:
+             raise ResponseStateNotFoundError(f"Response state not found: {response_id}")
+ 
+@@ -769,7 +769,7 @@ class ResponseStore:
+         for record in chain:
+             messages.extend(copy.deepcopy(record.get("input_messages", [])))
+             messages.extend(copy.deepcopy(record.get("output_messages", [])))
+-        return _consolidate_system_messages(messages)
++        return messages
+ 
+     def delete(self, response_id: str) -> bool:
+         """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..d0420f2
+index 0000000..112e201
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7456 @@
+@@ -0,0 +1,7466 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -13794,9 +13829,13 @@ index 0000000..d0420f2
 +        chat_template_kwargs: dict[str, Any] | None = None,
 +        is_partial: bool | None = None,
 +        add_generation_prompt: bool | None = None,
++        *,
++        system_messages_prepared: bool = False,
 +    ) -> str:
 +        self._ensure_tokenizer_loaded()
-+        messages = _consolidate_system_messages([dict(m) for m in messages])
++        messages = [dict(m) for m in messages]
++        if not system_messages_prepared:
++            messages = _consolidate_system_messages(messages)
 +        if hasattr(self._tokenizer, "apply_chat_template"):
 +            if is_partial is None:
 +                is_partial = detect_and_strip_partial(messages)
@@ -13846,6 +13885,8 @@ index 0000000..d0420f2
 +        is_partial: bool | None = None,
 +        add_generation_prompt: bool | None = None,
 +        add_special_tokens: bool | None = None,
++        *,
++        system_messages_prepared: bool = False,
 +    ) -> tuple[str, list[int]]:
 +        self._ensure_tokenizer_loaded()
 +        template_tools = convert_tools_for_template(tools) if tools else None
@@ -13855,6 +13896,7 @@ index 0000000..d0420f2
 +            chat_template_kwargs=chat_template_kwargs,
 +            is_partial=is_partial,
 +            add_generation_prompt=add_generation_prompt,
++            system_messages_prepared=system_messages_prepared,
 +        )
 +        if add_special_tokens is None:
 +            token_ids = list(self._tokenizer.encode(prompt))
@@ -13887,6 +13929,8 @@ index 0000000..d0420f2
 +        is_partial: bool | None = None,
 +        add_generation_prompt: bool | None = None,
 +        add_special_tokens: bool | None = None,
++        *,
++        system_messages_prepared: bool = False,
 +    ) -> list[int]:
 +        if self._process is None:
 +            await self.start()
@@ -13898,6 +13942,7 @@ index 0000000..d0420f2
 +            is_partial,
 +            add_generation_prompt,
 +            add_special_tokens,
++            system_messages_prepared=system_messages_prepared,
 +        )
 +        return token_ids
 +
@@ -18220,7 +18265,7 @@ index e7828a3..3b48afa 100644
              freed_hot = await asyncio.to_thread(
                  self._shrink_hot_cache_for_pressure,
 diff --git a/omlx/server.py b/omlx/server.py
-index 23ae521..08e92a8 100644
+index 23ae521..b77b484 100644
 --- a/omlx/server.py
 +++ b/omlx/server.py
 @@ -55,7 +55,7 @@ from dataclasses import asdict, dataclass, field
@@ -18286,16 +18331,26 @@ index 23ae521..08e92a8 100644
  def _resolve_gpu_power_limit(request, model_id: str | None) -> int | None:
      """Return the lower of the request and model-settings GPU power caps."""
      limits = [getattr(request, "gpu_power_limit_w", None)]
-@@ -2417,7 +2451,7 @@ def _prepare_chat_prompt_for_request(
+@@ -2415,7 +2449,18 @@ def _prepare_chat_prompt_for_request(
+     tools: list | None = None,
+     chat_template_kwargs: dict | None = None,
      is_partial: bool | None = None,
++    *,
++    system_messages_prepared: bool = False,
  ) -> tuple[int, tuple[str, list[int]] | None]:
++    if isinstance(engine, M5SidecarEngine):
++        prepared = engine.prepare_chat_prompt(
++            messages,
++            tools,
++            chat_template_kwargs,
++            is_partial,
++            system_messages_prepared=system_messages_prepared,
++        )
++        return len(prepared[1]), prepared
      # Subclasses (e.g. distributed) have their own prompt handling.
--    if type(engine) in (BatchedEngine, VLMBatchedEngine):
-+    if type(engine) in (BatchedEngine, VLMBatchedEngine) or isinstance(engine, M5SidecarEngine):
+     if type(engine) in (BatchedEngine, VLMBatchedEngine):
          prepared = engine.prepare_chat_prompt(
-             messages, tools, chat_template_kwargs, is_partial
-         )
-@@ -2438,7 +2472,7 @@ async def _prepare_prompt_off_loop(engine: BaseEngine, prepare, *args, **kwargs)
+@@ -2438,7 +2483,7 @@ async def _prepare_prompt_off_loop(engine: BaseEngine, prepare, *args, **kwargs)
  
      Encoding a long prompt on the event loop stalls every other stream.
      """
@@ -18304,7 +18359,7 @@ index 23ae521..08e92a8 100644
          return await asyncio.to_thread(prepare, engine, *args, **kwargs)
      return prepare(engine, *args, **kwargs)
  
-@@ -4597,6 +4631,38 @@ async def _decisions_body(
+@@ -4597,6 +4642,38 @@ async def _decisions_body(
  # =============================================================================
  
  
@@ -18343,18 +18398,33 @@ index 23ae521..08e92a8 100644
  @app.post("/v1/completions")
  async def create_completion(
      request: CompletionRequest,
-@@ -4617,6 +4683,10 @@ async def create_completion(
+@@ -4605,6 +4682,11 @@ async def create_completion(
+ ):
+     """Create a text completion."""
+     _reject_lone_surrogates(request)
++    prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
++    if request.stream and len(prompts) != 1:
++        raise InvalidRequestError(
++            "Streaming completions require exactly one prompt.", field="prompt"
++        )
+     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+         raise HTTPException(
+             status_code=503,
+@@ -4617,10 +4699,9 @@ async def create_completion(
          model_load_duration = time.perf_counter() - load_start
          lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
          resolved_model = _serving_model_id(lease, request.model)
+-
+-        # Handle single prompt or list of prompts
+-        prompts = (
+-            request.prompt if isinstance(request.prompt, list) else [request.prompt]
 +        generation_options = _completion_generation_options(request)
 +        control_warnings = _preflight_miv_request_controls(
 +            engine, request, generation_options
-+        )
+         )
  
-         # Handle single prompt or list of prompts
-         prompts = (
-@@ -4661,6 +4731,7 @@ async def create_completion(
+         # Validate context window for each prompt
+@@ -4661,6 +4742,7 @@ async def create_completion(
                                  response_id=response_id,
                                  inference_request_id=inference_request_id,
                                  skip_cache_store=bool(_cache_store_kwargs(http_request)),
@@ -18362,7 +18432,7 @@ index 23ae521..08e92a8 100644
                              ),
                              http_request=http_request,
                              keepalive_chunk=keepalive,
-@@ -4676,6 +4747,7 @@ async def create_completion(
+@@ -4676,6 +4758,7 @@ async def create_completion(
                      "X-Accel-Buffering": "no",
                      "Cache-Control": "no-cache",
                      _REQUEST_ID_HEADER: inference_request_id,
@@ -18370,7 +18440,7 @@ index 23ae521..08e92a8 100644
                  },
              )
  
-@@ -4688,48 +4760,10 @@ async def create_completion(
+@@ -4688,48 +4771,10 @@ async def create_completion(
              total_prompt_tokens = 0
              total_cached_tokens = 0
  
@@ -18420,7 +18490,7 @@ index 23ae521..08e92a8 100644
  
              # First prompt's first-token timestamp only: later prompts start
              # after earlier generations, so their first_token_at would count
-@@ -4737,19 +4771,7 @@ async def create_completion(
+@@ -4737,19 +4782,7 @@ async def create_completion(
              first_token_at = None
              for i, prompt in enumerate(prompts):
                  output = await engine.generate(
@@ -18441,7 +18511,7 @@ index 23ae521..08e92a8 100644
                      **gen_kwargs,
                  )
                  if i == 0:
-@@ -4826,11 +4848,10 @@ async def create_completion(
+@@ -4826,11 +4859,10 @@ async def create_completion(
              http_request,
              _build_completion(),
              lease=lease,
@@ -18457,7 +18527,7 @@ index 23ae521..08e92a8 100644
          )
      except BaseException:
          await lease.release()
-@@ -4838,9 +4859,9 @@ async def create_completion(
+@@ -4838,9 +4870,9 @@ async def create_completion(
  
  
  def _merge_chat_template_kwargs(
@@ -18470,7 +18540,7 @@ index 23ae521..08e92a8 100644
      merged_ct_kwargs = merge_chat_template_request_kwargs(
          ms,
          merge_reasoning_effort_chat_template_kwargs(
-@@ -4854,14 +4875,13 @@ def _merge_chat_template_kwargs(
+@@ -4854,14 +4886,13 @@ def _merge_chat_template_kwargs(
      # templates (e.g. Gemma 4) explicitly suppress thinking unless this
      # kwarg is True.  Set it before grammar compilation, which reads the
      # thinking state to build the reasoning phase.
@@ -18486,7 +18556,7 @@ index 23ae521..08e92a8 100644
  
  
  @dataclass
-@@ -5084,7 +5104,9 @@ async def create_chat_completion(
+@@ -5084,7 +5115,9 @@ async def create_chat_completion(
              max_tool_result_tokens = ms.max_tool_result_tokens
              reasoning_parser = ms.reasoning_parser
              settings_guided_grammar = _settings_guided_grammar(ms)
@@ -18497,7 +18567,15 @@ index 23ae521..08e92a8 100644
  
          chat_messages = _extract_chat_messages(
              request, engine, resolved_model, max_tool_result_tokens
-@@ -5293,6 +5315,7 @@ async def create_chat_completion(
+@@ -5172,6 +5205,7 @@ async def create_chat_completion(
+                 tools_for_template,
+                 chat_template_kwargs=merged_ct_kwargs or None,
+                 is_partial=is_partial,
++                system_messages_prepared=True,
+             )
+         except Exception as e:
+             if _is_chat_template_error(e):
+@@ -5293,6 +5327,7 @@ async def create_chat_completion(
          # handled exception, but response already started" and the client sees
          # an incomplete chunked read. Running the check here lets
          # prefill_memory_exceeded_handler return a clean HTTP 400.
@@ -18505,7 +18583,7 @@ index 23ae521..08e92a8 100644
          await _raise_if_llm_lease_abort_requested(lease)
          await engine.preflight_chat(
              messages,
-@@ -5316,8 +5339,7 @@ async def create_chat_completion(
+@@ -5316,8 +5351,7 @@ async def create_chat_completion(
                  "Cache-Control": "no-cache",
                  _REQUEST_ID_HEADER: inference_request_id,
              }
@@ -18515,7 +18593,7 @@ index 23ae521..08e92a8 100644
              return StreamingResponse(
                  _release_after_stream(
                      _with_request_disconnect_abort(
-@@ -5516,8 +5538,7 @@ async def create_chat_completion(
+@@ -5516,8 +5550,7 @@ async def create_chat_completion(
              ).model_dump_json(exclude_none=True)
  
          json_headers = {_REQUEST_ID_HEADER: inference_request_id}
@@ -18525,7 +18603,7 @@ index 23ae521..08e92a8 100644
          return await _json_response_or_keepalive(
              http_request, _build_chat_completion(), lease=lease, headers=json_headers
          )
-@@ -6076,6 +6097,7 @@ async def stream_completion(
+@@ -6076,6 +6109,7 @@ async def stream_completion(
      response_id: str | None = None,
      inference_request_id: str | None = None,
      skip_cache_store: bool = False,
@@ -18533,7 +18611,7 @@ index 23ae521..08e92a8 100644
  ) -> AsyncIterator[str]:
      """Stream completion response."""
      response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
-@@ -6089,65 +6111,24 @@ async def stream_completion(
+@@ -6089,65 +6123,24 @@ async def stream_completion(
          getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
      )
  
@@ -18607,7 +18685,7 @@ index 23ae521..08e92a8 100644
          **gen_kwargs,
      )
      if progress_request_id is not None:
-@@ -7807,6 +7788,7 @@ class _AnthropicPrompt:
+@@ -7807,6 +7800,7 @@ class _AnthropicPrompt:
      native_reasoning: bool
      thinking_budget: int | None
      model_settings: object | None
@@ -18615,7 +18693,7 @@ index 23ae521..08e92a8 100644
  
  
  async def _prepare_anthropic_prompt(
-@@ -7907,7 +7889,8 @@ async def _prepare_anthropic_prompt(
+@@ -7907,7 +7901,8 @@ async def _prepare_anthropic_prompt(
      # Auto-set enable_thinking in chat template kwargs when a positive thinking
      # budget is active but enable_thinking was not already set (e.g. via
      # the Anthropic thinking.type field above or model settings).
@@ -18625,7 +18703,7 @@ index 23ae521..08e92a8 100644
      if (
          thinking_budget is not None
          and thinking_budget > 0
-@@ -7968,6 +7951,7 @@ async def _prepare_anthropic_prompt(
+@@ -7968,6 +7963,7 @@ async def _prepare_anthropic_prompt(
          native_reasoning=native_reasoning,
          thinking_budget=thinking_budget,
          model_settings=ms,
@@ -18633,7 +18711,15 @@ index 23ae521..08e92a8 100644
      )
  
  
-@@ -8092,7 +8076,7 @@ async def create_anthropic_message(
+@@ -7981,6 +7977,7 @@ def _count_anthropic_prompt(
+             prompt.tools,
+             chat_template_kwargs=prompt.chat_template_kwargs or None,
+             is_partial=prompt.is_partial,
++            system_messages_prepared=True,
+         )
+     except Exception as e:
+         if _is_chat_template_error(e):
+@@ -8092,7 +8089,7 @@ async def create_anthropic_message(
          if prompt.thinking_budget is not None:
              chat_kwargs["thinking_budget"] = prompt.thinking_budget
  
@@ -18642,7 +18728,7 @@ index 23ae521..08e92a8 100644
              # Claude Code sends no thinking field here for non-Claude model
              # names. Bound reasoning to its deadline, but do not turn it on.
              chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
-@@ -8130,6 +8114,8 @@ async def create_anthropic_message(
+@@ -8130,6 +8127,8 @@ async def create_anthropic_message(
  
          # Pre-flight prefill memory guard — must precede any StreamingResponse
          # return so PrefillMemoryExceededError can be mapped to HTTP 400.
@@ -18651,7 +18737,7 @@ index 23ae521..08e92a8 100644
          await _raise_if_llm_lease_abort_requested(lease)
          await engine.preflight_chat(
              messages,
-@@ -8166,6 +8152,7 @@ async def create_anthropic_message(
+@@ -8166,6 +8165,7 @@ async def create_anthropic_message(
                      "X-Accel-Buffering": "no",
                      "Cache-Control": "no-cache",
                      _REQUEST_ID_HEADER: inference_request_id,
@@ -18659,7 +18745,7 @@ index 23ae521..08e92a8 100644
                  },
              )
  
-@@ -8275,7 +8262,10 @@ async def create_anthropic_message(
+@@ -8275,7 +8275,10 @@ async def create_anthropic_message(
              http_request,
              _build_anthropic_message(),
              lease=lease,
@@ -18671,7 +18757,7 @@ index 23ae521..08e92a8 100644
          )
  
      except BaseException:
-@@ -8432,7 +8422,8 @@ async def _tokenize_chat_messages(
+@@ -8432,7 +8435,8 @@ async def _tokenize_chat_messages(
      )
      ms = get_model_settings_for_request(chat_request.model)
      max_tool_result_tokens = ms.max_tool_result_tokens if ms else None
@@ -18681,7 +18767,25 @@ index 23ae521..08e92a8 100644
      chat_messages = _extract_chat_messages(
          chat_request, engine, resolved_model, max_tool_result_tokens
      )
-@@ -8726,7 +8717,8 @@ async def create_response(
+@@ -8451,6 +8455,9 @@ async def _tokenize_chat_messages(
+     add_generation_prompt = (
+         None if is_partial or request.add_generation_prompt else False
+     )
++    renderer_options = (
++        {"system_messages_prepared": True} if isinstance(engine, M5SidecarEngine) else {}
++    )
+     try:
+         return await engine.tokenize_chat(
+             messages,
+@@ -8459,6 +8466,7 @@ async def _tokenize_chat_messages(
+             is_partial=is_partial,
+             add_generation_prompt=add_generation_prompt,
+             add_special_tokens=request.add_special_tokens,
++            **renderer_options,
+         )
+     except NotImplementedError as e:
+         raise InvalidRequestError(
+@@ -8726,7 +8734,8 @@ async def create_response(
  
          # Auto-set enable_thinking when a positive thinking budget is active.
          # Set it before grammar compilation, which reads the thinking state.
@@ -18691,7 +18795,15 @@ index 23ae521..08e92a8 100644
          if (
              thinking_budget is not None
              and thinking_budget > 0
-@@ -8874,7 +8866,9 @@ async def create_response(
+@@ -8844,6 +8853,7 @@ async def create_response(
+                 messages,
+                 tools_for_template,
+                 chat_template_kwargs=merged_ct_kwargs or None,
++                system_messages_prepared=True,
+             )
+         except Exception as e:
+             err_name = type(e).__name__.lower()
+@@ -8874,7 +8884,9 @@ async def create_response(
              request.top_p,
              request.model,
              req_top_k=getattr(request, "top_k", None),
@@ -18702,7 +18814,7 @@ index 23ae521..08e92a8 100644
              req_max_tokens=request.max_output_tokens,
          )
          chat_kwargs = {
-@@ -8941,6 +8935,7 @@ async def create_response(
+@@ -8941,6 +8953,7 @@ async def create_response(
  
          # Pre-flight prefill memory guard — must precede any StreamingResponse
          # return so PrefillMemoryExceededError can be mapped to HTTP 400.
@@ -18710,7 +18822,7 @@ index 23ae521..08e92a8 100644
          await _raise_if_llm_lease_abort_requested(lease)
          await engine.preflight_chat(
              messages,
-@@ -8957,8 +8952,7 @@ async def create_response(
+@@ -8957,8 +8970,7 @@ async def create_response(
                  "Cache-Control": "no-cache",
                  _REQUEST_ID_HEADER: inference_request_id,
              }
@@ -18720,7 +18832,7 @@ index 23ae521..08e92a8 100644
              stream_state = _ResponsesStreamState()
              return StreamingResponse(
                  _release_after_stream(
-@@ -9164,8 +9158,7 @@ async def create_response(
+@@ -9164,8 +9176,7 @@ async def create_response(
              return response_obj.model_dump_json()
  
          json_headers = {_REQUEST_ID_HEADER: inference_request_id}
@@ -18730,7 +18842,7 @@ index 23ae521..08e92a8 100644
          return await _json_response_or_keepalive(
              http_request, _build_responses_api(), lease=lease, headers=json_headers
          )
-@@ -9970,6 +9963,9 @@ async def stream_responses_api(
+@@ -9970,6 +9981,9 @@ async def stream_responses_api(
      if request.previous_response_id:
          final_response["previous_response_id"] = request.previous_response_id
  
@@ -18740,7 +18852,7 @@ index 23ae521..08e92a8 100644
      seq = stream_state.next_sequence()
      yield format_sse_event(
          terminal_event,
-@@ -9980,11 +9976,6 @@ async def stream_responses_api(
+@@ -9980,11 +9994,6 @@ async def stream_responses_api(
          },
      )
  
@@ -18809,6 +18921,42 @@ index 0000000..8dad34e
 +model_dir = "/tmp/omlx-contract-fixture"
 +spec_backend = "dflash2"
 +draft_tokens = 0
+diff --git a/tests/integration/test_server_endpoints.py b/tests/integration/test_server_endpoints.py
+index d840048..cbe364b 100644
+--- a/tests/integration/test_server_endpoints.py
++++ b/tests/integration/test_server_endpoints.py
+@@ -1053,7 +1053,30 @@ class TestCompletionEndpoint:
+ 
+         assert response.status_code == 200
+         data = response.json()
+-        assert "choices" in data
++        assert len(data["choices"]) == 2
++
++    @pytest.mark.parametrize("prompts", [[], ["First prompt", "Second prompt"]])
++    def test_streaming_requires_one_prompt_before_loading(
++        self, client, mock_engine_pool, prompts
++    ):
++        before = len(mock_engine_pool.get_engine_calls)
++        response = client.post(
++            "/v1/completions",
++            json={"model": "test-model", "prompt": prompts, "stream": True},
++        )
++
++        assert response.status_code == 400
++        assert response.json()["error"]["param"] == "prompt"
++        assert len(mock_engine_pool.get_engine_calls) == before
++
++    def test_streaming_accepts_one_prompt_in_list(self, client):
++        response = client.post(
++            "/v1/completions",
++            json={"model": "test-model", "prompt": ["Only prompt"], "stream": True},
++        )
++
++        assert response.status_code == 200
++        assert "data: [DONE]" in response.text
+ 
+     @pytest.mark.parametrize(
+         "prompt", ["Only prompt", ["First prompt", "Second prompt"]]
 diff --git a/tests/test_admin_model_settings.py b/tests/test_admin_model_settings.py
 index 210dcbd..15582b0 100644
 --- a/tests/test_admin_model_settings.py
@@ -18978,10 +19126,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..d52ef59
+index 0000000..8a4624a
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,3860 @@
+@@ -0,0 +1,4035 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -19974,6 +20122,181 @@ index 0000000..d52ef59
 +                    "Question <think></think>\n", max_tokens=32, thinking_budget=0
 +                )
 +                assert mock_srv.submitted_requests[-1]["thinking_budget"]["start_in_thinking"] is False
++        finally:
++            engine._process = None
++            await engine.stop()
++            await mock_srv.close()
++
++    @pytest.mark.parametrize("stream", [False, True])
++    @pytest.mark.parametrize(
++        "supports_mid_system, keep_prefix, expected_mid_role",
++        [(True, True, "system"), (False, True, "user"), (False, False, "merged_system")],
++    )
++    async def test_responses_replay_preserves_prepared_prompt(
++        self, tmp_path, monkeypatch, stream, supports_mid_system, keep_prefix, expected_mid_role
++    ):
++        sock = Path("/tmp") / f"m5-mock-{os.getpid()}-responses.sock"
++        mock_srv = _MockUdsSidecarServer(sock, support_push=True)
++        await mock_srv.start()
++        engine = await self._attach_mock_engine(tmp_path / "responses", mock_srv)
++        tokenizer = engine.tokenizer
++        tokenizer._omlx_supports_mid_system_messages = supports_mid_system
++        tokenizer.chat_template = (
++            "{% for message in messages %}"
++            "{{ message['role'] }}: {{ message['content'] }}"
++            "{{ message.get('tool_call_id', '') }}"
++            "{{ message.get('tool_calls', []) | tojson }}\n"
++            "{% endfor %}"
++            "{% if add_generation_prompt %}assistant: {% endif %}"
++        )
++
++        rendered = []
++        apply_template = tokenizer.apply_chat_template
++
++        def capture_template(messages, *args, **kwargs):
++            rendered.append(messages)
++            if not supports_mid_system:
++                assert all(m["role"] != "system" for m in messages[1:])
++            return apply_template(messages, *args, **kwargs)
++
++        monkeypatch.setattr(tokenizer, "apply_chat_template", capture_template)
++
++        async def get_engine(*args, **kwargs):
++            return engine
++
++        pool = MagicMock()
++        pool.get_entry.return_value = None
++        settings = GlobalSettings(base_path=tmp_path)
++        settings.server.preserve_mid_system_cache = keep_prefix
++        state_dir = tmp_path / "response-state"
++        state = srv.ServerState(
++            default_model="test-model",
++            engine_pool=pool,
++            global_settings=settings,
++            responses_store=ResponseStore(state_dir=state_dir),
++        )
++        monkeypatch.setattr(srv, "_server_state", state)
++        monkeypatch.setattr(srv, "get_engine_for_model", get_engine)
++        common = {
++            "model": "test-model",
++            "max_output_tokens": 256,
++            "stream": stream,
++            "tools": [{"type": "function", "name": "lookup"}],
++        }
++
++        async def respond(client, **kwargs):
++            before = len(rendered)
++            response = await client.post("/v1/responses", json={**common, **kwargs})
++            assert response.status_code == 200, response.text
++            assert len(rendered) == before + 1
++            if not stream:
++                return response.json()
++            return next(
++                event["response"]
++                for line in response.text.splitlines()
++                if line.startswith("data: ")
++                for event in [json.loads(line[6:])]
++                if event["type"] == "response.completed"
++            )
++
++        try:
++            transport = httpx.ASGITransport(app=srv.app)
++            async with httpx.AsyncClient(
++                transport=transport, base_url="http://testserver"
++            ) as client:
++                first_input = [
++                    {"role": "system", "content": "Persistent system"},
++                    {"role": "user", "content": "Find the value"},
++                ]
++                mock_srv.token_plan = [
++                    tokenizer.encode('<tool_call>{"name":"lookup","arguments":{}}</tool_call>')
++                ]
++                first = await respond(
++                    client, input=first_input, instructions="First request only"
++                )
++                call = next(item for item in first["output"] if item["type"] == "function_call")
++                result = {
++                    "type": "function_call_output",
++                    "call_id": call["call_id"],
++                    "output": "Blue",
++                }
++                second_input = [
++                    result,
++                    {"role": "developer", "content": "Mid-turn marker"},
++                    {"role": "user", "content": "Summarize it"},
++                ]
++                mock_srv.token_plan = [tokenizer.encode("It is blue.")]
++                second = await respond(
++                    client, input=second_input, previous_response_id=first["id"]
++                )
++
++                state.responses_store = ResponseStore(state_dir=state_dir)
++                final = {"role": "user", "content": "Repeat the answer"}
++                await respond(
++                    client, input=[final], previous_response_id=second["id"],
++                    instructions="Current request only",
++                )
++                replay_tokens = mock_srv.submitted_requests[-1]["prompt_tokens"]
++                replay_messages = rendered[-1]
++                await respond(
++                    client,
++                    input=[
++                        *first_input,
++                        *first["output"],
++                        *second_input,
++                        *second["output"],
++                        final,
++                    ],
++                    instructions="Current request only",
++                )
++                assert mock_srv.submitted_requests[-1]["prompt_tokens"] == replay_tokens
++                assert rendered[-1] == replay_messages
++                assert "First request only" not in tokenizer.decode(replay_tokens)
++                assert "Current request only" in tokenizer.decode(replay_tokens)
++
++                tool_index = next(
++                    i for i, msg in enumerate(replay_messages) if msg["role"] == "tool"
++                )
++                assert replay_messages[tool_index]["tool_call_id"] == call["call_id"]
++                assert replay_messages[tool_index - 1]["tool_calls"][0]["id"] == call["call_id"]
++                mid_index = next(
++                    i
++                    for i, msg in enumerate(replay_messages)
++                    if "Mid-turn marker" in msg["content"]
++                )
++                if expected_mid_role == "merged_system":
++                    assert mid_index == 0
++                else:
++                    assert mid_index > tool_index
++                    assert replay_messages[mid_index]["role"] == expected_mid_role
++
++                if supports_mid_system and not stream:
++                    chat = {
++                        "model": "test-model",
++                        "messages": [
++                            *first_input,
++                            {"role": "system", "content": "Chat mid-turn marker"},
++                        ],
++                    }
++                    before = len(rendered)
++                    response = await client.post("/v1/chat/completions", json=chat)
++                    assert response.status_code == 200, response.text
++                    assert len(rendered) == before + 1
++                    assert rendered[-1][-1]["role"] == "system"
++                    chat_ids = mock_srv.submitted_requests[-1]["prompt_tokens"]
++                    response = await client.post(
++                        "/v1/tokenize", json={**chat, "add_generation_prompt": True}
++                    )
++                    assert response.status_code == 200, response.text
++                    assert len(rendered) == before + 2
++                    assert response.json()["tokens"] == chat_ids
++
++                # Calling the engine directly still applies its old strict preparation.
++                engine.prepare_chat_prompt(
++                    [*first_input, {"role": "system", "content": "Direct"}]
++                )
++                assert rendered[-1][0]["content"].endswith("Direct")
++                assert [m["role"] for m in rendered[-1]] == ["system", "user"]
 +        finally:
 +            engine._process = None
 +            await engine.stop()
@@ -23320,6 +23643,72 @@ index 39637c7..db52e5d 100644
 +    assert dropped_names == ["external_engine"]
 +    assert dropped["external_engine"] is None
 +
+diff --git a/tests/test_responses.py b/tests/test_responses.py
+index 801ec21..0e438fb 100644
+--- a/tests/test_responses.py
++++ b/tests/test_responses.py
+@@ -1074,12 +1074,35 @@ class TestResponseStore:
+     def test_resolve_chain_messages(self, tmp_path):
+         state_dir = tmp_path / "response-state"
+         store = ResponseStore(max_size=10, state_dir=state_dir)
++        first_input = [
++            {"role": "system", "content": "First system"},
++            {"role": "user", "content": "First question"},
++        ]
++        first_output = [
++            {
++                "role": "assistant",
++                "content": "",
++                "tool_calls": [
++                    {
++                        "id": "call_1",
++                        "type": "function",
++                        "function": {"name": "lookup", "arguments": {}},
++                    }
++                ],
++            }
++        ]
++        second_input = [
++            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
++            {"role": "system", "content": "After tool result"},
++            {"role": "user", "content": "Follow up"},
++        ]
++        second_output = [{"role": "assistant", "content": "Two"}]
+         store.put(
+             "resp_1",
+             build_response_store_record(
+                 {"id": "resp_1", "created_at": 1, "output": []},
+-                [{"role": "user", "content": "First"}],
+-                [{"role": "assistant", "content": "One"}],
++                first_input,
++                first_output,
+             ),
+         )
+         store.put(
+@@ -1091,18 +1114,14 @@ class TestResponseStore:
+                     "previous_response_id": "resp_1",
+                     "output": [],
+                 },
+-                [{"role": "tool", "tool_call_id": "call_1", "content": "result"}],
+-                [{"role": "assistant", "content": "Two"}],
++                second_input,
++                second_output,
+             ),
+         )
+ 
+-        messages = store.resolve_chain_messages("resp_2")
+-        assert [m["content"] for m in messages if "content" in m] == [
+-            "First",
+-            "One",
+-            "result",
+-            "Two",
+-        ]
++        reopened = ResponseStore(max_size=10, state_dir=state_dir)
++        messages = reopened.resolve_chain_messages("resp_2")
++        assert messages == first_input + first_output + second_input + second_output
+ 
+     def test_missing_response_chain_raises_not_found(self):
+         store = ResponseStore(max_size=10)
 diff --git a/tests/test_splash_engine.py b/tests/test_splash_engine.py
 index e15afb1..d13cc47 100644
 --- a/tests/test_splash_engine.py

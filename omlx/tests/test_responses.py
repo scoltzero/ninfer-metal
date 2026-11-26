@@ -1074,12 +1074,35 @@ class TestResponseStore:
     def test_resolve_chain_messages(self, tmp_path):
         state_dir = tmp_path / "response-state"
         store = ResponseStore(max_size=10, state_dir=state_dir)
+        first_input = [
+            {"role": "system", "content": "First system"},
+            {"role": "user", "content": "First question"},
+        ]
+        first_output = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            }
+        ]
+        second_input = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "After tool result"},
+            {"role": "user", "content": "Follow up"},
+        ]
+        second_output = [{"role": "assistant", "content": "Two"}]
         store.put(
             "resp_1",
             build_response_store_record(
                 {"id": "resp_1", "created_at": 1, "output": []},
-                [{"role": "user", "content": "First"}],
-                [{"role": "assistant", "content": "One"}],
+                first_input,
+                first_output,
             ),
         )
         store.put(
@@ -1091,18 +1114,14 @@ class TestResponseStore:
                     "previous_response_id": "resp_1",
                     "output": [],
                 },
-                [{"role": "tool", "tool_call_id": "call_1", "content": "result"}],
-                [{"role": "assistant", "content": "Two"}],
+                second_input,
+                second_output,
             ),
         )
 
-        messages = store.resolve_chain_messages("resp_2")
-        assert [m["content"] for m in messages if "content" in m] == [
-            "First",
-            "One",
-            "result",
-            "Two",
-        ]
+        reopened = ResponseStore(max_size=10, state_dir=state_dir)
+        messages = reopened.resolve_chain_messages("resp_2")
+        assert messages == first_input + first_output + second_input + second_output
 
     def test_missing_response_chain_raises_not_found(self):
         store = ResponseStore(max_size=10)

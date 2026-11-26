@@ -228,6 +228,13 @@ SyntheticTestAssets build_synthetic_assets() {
       "{%- elif scenario is defined and scenario == 'xml_tool' -%}<|trig_xml|>"
       "{%- elif scenario is defined and scenario == 'json_tool' -%}<|trig_json|>"
       "{%- elif scenario is defined and scenario == 'stop' -%}<|trig_stop|>"
+      "{%- elif scenario is defined and scenario == 'tool_history' -%}"
+      "{%- if tools is defined -%}<|trig_xml|>"
+      "{%- elif messages[1].tool_calls[0].function.name == 'previous_lookup' "
+      "and messages[2].role == 'tool' and messages[2].content == 'previous result' "
+      "and messages[2].tool_call_id == 'call_previous' -%}<|trig_json|>"
+      "{%- else -%}<|trig_plain|>"
+      "{%- endif -%}"
       "{%- else -%}<|trig_plain|>"
       "{%- endif -%}"
       "{%- endif -%}";
@@ -746,6 +753,67 @@ void test_http_server_e2e() {
       check(saw_tool_delta, "XML tool SSE missing tool_calls delta");
       check(finish_reason == "tool_calls",
             "XML tool SSE finish_reason must be tool_calls");
+
+      // Current tool definitions select XML. With only the full history,
+      // the template selects a JSON tool call that must stay literal text.
+      req["messages"].push_back({
+          {"role", "assistant"},
+          {"content", nullptr},
+          {"tool_calls",
+           Json::array({{
+               {"id", "call_previous"},
+               {"type", "function"},
+               {"function", {{"name", "previous_lookup"}, {"arguments", "{}"}}},
+           }})},
+      });
+      req["messages"].push_back({{"role", "tool"},
+                                 {"tool_call_id", "call_previous"},
+                                 {"content", "previous result"}});
+      req["chat_template_kwargs"] = {{"scenario", "tool_history"},
+                                     {"tools", tools}};
+      req["stream"] = false;
+      auto enabled = client.Post("/v1/chat/completions", auth_headers,
+                                 req.dump(), "application/json");
+      check(enabled && enabled->status == 200,
+            "chat tool history with tools enabled must return 200");
+      check(Json::parse(enabled->body).at("choices")[0].at("finish_reason") ==
+                "tool_calls",
+            "chat tool history control must expose current definitions");
+
+      req["tool_choice"] = "none";
+      const std::string expected =
+          "<tool_call>\n{\"name\": \"lookup_stock\", \"arguments\": "
+          "{\"ticker\": \"AAPL\", \"limit\": 5}}\n</tool_call>";
+      auto disabled = client.Post("/v1/chat/completions", auth_headers,
+                                  req.dump(), "application/json");
+      check(disabled && disabled->status == 200,
+            "chat tool_choice=none sync must return 200");
+      const auto disabled_body = Json::parse(disabled->body);
+      const auto &disabled_choice = disabled_body.at("choices")[0];
+      const auto &disabled_message = disabled_choice.at("message");
+      check(disabled_choice.at("finish_reason") == "stop" &&
+                !disabled_message.contains("tool_calls") &&
+                disabled_message.at("content") == expected,
+            "chat tool_choice=none must hide definitions and retain tool history");
+
+      req["stream"] = true;
+      auto disabled_stream = client.Post("/v1/chat/completions", auth_headers,
+                                         req.dump(), "application/json");
+      check(disabled_stream && disabled_stream->status == 200,
+            "chat tool_choice=none SSE must return 200");
+      const auto disabled_sse = parse_sse_body(disabled_stream->body);
+      std::string disabled_content;
+      for (const auto &chunk : disabled_sse.chunks) {
+        const auto &choices = chunk.at("choices");
+        if (!choices.empty()) {
+          const auto &delta = choices[0].at("delta");
+          check(!delta.contains("tool_calls"),
+                "chat tool_choice=none SSE emitted tool_calls");
+          disabled_content += delta.value("content", "");
+        }
+      }
+      check(disabled_sse.saw_done && disabled_content == expected,
+            "chat tool_choice=none SSE must hide definitions and retain tool history");
     }
 
     // 9) Qwen JSON <tool_call> (sync + SSE)

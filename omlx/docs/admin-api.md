@@ -45,7 +45,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | `GET /admin/api/device-info` | Chip, GPU cores, and memory |
 | `POST /admin/api/ssd-cache/clear`, `POST /admin/api/hot-cache/clear` | Clear the SSD or in-memory KV cache |
 
-Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. A `/v1/completions` request with a list of prompts has no single id and gets no header.
+Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. Streaming `/v1/completions` requires exactly one prompt. Non-streaming requests with multiple prompts have no single engine request id and get no header.
 
 The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
 
