@@ -205,7 +205,9 @@ inline void emit_paged_split_attention_exact_1pass_gqa(
     const QwenModelConfig &c, U32 t, U32 splits, Ref query, Ref gate,
     Ref state_k, Ref state_v, Ref mixer, Ref page_table, Ref split_max,
     Ref split_sum, Ref split_output, Ref attention_positions,
-    std::vector<std::byte> split_params) {
+    std::vector<std::byte> split_params,
+    std::optional<U32> tok_word = 3u,
+    std::optional<U32> pos_word = 4u) {
   const char *partial_fn = "omlx_m5_paged_attention_exact_1pass_partial";
   const U32 partial_tptg_y = exact_attention_1pass_gqa_threads_y(
       ctx, libs, partial_fn, t, U32(c.num_attention_heads),
@@ -218,7 +220,7 @@ inline void emit_paged_split_attention_exact_1pass_gqa(
        attention_positions});
   e.profile.attention_kernel = partial_fn;
   e.profile.attention_grid = partial.grid;
-  e.dynamic(partial, 8, split_params, 3, 4);
+  e.dynamic(partial, 8, split_params, tok_word, pos_word);
 
   auto &merge = e.emit(
       "attention_exact", "omlx_m5_paged_attention_exact_1pass_merge",
@@ -230,14 +232,16 @@ inline void emit_paged_split_attention_exact_1pass_gqa(
   e.profile.attention_numeric_contract_id =
       "paged.simd32.online_sb512.ordered_softmax.f32_gate.v1";
   e.profile.attention_row_exact_eligible = true;
-  e.dynamic(merge, 5, std::move(split_params), 3, 4);
+  e.dynamic(merge, 5, std::move(split_params), tok_word, pos_word);
 }
 
 inline void emit_paged_split_attention_exact_gqa(
     Encoder &e, const QwenModelConfig &c, U32 t, U32 splits, Ref query,
     Ref gate, Ref state_k, Ref state_v, Ref mixer, Ref page_table,
     Ref split_max, Ref attention_positions,
-    std::vector<std::byte> split_params) {
+    std::vector<std::byte> split_params,
+    std::optional<U32> tok_word = 3u,
+    std::optional<U32> pos_word = 4u) {
   const U32 max_tptg_y = exact_attention_gqa_threads_y(
       t, U32(c.num_attention_heads), U32(c.num_key_value_heads),
       U32(c.head_dim), splits);
@@ -251,7 +255,7 @@ inline void emit_paged_split_attention_exact_gqa(
       {query, state_k, split_max, page_table, attention_positions});
   e.profile.attention_kernel = "omlx_m5_paged_attention_exact_max";
   e.profile.attention_grid = maximum.grid;
-  e.dynamic(maximum, 5, split_params, 3, 4);
+  e.dynamic(maximum, 5, split_params, tok_word, pos_word);
 
   auto &ordered = e.emit(
       "attention_exact", "omlx_m5_paged_attention_exact_merge",
@@ -264,7 +268,7 @@ inline void emit_paged_split_attention_exact_gqa(
   e.profile.attention_numeric_contract_id =
       "paged.simd32.globalmax.ordered_softmax.f32_gate.v1";
   e.profile.attention_row_exact_eligible = true;
-  e.dynamic(ordered, 8, std::move(split_params), 3, 4);
+  e.dynamic(ordered, 8, std::move(split_params), tok_word, pos_word);
 }
 
 inline void emit_paged_flash_prefill_nax(

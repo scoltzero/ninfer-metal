@@ -585,7 +585,7 @@ public:
         if (kv_page_b > 0 && eff_kv_pages > logical_kv_pages + 1U) {
           const U64 max_safe_pages =
               std::min<U64>(context.capabilities().max_buffer_length,
-                            2ULL << 30) /
+                            8ULL << 30) /
               kv_page_b;
           if (max_safe_pages >= logical_kv_pages + 1U) {
             eff_kv_pages = std::min<U32>(eff_kv_pages, U32(max_safe_pages));
@@ -3105,72 +3105,71 @@ public:
         pos_patches->emplace_back(off_app, 4U);
     }
 
-    if (!pos_placeholder.has_value() && dynamic_tokens) {
-      if (!split && (!exact_attention || c.hidden_size >= 1024) &&
-          flash_nax_prefill_ && t >= kFlashNaxPrefillMinTokens &&
-          attn_pos_ref.buffer != nullptr &&
-          flash_nax_prefill_runtime_eligible(context, libraries,
-                                             U32(c.head_dim))) {
-        emit_paged_flash_prefill_nax(e, c, t, q_ref, gate_ref,
-                                     state_block.state0, state_block.state1,
-                                     mix_ref, table_ref, attn_pos_ref,
-                                     std::move(params));
-        return;
-      }
-      if (split && exact_attention) {
-        if (strict_two_pass_attn_) {
-          const U32 splits = (context_envelope + 511) / 512;
-          if (!splits || U64(t) * c.num_attention_heads * splits * 4 >
-                             split_max.bytes)
-            throw std::invalid_argument("split Attention workspace exceeded");
-          e.profile.split_attention = true;
-          e.profile.split_count = splits;
-          e.profile.split_workspace_bytes =
-              U64(t) * c.num_attention_heads * splits * 4;
-          auto split_params =
-              words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
-                     U32(c.head_dim), t, 0, slot_max_context, 64,
-                     slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
-                     kv, q * 2, U32(c.head_dim * 2), splits, 512});
-          emit_paged_split_attention_exact_gqa(
-              e, c, t, splits, q_ref, gate_ref, state_block.state0,
-              state_block.state1, mix_ref, table_ref, split_max, attn_pos_ref,
-              std::move(split_params));
-        } else {
-          const U32 chunk_tokens =
-              exact_attention_split_chunk_tokens(slot_max_context, 0U);
-          const U32 splits = exact_attention_split_count(
-              context_envelope, slot_max_context, 0U);
-          if (!splits ||
-              U64(t) * c.num_attention_heads * splits * 4 > split_max.bytes ||
-              U64(t) * c.num_attention_heads * splits * 4 > split_sum.bytes ||
-              U64(t) * c.num_attention_heads * splits * c.head_dim * 4 >
-                  split_output.bytes)
-            throw std::invalid_argument("split Attention workspace exceeded");
-          e.profile.split_attention = true;
-          e.profile.split_count = splits;
-          e.profile.split_workspace_bytes =
-              U64(t) * c.num_attention_heads * splits * (8 + c.head_dim * 4);
-          auto split_params =
-              words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
-                     U32(c.head_dim), t, 0, slot_max_context, 64,
-                     slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
-                     kv, q * 2, U32(c.head_dim * 2), splits, chunk_tokens});
-          emit_paged_split_attention_exact_1pass_gqa(
-              e, context, libraries, c, t, splits, q_ref, gate_ref,
-              state_block.state0, state_block.state1, mix_ref, table_ref,
-              split_max, split_sum, split_output, attn_pos_ref,
-              std::move(split_params));
-        }
-        return;
-      }
-      if (!split && exact_attention) {
-        emit_paged_causal_attention_exact_gqa(
-            e, context, libraries, c, t, strict_two_pass_attn_, q_ref, gate_ref,
+    if (!pos_placeholder.has_value() && dynamic_tokens && !split &&
+        (!exact_attention || c.hidden_size >= 1024) && flash_nax_prefill_ &&
+        t >= kFlashNaxPrefillMinTokens && attn_pos_ref.buffer != nullptr &&
+        flash_nax_prefill_runtime_eligible(context, libraries,
+                                           U32(c.head_dim))) {
+      emit_paged_flash_prefill_nax(e, c, t, q_ref, gate_ref,
+                                   state_block.state0, state_block.state1,
+                                   mix_ref, table_ref, attn_pos_ref,
+                                   std::move(params));
+      return;
+    }
+    if (split && exact_attention && attn_pos_ref.buffer != nullptr) {
+      if (strict_two_pass_attn_) {
+        const U32 splits = (context_envelope + 511) / 512;
+        if (!splits || U64(t) * c.num_attention_heads * splits * 4 >
+                           split_max.bytes)
+          throw std::invalid_argument("split Attention workspace exceeded");
+        e.profile.split_attention = true;
+        e.profile.split_count = splits;
+        e.profile.split_workspace_bytes =
+            U64(t) * c.num_attention_heads * splits * 4;
+        auto split_params =
+            words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
+                   U32(c.head_dim), t, pos_init, slot_max_context, 64,
+                   slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
+                   kv, q * 2, U32(c.head_dim * 2), splits, 512});
+        emit_paged_split_attention_exact_gqa(
+            e, c, t, splits, q_ref, gate_ref, state_block.state0,
+            state_block.state1, mix_ref, table_ref, split_max, attn_pos_ref,
+            std::move(split_params), tok_word_attn, pos_word_attn);
+      } else {
+        const U32 chunk_tokens =
+            exact_attention_split_chunk_tokens(slot_max_context, 0U);
+        const U32 splits = exact_attention_split_count(
+            context_envelope, slot_max_context, 0U);
+        if (!splits ||
+            U64(t) * c.num_attention_heads * splits * 4 > split_max.bytes ||
+            U64(t) * c.num_attention_heads * splits * 4 > split_sum.bytes ||
+            U64(t) * c.num_attention_heads * splits * c.head_dim * 4 >
+                split_output.bytes)
+          throw std::invalid_argument("split Attention workspace exceeded");
+        e.profile.split_attention = true;
+        e.profile.split_count = splits;
+        e.profile.split_workspace_bytes =
+            U64(t) * c.num_attention_heads * splits * (8 + c.head_dim * 4);
+        auto split_params =
+            words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
+                   U32(c.head_dim), t, pos_init, slot_max_context, 64,
+                   slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
+                   kv, q * 2, U32(c.head_dim * 2), splits, chunk_tokens});
+        emit_paged_split_attention_exact_1pass_gqa(
+            e, context, libraries, c, t, splits, q_ref, gate_ref,
             state_block.state0, state_block.state1, mix_ref, table_ref,
-            attn_pos_ref, std::move(params));
-        return;
+            split_max, split_sum, split_output, attn_pos_ref,
+            std::move(split_params), tok_word_attn, pos_word_attn);
       }
+      return;
+    }
+    if (!pos_placeholder.has_value() && dynamic_tokens && !split &&
+        exact_attention) {
+      emit_paged_causal_attention_exact_gqa(
+          e, context, libraries, c, t, strict_two_pass_attn_, q_ref, gate_ref,
+          state_block.state0, state_block.state1, mix_ref, table_ref,
+          attn_pos_ref, std::move(params));
+      return;
     }
 
     if (split) {
@@ -4153,20 +4152,23 @@ public:
         uw.parent_shape != std::vector<U64>{256, f, h} ||
         dw.parent_shape != std::vector<U64>{256, h, f})
       return false;
+    const bool has_moe_min_env =
+        (std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
     const bool force_t1_moe_qmv =
-        !speculative_enabled && allow_tdom_t1() &&
-        explicit_t.value_or(0U) < 2U && t_domain_active() &&
-        std::getenv("OMLX_M5_MOE_NAX_MIN_T") == nullptr;
+        gw.format == "mxfp4_e2m1_g32_e8m0_v1" && !speculative_enabled &&
+        allow_tdom_t1() && explicit_t.value_or(0U) < 2U && t_domain_active() &&
+        !has_moe_min_env;
     const bool unlock_moe_nax =
         !force_t1_moe_qmv &&
         (speculative_enabled ||
          linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         explicit_t.value_or(0U) >= 2U ||
-         std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
+         explicit_t.value_or(0U) >= 2U || has_moe_min_env);
     const U32 eff_moe_min_t =
-        unlock_moe_nax
-            ? silicon_tuning.moe_nax_min_tokens
-            : std::max<U32>(silicon_tuning.moe_nax_min_tokens, 8U);
+        has_moe_min_env
+            ? moe_nax_min_tokens()
+            : (unlock_moe_nax
+                   ? silicon_tuning.moe_nax_min_tokens
+                   : std::max<U32>(silicon_tuning.moe_nax_min_tokens, 8U));
     return t >= eff_moe_min_t && moe_nax_weight_eligible(gw, uw, dw, h, f);
   }
 
@@ -4187,20 +4189,23 @@ public:
       return false;
     }
     const U32 t = explicit_t.value_or(e.profile.capacity);
+    const bool has_moe_min_env =
+        (std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
     const bool force_t1_moe_qmv =
-        !speculative_enabled && allow_tdom_t1() &&
-        explicit_t.value_or(0U) < 2U && t_domain_active() &&
-        std::getenv("OMLX_M5_MOE_NAX_MIN_T") == nullptr;
+        gw.format == "mxfp4_e2m1_g32_e8m0_v1" && !speculative_enabled &&
+        allow_tdom_t1() && explicit_t.value_or(0U) < 2U && t_domain_active() &&
+        !has_moe_min_env;
     const bool unlock_moe_nax =
         !force_t1_moe_qmv &&
         (speculative_enabled ||
          linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         explicit_t.value_or(0U) >= 2U ||
-         std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
+         explicit_t.value_or(0U) >= 2U || has_moe_min_env);
     const U32 eff_moe_min_t =
-        unlock_moe_nax
-            ? silicon_tuning.moe_nax_min_tokens
-            : std::max<U32>(silicon_tuning.moe_nax_min_tokens, 8U);
+        has_moe_min_env
+            ? moe_nax_min_tokens()
+            : (unlock_moe_nax
+                   ? silicon_tuning.moe_nax_min_tokens
+                   : std::max<U32>(silicon_tuning.moe_nax_min_tokens, 8U));
     if (t >= eff_moe_min_t &&
         emit_moe_nax_ffn(e, moe_nax_ws, gw, uw, dw, norm, route_ids,
                          route_scores, expert_output, routed, t, h, f, 8u, 256u,
@@ -4824,29 +4829,63 @@ public:
          pretiled_qmv_t1_enabled() && !inspect_tensors_workspace &&
          rms_sq_buf.buffer != nullptr && moe_tg_done_buf.buffer != nullptr &&
          h < 65536U);
+    const bool affine_xs_eligible =
+        (!allow_t1_fused_norms && t > 1U && affine_nax_active() &&
+         affine_nax_xs.buffer != nullptr && (h % 64U) == 0U);
     const U32 num_sq_words = U32(blocks.size()) * 2U + 4U;
     const U32 num_moe_words =
         config.num_experts ? (U32(blocks.size()) + 4U) : 0U;
     std::optional<U32> pending_sq_slot;
+    std::optional<Encoder::GroupSumKey> carried_affine_xs;
+    auto restore_carried_xs = [&]() {
+      if (carried_affine_xs.has_value()) {
+        e.set_group_sum(*carried_affine_xs);
+        carried_affine_xs.reset();
+      }
+    };
+    auto make_norm_xs_key = [&]() -> Encoder::GroupSumKey {
+      return Encoder::GroupSumKey{affine_nax_xs.buffer,
+                                  affine_nax_xs.offset,
+                                  norm.buffer,
+                                  norm.offset,
+                                  h,
+                                  64U,
+                                  t,
+                                  true,
+                                  2U};
+    };
     U32 layer_index = 0;
     for (const auto &block : blocks) {
       const bool in_f16 = block_input_nax(block, t);
       const bool mlp_f16 = block_mlp_input_nax(block, t);
+      const bool in_affine_xs = (!in_f16 && affine_xs_eligible);
+      const bool mlp_affine_xs = (!mlp_f16 && affine_xs_eligible);
       const bool layer_fuse = allow_t1_fused_norms && !in_f16 && !mlp_f16;
       e.begin_stage(
           "layer." + std::to_string(layer_index) +
           (block.type == LayerType::full_attention ? ".attention" : ".gdn"));
+      restore_carried_xs();
       if (layer_index == 0) {
         if (in_f16)
           normalize_f16(e, block.get("input_norm"), hidden, f16_norm);
         else if (allow_t1_fused_norms)
           normalize_init_zero_t1(e, block.get("input_norm"), hidden, norm,
                                  num_sq_words, num_moe_words);
+        else if (in_affine_xs)
+          emit_affine_rmsnorm_xsum(e, hidden, direct(block.get("input_norm"), h),
+                                   norm, affine_nax_xs, h,
+                                   float(config.rms_norm_eps),
+                                   normalization_weight_offset);
         else
           normalize(e, block.get("input_norm"), hidden, norm);
       } else if (!layer_fuse && pending_sq_slot.has_value()) {
         if (in_f16)
           normalize_f16(e, block.get("input_norm"), hidden, f16_norm);
+        else if (in_affine_xs)
+          emit_affine_rmsnorm_xsum(e, hidden, direct(block.get("input_norm"), h),
+                                   norm, affine_nax_xs, h,
+                                   float(config.rms_norm_eps),
+                                   normalization_weight_offset);
         else
           normalize(e, block.get("input_norm"), hidden, norm);
         pending_sq_slot.reset();
@@ -4865,6 +4904,11 @@ public:
         if (mlp_f16)
           add_normalize_f16(e, block.get("post_attention_norm"), hidden, delta,
                             f16_norm);
+        else if (mlp_affine_xs)
+          emit_affine_add_rmsnorm_xsum(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, affine_nax_xs, h, float(config.rms_norm_eps),
+              normalization_weight_offset);
         else
           add_normalize(e, block.get("post_attention_norm"), hidden, delta,
                         norm);
@@ -4875,16 +4919,29 @@ public:
                      : std::optional<U32>{});
       if (!pending_sq_slot.has_value()) {
         if (layer_index + 1 < blocks.size()) {
-          if (block_input_nax(blocks[layer_index + 1], t))
+          const bool next_in_f16 = block_input_nax(blocks[layer_index + 1], t);
+          if (next_in_f16)
             add_normalize_f16(e, blocks[layer_index + 1].get("input_norm"),
                               hidden, delta, f16_norm);
-          else
+          else if (affine_xs_eligible) {
+            emit_affine_add_rmsnorm_xsum(
+                e, hidden, delta,
+                direct(blocks[layer_index + 1].get("input_norm"), h), norm,
+                affine_nax_xs, h, float(config.rms_norm_eps),
+                normalization_weight_offset);
+            carried_affine_xs = make_norm_xs_key();
+          } else
             add_normalize(e, blocks[layer_index + 1].get("input_norm"), hidden,
                           delta, norm);
         } else if (!extract_last_row_head) {
           if (nax_head)
             add_normalize_f16(e, final_norm, hidden, delta, f16_norm);
-          else
+          else if (affine_xs_eligible) {
+            emit_affine_add_rmsnorm_xsum(
+                e, hidden, delta, direct(final_norm, h), norm, affine_nax_xs, h,
+                float(config.rms_norm_eps), normalization_weight_offset);
+            carried_affine_xs = make_norm_xs_key();
+          } else
             add_normalize(e, final_norm, hidden, delta, norm);
         } else {
           add(e);
@@ -4909,6 +4966,7 @@ public:
       return e.finish();
     }
     e.begin_stage("head");
+    restore_carried_xs();
     if (feature_history.buffer && !verify)
       append_features(e);
     Ref sample_logits = last_logits;
@@ -5267,6 +5325,7 @@ public:
     bool sample_in_icb = false;
     bool scatter_slot_logits = true;
     U32 affine4_split_env = 0;
+    U32 bf16_split_env = 0;
     std::vector<const Impl *> slots;
     std::vector<U32> widths;
     bool operator==(const PackedShapeKey &) const = default;
@@ -5330,6 +5389,7 @@ public:
     sk_hash.u64(skey.verify ? 1ULL : 0ULL);
     sk_hash.u64(skey.sample_in_icb ? 2ULL : (skey.scatter_slot_logits ? 1ULL : 0ULL));
     sk_hash.u64(skey.affine4_split_env);
+    sk_hash.u64(skey.bf16_split_env);
     for (std::size_t b_idx = 0; b_idx < B; ++b_idx) {
       sk_hash.u64(skey.slots[b_idx]->owner_id);
       sk_hash.u64(skey.widths[b_idx]);
@@ -5480,7 +5540,8 @@ public:
             block.get("attention_v")};
         const std::array<U32, 3> part_ns{2 * q, kv, kv};
 
-        bool can_batched_attn = batched_attn_base;
+        bool can_batched_attn =
+            batched_attn_base && (skey.bf16_split_env == 0U);
         bool can_batched_affine4_attn =
             batched_attn_base && config.head_dim == 256 &&
             affine4_kv_runtime_eligible(
@@ -5943,11 +6004,18 @@ public:
                 used_strided_qkv
                     ? Ref{concat_out.buffer, mul(2 * q + kv, 2), mul(kv, 2)}
                     : row_slice_ref(value, r_off, w_b, kv);
+            const bool slot_split =
+                (skey.bf16_split_env > 0U) &&
+                (sp.kv_format_ == KvStorageFormat::BFloat16) &&
+                split_attention_enabled;
+            const U32 slot_env =
+                slot_split ? std::min(skey.bf16_split_env, sp.max_context) : 0U;
             emit_attention_state_step(
                 e, block, sp.blocks[layer_index], *sp.page_pool, sp.max_context,
                 sp.kv_format_, q_s, k_s, v_s,
-                row_slice_ref(mixer, r_off, w_b, q), slice_attn_pos, w_b, false,
-                0U, false, 0xFF000000U | U32(b_idx), &raw_patches);
+                row_slice_ref(mixer, r_off, w_b, q), slice_attn_pos, w_b,
+                slot_split, slot_env, false, 0xFF000000U | U32(b_idx),
+                &raw_patches);
             add_slot_patches(U32(b_idx), raw_patches);
           }
         }
@@ -7035,6 +7103,12 @@ public:
          !inspect_tensors_workspace && attention_positions.buffer != nullptr &&
          split_max.buffer != nullptr && split_sum.buffer != nullptr &&
          split_output.buffer != nullptr);
+    bool all_bf16 =
+        (slices.size() >= 2U && slices.size() <= 8U &&
+         split_attention_enabled && !inspect_tensors_workspace &&
+         attention_positions.buffer != nullptr && split_max.buffer != nullptr &&
+         (strict_two_pass_attn_ ||
+          (split_sum.buffer != nullptr && split_output.buffer != nullptr)));
     for (const auto &s : slices) {
       if (!s.slot_program)
         throw std::invalid_argument("Qwen packed batch slice missing slot_program");
@@ -7064,6 +7138,7 @@ public:
       max_end_pos = std::max(max_end_pos, sp.next_position + w_b);
       max_slot_ctx = std::max(max_slot_ctx, sp.max_context);
       all_affine4 &= (sp.kv_format_ == KvStorageFormat::Affine4Group128);
+      all_bf16 &= (sp.kv_format_ == KvStorageFormat::BFloat16);
       shape_key.slots.push_back(&sp);
       shape_key.widths.push_back(w_b);
     }
@@ -7081,6 +7156,18 @@ public:
         }
       }
       shape_key.affine4_split_env = std::max(512U, env);
+    }
+    const U32 split_min_ctx =
+        std::max<U32>(512U, silicon_tuning.split_kv_min_context);
+    if (all_bf16 && max_w_run <= 8U && max_end_pos >= split_min_ctx) {
+      U32 env = max_slot_ctx;
+      for (U32 cand : {2048U, 4096U, 8192U, 16384U, 32768U, 65536U}) {
+        if (cand >= max_end_pos) {
+          env = std::min(cand, max_slot_ctx);
+          break;
+        }
+      }
+      shape_key.bf16_split_env = std::max(512U, env);
     }
 
     auto &entry = acquire_packed_profile(shape_key);

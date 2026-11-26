@@ -157,10 +157,11 @@ public:
       : cfg_(cfg), slots_(std::max<std::size_t>(1, cfg.max_slots)) {
     const bool is_moe = cfg_.num_experts > 0 && cfg_.experts_per_token > 0;
     if (is_moe) {
-      // Priors calibrated from M5 Ultra 64c 35B-A3B (AR ~7.7ms, DFlash2 ~6.5ms).
+      // Priors calibrated from M5 Ultra 35B-A3B + parallel block-diffusion DFlash2:
+      // DFlash2 proposes all K<=7 tokens in ONE BM=8 NAX forward + ~0.03ms/tok selector.
       ema_ar_base_ms_ = 7.7;
       ema_draft_base_ms_ = 5.4;
-      ema_draft_tok_ms_ = 0.25;
+      ema_draft_tok_ms_ = 0.03;
       ema_commit_ms_ = 0.75;
     } else {
       // Priors calibrated from M5 Ultra 64c 27B + DFlash2 parallel block-diffusion:

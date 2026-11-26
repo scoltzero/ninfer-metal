@@ -8256,10 +8256,10 @@ index 7b0e787..e06e4de 100644
          """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..86fa091
+index 0000000..99fee75
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7615 @@
+@@ -0,0 +1,7663 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -11060,6 +11060,47 @@ index 0000000..86fa091
 +    return False
 +
 +
++def inspect_safetensors_has_mtp_weights(model_dir: Path | None) -> bool | None:
++    """Inspect `model.safetensors.index.json` or `model.safetensors` header for MTP tensors.
++
++    Returns ``True``/``False`` when real safetensors metadata is present (catching
++    MLX conversions such as `OsaurusAI/Qwen3.6-35B-A3B-mxfp4` that retain
++    `mtp_num_hidden_layers: 1` in `config.json` while stripping `mtp.*` weights),
++    or ``None`` when no valid safetensors metadata exists (e.g. synthetic fixtures).
++    """
++    if model_dir is None:
++        return None
++    idx_json = _read_json(model_dir / "model.safetensors.index.json")
++    if isinstance(idx_json, dict):
++        weight_map = idx_json.get("weight_map")
++        if isinstance(weight_map, dict) and weight_map:
++            return any(
++                isinstance(k, str) and (k.startswith("mtp.") or ".mtp." in k)
++                for k in weight_map
++            )
++    single_st = model_dir / "model.safetensors"
++    try:
++        st_stat = single_st.stat()
++        if st_stat.st_size < 8:
++            return None
++        with single_st.open("rb") as fh:
++            hdr_len = int.from_bytes(fh.read(8), "little")
++            if hdr_len <= 0 or hdr_len > _OMLXM5_MAX_MANIFEST_BYTES or 8 + hdr_len > st_stat.st_size:
++                return None
++            hdr_raw = fh.read(hdr_len)
++        if len(hdr_raw) != hdr_len:
++            return None
++        hdr = json.loads(hdr_raw.decode("utf-8"))
++    except (OSError, UnicodeDecodeError, ValueError):
++        return None
++    if not isinstance(hdr, dict):
++        return None
++    tensor_keys = [k for k in hdr if isinstance(k, str) and k != "__metadata__"]
++    if not tensor_keys:
++        return None
++    return any(k.startswith("mtp.") or ".mtp." in k for k in tensor_keys)
++
++
 +def _resolve_effective_kv_dtype(
 +    opts: dict[str, Any],
 +    model_settings: object | None,
@@ -11195,14 +11236,21 @@ index 0000000..86fa091
 +            embedded_mtp = inspect_omlxm5_has_mtp_weights(target_art)
 +            if embedded_mtp is True:
 +                spec_backend = "mtp"
-+            elif (
-+                embedded_mtp is None
-+                and model_dir is not None
-+                and _config_json_has_mtp(_read_json(model_dir / "config.json"))
-+            ):
-+                spec_backend = "mtp"
-+            else:
++            elif embedded_mtp is False:
 +                spec_backend = "none"
++            else:
++                st_mtp = inspect_safetensors_has_mtp_weights(model_dir)
++                if st_mtp is True:
++                    spec_backend = "mtp"
++                elif st_mtp is False:
++                    spec_backend = "none"
++                elif (
++                    model_dir is not None
++                    and _config_json_has_mtp(_read_json(model_dir / "config.json"))
++                ):
++                    spec_backend = "mtp"
++                else:
++                    spec_backend = "none"
 +
 +    if spec_backend == "none":
 +        return "none", 0
@@ -19339,10 +19387,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..934e6d2
+index 0000000..1908370
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4253 @@
+@@ -0,0 +1,4318 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -23596,6 +23644,71 @@ index 0000000..934e6d2
 +    pool.request_unload = fake_request_unload  # type: ignore[method-assign]
 +    await pool.apply_max_concurrent_requests(4)
 +    assert reloaded == [("global-stale", False, "max_concurrent_requests changed")]
++
++
++def test_pre_convert_safetensors_mtp_detection_prevents_stripped_mtp_mismatch(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setenv("NINFER_METAL_CONFIG", str(tmp_path / "none.toml"))
++    binary = M5Binary(
++        path=Path("/fake/mseries_backendd"),
++        version="miv-v0.03",
++        protocol_version=2,
++        auto_detected=False,
++    )
++
++    # 1) OsaurusAI/Qwen3.6-35B-A3B-mxfp4 style: config.json keeps mtp_num_hidden_layers=1
++    #    while model.safetensors.index.json has 0 MTP keys -> must resolve to "none" pre-convert.
++    stripped_dir = tmp_path / "Qwen3.6-35B-A3B-mxfp4"
++    stripped_dir.mkdir()
++    (stripped_dir / "config.json").write_text(
++        json.dumps({"text_config": {"mtp_num_hidden_layers": 1, "max_position_embeddings": 262144}}),
++        encoding="utf-8",
++    )
++    (stripped_dir / "model.safetensors.index.json").write_text(
++        json.dumps({"weight_map": {"language_model.lm_head.weight": "model-00001.safetensors"}}),
++        encoding="utf-8",
++    )
++    t_stripped = M5Target(
++        binary=binary,
++        artifact_path=None,
++        metallib_dir=tmp_path,
++        auto_convert_output=stripped_dir / "model.miv",
++    )
++    p_stripped = m5_mod.build_m5rt_options(
++        stripped_dir, t_stripped, ModelSettings(), default_context=65536, memory_budget_bytes=0
++    )
++    assert p_stripped.speculative_backend == "none"
++
++    # 2) Jundot/Qwen3.6-35B-A3B-oQ4e-mtp style: weight_map retains language_model.mtp.* -> "mtp".
++    mtp_dir = tmp_path / "Qwen3.6-35B-A3B-oQ4e-mtp"
++    mtp_dir.mkdir()
++    (mtp_dir / "config.json").write_text(
++        json.dumps({"text_config": {"mtp_num_hidden_layers": 1, "max_position_embeddings": 262144}}),
++        encoding="utf-8",
++    )
++    (mtp_dir / "model.safetensors.index.json").write_text(
++        json.dumps(
++            {
++                "weight_map": {
++                    "language_model.lm_head.weight": "model-00001.safetensors",
++                    "language_model.mtp.fc.weight": "model-00004.safetensors",
++                }
++            }
++        ),
++        encoding="utf-8",
++    )
++    t_mtp = M5Target(
++        binary=binary,
++        artifact_path=None,
++        metallib_dir=tmp_path,
++        auto_convert_output=mtp_dir / "model.miv",
++    )
++    p_mtp = m5_mod.build_m5rt_options(
++        mtp_dir, t_mtp, ModelSettings(), default_context=65536, memory_budget_bytes=0
++    )
++    assert p_mtp.speculative_backend == "mtp"
++
 diff --git a/tests/test_microkernel_manager.py b/tests/test_microkernel_manager.py
 new file mode 100644
 index 0000000..b90774c

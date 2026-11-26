@@ -4251,3 +4251,68 @@ async def test_apply_max_concurrent_requests_reloads_only_global_sidecars(tmp_pa
     pool.request_unload = fake_request_unload  # type: ignore[method-assign]
     await pool.apply_max_concurrent_requests(4)
     assert reloaded == [("global-stale", False, "max_concurrent_requests changed")]
+
+
+def test_pre_convert_safetensors_mtp_detection_prevents_stripped_mtp_mismatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("NINFER_METAL_CONFIG", str(tmp_path / "none.toml"))
+    binary = M5Binary(
+        path=Path("/fake/mseries_backendd"),
+        version="miv-v0.03",
+        protocol_version=2,
+        auto_detected=False,
+    )
+
+    # 1) OsaurusAI/Qwen3.6-35B-A3B-mxfp4 style: config.json keeps mtp_num_hidden_layers=1
+    #    while model.safetensors.index.json has 0 MTP keys -> must resolve to "none" pre-convert.
+    stripped_dir = tmp_path / "Qwen3.6-35B-A3B-mxfp4"
+    stripped_dir.mkdir()
+    (stripped_dir / "config.json").write_text(
+        json.dumps({"text_config": {"mtp_num_hidden_layers": 1, "max_position_embeddings": 262144}}),
+        encoding="utf-8",
+    )
+    (stripped_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"language_model.lm_head.weight": "model-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    t_stripped = M5Target(
+        binary=binary,
+        artifact_path=None,
+        metallib_dir=tmp_path,
+        auto_convert_output=stripped_dir / "model.miv",
+    )
+    p_stripped = m5_mod.build_m5rt_options(
+        stripped_dir, t_stripped, ModelSettings(), default_context=65536, memory_budget_bytes=0
+    )
+    assert p_stripped.speculative_backend == "none"
+
+    # 2) Jundot/Qwen3.6-35B-A3B-oQ4e-mtp style: weight_map retains language_model.mtp.* -> "mtp".
+    mtp_dir = tmp_path / "Qwen3.6-35B-A3B-oQ4e-mtp"
+    mtp_dir.mkdir()
+    (mtp_dir / "config.json").write_text(
+        json.dumps({"text_config": {"mtp_num_hidden_layers": 1, "max_position_embeddings": 262144}}),
+        encoding="utf-8",
+    )
+    (mtp_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "language_model.lm_head.weight": "model-00001.safetensors",
+                    "language_model.mtp.fc.weight": "model-00004.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    t_mtp = M5Target(
+        binary=binary,
+        artifact_path=None,
+        metallib_dir=tmp_path,
+        auto_convert_output=mtp_dir / "model.miv",
+    )
+    p_mtp = m5_mod.build_m5rt_options(
+        mtp_dir, t_mtp, ModelSettings(), default_context=65536, memory_budget_bytes=0
+    )
+    assert p_mtp.speculative_backend == "mtp"
+

@@ -953,7 +953,7 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
   QwenForwardMemoryPlan plan;
   const bool is_moe = c.num_experts > 0;
   const U32 priming_rows =
-      (!is_moe && c.hidden_size >= 1024)
+      (c.hidden_size >= 1024)
           ? std::min<U32>(max_context, 256U)
           : std::min<U32>(max_context, 64U);
   plan.workspace_rows = priming_rows;
@@ -2543,18 +2543,23 @@ public:
         dynamic_rows ? std::optional<U32>(5U) : std::nullopt;
 
     emit_linear(e, moe_router, get("norm"), get("router"), 256U, h, explicit_t);
-    auto &rt = e.emit("qwen_forward", "omlx_m5_forward_router_top8_logits",
-                      {.width = 32U, .height = rows}, {.width = 32U},
-                      {get("router"), get("route_ids"), get("route_scores")});
-    e.dynamic(rt, 3, words({rows, 256U}), tok_w0);
 
     bool handled = false;
-    if (dynamic_rows && moe_nax_ws.active &&
+    bool wrote_expert_output = false;
+    if (moe_nax_ws.active &&
         emit_moe_nax_ffn(e, moe_nax_ws, moe_gate, moe_up, moe_down, get("norm"),
                          get("route_ids"), get("route_scores"),
                          get("expert_output"), get("routed"), rows, h, f, 8U,
-                         256U, gpu_cores)) {
+                         256U, gpu_cores, explicit_t, get("router"),
+                         /*emit_reduce=*/false)) {
       handled = true;
+      wrote_expert_output = true;
+    }
+    if (!handled) {
+      auto &rt = e.emit("qwen_forward", "omlx_m5_forward_router_top8_logits",
+                        {.width = 32U, .height = rows}, {.width = 32U},
+                        {get("router"), get("route_ids"), get("route_scores")});
+      e.dynamic(rt, 3, words({rows, 256U}), tok_w0);
     }
     if (!handled && moe_gate.format == "mxfp4_e2m1_g32_e8m0_v1" &&
         moe_down.format == "mxfp4_e2m1_g32_e8m0_v1") {
@@ -2662,11 +2667,19 @@ public:
                 explicit_t);
     emit_linear(e, shared_expert_gate, get("norm"), get("shared_gate"), 1U, h,
                 explicit_t);
-    auto &comb = e.emit("mlp", "omlx_m5_moe_shared_combine",
-                        {.width = U64(rows) * h}, {.width = 128U},
-                        {get("routed"), get("shared"), get("shared_gate"),
-                         get("delta")});
-    e.dynamic(comb, 4, words({rows, 8U, h, 0U}), tok_w0);
+    if (wrote_expert_output) {
+      auto &comb = e.emit("mlp", "omlx_m5_moe_topk_shared_combine",
+                          {.width = U64(rows) * h}, {.width = 128U},
+                          {get("expert_output"), get("shared"),
+                           get("shared_gate"), get("delta")});
+      e.dynamic(comb, 4, words({rows, 8U, h, 0U}), tok_w0);
+    } else {
+      auto &comb = e.emit("mlp", "omlx_m5_moe_shared_combine",
+                          {.width = U64(rows) * h}, {.width = 128U},
+                          {get("routed"), get("shared"), get("shared_gate"),
+                           get("delta")});
+      e.dynamic(comb, 4, words({rows, 8U, h, 0U}), tok_w0);
+    }
   }
 
   bool use_fc_dual_bf16(U32 rows) const {

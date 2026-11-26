@@ -211,6 +211,24 @@ Json test_silicon_tuning(const MetalContext &ctx,
                 isolated.linear_split_k_target_slices == 8U,
             "calibration SKU isolation failed");
   }
+  {
+    const auto cal_64 =
+        repo_root / "docs/backend/silicon-calibrations/apple-m5-ultra-64gpu.json";
+    const auto cal_80 =
+        repo_root / "docs/backend/silicon-calibrations/apple-m5-ultra-80gpu.json";
+    if (std::filesystem::is_regular_file(cal_64)) {
+      ScopedEnv env_cores("OMLX_M5_GPU_CORES", "64");
+      const auto t64 = detail::resolve_silicon_tuning(ctx, cal_64);
+      require(t64.loaded_from_json && t64.moe_nax_min_tokens == 1U,
+              "apple-m5-ultra-64gpu.json must keep moe_nax_min_tokens == 1");
+    }
+    if (std::filesystem::is_regular_file(cal_80)) {
+      ScopedEnv env_cores("OMLX_M5_GPU_CORES", "80");
+      const auto t80 = detail::resolve_silicon_tuning(ctx, cal_80);
+      require(t80.loaded_from_json && t80.moe_nax_min_tokens == 1U,
+              "apple-m5-ultra-80gpu.json must keep moe_nax_min_tokens == 1");
+    }
+  }
 
   // Verify Q3 affine quantization is accepted in model_config.cpp.
   {

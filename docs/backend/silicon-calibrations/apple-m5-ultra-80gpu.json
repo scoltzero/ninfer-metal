@@ -96,7 +96,7 @@
     "linear_nax_min_tokens": 1,
     "linear_split_k_target_slices": 8,
     "moe_grouped_vs_fallback_active_tokens": 8,
-    "moe_prefill_nax_min_tokens": 8,
+    "moe_prefill_nax_min_tokens": 1,
     "prefix_cache_budget_bytes": 4294967296
   },
   "notes": "Measured real-hardware calibration strictly isolated to full-core Apple M5 Ultra (36 CPU / 80 GPU / 80 NAX / 256 GiB UMA, AGXAcceleratorG17X, macOS 27.2.1 build 26B131, Xcode 27.2 build 27B52) across v0.8.0-m5rt.14 (Dim D 19/19 sweep), v0.8.0-m5rt.15 (Dim E long-context foscar_affine4_g128 & zero-move UMA prefix cache 13/13 sweep), and v0.8.0-m5rt.16 (multi-turn rolling prefix cache & batched affine4 NAX attention 10/10 sweep). Never reused to qualify 64-GPU binned or non-Ultra SKUs."

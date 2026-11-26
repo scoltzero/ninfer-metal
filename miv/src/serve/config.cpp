@@ -925,14 +925,81 @@ void resolve_auto_speculative(ModelServeConfig &model_cfg) {
           return;
         }
       } catch (...) {
-        // Synthetic placeholder artifact; fall back to config.json inspection.
+        // Synthetic placeholder artifact; fall back to safetensors / config.json.
       }
     }
-    if (!inspected_real_artifact &&
-        config_json_has_mtp(model_dir / "config.json")) {
-      model_cfg.spec_backend = SpeculativeBackend::mtp;
-      model_cfg.spec_backend_auto = false;
-      return;
+    if (!inspected_real_artifact) {
+      std::optional<bool> st_has_mtp;
+      const auto is_mtp_key = [](std::string_view k) {
+        return k.starts_with("mtp.") || k.find(".mtp.") != std::string_view::npos;
+      };
+      const auto idx_path = model_dir / "model.safetensors.index.json";
+      if (std::filesystem::is_regular_file(idx_path, ec)) {
+        std::ifstream idx_in(idx_path);
+        const auto idx_json = nlohmann::json::parse(idx_in, nullptr, false);
+        if (idx_json.is_object()) {
+          const auto wm_it = idx_json.find("weight_map");
+          if (wm_it != idx_json.end() && wm_it->is_object() && !wm_it->empty()) {
+            bool any_mtp = false;
+            for (auto it = wm_it->begin(); it != wm_it->end(); ++it) {
+              if (is_mtp_key(it.key())) {
+                any_mtp = true;
+                break;
+              }
+            }
+            st_has_mtp = any_mtp;
+          }
+        }
+      } else {
+        const auto single_st = model_dir / "model.safetensors";
+        const auto fsize = std::filesystem::file_size(single_st, ec);
+        if (!ec && fsize >= 8ULL) {
+          std::ifstream st_in(single_st, std::ios::binary);
+          std::uint64_t hdr_len = 0;
+          std::array<unsigned char, 8> len_buf{};
+          if (st_in.read(reinterpret_cast<char *>(len_buf.data()), 8)) {
+            for (int b = 0; b < 8; ++b) {
+              hdr_len |= static_cast<std::uint64_t>(len_buf[b]) << (8 * b);
+            }
+            if (hdr_len > 0ULL && hdr_len <= (64ULL << 20) &&
+                8ULL + hdr_len <= fsize) {
+              std::string hdr_raw(static_cast<std::size_t>(hdr_len), '\0');
+              if (st_in.read(hdr_raw.data(),
+                             static_cast<std::streamsize>(hdr_len))) {
+                const auto hdr_json =
+                    nlohmann::json::parse(hdr_raw, nullptr, false);
+                if (hdr_json.is_object()) {
+                  bool saw_tensor = false;
+                  bool any_mtp = false;
+                  for (auto it = hdr_json.begin(); it != hdr_json.end(); ++it) {
+                    if (it.key() == "__metadata__")
+                      continue;
+                    saw_tensor = true;
+                    if (is_mtp_key(it.key())) {
+                      any_mtp = true;
+                      break;
+                    }
+                  }
+                  if (saw_tensor) {
+                    st_has_mtp = any_mtp;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      if (st_has_mtp.has_value()) {
+        if (*st_has_mtp) {
+          model_cfg.spec_backend = SpeculativeBackend::mtp;
+          model_cfg.spec_backend_auto = false;
+          return;
+        }
+      } else if (config_json_has_mtp(model_dir / "config.json")) {
+        model_cfg.spec_backend = SpeculativeBackend::mtp;
+        model_cfg.spec_backend_auto = false;
+        return;
+      }
     }
   }
 

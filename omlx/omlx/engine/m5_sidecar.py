@@ -2798,6 +2798,47 @@ def _config_json_has_mtp(config: dict[str, Any] | None) -> bool:
     return False
 
 
+def inspect_safetensors_has_mtp_weights(model_dir: Path | None) -> bool | None:
+    """Inspect `model.safetensors.index.json` or `model.safetensors` header for MTP tensors.
+
+    Returns ``True``/``False`` when real safetensors metadata is present (catching
+    MLX conversions such as `OsaurusAI/Qwen3.6-35B-A3B-mxfp4` that retain
+    `mtp_num_hidden_layers: 1` in `config.json` while stripping `mtp.*` weights),
+    or ``None`` when no valid safetensors metadata exists (e.g. synthetic fixtures).
+    """
+    if model_dir is None:
+        return None
+    idx_json = _read_json(model_dir / "model.safetensors.index.json")
+    if isinstance(idx_json, dict):
+        weight_map = idx_json.get("weight_map")
+        if isinstance(weight_map, dict) and weight_map:
+            return any(
+                isinstance(k, str) and (k.startswith("mtp.") or ".mtp." in k)
+                for k in weight_map
+            )
+    single_st = model_dir / "model.safetensors"
+    try:
+        st_stat = single_st.stat()
+        if st_stat.st_size < 8:
+            return None
+        with single_st.open("rb") as fh:
+            hdr_len = int.from_bytes(fh.read(8), "little")
+            if hdr_len <= 0 or hdr_len > _OMLXM5_MAX_MANIFEST_BYTES or 8 + hdr_len > st_stat.st_size:
+                return None
+            hdr_raw = fh.read(hdr_len)
+        if len(hdr_raw) != hdr_len:
+            return None
+        hdr = json.loads(hdr_raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(hdr, dict):
+        return None
+    tensor_keys = [k for k in hdr if isinstance(k, str) and k != "__metadata__"]
+    if not tensor_keys:
+        return None
+    return any(k.startswith("mtp.") or ".mtp." in k for k in tensor_keys)
+
+
 def _resolve_effective_kv_dtype(
     opts: dict[str, Any],
     model_settings: object | None,
@@ -2933,14 +2974,21 @@ def _resolve_effective_speculative(
             embedded_mtp = inspect_omlxm5_has_mtp_weights(target_art)
             if embedded_mtp is True:
                 spec_backend = "mtp"
-            elif (
-                embedded_mtp is None
-                and model_dir is not None
-                and _config_json_has_mtp(_read_json(model_dir / "config.json"))
-            ):
-                spec_backend = "mtp"
-            else:
+            elif embedded_mtp is False:
                 spec_backend = "none"
+            else:
+                st_mtp = inspect_safetensors_has_mtp_weights(model_dir)
+                if st_mtp is True:
+                    spec_backend = "mtp"
+                elif st_mtp is False:
+                    spec_backend = "none"
+                elif (
+                    model_dir is not None
+                    and _config_json_has_mtp(_read_json(model_dir / "config.json"))
+                ):
+                    spec_backend = "mtp"
+                else:
+                    spec_backend = "none"
 
     if spec_backend == "none":
         return "none", 0

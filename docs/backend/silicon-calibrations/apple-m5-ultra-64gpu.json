@@ -151,7 +151,7 @@
     "linear_nax_min_tokens": 1,
     "linear_split_k_target_slices": 8,
     "moe_grouped_vs_fallback_active_tokens": 8,
-    "moe_prefill_nax_min_tokens": 8,
+    "moe_prefill_nax_min_tokens": 1,
     "prefix_cache_budget_bytes": 536870912
   },
   "notes": "Complete Stage A real-hardware calibration through Phase 4 Full NInfer Squeeze (v0.8.0-m5rt.4) on Apple M5 Ultra 30/64-core 96GB (macOS 27.2.1 Build 26B131): 6.4x faster parallel load (11.84s -> 1.84s); fused single-ICB DFlash2 (context+backbone+selector_nax_f32, draft 7.42 ms, verify 24.86 ms) reaching 161.23 tok/s 27B-MXFP4 coding (+13.2%) & 91.96 tok/s reasoning; cross-slot single-weight-read run_packed_batch + SharedPrimary reaching 135.49 tok/s 27B-MXFP4 B=4 AR (2.45x), 132.36 tok/s 27B-oQ4e B=4 AR (3.81x), 168.08 tok/s 27B-oQ4e B=4 DFlash2, and 463.46 tok/s 35B-A3B-MXFP4 B=8@64K AR (+87.1% over m5rt.3, 4.78x over opt_v3); W4A4 + FlashNaxV1 (#4808) prefill reaching 1471.75 ms @ 1K, 5942.49 ms @ 4K, 12018.12 ms @ 8K (-5.78s vs A16); 35B-A3B NSG=2 moe_nax prefill 282.27 ms @ 1K (3.21x vs SIMD); oQ4e g64+g128 NAX pre-tile cutting RAM 32.8 -> 18.4 GB (-14.4 GB) + QDA q3 NAX; cyclic feature_history + FOSCAR Affine4Group128 KV unlocking B=8@64K (24.5 GB) & B=4@128K (23.8 GB) on 96GB; COW SharedPrefixCache 100% B=4 hit rate (633.89 ms warm TTFT); #5164 contended prefill decode-protect (24.53 ms p50 ITL). 100% position_coupled_v1 exact AR==DFlash2==Batch parity across all models."

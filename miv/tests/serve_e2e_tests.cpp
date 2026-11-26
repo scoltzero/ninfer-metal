@@ -1969,6 +1969,33 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
             !r_mtp_emb.spec_backend_auto,
         "auto spec failed to resolve embedded MTP from config.json");
 
+  // Stripped-MTP safetensors checkpoint (e.g. OsaurusAI/Qwen3.6-35B-A3B-mxfp4):
+  // config.json retains mtp_num_hidden_layers=1 while weight_map has 0 MTP keys.
+  const auto model_mtp_stripped = spec_root / "model_mtp_stripped";
+  const auto model_mtp_indexed = spec_root / "model_mtp_indexed";
+  std::filesystem::create_directories(model_mtp_stripped);
+  std::filesystem::create_directories(model_mtp_indexed);
+  {
+    std::ofstream(model_mtp_stripped / "config.json")
+        << R"({"text_config": {"mtp_num_hidden_layers": 1}})";
+    std::ofstream(model_mtp_stripped / "model.safetensors.index.json")
+        << R"({"weight_map": {"language_model.lm_head.weight": "model-00001.safetensors"}})";
+  }
+  {
+    std::ofstream(model_mtp_indexed / "config.json")
+        << R"({"text_config": {"mtp_num_hidden_layers": 1}})";
+    std::ofstream(model_mtp_indexed / "model.safetensors.index.json")
+        << R"({"weight_map": {"language_model.lm_head.weight": "model-00001.safetensors", "language_model.mtp.fc.weight": "model-00002.safetensors"}})";
+  }
+  const auto r_mtp_stripped = resolve_for(model_mtp_stripped);
+  check(r_mtp_stripped.spec_backend == SpeculativeBackend::none &&
+            !r_mtp_stripped.spec_backend_auto,
+        "auto spec falsely selected MTP when safetensors weight_map stripped MTP");
+  const auto r_mtp_indexed = resolve_for(model_mtp_indexed);
+  check(r_mtp_indexed.spec_backend == SpeculativeBackend::mtp &&
+            !r_mtp_indexed.spec_backend_auto,
+        "auto spec failed to select MTP when safetensors weight_map has MTP");
+
   const auto r_plain = resolve_for(model_plain);
   check(r_plain.spec_backend == SpeculativeBackend::none &&
             !r_plain.spec_backend_auto,
