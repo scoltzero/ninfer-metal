@@ -194,6 +194,19 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "reload_required": True,
     },
     {
+        "key": "max_context",
+        "label": "Max Context Window",
+        "type": "int",
+        "min": 1024,
+        "max": 1048576,
+        "default": 262144,
+        "description": (
+            "Maximum sequence context length in tokens (supports 256K = 262144 "
+            "and above when model permits)."
+        ),
+        "reload_required": True,
+    },
+    {
         "key": "rolling_prefix_cache",
         "label": "Rolling Prefix Cache",
         "type": "bool",
@@ -207,6 +220,68 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "min": 0,
         "max": 128,
         "default": 4,
+        "reload_required": True,
+    },
+    {
+        "key": "prefill_linear_mode",
+        "label": "Prefill Linear Precision",
+        "type": "enum",
+        "options": ["bf16", "w4a8"],
+        "option_labels": {
+            "bf16": "BF16 NAX (Default / Exact)",
+            "w4a8": "W4A8 INT8/FP8 TensorOps",
+        },
+        "description": (
+            "Prefill dense linear GEMM precision route (BF16 NAX vs W4A8 INT8/FP8 TensorOps)."
+        ),
+        "default": "bf16",
+        "reload_required": True,
+    },
+    {
+        "key": "prefill_attention_mode",
+        "label": "Prefill Attention Kernel",
+        "type": "enum",
+        "options": ["exact_nax", "sage2"],
+        "option_labels": {
+            "exact_nax": "Exact NAX Flash (Default)",
+            "sage2": "SageAttention2 (INT8 QK + FP8 PV)",
+        },
+        "description": (
+            "Prefill full-attention kernel route (Exact NAX vs SageAttention2 INT8 QK + FP8 PV)."
+        ),
+        "default": "exact_nax",
+        "reload_required": True,
+    },
+    {
+        "key": "prefill_sparse_minference",
+        "label": "MInference Sparse Tiles (Sage2)",
+        "type": "bool",
+        "description": (
+            "Enable MInference vertical-slash dynamic sparse attention tiles when "
+            "prefill_attention_mode is sage2."
+        ),
+        "default": False,
+        "reload_required": True,
+    },
+    {
+        "key": "prefill_cache_blend",
+        "label": "Cross-Chunk CacheBlend (RAG)",
+        "type": "bool",
+        "description": (
+            "Enable cross-chunk non-contiguous RAG KV+GDN cache reuse with ~15% HKVD "
+            "selective recomputation."
+        ),
+        "default": False,
+        "reload_required": True,
+    },
+    {
+        "key": "prefill_ane_offload",
+        "label": "Dual-ANE Co-Execution Offload",
+        "type": "bool",
+        "description": (
+            "Enable Dual-ANE output-channel-split co-execution alongside GPU BF16 or W4A8 prefill."
+        ),
+        "default": False,
         "reload_required": True,
     },
     {
@@ -300,6 +375,8 @@ LOG_TAIL_LINES = 8
 SUPPORTED_PROTOCOLS = frozenset({1, 2})
 VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
 VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
+VALID_PREFILL_LINEAR_MODES = frozenset({"bf16", "w4a8"})
+VALID_PREFILL_ATTENTION_MODES = frozenset({"exact_nax", "sage2"})
 M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
 M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
 M5RT_MAX_REPETITION_CONTEXT_SIZE = 4096
@@ -643,6 +720,11 @@ class M5Options:
     max_concurrency: int = 1
     kv_dtype: str = "bf16"
     prefill_engine: str = "auto"
+    prefill_linear_mode: str = "bf16"
+    prefill_attention_mode: str = "exact_nax"
+    prefill_sparse_minference: bool = False
+    prefill_cache_blend: bool = False
+    prefill_ane_offload: bool = False
     sampling_contract: str = M5RT_DEFAULT_SAMPLING_CONTRACT
     speculative_backend: str = "none"
     speculative_policy: str = "auto"
@@ -659,6 +741,36 @@ class M5Options:
     trust_remote_code: bool = False
     lora_adapter: str = ""
     lora_mode: str = "merge"
+
+    def to_rpc_dict(self) -> dict[str, Any]:
+        """Serialize resolved M5 options for the sidecar `load` RPC payload."""
+        payload: dict[str, Any] = {
+            "max_concurrency": self.max_concurrency,
+            "max_context": self.max_context,
+            "kv_dtype": self.kv_dtype,
+            "prefill_engine": self.prefill_engine,
+            "prefill_linear_mode": self.prefill_linear_mode,
+            "prefill_attention_mode": self.prefill_attention_mode,
+            "prefill_sparse_minference": bool(self.prefill_sparse_minference),
+            "prefill_cache_blend": bool(self.prefill_cache_blend),
+            "prefill_ane_offload": bool(self.prefill_ane_offload),
+            "sampling_contract": self.sampling_contract,
+            "lora_adapter": self.lora_adapter,
+            "lora_mode": self.lora_mode,
+            "speculative": {
+                "backend": self.speculative_backend,
+                "draft_tokens": self.draft_tokens,
+            },
+        }
+        if self.spec_search is not None:
+            payload["spec_search"] = self.spec_search
+        if self.memory_budget_bytes > 0:
+            payload["memory_budget_bytes"] = int(self.memory_budget_bytes)
+        if self.rolling_prefix_cache is not None:
+            payload["rolling_prefix_cache"] = "on" if self.rolling_prefix_cache else "off"
+        if self.path_overrides:
+            payload["path_overrides"] = dict(self.path_overrides)
+        return payload
 
 
 def _executable(path: Path) -> bool:
@@ -1170,6 +1282,28 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
             raise ValueError("m5rt_options.lora_adapter must be a string")
         cleaned["lora_adapter"] = raw_lora.strip()
 
+    if "prefill_linear_mode" in options and options.get("prefill_linear_mode") is not None:
+        raw_plm = options.get("prefill_linear_mode")
+        if not isinstance(raw_plm, str) or raw_plm.strip().lower() not in VALID_PREFILL_LINEAR_MODES:
+            raise ValueError(
+                f"m5rt_options.prefill_linear_mode must be one of {sorted(VALID_PREFILL_LINEAR_MODES)}"
+            )
+        cleaned["prefill_linear_mode"] = raw_plm.strip().lower()
+
+    if "prefill_attention_mode" in options and options.get("prefill_attention_mode") is not None:
+        raw_pam = options.get("prefill_attention_mode")
+        if not isinstance(raw_pam, str) or raw_pam.strip().lower() not in VALID_PREFILL_ATTENTION_MODES:
+            raise ValueError(
+                f"m5rt_options.prefill_attention_mode must be one of {sorted(VALID_PREFILL_ATTENTION_MODES)}"
+            )
+        cleaned["prefill_attention_mode"] = raw_pam.strip().lower()
+
+    for bool_key in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
+        if bool_key in options and options.get(bool_key) is not None:
+            parsed = _parse_optional_toggle(options.get(bool_key), f"m5rt_options.{bool_key}")
+            if parsed is not None:
+                cleaned[bool_key] = parsed
+
     return cleaned
 
 
@@ -1446,6 +1580,11 @@ def _extract_toml_layered_options(
             "max_context",
             "kv_dtype",
             "prefill_engine",
+            "prefill_linear_mode",
+            "prefill_attention_mode",
+            "prefill_sparse_minference",
+            "prefill_cache_blend",
+            "prefill_ane_offload",
             "spec_search",
             "speculative_backend",
             "sampling_contract",
@@ -3160,6 +3299,49 @@ def resolve_sidecar_lora_settings(
     return resolved_lora, lora_mode
 
 
+def _estimate_shared_kv_pool_bytes(
+    text_cfg: dict[str, Any],
+    kv_dtype: str,
+    max_context: int,
+    max_concurrency: int,
+    *,
+    model_type: str | None = None,
+) -> int:
+    """Estimate shared `KvPagePool` base allocation matching `native_backend.cpp`."""
+    eff_kv_dtype = str(kv_dtype or "").strip().lower()
+    if eff_kv_dtype in ("", "auto"):
+        mt = str(model_type or text_cfg.get("model_type") or "").strip().lower()
+        eff_kv_dtype = "affine4_g128" if mt in M5RT_SUPPORTED_MODEL_TYPES else "bf16"
+    layer_types = text_cfg.get("layer_types") or []
+    full_layers = sum(1 for k in layer_types if k == "full_attention")
+    if not full_layers:
+        num_layers = int(text_cfg.get("num_hidden_layers") or 0)
+        interval = max(1, int(text_cfg.get("full_attention_interval") or 1))
+        full_layers = num_layers // interval
+    kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
+    head_dim = int(text_cfg.get("head_dim") or 128)
+    if full_layers <= 0 or kv_heads <= 0 or head_dim <= 0 or max_context <= 0:
+        return 0
+    page_tokens = 64
+    logical_pages = (int(max_context) + page_tokens - 1) // page_tokens
+    b_slots = max(1, int(max_concurrency))
+    if b_slots > 1:
+        physical_pages = min(
+            logical_pages * b_slots + b_slots,
+            max(logical_pages + 8 * b_slots, 1088),
+        )
+        physical_pages = max(physical_pages, logical_pages + 1)
+    else:
+        physical_pages = logical_pages + 1
+    if eff_kv_dtype == "affine4_g128":
+        vec_bytes = (head_dim // 2) + 16
+        head_bytes = page_tokens * vec_bytes + 32
+        kv_page_b = kv_heads * head_bytes
+    else:
+        kv_page_b = page_tokens * kv_heads * head_dim * 2
+    return physical_pages * full_layers * 2 * kv_page_b
+
+
 def m5rt_memory_estimate(
     model_path: str | Path,
     target: M5Target,
@@ -3190,7 +3372,9 @@ def m5rt_memory_estimate(
     )
     if target.fake:
         return 64 * 1024**2 + lora_bytes
-    text_cfg = _text_config(_read_json(mdir / "config.json") or {})
+    raw_cfg = _read_json(mdir / "config.json") or {}
+    text_cfg = _text_config(raw_cfg)
+    model_type = str(raw_cfg.get("model_type") or text_cfg.get("model_type") or "").strip().lower()
     vocab_size = max(256, int(text_cfg.get("vocab_size") or 248320))
 
     if target.artifact_path is not None:
@@ -3217,9 +3401,18 @@ def m5rt_memory_estimate(
         draft = int(draft_st * 1.01) if draft_st > 0 else 0
     else:
         draft = 0
-    kv = _kv_bytes_per_token(text_cfg, plan.kv_dtype) * plan.max_context * plan.max_concurrency
+    kv = _estimate_shared_kv_pool_bytes(
+        text_cfg,
+        plan.kv_dtype,
+        plan.max_context,
+        plan.max_concurrency,
+        model_type=model_type,
+    )
     workspace = max(64 * 1024**2, 1024 * vocab_size * 2 * plan.max_concurrency)
     return weights + draft + kv + workspace + plan.prefix_cache_bytes + lora_bytes
+
+
+estimate_m5rt_memory_bytes = m5rt_memory_estimate
 
 
 def _safe_lora_fingerprint(
@@ -3446,7 +3639,10 @@ def build_m5rt_options(
     native_ctx = int(native_ctx_raw) if native_ctx_raw else max(32768, int(configured_ctx or 32768))
     max_context = max(1024, min(int(configured_ctx or native_ctx), native_ctx))
     policy = getattr(getattr(global_settings, "sampling", None), "max_context_window_policy", None)
-    if not getattr(model_settings, "max_context_window", None) and policy:
+    has_explicit_model_ctx = bool(getattr(model_settings, "max_context_window", None)) or (
+        explicit_opts.get("max_context") is not None
+    )
+    if not has_explicit_model_ctx and policy:
         max_context = max(1024, min(max_context, int(policy)))
 
     max_concurrency = _resolve_effective_concurrency(opts, global_settings)
@@ -3539,11 +3735,55 @@ def build_m5rt_options(
     batch_mode = _parse_optional_toggle(
         raw_batch_mode, f"{eff_engine_id}.batch_mode"
     )
+
+    raw_linear_mode = str(opts.get("prefill_linear_mode") or "bf16").strip().lower()
+    if raw_linear_mode not in VALID_PREFILL_LINEAR_MODES:
+        raise ValueError(
+            f"{eff_engine_id}.prefill_linear_mode must be one of {sorted(VALID_PREFILL_LINEAR_MODES)}"
+        )
+    raw_attn_mode = str(opts.get("prefill_attention_mode") or "exact_nax").strip().lower()
+    if raw_attn_mode not in VALID_PREFILL_ATTENTION_MODES:
+        raise ValueError(
+            f"{eff_engine_id}.prefill_attention_mode must be one of {sorted(VALID_PREFILL_ATTENTION_MODES)}"
+        )
+    prefill_sparse_minference = bool(
+        _parse_optional_toggle(
+            opts.get("prefill_sparse_minference"),
+            f"{eff_engine_id}.prefill_sparse_minference",
+        )
+        or False
+    )
+    prefill_cache_blend = bool(
+        _parse_optional_toggle(
+            opts.get("prefill_cache_blend"),
+            f"{eff_engine_id}.prefill_cache_blend",
+        )
+        or False
+    )
+    prefill_ane_offload = False
+    for layer in (explicit_opts, model_toml, shared_toml):
+        if layer.get("prefill_ane_offload") is not None:
+            prefill_ane_offload = bool(
+                _parse_optional_toggle(
+                    layer.get("prefill_ane_offload"),
+                    f"{eff_engine_id}.prefill_ane_offload",
+                )
+            )
+            break
+        if str(layer.get("prefill_engine") or "").strip().lower() == "nax_ane":
+            prefill_ane_offload = True
+            break
+
     return M5Options(
         max_context=max_context,
         max_concurrency=max_concurrency,
         kv_dtype=kv_dtype,
         prefill_engine=str(opts.get("prefill_engine") or "auto"),
+        prefill_linear_mode=raw_linear_mode,
+        prefill_attention_mode=raw_attn_mode,
+        prefill_sparse_minference=prefill_sparse_minference,
+        prefill_cache_blend=prefill_cache_blend,
+        prefill_ane_offload=prefill_ane_offload,
         sampling_contract=str(opts.get("sampling_contract") or (
             M5RT_DEFAULT_SAMPLING_CONTRACT if is_miv else "legacy_rejection_v1"
         )),
@@ -4961,6 +5201,11 @@ class M5SidecarEngine(BaseEngine):
                 "max_context": opts.max_context,
                 "kv_dtype": opts.kv_dtype,
                 "prefill_engine": opts.prefill_engine,
+                "prefill_linear_mode": opts.prefill_linear_mode,
+                "prefill_attention_mode": opts.prefill_attention_mode,
+                "prefill_sparse_minference": bool(opts.prefill_sparse_minference),
+                "prefill_cache_blend": bool(opts.prefill_cache_blend),
+                "prefill_ane_offload": bool(opts.prefill_ane_offload),
                 "sampling_contract": "legacy_rejection_v1",
                 "lora_adapter": opts.lora_adapter,
                 "lora_mode": opts.lora_mode,
@@ -5041,13 +5286,7 @@ class M5SidecarEngine(BaseEngine):
         payload: dict[str, Any] = {
             "model_dir": str(self._path),
             "draft_dir": str(self._target.draft_dir) if self._target.draft_dir else "",
-            "max_concurrency": opts.max_concurrency,
-            "max_context": opts.max_context,
-            "kv_dtype": opts.kv_dtype,
-            "prefill_engine": opts.prefill_engine,
-            "sampling_contract": opts.sampling_contract,
-            "lora_adapter": opts.lora_adapter,
-            "lora_mode": opts.lora_mode,
+            **opts.to_rpc_dict(),
             "speculative": {
                 "backend": spec_backend,
                 "draft_tokens": draft_tokens,

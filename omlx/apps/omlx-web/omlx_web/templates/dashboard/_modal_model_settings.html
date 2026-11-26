@@ -1098,7 +1098,9 @@
                                  x-cloak x-transition
                                  class="pt-3 mt-1 border-t border-neutral-100 space-y-3">
                                 <template x-for="opt in externalEngineGeneralOptionsSchema()" :key="opt.key">
-                                    <div class="space-y-1.5">
+                                    <div class="space-y-1.5"
+                                         :class="externalEngineOptionContainerClass(opt)"
+                                         :title="externalEngineOptionTooltip(opt)">
                                         <template x-if="opt.type === 'bool'">
                                             <div class="flex items-start justify-between gap-3">
                                                 <div class="min-w-0">
@@ -1106,9 +1108,11 @@
                                                     <p x-show="opt.description" class="text-xs text-neutral-500 mt-0.5" x-text="opt.description"></p>
                                                 </div>
                                                 <button type="button" role="switch"
+                                                        :disabled="externalEngineOptionDisabled(opt)"
+                                                        :aria-disabled="externalEngineOptionDisabled(opt) ? 'true' : 'false'"
                                                         :aria-checked="getExternalEngineOption(opt) ? 'true' : 'false'"
-                                                        @click="setExternalEngineOption(opt, !getExternalEngineOption(opt))"
-                                                        :class="getExternalEngineOption(opt) ? 'bg-black' : 'bg-neutral-200'"
+                                                        @click="if (!externalEngineOptionDisabled(opt)) setExternalEngineOption(opt, !getExternalEngineOption(opt))"
+                                                        :class="[getExternalEngineOption(opt) ? 'bg-black' : 'bg-neutral-200', externalEngineOptionDisabled(opt) ? 'cursor-not-allowed' : '']"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="getExternalEngineOption(opt) ? 'translate-x-5' : 'translate-x-0'"
                                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

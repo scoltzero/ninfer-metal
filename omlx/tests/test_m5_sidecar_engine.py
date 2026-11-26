@@ -2899,11 +2899,16 @@ class TestPathBMultiMicrokernelSidecars:
             model_id="Qwen3.8-SharedDefault",
         )
         assert opts.max_concurrency == 4
-        assert opts.max_context == 65536
+        assert opts.max_context == 262144
         assert opts.kv_dtype == "affine4_g128"
         assert opts.rolling_prefix_cache is True
         assert opts.prefix_cache_bytes == 4 * (1 << 30)
         assert opts.sampling_contract == "position_coupled_v1"
+        assert opts.prefill_linear_mode == "bf16"
+        assert opts.prefill_attention_mode == "exact_nax"
+        assert opts.prefill_sparse_minference is False
+        assert opts.prefill_cache_blend is False
+        assert opts.prefill_ane_offload is False
         # speculative.backend = "auto" on plain model resolves cleanly to "none" without error
         assert opts.speculative_backend == "none"
         assert opts.draft_tokens == 0
@@ -4315,4 +4320,248 @@ def test_pre_convert_safetensors_mtp_detection_prevents_stripped_mtp_mismatch(
         mtp_dir, t_mtp, ModelSettings(), default_context=65536, memory_budget_bytes=0
     )
     assert p_mtp.speculative_backend == "mtp"
+
+
+def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
+    monkeypatch.delenv("NINFER_METAL_CONFIG", raising=False)
+
+    schema_by_key = {item["key"]: item for item in m5_mod.M5RT_DEFAULT_OPTIONS_SCHEMA}
+    assert schema_by_key["max_context"]["max"] >= 262144
+    assert schema_by_key["max_context"]["default"] == 262144
+    assert schema_by_key["prefill_linear_mode"]["options"] == ["bf16", "w4a8"]
+    assert schema_by_key["prefill_linear_mode"]["default"] == "bf16"
+    assert schema_by_key["prefill_attention_mode"]["options"] == ["exact_nax", "sage2"]
+    assert schema_by_key["prefill_attention_mode"]["default"] == "exact_nax"
+    for bkey in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
+        assert schema_by_key[bkey]["type"] == "bool"
+        assert schema_by_key[bkey]["default"] is False
+
+    model_dir = _write_test_model(tmp_path / "Qwen3.8-27B-SPI")
+    cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    cfg["model_type"] = "qwen3_8"
+    cfg["text_config"]["max_position_embeddings"] = 262144
+    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
+    binary, err = find_m5rt_binary(str(fake_bin))
+    assert binary is not None and err == ""
+    target = M5Target(
+        binary=binary,
+        artifact_path=model_dir / "model.omlxm5",
+        metallib_dir=tmp_path / "bin",
+        fake=False,
+    )
+
+    combos = 0
+    seen_sigs = set()
+    for lm in ("bf16", "w4a8"):
+        for am in ("exact_nax", "sage2"):
+            for sp in (False, True):
+                for cb in (False, True):
+                    for ane in (False, True):
+                        combos += 1
+                        raw = {
+                            "max_context": 262144,
+                            "prefill_linear_mode": lm,
+                            "prefill_attention_mode": am,
+                            "prefill_sparse_minference": sp,
+                            "prefill_cache_blend": cb,
+                            "prefill_ane_offload": ane,
+                        }
+                        validated = m5_mod.validate_m5rt_options(raw)
+                        assert validated is not None
+                        assert validated["prefill_linear_mode"] == lm
+                        assert validated["prefill_attention_mode"] == am
+                        assert validated["prefill_sparse_minference"] is sp
+                        assert validated["prefill_cache_blend"] is cb
+                        assert validated["prefill_ane_offload"] is ane
+
+                        ms = ModelSettings(
+                            external_engine=M5RT_ENGINE_ID,
+                            external_engine_options={M5RT_ENGINE_ID: raw},
+                        )
+                        plan = m5_mod.build_m5rt_options(
+                            model_dir,
+                            target,
+                            ms,
+                            default_context=32768,
+                            memory_budget_bytes=0,
+                        )
+                        assert plan.max_context == 262144
+                        assert plan.prefill_linear_mode == lm
+                        assert plan.prefill_attention_mode == am
+                        assert plan.prefill_sparse_minference is sp
+                        assert plan.prefill_cache_blend is cb
+                        assert plan.prefill_ane_offload is ane
+
+                        rpc = plan.to_rpc_dict()
+                        assert rpc["prefill_linear_mode"] == lm
+                        assert rpc["prefill_attention_mode"] == am
+                        assert rpc["prefill_sparse_minference"] is sp
+                        assert rpc["prefill_cache_blend"] is cb
+                        assert rpc["prefill_ane_offload"] is ane
+
+                        eng = M5SidecarEngine(
+                            str(model_dir), "spi-test", target, tmp_path / "logs", plan
+                        )
+                        load_params = eng._build_load_params()
+                        assert load_params["prefill_linear_mode"] == lm
+                        assert load_params["prefill_attention_mode"] == am
+                        assert load_params["prefill_sparse_minference"] is sp
+                        assert load_params["prefill_cache_blend"] is cb
+                        assert load_params["prefill_ane_offload"] is ane
+
+                        sig = m5_mod.m5rt_runtime_signature(
+                            ms,
+                            None,
+                            model_path=model_dir,
+                            target=target,
+                            default_context=32768,
+                        )
+                        seen_sigs.add(json.dumps(sig, sort_keys=True))
+
+    assert combos == 32
+    assert len(seen_sigs) == 32
+
+    # Invalid values must raise ValueError
+    with pytest.raises(ValueError, match="prefill_linear_mode"):
+        m5_mod.validate_m5rt_options({"prefill_linear_mode": "int4"})
+    with pytest.raises(ValueError, match="prefill_attention_mode"):
+        m5_mod.validate_m5rt_options({"prefill_attention_mode": "flash2"})
+
+    # Legacy prefill_engine = "nax_ane" shim maps prefill_ane_offload=True
+    # WITHOUT touching w4a8 / sage2 / minference / cache_blend!
+    ms_legacy = ModelSettings(
+        external_engine=M5RT_ENGINE_ID,
+        external_engine_options={
+            M5RT_ENGINE_ID: {
+                "prefill_engine": "nax_ane",
+                "prefill_linear_mode": "w4a8",
+                "prefill_attention_mode": "sage2",
+                "prefill_sparse_minference": True,
+                "prefill_cache_blend": True,
+            }
+        },
+    )
+    plan_legacy = m5_mod.build_m5rt_options(
+        model_dir, target, ms_legacy, default_context=32768, memory_budget_bytes=0
+    )
+    assert plan_legacy.prefill_ane_offload is True
+    assert plan_legacy.prefill_linear_mode == "w4a8"
+    assert plan_legacy.prefill_attention_mode == "sage2"
+    assert plan_legacy.prefill_sparse_minference is True
+    assert plan_legacy.prefill_cache_blend is True
+
+    # Explicit prefill_ane_offload=False beats legacy prefill_engine="nax_ane"
+    ms_override = ModelSettings(
+        external_engine=M5RT_ENGINE_ID,
+        external_engine_options={
+            M5RT_ENGINE_ID: {
+                "prefill_engine": "nax_ane",
+                "prefill_ane_offload": False,
+                "prefill_linear_mode": "w4a8",
+            }
+        },
+    )
+    plan_override = m5_mod.build_m5rt_options(
+        model_dir, target, ms_override, default_context=32768, memory_budget_bytes=0
+    )
+    assert plan_override.prefill_ane_offload is False
+    assert plan_override.prefill_linear_mode == "w4a8"
+
+
+def test_m4a_c5_max_context_policy_unclamping_and_c6_shared_kv_memory_estimate(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
+    monkeypatch.delenv("NINFER_METAL_CONFIG", raising=False)
+
+    # Qwen3.8-27B geometry: 48 GDN + 16 Full-Attn, 4 KV heads, head_dim=256, 256K native ctx
+    model_dir = _write_test_model(tmp_path / "Qwen3.8-27B-256K")
+    cfg = {
+        "model_type": "qwen3_8",
+        "text_config": {
+            "model_type": "qwen3_8",
+            "max_position_embeddings": 262144,
+            "num_hidden_layers": 64,
+            "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+        },
+    }
+    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    fake_bin = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
+    binary, _ = find_m5rt_binary(str(fake_bin))
+    assert binary is not None
+    target = M5Target(
+        binary=binary,
+        artifact_path=model_dir / "model.omlxm5",
+        metallib_dir=tmp_path / "bin",
+        fake=False,
+    )
+
+    # C5: global max_context_window_policy MUST NOT clamp explicit ext_opts["max_context"]
+    gs = GlobalSettings(base_path=tmp_path / "base")
+    gs.sampling.max_context_window_policy = 32768
+
+    ms_explicit_ext = ModelSettings(
+        external_engine=M5RT_ENGINE_ID,
+        external_engine_options={M5RT_ENGINE_ID: {"max_context": 262144}},
+    )
+    plan_ext = m5_mod.build_m5rt_options(
+        model_dir,
+        target,
+        ms_explicit_ext,
+        default_context=32768,
+        memory_budget_bytes=0,
+        global_settings=gs,
+    )
+    assert plan_ext.max_context == 262144
+
+    # When neither max_context_window nor ext_opts["max_context"] is set, policy still clamps
+    plan_clamped = m5_mod.build_m5rt_options(
+        model_dir,
+        target,
+        ModelSettings(),
+        default_context=262144,
+        memory_budget_bytes=0,
+        global_settings=gs,
+    )
+    assert plan_clamped.max_context == 32768
+
+    # C6: estimate_m5rt_memory_bytes resolves "auto" -> "affine4_g128" for Qwen3.8
+    # and uses shared KvPagePool page count (4128 pages at 262144, B=4 -> ~4.55 GiB KV),
+    # NOT B * max_context * bf16 (~64 GiB)!
+    plan_auto = m5_mod.M5Options(
+        max_context=262144,
+        max_concurrency=4,
+        kv_dtype="auto",
+        prefix_cache_bytes=0,
+    )
+    plan_aff4 = m5_mod.M5Options(
+        max_context=262144,
+        max_concurrency=4,
+        kv_dtype="affine4_g128",
+        prefix_cache_bytes=0,
+    )
+    est_auto = m5_mod.estimate_m5rt_memory_bytes(
+        model_dir, target, 262144, plan=plan_auto
+    )
+    est_aff4 = m5_mod.estimate_m5rt_memory_bytes(
+        model_dir, target, 262144, plan=plan_aff4
+    )
+    assert est_auto == est_aff4
+
+    # Exact shared KvPagePool formula: 4128 * 1,183,744 = 4,886,495,232 (~4.55 GiB)
+    expected_kv = 4128 * 1183744
+    weights_sz = (model_dir / "model.omlxm5").stat().st_size
+    expected_ws = max(64 * 1024**2, 1024 * 248320 * 2 * 4)
+    assert est_auto == weights_sz + expected_kv + expected_ws
+    assert est_auto < 10 * (1 << 30)  # Far below old 64 GiB bf16*B overestimate!
+
 

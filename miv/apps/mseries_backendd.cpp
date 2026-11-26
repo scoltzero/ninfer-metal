@@ -414,6 +414,25 @@ std::string parse_lora_mode_strict(std::string_view value,
                               std::string(value));
 }
 
+bool parse_json_bool_or_toggle(const Json &node, std::string_view key) {
+  if (node.is_boolean()) {
+    return node.get<bool>();
+  }
+  if (node.is_string()) {
+    const std::string val = node.get<std::string>();
+    if (val == "on" || val == "ON" || val == "1" || val == "true" ||
+        val == "TRUE") {
+      return true;
+    }
+    if (val == "off" || val == "OFF" || val == "0" || val == "false" ||
+        val == "FALSE") {
+      return false;
+    }
+  }
+  throw std::invalid_argument(std::string(key) +
+                              " must be a boolean or on/off string");
+}
+
 struct CliOptions {
   bool show_version = false;
   bool describe = false;
@@ -580,6 +599,74 @@ omlx::m5::LoadOptions load_options(const Json &value,
       (value.contains("speculative") && value.at("speculative").contains("backend"));
   if (explicit_backend && result.speculative.backend == omlx::m5::SpeculativeBackend::none)
     result.path_overrides["enable_mtp"] = "off";
+
+  // Strictly orthogonal prefill switches: all 32 boolean/enum combinations are
+  // accepted without mutual exclusion.
+  if (value.contains("prefill_linear_mode") &&
+      !value.at("prefill_linear_mode").is_null()) {
+    if (!value.at("prefill_linear_mode").is_string()) {
+      throw std::invalid_argument("prefill_linear_mode must be a string");
+    }
+    result.prefill_linear_mode = omlx::m5::parse_prefill_linear_mode(
+        value.at("prefill_linear_mode").get<std::string>());
+  } else if (const auto it = result.path_overrides.find("prefill_linear_mode");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_linear_mode =
+        omlx::m5::parse_prefill_linear_mode(it->second);
+  }
+
+  if (value.contains("prefill_attention_mode") &&
+      !value.at("prefill_attention_mode").is_null()) {
+    if (!value.at("prefill_attention_mode").is_string()) {
+      throw std::invalid_argument("prefill_attention_mode must be a string");
+    }
+    result.prefill_attention_mode = omlx::m5::parse_prefill_attention_mode(
+        value.at("prefill_attention_mode").get<std::string>());
+  } else if (const auto it =
+                 result.path_overrides.find("prefill_attention_mode");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_attention_mode =
+        omlx::m5::parse_prefill_attention_mode(it->second);
+  }
+
+  if (value.contains("prefill_sparse_minference") &&
+      !value.at("prefill_sparse_minference").is_null()) {
+    result.prefill_sparse_minference = parse_json_bool_or_toggle(
+        value.at("prefill_sparse_minference"), "prefill_sparse_minference");
+  } else if (const auto it =
+                 result.path_overrides.find("prefill_sparse_minference");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_sparse_minference = parse_json_bool_or_toggle(
+        Json(it->second), "prefill_sparse_minference");
+  }
+
+  if (value.contains("prefill_cache_blend") &&
+      !value.at("prefill_cache_blend").is_null()) {
+    result.prefill_cache_blend = parse_json_bool_or_toggle(
+        value.at("prefill_cache_blend"), "prefill_cache_blend");
+  } else if (const auto it = result.path_overrides.find("prefill_cache_blend");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_cache_blend =
+        parse_json_bool_or_toggle(Json(it->second), "prefill_cache_blend");
+  }
+
+  bool ane_offload_explicit = false;
+  if (value.contains("prefill_ane_offload") &&
+      !value.at("prefill_ane_offload").is_null()) {
+    result.prefill_ane_offload = parse_json_bool_or_toggle(
+        value.at("prefill_ane_offload"), "prefill_ane_offload");
+    ane_offload_explicit = true;
+  } else if (const auto it = result.path_overrides.find("prefill_ane_offload");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_ane_offload =
+        parse_json_bool_or_toggle(Json(it->second), "prefill_ane_offload");
+    ane_offload_explicit = true;
+  }
+  // Legacy compatibility shim: prefill_engine = "nax_ane" maps to
+  // prefill_ane_offload = true when unset, without altering any other switch.
+  if (!ane_offload_explicit && result.prefill_engine == "nax_ane") {
+    result.prefill_ane_offload = true;
+  }
   return result;
 }
 
@@ -745,6 +832,28 @@ Json stats_json(const omlx::m5::StatsReport &value) {
       {"lora_mode", value.lora_mode},
       {"lora_buffer_bytes", value.lora_buffer_bytes},
       {"lora_adapted_layers", value.lora_adapted_layers},
+      {"prefill_linear_mode", value.prefill_linear_mode},
+      {"prefill_attention_mode", value.prefill_attention_mode},
+      {"prefill_sparse_minference", value.prefill_sparse_minference},
+      {"prefill_sparse_minference_effective",
+       value.prefill_sparse_minference_effective},
+      {"prefill_sparse_minference_inactive_reason",
+       value.prefill_sparse_minference_inactive_reason},
+      {"prefill_cache_blend", value.prefill_cache_blend},
+      {"prefill_ane_offload", value.prefill_ane_offload},
+      {"prefill_ane_active", value.prefill_ane_active},
+      {"prefill_ane_split_alpha", value.prefill_ane_split_alpha},
+      {"prefill_w4a8_tokens", value.prefill_w4a8_tokens},
+      {"prefill_sage2_tokens", value.prefill_sage2_tokens},
+      {"prefill_minference_blocks_skipped",
+       value.prefill_minference_blocks_skipped},
+      {"prefill_minference_blocks_total",
+       value.prefill_minference_blocks_total},
+      {"prefill_cache_blend_hit_tokens", value.prefill_cache_blend_hit_tokens},
+      {"prefill_cache_blend_recomputed_tokens",
+       value.prefill_cache_blend_recomputed_tokens},
+      {"prefill_ane_offload_tokens", value.prefill_ane_offload_tokens},
+      {"prefill_ane_fallback_tokens", value.prefill_ane_fallback_tokens},
   };
 }
 
@@ -765,9 +874,17 @@ Json provider_contract() {
       {"kv_formats", {"bf16", "affine4_g128"}},
       {"speculative_limits", {{"mtp", omlx::m5::kMaxMtpDraftTokens},
                               {"dflash2", omlx::m5::kMaxDFlash2DraftTokens}}},
-      {"load_defaults", {{"max_concurrency", 4}, {"kv_dtype", "affine4_g128"},
-                         {"sampling_contract", omlx::m5::kDefaultServingSamplingContract},
-                         {"draft_tokens", 0}}},
+      {"load_defaults",
+       {{"max_concurrency", 4},
+        {"max_context", 262144},
+        {"kv_dtype", "affine4_g128"},
+        {"sampling_contract", omlx::m5::kDefaultServingSamplingContract},
+        {"draft_tokens", 0},
+        {"prefill_linear_mode", "bf16"},
+        {"prefill_attention_mode", "exact_nax"},
+        {"prefill_sparse_minference", false},
+        {"prefill_cache_blend", false},
+        {"prefill_ane_offload", false}}},
       {"supported_standard_settings",
        {"max_context_window", "lora_adapter", "mtp_enabled",
         "mtp_adaptive_max_depth", "mtp_fixed_depth", "dflash_enabled",
@@ -782,6 +899,16 @@ Json provider_contract() {
             {"max", 8},
             {"default", 4},
             {"reload_required", true}},
+           {{"key", "max_context"},
+            {"label", "Max Context Window"},
+            {"type", "int"},
+            {"min", 1024},
+            {"max", 1048576},
+            {"default", 262144},
+            {"description",
+             "Maximum sequence context length in tokens (supports 256K = "
+             "262144 and above when model permits)."},
+            {"reload_required", true}},
            {{"key", "rolling_prefix_cache"},
             {"label", "Rolling Prefix Cache"},
             {"type", "bool"},
@@ -793,6 +920,54 @@ Json provider_contract() {
             {"min", 0},
             {"max", 128},
             {"default", 4},
+            {"reload_required", true}},
+           {{"key", "prefill_linear_mode"},
+            {"label", "Prefill Linear Precision"},
+            {"type", "enum"},
+            {"options", Json::array({"bf16", "w4a8"})},
+            {"option_labels",
+             {{"bf16", "BF16 NAX (Default / Exact)"},
+              {"w4a8", "W4A8 INT8/FP8 TensorOps"}}},
+            {"description",
+             "Prefill dense linear GEMM precision route (BF16 NAX vs W4A8 "
+             "INT8/FP8 TensorOps)."},
+            {"default", "bf16"},
+            {"reload_required", true}},
+           {{"key", "prefill_attention_mode"},
+            {"label", "Prefill Attention Kernel"},
+            {"type", "enum"},
+            {"options", Json::array({"exact_nax", "sage2"})},
+            {"option_labels",
+             {{"exact_nax", "Exact NAX Flash (Default)"},
+              {"sage2", "SageAttention2 (INT8 QK + FP8 PV)"}}},
+            {"description",
+             "Prefill full-attention kernel route (Exact NAX vs SageAttention2 "
+             "INT8 QK + FP8 PV)."},
+            {"default", "exact_nax"},
+            {"reload_required", true}},
+           {{"key", "prefill_sparse_minference"},
+            {"label", "MInference Sparse Tiles (Sage2)"},
+            {"type", "bool"},
+            {"description",
+             "Enable MInference vertical-slash dynamic sparse attention tiles "
+             "when prefill_attention_mode is sage2."},
+            {"default", false},
+            {"reload_required", true}},
+           {{"key", "prefill_cache_blend"},
+            {"label", "Cross-Chunk CacheBlend (RAG)"},
+            {"type", "bool"},
+            {"description",
+             "Enable cross-chunk non-contiguous RAG KV+GDN cache reuse with "
+             "~15% HKVD selective recomputation."},
+            {"default", false},
+            {"reload_required", true}},
+           {{"key", "prefill_ane_offload"},
+            {"label", "Dual-ANE Co-Execution Offload"},
+            {"type", "bool"},
+            {"description",
+             "Enable Dual-ANE output-channel-split co-execution alongside GPU "
+             "BF16 or W4A8 prefill."},
+            {"default", false},
             {"reload_required", true}},
            {{"key", "speculative_backend"},
             {"label", "Speculative Backend"},
@@ -864,6 +1039,11 @@ bool base_load_options_equal(const omlx::m5::LoadOptions &a,
          a.speculative.backend == b.speculative.backend &&
          a.speculative.draft_tokens == b.speculative.draft_tokens &&
          a.kv_dtype == b.kv_dtype && a.prefill_engine == b.prefill_engine &&
+         a.prefill_linear_mode == b.prefill_linear_mode &&
+         a.prefill_attention_mode == b.prefill_attention_mode &&
+         a.prefill_sparse_minference == b.prefill_sparse_minference &&
+         a.prefill_cache_blend == b.prefill_cache_blend &&
+         a.prefill_ane_offload == b.prefill_ane_offload &&
          a.path_overrides == b.path_overrides &&
          a.sampling_contract == b.sampling_contract &&
          a.spec_search == b.spec_search &&

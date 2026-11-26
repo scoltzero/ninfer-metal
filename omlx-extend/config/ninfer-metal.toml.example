@@ -48,7 +48,7 @@ max_concurrency = 4
 
 # Maximum context window (Context L, tokens). Honors up to model native max_position_embeddings (e.g. 262144).
 # In oMLX sidecar mode, stock Model Settings `max_context_window` maps here automatically.
-max_context = 65536
+max_context = 262144
 
 # KV cache storage format implemented in miv:
 #   "bf16"         - full-precision BF16 KV cache (2.0 B/val)
@@ -60,7 +60,21 @@ kv_dtype = "affine4_g128"
 rolling_prefix_cache = true
 prefix_cache_gb = 4.0
 
-# Prefill execution engine: "auto" | "nax" | "nax_ane"
+# Strictly orthogonal prefill execution switches (independent; never mutually exclusive):
+# Prefill dense linear GEMM precision route: "bf16" | "w4a8"
+prefill_linear_mode = "bf16"
+# Prefill full-attention kernel route: "exact_nax" | "sage2"
+prefill_attention_mode = "exact_nax"
+# Sub-switch under sage2: MInference vertical-slash dynamic sparse attention tiles
+prefill_sparse_minference = false
+# Tier-2 cross-chunk non-contiguous RAG KV+GDN cache reuse (~15% HKVD selective recomputation)
+prefill_cache_blend = false
+# Dual-ANE output-channel-split co-execution alongside GPU bf16 or w4a8 prefill
+prefill_ane_offload = false
+
+# Legacy prefill execution engine alias: "auto" | "nax" | "nax_ane"
+# ("nax_ane" maps to prefill_ane_offload = true when prefill_ane_offload is unset,
+# without modifying any other prefill switch.)
 prefill_engine = "auto"
 
 # Speculative sampling verification contract: "position_coupled_v1" | "legacy_rejection_v1"

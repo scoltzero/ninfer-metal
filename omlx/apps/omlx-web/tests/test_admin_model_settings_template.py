@@ -1240,3 +1240,100 @@ assert.equal(payload.external_engine_options.m5rt.sampling_contract, 'position_c
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+
+def test_external_engine_prefill_switches_orthogonality_labels_and_minference_gating():
+    template = _model_settings_template()
+    assert "externalEngineOptionContainerClass(opt)" in template
+    assert "externalEngineOptionDisabled(opt)" in template
+    assert "externalEngineOptionTooltip(opt)" in template
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+globalThis.document = {documentElement: {lang: 'en'}};
+"""
+        + _dashboard_script()
+        + """
+const app = dashboard();
+const m5EngineRow = {
+    id: 'm5rt',
+    provider_id: 'io.ninfer.metal',
+    label: 'miv Core Backend (ninfer-metal)',
+    compatible: true,
+    options_schema: [
+        {key: 'max_context', label: 'Max Context Window', type: 'int', min: 1024, max: 1048576, default: 262144},
+        {key: 'prefill_linear_mode', label: 'Prefill Linear Precision', type: 'enum', options: ['bf16', 'w4a8'], default: 'bf16'},
+        {key: 'prefill_attention_mode', label: 'Prefill Attention Kernel', type: 'enum', options: ['exact_nax', 'sage2'], default: 'exact_nax'},
+        {key: 'prefill_sparse_minference', label: 'MInference Sparse Tiles (Sage2)', type: 'bool', default: false},
+        {key: 'prefill_cache_blend', label: 'Cross-Chunk CacheBlend (RAG)', type: 'bool', default: false},
+        {key: 'prefill_ane_offload', label: 'Dual-ANE Co-Execution Offload', type: 'bool', default: false},
+    ],
+};
+app.modelSettings = app.buildModelSettingsState(
+    {external_engines: [m5EngineRow], auto_external_engine: 'm5rt'},
+    {}
+);
+const opts = Object.fromEntries(app.externalEngineGeneralOptionsSchema().map(o => [o.key, o]));
+
+// EN labels
+assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'Prefill Linear Precision');
+assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Prefill Attention Kernel');
+assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference Sparse Tiles'));
+assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'Cross-Chunk CacheBlend (RAG)');
+assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), 'Dual-ANE Co-Execution Offload');
+
+// ZH labels
+globalThis.document.documentElement.lang = 'zh-CN';
+assert.ok(app.externalEngineOptionLabel(opts.prefill_linear_mode).includes('BF16 / W4A8'));
+assert.ok(app.externalEngineOptionLabel(opts.prefill_attention_mode).includes('Exact NAX / Sage2'));
+assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
+assert.ok(app.externalEngineOptionLabel(opts.prefill_cache_blend).includes('CacheBlend'));
+assert.ok(app.externalEngineOptionLabel(opts.prefill_ane_offload).includes('ANE'));
+globalThis.document.documentElement.lang = 'en';
+
+// When prefill_attention_mode === 'exact_nax', ONLY prefill_sparse_minference is indented & disabled/dimmed
+assert.equal(app.externalEngineOptionIndented(opts.prefill_sparse_minference), true);
+assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), true);
+assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
+assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('pl-4'));
+assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), 'Active when Prefill Attention Kernel is set to sage2');
+
+// All other switches stay 100% independent and never disabled
+for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_cache_blend', 'prefill_ane_offload']) {
+    assert.equal(app.externalEngineOptionDisabled(opts[k]), false);
+    assert.equal(app.externalEngineOptionIndented(opts[k]), false);
+}
+
+// Enabling sage2 enables prefill_sparse_minference; enabling prefill_ane_offload NEVER disables any other switch
+app.setExternalEngineOption(opts.prefill_linear_mode, 'w4a8');
+app.setExternalEngineOption(opts.prefill_attention_mode, 'sage2');
+assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), false);
+assert.ok(!app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
+assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), '');
+
+app.setExternalEngineOption(opts.prefill_sparse_minference, true);
+app.setExternalEngineOption(opts.prefill_cache_blend, true);
+app.setExternalEngineOption(opts.prefill_ane_offload, true);
+app.setExternalEngineOption(opts.max_context, '262144');
+
+const payload = app.buildModelSettingsPayload(app.modelSettings);
+assert.equal(payload.external_engine_options.m5rt.max_context, 262144);
+assert.equal(payload.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
+assert.equal(payload.external_engine_options.m5rt.prefill_attention_mode, 'sage2');
+assert.equal(payload.external_engine_options.m5rt.prefill_sparse_minference, true);
+assert.equal(payload.external_engine_options.m5rt.prefill_cache_blend, true);
+assert.equal(payload.external_engine_options.m5rt.prefill_ane_offload, true);
+"""
+    )
+    result = subprocess.run(
+        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+

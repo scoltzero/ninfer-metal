@@ -223,6 +223,7 @@ public:
     result.max_concurrency = load_options_.max_concurrency;
     result.kv_dtype = load_options_.kv_dtype;
     result.sampling_contract_id = load_options_.sampling_contract;
+    populate_prefill_config_stats(load_options_, result);
     backend_->populate_stats(result);
     return result;
   }
