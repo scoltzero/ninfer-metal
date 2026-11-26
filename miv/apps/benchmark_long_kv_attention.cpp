@@ -15,6 +15,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../src/attention_nax.h"
+#include "../src/attention_sage2.h"
 #include "../src/forward_plan.h"
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/quantization.h"
@@ -466,13 +468,240 @@ nlohmann::json benchmark(const MetalContext &context,
       {"reference_relative_l2", relative},
       {"reference_values_checked", checked}};
 }
+
+U64 affine4_page_bytes_bench(U32 page_tokens, U32 kvh, U32 hd) {
+  return U64(kvh) * (U64(page_tokens) * (U64(hd / 2u) + 16ull) + 32ull);
+}
+
+nlohmann::json benchmark_m2_prefill(
+    const MetalContext &context, const QwenModelConfig &config,
+    const std::filesystem::path &libraries, std::string_view mode,
+    bool minference, bool is_affine4, U32 history, U32 chunk, U32 repeats) {
+  const U32 qh = U32(config.num_attention_heads);
+  const U32 kvh = U32(config.num_key_value_heads);
+  const U32 hd = U32(config.head_dim);
+  constexpr U32 page_tokens = 64u;
+  if (hd != 256u || kvh == 0u || (qh % kvh) != 0u) {
+    throw std::invalid_argument("M2 prefill benchmark requires hd=256 and valid GQA");
+  }
+  const U32 total_kv = history + chunk;
+  const U32 pages = (total_kv + page_tokens - 1u) / page_tokens;
+  const U32 q_stride = qh * hd * 2u;
+  const U32 kv_width = kvh * hd;
+
+  std::vector<U32> positions(chunk);
+  for (U32 t = 0; t < chunk; ++t) positions[t] = history + t;
+  std::vector<U32> page_table(pages);
+  std::iota(page_table.begin(), page_table.end(), 0u);
+
+  std::vector<std::uint16_t> query(U64(chunk) * q_stride);
+  for (U32 t = 0; t < chunk; ++t) {
+    for (U32 h = 0; h < qh; ++h) {
+      const U64 base = U64(t) * q_stride + U64(h) * 2u * hd;
+      for (U32 d = 0; d < hd; ++d) {
+        query[base + d] = sample(history + t, h, d, 113u);
+        query[base + hd + d] = sample(history + t, h, d, 179u);
+      }
+    }
+  }
+  std::vector<std::uint16_t> raw_k(U64(total_kv) * kv_width);
+  std::vector<std::uint16_t> raw_v(U64(total_kv) * kv_width);
+  for (U32 pos = 0; pos < total_kv; ++pos) {
+    for (U32 h = 0; h < kvh; ++h) {
+      const U64 base = (U64(pos) * kvh + h) * hd;
+      for (U32 d = 0; d < hd; ++d) {
+        raw_k[base + d] = sample(pos, h, d, 11u);
+        raw_v[base + d] = sample(pos, h, d, 67u);
+      }
+    }
+  }
+
+  const auto qb = context.upload(std::as_bytes(std::span(query)));
+  const auto ptb = context.upload(std::as_bytes(std::span(page_table)));
+  const auto posb = context.upload(std::as_bytes(std::span(positions)));
+  const auto ref_of = [](const MetalBuffer &b) { return Ref{&b, 0u, b.size()}; };
+
+  std::optional<MetalBuffer> kb, vb;
+  if (!is_affine4) {
+    std::vector<std::uint16_t> pk(U64(pages) * page_tokens * kv_width, 0u);
+    std::vector<std::uint16_t> pv(pk.size(), 0u);
+    std::copy(raw_k.begin(), raw_k.end(), pk.begin());
+    std::copy(raw_v.begin(), raw_v.end(), pv.begin());
+    kb.emplace(context.upload(std::as_bytes(std::span(pk))));
+    vb.emplace(context.upload(std::as_bytes(std::span(pv))));
+  } else {
+    const U64 pbytes = affine4_page_bytes_bench(page_tokens, kvh, hd);
+    kb.emplace(context.make_buffer(U64(pages) * pbytes));
+    vb.emplace(context.make_buffer(U64(pages) * pbytes));
+    const auto kin = context.upload(std::as_bytes(std::span(raw_k)));
+    const auto vin = context.upload(std::as_bytes(std::span(raw_v)));
+    const auto app_params =
+        words({qh, kvh, hd, total_kv, 0u, pages * page_tokens, page_tokens,
+               pages, q_stride, hd * 2u, kv_width, kv_width, q_stride, hd * 2u});
+    Encoder enc_app(context, libraries, total_kv, "bench.m2.aff4.append");
+    emit_paged_kv_append_affine4_g128(enc_app, config, total_kv, ref_of(kin),
+                                      ref_of(vin), ref_of(*kb), ref_of(*vb),
+                                      ref_of(ptb), app_params);
+    auto prof_app = enc_app.finish();
+    const std::array c_app{MetalCommandInvocation{
+        .plan = &prof_app.plan,
+        .bindings = prof_app.bindings,
+        .parameters = &prof_app.parameters}};
+    static_cast<void>(context.execute_batch(c_app));
+  }
+
+  auto out_buf = context.make_buffer(U64(chunk) * qh * hd * 2ULL);
+  const auto params = words({qh, kvh, hd, chunk, history, pages * page_tokens,
+                             page_tokens, pages, q_stride, hd * 2u, kv_width,
+                             kv_width, q_stride, hd * 2u});
+
+  std::optional<MetalBuffer> scratch_buf;
+  if (minference) {
+    const auto lo = plan_minference_scratch(chunk, qh, kvh, total_kv);
+    scratch_buf.emplace(context.make_buffer(lo.total_bytes));
+  }
+
+  Encoder enc(context, libraries, chunk, "bench.m2." + std::string(mode));
+  if (mode == "exact_nax") {
+    if (is_affine4) {
+      emit_paged_flash_prefill_affine4_g128(
+          enc, config, chunk, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(*kb), ref_of(*vb), ref_of(out_buf), ref_of(ptb), ref_of(posb),
+          params);
+    } else {
+      emit_paged_flash_prefill_nax(
+          enc, config, chunk, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(*kb), ref_of(*vb), ref_of(out_buf), ref_of(ptb), ref_of(posb),
+          params);
+    }
+  } else if (mode == "exact_nax_legacy") {
+    if (is_affine4) {
+      emit_paged_flash_prefill_affine4_g128_unpacked_legacy(
+          enc, config, chunk, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(*kb), ref_of(*vb), ref_of(out_buf), ref_of(ptb), ref_of(posb),
+          params);
+    } else {
+      emit_paged_flash_prefill_nax_unpacked_legacy(
+          enc, config, chunk, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(*kb), ref_of(*vb), ref_of(out_buf), ref_of(ptb), ref_of(posb),
+          params);
+    }
+  } else if (mode == "sage2_fp16pv" || mode == "sage2_mxfp8pv") {
+    const Sage2PvMode pv =
+        (mode == "sage2_mxfp8pv") ? Sage2PvMode::Mxfp8 : Sage2PvMode::Fp16;
+    const std::optional<Ref> sc_ref =
+        scratch_buf.has_value() ? std::optional<Ref>{ref_of(*scratch_buf)}
+                                : std::nullopt;
+    emit_paged_flash_prefill_sage2(
+        enc, config, chunk, total_kv, is_affine4, minference, ref_of(qb),
+        sub(ref_of(qb), hd * 2u), ref_of(*kb), ref_of(*vb), ref_of(out_buf),
+        ref_of(ptb), ref_of(posb), params, sc_ref, pv);
+  } else {
+    throw std::invalid_argument("unknown --mode: " + std::string(mode));
+  }
+  auto prof = enc.finish();
+  const std::array calls{MetalCommandInvocation{.plan = &prof.plan,
+                                                .bindings = prof.bindings,
+                                                .parameters = &prof.parameters}};
+  std::vector<double> gpu_ms, wall_ms;
+  for (U32 i = 0; i < repeats + 2u; ++i) {
+    const auto sub_res = context.execute_batch(calls);
+    if (i >= 2u) {
+      gpu_ms.push_back(sub_res.timing.gpu_ms);
+      wall_ms.push_back(sub_res.timing.wall_ms);
+    }
+  }
+  // Effective causal attention FLOPs: 4 * qh * hd * (chunk * history + chunk*(chunk+1)/2)
+  const double causal_pairs =
+      double(chunk) * double(history) + 0.5 * double(chunk) * double(chunk + 1u);
+  const double flops = 4.0 * double(qh) * double(hd) * causal_pairs;
+  const double med_ms = median(gpu_ms);
+  const double eff_tflops = (med_ms > 0.0) ? (flops / (med_ms * 1e9)) : 0.0;
+
+  return {{"mode", std::string(mode)},
+          {"minference", minference},
+          {"kv", is_affine4 ? "affine4_g128" : "bf16"},
+          {"history_tokens", history},
+          {"chunk_tokens", chunk},
+          {"total_kv", total_kv},
+          {"query_heads", qh},
+          {"kv_heads", kvh},
+          {"head_dim", hd},
+          {"kernel", prof.attention_kernel},
+          {"dispatches", prof.plan.dispatch_count()},
+          {"gpu_median_ms", med_ms},
+          {"wall_median_ms", median(wall_ms)},
+          {"effective_tflops", eff_tflops},
+          {"gpu_ms", gpu_ms}};
+}
 } // namespace
 
 int main(int argc, char **argv) {
   try {
+    bool m2_cli = false;
+    for (int i = 1; i < argc; ++i) {
+      if (std::string_view(argv[i]).starts_with("--")) {
+        m2_cli = true;
+        break;
+      }
+    }
+    if (m2_cli) {
+      std::string mode = "exact_nax";
+      std::string kv_fmt = "affine4";
+      std::string config_path;
+      std::string libs_path;
+      bool minference = false;
+      U32 chunk = 2048u;
+      U32 history = 4096u;
+      U32 repeats = 5u;
+      for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        auto parse_val = [&](std::string_view prefix) -> std::optional<std::string_view> {
+          if (arg.starts_with(prefix)) return arg.substr(prefix.size());
+          return std::nullopt;
+        };
+        if (auto v = parse_val("--mode=")) mode = std::string(*v);
+        else if (auto v = parse_val("--minference=")) minference = (*v == "1" || *v == "true");
+        else if (auto v = parse_val("--chunk=")) chunk = U32(std::stoul(std::string(*v)));
+        else if (auto v = parse_val("--history=")) history = U32(std::stoul(std::string(*v)));
+        else if (auto v = parse_val("--kv=")) kv_fmt = std::string(*v);
+        else if (auto v = parse_val("--config=")) config_path = std::string(*v);
+        else if (auto v = parse_val("--libs=")) libs_path = std::string(*v);
+        else if (auto v = parse_val("--repeats=")) repeats = U32(std::stoul(std::string(*v)));
+        else throw std::invalid_argument("unknown option: " + std::string(arg));
+      }
+      if (libs_path.empty()) {
+        throw std::invalid_argument("--libs=METALLIB_DIR is required");
+      }
+      QwenModelConfig config{};
+      if (!config_path.empty()) {
+        config = load_qwen_model_config(config_path);
+      } else {
+        config.hidden_size = 5120;
+        config.num_attention_heads = 24;
+        config.num_key_value_heads = 4;
+        config.head_dim = 256;
+        config.partial_rotary_factor = 0.25;
+        config.rope_theta = 1000000.0;
+        config.rms_norm_eps = 1e-6;
+      }
+      const auto context = MetalContext::create();
+      const bool is_aff4 = (kv_fmt == "affine4" || kv_fmt == "affine4_g128");
+      const auto res = benchmark_m2_prefill(context, config, libs_path, mode,
+                                            minference, is_aff4, history, chunk,
+                                            repeats);
+      std::cout << nlohmann::json({{"schema", "omlx-m5-m2-attention-bench-v1"},
+                                   {"device", context.capabilities().device_name},
+                                   {"result", res}})
+                       .dump(2)
+                << '\n';
+      return 0;
+    }
+
     if (argc != 4 && argc != 5)
-      throw std::invalid_argument("usage: benchmark_long_kv_attention CONFIG "
-                                  "LIBRARIES REPEATS [PATTERN=0..4]");
+      throw std::invalid_argument(
+          "usage: benchmark_long_kv_attention CONFIG LIBRARIES REPEATS [PATTERN=0..4]\n"
+          "   or: benchmark_long_kv_attention --libs=DIR --mode=exact_nax|exact_nax_legacy|sage2_fp16pv|sage2_mxfp8pv [--minference=0|1] [--chunk=2048] [--history=4096] [--kv=affine4|bf16] [--config=PATH] [--repeats=5]");
     const auto config = load_qwen_model_config(argv[1]);
     const auto context = MetalContext::create();
     const U32 repeats = U32(std::stoul(argv[3]));

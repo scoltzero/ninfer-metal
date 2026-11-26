@@ -271,7 +271,101 @@ inline void emit_paged_split_attention_exact_gqa(
   e.dynamic(ordered, 8, std::move(split_params), tok_word, pos_word);
 }
 
-inline void emit_paged_flash_prefill_nax(
+struct GqaFlashPrefillTier {
+  U32 wm = 8u;
+  U32 tg_threads = 512u;
+  U32 bm_tok = 16u;
+  const char *bf16_kernel =
+      "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm8";
+  const char *affine4_kernel =
+      "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8";
+  const char *tier_tag = "L";
+};
+
+inline bool gqa_flash_prefill_eligible(U32 query_heads, U32 kv_heads,
+                                       U32 head_dim) {
+  if (env_flag_enabled("OMLX_M5_DISABLE_GQA_FLASH_PREFILL"))
+    return false;
+  if (head_dim != 256u || kv_heads == 0u || (query_heads % kv_heads) != 0u)
+    return false;
+  const U32 repeat = query_heads / kv_heads;
+  return repeat >= 1u && repeat <= 16u;
+}
+
+inline GqaFlashPrefillTier select_gqa_flash_prefill_tier(
+    U32 tokens, U32 query_heads, U32 kv_heads, U32 forced_wm = 0u) {
+  const U32 repeat = (kv_heads > 0u && query_heads >= kv_heads)
+                         ? (query_heads / kv_heads)
+                         : 1u;
+  U32 wm = forced_wm;
+  if (wm == 0u) {
+    if (const char *env = std::getenv("OMLX_M5_GQA_FLASH_TIER")) {
+      const std::string_view sv(env);
+      if (sv == "3" || sv == "S3" || sv == "wm3" || sv == "WM3")
+        wm = 3u;
+      else if (sv == "4" || sv == "S" || sv == "S4" || sv == "wm4" ||
+               sv == "WM4")
+        wm = 4u;
+      else if (sv == "6" || sv == "M" || sv == "wm6" || sv == "WM6")
+        wm = 6u;
+      else if (sv == "8" || sv == "L" || sv == "wm8" || sv == "WM8")
+        wm = 8u;
+    }
+  }
+  if (wm == 0u) {
+    if (tokens > 96u) {
+      wm = 8u;
+    } else if (tokens > 16u) {
+      wm = 6u;
+    } else if (repeat == 6u && tokens <= 8u) {
+      wm = 3u;
+    } else {
+      wm = 4u;
+    }
+  }
+  if (wm != 3u && wm != 4u && wm != 6u && wm != 8u) {
+    wm = 8u;
+  }
+  const U32 m_tile = wm * 16u;
+  const U32 bm_tok = std::max<U32>(1u, m_tile / std::max<U32>(1u, repeat));
+  if (wm == 3u) {
+    return {3u, 192u, bm_tok,
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm3",
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm3",
+            "S3"};
+  }
+  if (wm == 4u) {
+    return {4u, 256u, bm_tok,
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm4",
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm4",
+            "S4"};
+  }
+  if (wm == 6u) {
+    return {6u, 384u, bm_tok,
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm6",
+            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm6",
+            "M"};
+  }
+  return {8u, 512u, bm_tok,
+          "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm8",
+          "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8",
+          "L"};
+}
+
+// Base 2.2 Wave 2 routing helper: detect short tail / HKVD chunks at long KV
+// where single-pass GQA-packed Flash would launch < 2 * gpu_cores TGs.
+inline bool gqa_flash_prefill_tail_needs_split_kv(
+    U32 tokens, U32 query_heads, U32 kv_heads, U32 context_envelope,
+    U32 gpu_cores) {
+  if (context_envelope < 4096u || kv_heads == 0u || tokens == 0u)
+    return false;
+  const auto tier = select_gqa_flash_prefill_tier(tokens, query_heads, kv_heads);
+  const U64 q_blocks = (U64(tokens) + tier.bm_tok - 1ull) / tier.bm_tok;
+  const U64 gqa_flash_tgs = q_blocks * U64(kv_heads);
+  return gqa_flash_tgs < 2ull * U64(std::max<U32>(1u, gpu_cores));
+}
+
+inline void emit_paged_flash_prefill_nax_unpacked_legacy(
     Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
     Ref state_k, Ref state_v, Ref mixer, Ref page_table,
     Ref attention_positions, std::vector<std::byte> params) {
@@ -302,6 +396,48 @@ inline void emit_paged_flash_prefill_nax(
       "paged.nax_flash_v1.bq64_bk32_dsplit.f32_softmax_gate.v1";
   e.profile.attention_row_exact_eligible = false;
   e.dynamic(attn, 7, std::move(params), 3, 4);
+}
+
+inline void emit_paged_flash_prefill_gqa_nax(
+    Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
+    Ref state_k, Ref state_v, Ref mixer, Ref page_table,
+    Ref attention_positions, std::vector<std::byte> params,
+    U32 forced_wm = 0u) {
+  const U32 qh = U32(c.num_attention_heads);
+  const U32 kvh = U32(c.num_key_value_heads);
+  if (c.head_dim != 256 || kvh == 0u || (qh % kvh) != 0u) {
+    throw std::invalid_argument("GQA FlashNax requires hd256 and valid GQA");
+  }
+  const auto tier = select_gqa_flash_prefill_tier(t, qh, kvh, forced_wm);
+  const U32 q_blocks = (t + tier.bm_tok - 1u) / tier.bm_tok;
+  auto &attn = e.emit(
+      "attention_nax_prefill", tier.bf16_kernel,
+      {.width = tier.tg_threads, .height = U64(q_blocks) * kvh},
+      {.width = tier.tg_threads},
+      {query, gate, state_k, state_v, mixer, page_table, attention_positions});
+  e.profile.attention_kernel = tier.bf16_kernel;
+  e.profile.attention_grid = attn.grid;
+  e.profile.attention_numeric_contract_id =
+      "paged.nax_flash_v2.gqa_lpt_pp_bk32.f32_softmax_gate.v1";
+  e.profile.attention_row_exact_eligible = false;
+  e.dynamic(attn, 7, std::move(params), 3, 4);
+}
+
+inline void emit_paged_flash_prefill_nax(
+    Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
+    Ref state_k, Ref state_v, Ref mixer, Ref page_table,
+    Ref attention_positions, std::vector<std::byte> params) {
+  if (gqa_flash_prefill_eligible(U32(c.num_attention_heads),
+                                 U32(c.num_key_value_heads),
+                                 U32(c.head_dim))) {
+    emit_paged_flash_prefill_gqa_nax(e, c, t, query, gate, state_k, state_v,
+                                     mixer, page_table, attention_positions,
+                                     std::move(params));
+    return;
+  }
+  emit_paged_flash_prefill_nax_unpacked_legacy(
+      e, c, t, query, gate, state_k, state_v, mixer, page_table,
+      attention_positions, std::move(params));
 }
 
 inline void emit_paged_split_attention_bf16_frag48(
@@ -595,7 +731,7 @@ inline void emit_batched_attention_affine4_g128(
   e.profile.attention_row_exact_eligible = true;
 }
 
-inline void emit_paged_flash_prefill_affine4_g128(
+inline void emit_paged_flash_prefill_affine4_g128_unpacked_legacy(
     Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
     Ref state_k, Ref state_v, Ref mixer, Ref page_table,
     Ref attention_positions, std::vector<std::byte> params) {
@@ -614,6 +750,49 @@ inline void emit_paged_flash_prefill_affine4_g128(
       "paged.nax_affine4_g128_flash_v1.bq64_bk32_dsplit.f32_softmax_gate.v1";
   e.profile.attention_row_exact_eligible = false;
   e.dynamic(attn, 7, std::move(params), 3, 4);
+}
+
+inline void emit_paged_flash_prefill_gqa_affine4_g128(
+    Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
+    Ref state_k, Ref state_v, Ref mixer, Ref page_table,
+    Ref attention_positions, std::vector<std::byte> params,
+    U32 forced_wm = 0u) {
+  const U32 qh = U32(c.num_attention_heads);
+  const U32 kvh = U32(c.num_key_value_heads);
+  if (c.head_dim != 256 || kvh == 0u || (qh % kvh) != 0u) {
+    throw std::invalid_argument(
+        "GQA Affine4Group128 flash prefill requires hd256 and valid GQA");
+  }
+  const auto tier = select_gqa_flash_prefill_tier(t, qh, kvh, forced_wm);
+  const U32 q_blocks = (t + tier.bm_tok - 1u) / tier.bm_tok;
+  auto &attn = e.emit(
+      "attention_affine4", tier.affine4_kernel,
+      {.width = tier.tg_threads, .height = U64(q_blocks) * kvh},
+      {.width = tier.tg_threads},
+      {query, gate, state_k, state_v, mixer, page_table, attention_positions});
+  e.profile.attention_kernel = tier.affine4_kernel;
+  e.profile.attention_grid = attn.grid;
+  e.profile.attention_numeric_contract_id =
+      "paged.nax_affine4_g128_flash_v2.gqa_lpt_pp_bk32.f32_softmax_gate.v1";
+  e.profile.attention_row_exact_eligible = false;
+  e.dynamic(attn, 7, std::move(params), 3, 4);
+}
+
+inline void emit_paged_flash_prefill_affine4_g128(
+    Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
+    Ref state_k, Ref state_v, Ref mixer, Ref page_table,
+    Ref attention_positions, std::vector<std::byte> params) {
+  if (gqa_flash_prefill_eligible(U32(c.num_attention_heads),
+                                 U32(c.num_key_value_heads),
+                                 U32(c.head_dim))) {
+    emit_paged_flash_prefill_gqa_affine4_g128(
+        e, c, t, query, gate, state_k, state_v, mixer, page_table,
+        attention_positions, std::move(params));
+    return;
+  }
+  emit_paged_flash_prefill_affine4_g128_unpacked_legacy(
+      e, c, t, query, gate, state_k, state_v, mixer, page_table,
+      attention_positions, std::move(params));
 }
 
 inline void emit_paged_kv_append_affine4_g128(
