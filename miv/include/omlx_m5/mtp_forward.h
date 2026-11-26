@@ -201,6 +201,22 @@ public:
   // without running prefill chunks. Rewinds/clears stale state cleanly.
   void reset();
 
+  // Snapshots / restores the 1-row normalized target trunk state (`h * 2` B)
+  // and truncates `mtp_kv_pool` to `committed_hist_tokens` so same-slot
+  // Rolling Prefix Cache hits (including `<think>`-stripped turns and tool-call
+  // turns) retain MTP KV history in O(1) without repriming from position 0.
+  [[nodiscard]] std::vector<std::byte> snapshot_pending_trunk() const;
+  void restore_frontier(std::uint32_t committed_hist_tokens,
+                        std::span<const std::byte> pending_trunk_bytes);
+
+  // Seals the final verified round's committed tokens `input[0..count-1]`
+  // (`count` in 1..5) against `target_trunk_hidden[0..count-1]` at decode-end
+  // so `committed_tokens() == target.position() - 1` and `has_pending_trunk()`
+  // holds ready for the next turn's prefix-cache hit.
+  MetalSubmission
+  seal_post_verify_frontier(std::span<const std::uint32_t> committed_round_tokens,
+                            bool use_icb = true);
+
   // Folds committed_tokens[0..c-1] (c in 1..5) without running lm_head or
   // drafting (used when MtpDepthController probes/parks at K == 0 so MTP KV
   // history stays 100% aligned with target.position() at minimal cost).
