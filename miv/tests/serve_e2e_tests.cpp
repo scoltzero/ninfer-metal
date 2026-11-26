@@ -541,6 +541,29 @@ void test_http_server_e2e() {
           "application/json");
       check(neg_tokens && neg_tokens->status == 400,
             "negative max_tokens must return 400");
+
+      const auto unsupported_penalty = client.Post(
+          "/v1/completions", auth_headers,
+          Json({{"model", "qwen-e2e-fake"}, {"prompt", "hi"}, {"stream", true},
+                {"frequency_penalty", 0.4}}).dump(), "application/json");
+      check(unsupported_penalty && unsupported_penalty->status == 400,
+            "legacy sampling must reject penalties before SSE");
+      const auto invalid_window = client.Post(
+          "/v1/completions", auth_headers,
+          Json({{"model", "qwen-e2e-fake"}, {"prompt", "hi"},
+                {"repetition_context_size", 0}}).dump(), "application/json");
+      check(invalid_window && invalid_window->status == 400 &&
+                invalid_window->body.find("repetition_context_size") != std::string::npos,
+            "the HTTP repetition window must be validated");
+      const auto invalid_budget = client.Post(
+          "/v1/chat/completions", auth_headers,
+          Json({{"model", "qwen-e2e-fake"},
+                {"messages", {{{"role", "user"}, {"content", "hi"}}}},
+                {"thinking_budget", -1}, {"stream", true}}).dump(),
+          "application/json");
+      check(invalid_budget && invalid_budget->status == 400 &&
+                invalid_budget->body.find("thinking_budget") != std::string::npos,
+            "thinking_budget must be validated before SSE");
     }
 
     // 6) POST /v1/completions sync + SSE + usage + [DONE]

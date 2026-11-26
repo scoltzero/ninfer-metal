@@ -7,6 +7,7 @@
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/mtp_forward.h"
 #include "omlx_m5/qwen_forward.h"
+#include "../src/native_backend.h"
 #include "../src/spec_controller.h"
 
 #include <algorithm>
@@ -1116,6 +1117,150 @@ Json test_end_to_end_engine_parity(const std::filesystem::path &qwen_fixtures,
                 mtp_t2.request_stats->fallback_reason.empty(),
             "Rolling MTP warm request telemetry did not report continued speculation");
     ++total_parity_checks;
+
+    // Request controls must use the same absolute-position sample in
+    // AR and MTP, including a forced close inside an active MTP round.
+    auto controlled = t1;
+    controlled.prompt_tokens.push_back(93);
+    controlled.sampling = {.temperature = 0.7F,
+                           .top_p = 0.95F,
+                           .top_k = 20,
+                           .seed = 123ULL,
+                           .repetition_penalty = 1.2F,
+                           .presence_penalty = 0.4F,
+                           .frequency_penalty = 0.1F,
+                           .repetition_context_size = 8};
+    const std::vector<std::int32_t> closing{17, 18, 19, 20};
+    controlled.thinking_budget = ThinkingBudget{
+        .budget = 2,
+        .start_in_thinking = true,
+        .end_token_ids = {18, 19},
+        .force_token_ids = closing,
+    };
+    const auto controlled_ar =
+        collect_request(*roll_ar, roll_ar->submit(controlled));
+    const auto controlled_mtp =
+        collect_request(*roll_mtp, roll_mtp->submit(controlled));
+    require(controlled_ar.tokens == controlled_mtp.tokens,
+            "Controlled MTP differs from same-seed AR");
+    require(controlled_mtp.tokens.size() > closing.size() + 1 &&
+                std::equal(closing.begin(), closing.end(),
+                           controlled_mtp.tokens.begin() + 1),
+            "Controlled MTP skipped forced reasoning close or stopped there");
+    require(controlled_mtp.request_stats &&
+                controlled_mtp.request_stats->spec_rounds > 0,
+            "MTP request controls disabled speculation");
+    ++total_parity_checks;
+
+    // Directly drive the owner-thread scheduler so the preferred slot is
+    // deterministically occupied when a continuation is admitted.
+    for (const bool packed : {false, true}) {
+      LoadOptions options = roll_mtp_opts;
+      options.max_concurrency = 2;
+      options.path_overrides["batch_mode"] = packed ? "on" : "off";
+      detail::NativeBackend backend(options);
+      backend.bind_owner(std::this_thread::get_id());
+      auto stats = [&] {
+        StatsReport result;
+        backend.populate_stats(result);
+        return result;
+      };
+      auto start = [&](const SubmitRequest &request,
+                       std::vector<std::int32_t> &tokens) {
+        return backend.start(
+            request, std::make_shared<std::atomic<bool>>(false),
+            [&tokens](std::vector<std::int32_t> chunk) {
+              tokens.insert(tokens.end(), chunk.begin(), chunk.end());
+            });
+      };
+
+      std::vector<std::int32_t> seed_tokens;
+      auto seed = start(t1, seed_tokens);
+      while (!seed->advance()) {
+      }
+      seed.reset();
+      require(seed_tokens == ar_t1.tokens, "B=2 MTP seed differs from AR");
+
+      // Different prompt chooses slot 0 and can overwrite its new live
+      // history; the seed checkpoint must remain valid in the cache.
+      SubmitRequest blocker_request;
+      blocker_request.prompt_tokens = make_prompt_i32(7U, 73U, 257U);
+      blocker_request.max_new_tokens = 256;
+      std::vector<std::int32_t> blocker_tokens;
+      auto blocker = start(blocker_request, blocker_tokens);
+
+      auto cross_slot_turn = [&](const SubmitRequest &request,
+                                 std::uint64_t expected_prefix,
+                                 bool trim_active_entries) {
+        const auto before = stats();
+        std::vector<std::int32_t> result;
+        auto warm = start(request, result);
+        if (trim_active_entries) {
+          // A lease may be evicted immediately after restore. Live readers
+          // still hold their own refs to the same physical pages.
+          require(backend.trim_cache(0).evicted_entries > 0U,
+                  "B=2 MTP eviction did not exercise a live restored prefix");
+        }
+        std::optional<detail::ExecutionResult> terminal;
+        while (!terminal) {
+          if (packed) {
+            const std::array<detail::BackendTask *, 2> lanes{
+                blocker.get(), warm.get()};
+            auto outcomes = backend.advance_batch(lanes);
+            require(!outcomes[0], "MTP blocker released the preferred slot");
+            terminal = std::move(outcomes[1]);
+          } else {
+            terminal = warm->advance();
+          }
+        }
+        const auto reported_stats = warm->request_stats();
+        const auto request_stats = reported_stats.value_or(RequestStats{});
+        require(terminal->kind == EventKind::finished && reported_stats &&
+                    request_stats.prefix_restored_tokens >= expected_prefix &&
+                    request_stats.spec_rounds > 0U &&
+                    request_stats.fallback_reason.empty(),
+                "Cross-slot warm request did not stay on MTP: packed=" +
+                    std::to_string(packed) + " trim=" + std::to_string(trim_active_entries) +
+                    " cached=" + std::to_string(request_stats.prefix_restored_tokens) +
+                    "/" + std::to_string(expected_prefix) +
+                    " rounds=" + std::to_string(request_stats.spec_rounds) +
+                    " fallback=" + request_stats.fallback_reason +
+                    " error=" + terminal->error);
+        auto after = stats();
+        require(after.prefix_shared_hits == before.prefix_shared_hits + 1U,
+                "MTP fixture did not force a cross-slot cache hit");
+        if (packed) {
+          require(after.batched_verify_rounds > before.batched_verify_rounds,
+                  "MTP fixture did not exercise batched verification");
+        }
+        return result;
+      };
+
+      const auto warm_tokens = cross_slot_turn(t2, 42U, false);
+      require(warm_tokens == ar_t2.tokens,
+              "Cross-slot partial tail COW changed MTP output");
+      blocker.reset();
+
+      // The warm request sealed a new checkpoint in slot 1. Take that slot
+      // with a fork of the same prefix, so both next requests share KV pages
+      // but append different suffixes. This also checks the packed seal.
+      SubmitRequest next;
+      next.prompt_tokens = t2.prompt_tokens;
+      next.prompt_tokens.insert(next.prompt_tokens.end(), warm_tokens.begin(),
+                                warm_tokens.end());
+      const auto next_prefix = std::uint64_t(next.prompt_tokens.size() - 1U);
+      auto fork = next;
+      next.prompt_tokens.push_back(8);
+      fork.prompt_tokens.push_back(29);
+      next.max_new_tokens = 18;
+      fork.max_new_tokens = 256;
+      blocker_tokens.clear();
+      blocker = start(fork, blocker_tokens);
+      const auto next_tokens = cross_slot_turn(next, next_prefix, true);
+      require(next_tokens == collect_request(*roll_ar, roll_ar->submit(next)).tokens,
+              "Evicting a retained checkpoint corrupted a live MTP prefix");
+      ++total_parity_checks;
+    }
   }
 
   return {{"parity_checks_passed", total_parity_checks},

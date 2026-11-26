@@ -499,14 +499,14 @@
                                        class="{{ ms_field_short }}">
                             </label>
                             <label class="{{ ms_row }}" x-show="!modelSettings.is_diffusion_model">
-                                <span class="{{ ms_row_label }}">{{ t('modal.model_settings.repetition_penalty') }}</span>
+                                <span class="{{ ms_row_label }}">{{ t('modal.model_settings.repetition_penalty') }}{{ miv_dot('repetition_penalty') }}</span>
                                 <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                        :disabled="modelSettings.vlm_mtp_enabled"
                                        :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
                                        class="{{ ms_field_short }}">
                             </label>
                             <label class="{{ ms_row }}" x-show="!modelSettings.is_diffusion_model">
-                                <span class="{{ ms_row_label }}">{{ t('modal.model_settings.presence_penalty') }}</span>
+                                <span class="{{ ms_row_label }}">{{ t('modal.model_settings.presence_penalty') }}{{ miv_dot('presence_penalty') }}</span>
                                 <input type="number" x-model.number="modelSettings.presence_penalty" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                        :disabled="modelSettings.vlm_mtp_enabled"
                                        :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
@@ -1187,7 +1187,7 @@
                              x-show="!modelSettings.is_diffusion_model" x-cloak>
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
-                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}{{ miv_dot('thinking_budget_enabled') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                 </div>
                                 <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"

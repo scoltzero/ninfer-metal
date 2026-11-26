@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -115,6 +116,22 @@ plan_mtp_forward_memory(const QwenModelConfig &config,
 
 class MtpForward;
 
+// Holds immutable committed MTP KV pages in the model's shared MTP arena.
+struct MtpPrefixCheckpoint {
+  std::uint32_t tokens = 0;
+  std::uint64_t kv_page_bytes = 0;
+  std::vector<std::uint32_t> kv_pages;
+  std::vector<std::byte> pending_trunk;
+
+  [[nodiscard]] const void *kv_allocator_id() const noexcept;
+  [[nodiscard]] std::uint64_t non_kv_bytes() const noexcept;
+
+private:
+  struct Lease;
+  std::shared_ptr<const Lease> lease_;
+  friend class MtpForward;
+};
+
 struct MtpPreparedPrime {
   MetalIcbProfile *prime_icb = nullptr;
   MetalIcbProfile *save_icb = nullptr;
@@ -172,7 +189,9 @@ public:
              std::string_view kv_dtype = "bf16",
              const QwenLayerCatalog *target_catalog = nullptr,
              const MaterializedModel *target_weights = nullptr,
-             const MetalBuffer *shared_prefill_trunk = nullptr);
+             const MetalBuffer *shared_prefill_trunk = nullptr,
+             const MtpForward *shared_kv_primary = nullptr,
+             std::uint32_t shared_kv_pages = 0);
   ~MtpForward();
   MtpForward(MtpForward &&) noexcept;
   MtpForward &operator=(MtpForward &&) noexcept;
@@ -208,6 +227,11 @@ public:
   [[nodiscard]] std::vector<std::byte> snapshot_pending_trunk() const;
   void restore_frontier(std::uint32_t committed_hist_tokens,
                         std::span<const std::byte> pending_trunk_bytes);
+
+  [[nodiscard]] std::optional<MtpPrefixCheckpoint> checkpoint_prefix();
+  void restore_prefix(const MtpPrefixCheckpoint &checkpoint,
+                      std::uint32_t committed_hist_tokens);
+  void set_kv_reclaimer(std::function<bool()> reclaimer);
 
   // Seals the final verified round's committed tokens `input[0..count-1]`
   // (`count` in 1..5) against `target_trunk_hidden[0..count-1]` at decode-end

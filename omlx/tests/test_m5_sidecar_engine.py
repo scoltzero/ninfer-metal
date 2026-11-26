@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import signal
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -68,7 +69,7 @@ def _build_bpe_chat_tokenizer(dest_dir: Path) -> PreTrainedTokenizerFast:
     # Sort alphabet deterministically (tokenizers' Rust HashSet varies per call).
     byte_alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
     vocab: dict[str, int] = {tok: idx for idx, tok in enumerate(byte_alphabet)}
-    specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+    specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"]
     for sp in specials:
         if sp not in vocab:
             vocab[sp] = len(vocab)
@@ -82,7 +83,7 @@ def _build_bpe_chat_tokenizer(dest_dir: Path) -> PreTrainedTokenizerFast:
         eos_token="<|im_end|>",
         bos_token="<|endoftext|>",
         pad_token="<|endoftext|>",
-        additional_special_tokens=["<|im_start|>", "<|im_end|>", "<|endoftext|>"],
+        additional_special_tokens=specials,
     )
     fast.chat_template = (
         "{% for message in messages %}"
@@ -870,6 +871,129 @@ class TestDualUdsTransportAndShowstoppers:
         engine._last_capacity = await engine._rpc("capacity", timeout=5.0)
         await engine._setup_event_stream()
         return engine
+
+    async def test_request_controls_api_and_wire(self, tmp_path, monkeypatch):
+        model_dir = _write_test_model(tmp_path / "prompt-model")
+        tokenizer = _build_bpe_chat_tokenizer(model_dir)
+        sock = Path("/tmp") / f"m5-mock-{os.getpid()}-controls.sock"
+        mock_srv = _MockUdsSidecarServer(
+            sock, support_push=True, token_plan=[tokenizer.encode("Answer")]
+        )
+        await mock_srv.start()
+        engine = await self._attach_mock_engine(tmp_path / "controls", mock_srv)
+
+        async def get_engine(*args, **kwargs):
+            return engine
+
+        pool = MagicMock()
+        pool.get_entry.return_value = None
+        state = srv.ServerState(default_model="test-model", engine_pool=pool)
+        monkeypatch.setattr(srv, "_server_state", state)
+        monkeypatch.setattr(srv, "get_engine_for_model", get_engine)
+        try:
+            transport = httpx.ASGITransport(app=srv.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                messages = [{"role": "user", "content": "Question"}]
+                for path, payload, field in (
+                    ("/v1/chat/completions", {"messages": messages, "thinking_budget": 0}, "thinking_budget"),
+                    ("/v1/completions", {"prompt": "Question", "repetition_context_size": 30}, "repetition_context_size"),
+                    ("/v1/responses", {"input": "Question", "frequency_penalty": 0.5}, "frequency_penalty"),
+                    ("/v1/messages", {"messages": messages, "thinking": {"budget_tokens": 0}}, "thinking.budget_tokens"),
+                ):
+                    response = await client.post(
+                        path,
+                        json={"model": "test-model", "max_tokens": 32, "stream": True, **payload},
+                    )
+                    assert response.status_code == 400, response.text
+                    assert response.json()["error"]["param"] == field
+                assert mock_srv.submitted_requests == []
+
+                # An inherited setting must not break existing clients on older daemons.
+                state.sampling.repetition_penalty = 1.25
+                response = await client.post(
+                    "/v1/completions",
+                    json={"model": "test-model", "prompt": "Question", "max_tokens": 32},
+                )
+                assert response.status_code == 200, response.text
+                assert "Inherited repetition_penalty is unsupported" in response.headers["warning"]
+                assert "repetition_penalty" not in mock_srv.submitted_requests[-1]["sampling"]
+
+                response = await client.post(
+                    "/v1/completions",
+                    json={"model": "test-model", "prompt": "Question", "max_tokens": 32,
+                          "repetition_penalty": 1.0},
+                )
+                assert response.status_code == 200, response.text
+                assert "warning" not in response.headers
+
+                engine._hello_info["capabilities"] += ["thinking_budget", "sampling_penalties"]
+                # A daemon can announce the feature while this model uses the legacy contract.
+                response = await client.post(
+                    "/v1/completions",
+                    json={"model": "test-model", "prompt": "Question", "repetition_penalty": 1.5,
+                          "stream": True},
+                )
+                assert response.status_code == 400, response.text
+                assert response.json()["error"]["param"] == "repetition_penalty"
+                assert "position_coupled_v1" in response.text
+
+                engine._options = replace(
+                    engine._options, sampling_contract="position_coupled_v1"
+                )
+                start_id = engine.tokenizer.convert_tokens_to_ids("<think>")
+                end_id = engine.tokenizer.convert_tokens_to_ids("</think>")
+                response = await client.post(
+                    "/v1/completions",
+                    json={"model": "test-model", "prompt": "Question <think>\n",
+                          "max_tokens": 32, "thinking_budget": 0, "stream": True},
+                )
+                assert response.status_code == 200, response.text
+                submitted = mock_srv.submitted_requests[-1]
+                assert submitted["thinking_budget"] == {
+                    "budget": 0, "start_in_thinking": True,
+                    "start_token_ids": [start_id], "end_token_ids": [end_id],
+                }
+                assert submitted["sampling"]["repetition_penalty"] == 1.25
+                assert "warning" not in response.headers
+
+                render_calls = 0
+                prepare = engine.prepare_chat_prompt
+
+                def count_render(*args, **kwargs):
+                    nonlocal render_calls
+                    render_calls += 1
+                    return prepare(*args, **kwargs)
+
+                monkeypatch.setattr(engine, "prepare_chat_prompt", count_render)
+                response = await client.post(
+                    "/v1/responses",
+                    json={"model": "test-model", "input": "Question", "max_output_tokens": 32,
+                          "repetition_penalty": 1.5, "repetition_context_size": 40,
+                          "presence_penalty": -0.25, "frequency_penalty": 0.5,
+                          "thinking_budget": 0},
+                )
+                assert response.status_code == 200, response.text
+                assert render_calls == 1
+                submitted = mock_srv.submitted_requests[-1]
+                assert submitted["thinking_budget"]["budget"] == 0
+                sampling = submitted["sampling"]
+                assert {field: sampling[field] for field in (
+                    "repetition_penalty", "repetition_context_size",
+                    "presence_penalty", "frequency_penalty",
+                )} == {
+                    "repetition_penalty": 1.5, "repetition_context_size": 40,
+                    "presence_penalty": -0.25, "frequency_penalty": 0.5,
+                }
+
+                # A closed block with whitespace in the prompt must not reopen.
+                await engine.generate(
+                    "Question <think></think>\n", max_tokens=32, thinking_budget=0
+                )
+                assert mock_srv.submitted_requests[-1]["thinking_budget"]["start_in_thinking"] is False
+        finally:
+            engine._process = None
+            await engine.stop()
+            await mock_srv.close()
 
     async def test_push_stream_early_event_race_eos_and_utf8_streaming(self, tmp_path):
         model_dir = _write_test_model(tmp_path / "proto-model")

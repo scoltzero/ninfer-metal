@@ -1261,7 +1261,11 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
             row["options_schema"] = schema
         if engine_id == M5RT_ENGINE_ID:
             row["provider_id"] = M5RT_PROVIDER_ID
+            entry = engine_pool.get_entry(model_info["id"])
+            control_settings = getattr(getattr(entry, "engine", None), "request_control_settings", None)
             row["request_settings"] = list(M5RT_REQUEST_SETTINGS)
+            if callable(control_settings):
+                row["request_settings"].extend(control_settings())
             row["kv_formats"] = ["bf16", "affine4_g128"]
             row["speculative_limits"] = M5RT_MAX_DRAFT_TOKENS
         elif engine_id in plugins and getattr(plugins[engine_id], "provider_id", None):

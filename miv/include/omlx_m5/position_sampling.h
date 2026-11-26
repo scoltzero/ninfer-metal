@@ -35,7 +35,8 @@ class PositionKeyedSampler final {
 public:
   PositionKeyedSampler(const MetalContext &,const MetalBuffer &logits,
                        std::uint32_t vocabulary,std::uint32_t max_rows,
-                       const std::filesystem::path &libraries);
+                       const std::filesystem::path &libraries,
+                       std::string_view plan_key = {});
   ~PositionKeyedSampler();
   [[nodiscard]] PositionSamplingResult sample(std::span<const PositionSamplingRow>,bool icb=true);
   // P04/P10 can keep normal tokens on GPU. Only a boundary decision requests

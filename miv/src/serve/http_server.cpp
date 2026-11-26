@@ -107,6 +107,23 @@ std::vector<std::string> parse_stop_strings(const Json &body) {
   throw std::invalid_argument("stop must be a string or an array of strings");
 }
 
+std::int32_t parse_control_integer(const Json &value, std::string_view field,
+                                   std::int32_t minimum) {
+  const auto invalid = [&] {
+    return std::invalid_argument(std::string(field) + " must be an integer in [" +
+                                 std::to_string(minimum) + ", " +
+                                 std::to_string(std::numeric_limits<std::int32_t>::max()) + "]");
+  };
+  if (!value.is_number_integer()) {
+    throw invalid();
+  }
+  const double number = value.get<double>();
+  if (number < minimum || number > std::numeric_limits<std::int32_t>::max()) {
+    throw invalid();
+  }
+  return static_cast<std::int32_t>(number);
+}
+
 SamplingSpec parse_sampling_spec(const Json &body) {
   SamplingSpec spec;
   if (body.contains("temperature") && !body.at("temperature").is_null()) {
@@ -166,7 +183,66 @@ SamplingSpec parse_sampling_spec(const Json &body) {
       spec.seed = static_cast<std::uint64_t>(s);
     }
   }
+  const auto set_penalty = [&](const char *key, float &out) {
+    const auto value = body.find(key);
+    if (value == body.end() || value->is_null()) {
+      return;
+    }
+    if (!value->is_number()) {
+      throw std::invalid_argument(std::string(key) + " must be a finite number");
+    }
+    out = value->get<float>();
+    if (!std::isfinite(out)) {
+      throw std::invalid_argument(std::string(key) + " must be a finite number");
+    }
+  };
+  set_penalty("repetition_penalty", spec.repetition_penalty);
+  set_penalty("presence_penalty", spec.presence_penalty);
+  set_penalty("frequency_penalty", spec.frequency_penalty);
+  if (spec.repetition_penalty <= 0.0F) {
+    throw std::invalid_argument("repetition_penalty must be positive");
+  }
+  if (const auto value = body.find("repetition_context_size");
+      value != body.end() && !value->is_null()) {
+    spec.repetition_context_size =
+        parse_control_integer(*value, "repetition_context_size", 1);
+  }
   return spec;
+}
+
+std::optional<ThinkingBudget> parse_thinking_budget(
+    const Json &body, const Tokenizer &tokenizer,
+    std::span<const std::int32_t> prompt_tokens) {
+  const auto value = body.find("thinking_budget");
+  if (value == body.end() || value->is_null()) {
+    return std::nullopt;
+  }
+  const auto budget = parse_control_integer(*value, "thinking_budget", 0);
+  const auto start = tokenizer.lookup_token_id("<think>");
+  const auto end = tokenizer.lookup_token_id("</think>");
+  if (!start || !end) {
+    throw std::invalid_argument(
+        "thinking_budget requires a tokenizer with <think> and </think> tokens");
+  }
+
+  bool start_in_thinking = false;
+  for (auto it = prompt_tokens.rbegin(); it != prompt_tokens.rend(); ++it) {
+    if (*it == *start || *it == *end) {
+      start_in_thinking = *it == *start;
+      break;
+    }
+  }
+  const auto closing = tokenizer.encode("\n</think>\n\n");
+  ThinkingBudget control{
+      .budget = budget,
+      .start_in_thinking = start_in_thinking,
+      .start_token_ids = {*start},
+      .end_token_ids = {*end},
+  };
+  if (std::ranges::find(closing, *end) != closing.end()) {
+    control.force_token_ids.assign(closing.begin(), closing.end());
+  }
+  return control;
 }
 
 bool parse_stream_flag(const Json &body) {
@@ -981,6 +1057,7 @@ struct ServeHttpServer::Impl {
     ChatRenderResult rendered;
     std::vector<std::int32_t> prompt_tokens;
     std::int32_t max_new_tokens = 1;
+    std::optional<ThinkingBudget> thinking_budget;
     OutputParserOptions parser_opts;
 
     try {
@@ -1029,6 +1106,8 @@ struct ServeHttpServer::Impl {
 
       max_new_tokens = parse_max_new_tokens(body, prompt_tokens.size(),
                                             target->max_context, 2048);
+      thinking_budget = parse_thinking_budget(body, *target->tokenizer,
+                                              prompt_tokens);
 
       parser_opts.enable_thinking_split = true;
       parser_opts.initial_in_thinking = rendered.prompt_opens_think;
@@ -1058,6 +1137,7 @@ struct ServeHttpServer::Impl {
     submit_req.prompt_tokens = std::move(prompt_tokens);
     submit_req.max_new_tokens = max_new_tokens;
     submit_req.sampling = sampling;
+    submit_req.thinking_budget = std::move(thinking_budget);
 
     std::shared_ptr<RequestStream> req_stream;
     try {
@@ -1424,6 +1504,7 @@ struct ServeHttpServer::Impl {
     std::string prompt_text;
     std::vector<std::int32_t> prompt_tokens;
     std::int32_t max_new_tokens = 1;
+    std::optional<ThinkingBudget> thinking_budget;
 
     try {
       stream = parse_stream_flag(body);
@@ -1478,6 +1559,8 @@ struct ServeHttpServer::Impl {
 
       max_new_tokens = parse_max_new_tokens(body, prompt_tokens.size(),
                                             target->max_context, 256);
+      thinking_budget = parse_thinking_budget(body, *target->tokenizer,
+                                              prompt_tokens);
     } catch (const std::invalid_argument &err) {
       write_openai_error(res, 400, err.what(), "invalid_request_error");
       return;
@@ -1496,6 +1579,7 @@ struct ServeHttpServer::Impl {
     submit_req.prompt_tokens = std::move(prompt_tokens);
     submit_req.max_new_tokens = max_new_tokens;
     submit_req.sampling = sampling;
+    submit_req.thinking_budget = std::move(thinking_budget);
 
     std::shared_ptr<RequestStream> req_stream;
     try {

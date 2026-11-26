@@ -35,6 +35,45 @@ LoadOptions options(const std::filesystem::path &target,const std::filesystem::p
     o.speculative={.backend=SpeculativeBackend::dflash2,.draft_tokens=d};}
   return o;
 }
+
+void test_warm_penalty_anchor(const std::filesystem::path &target,
+                              const std::filesystem::path &draft,
+                              const std::filesystem::path &libraries) {
+  auto opts = options(target, draft, libraries, 0);
+  opts.path_overrides["prefix_cache_bytes"] = "67108864";
+  auto warm = Engine::create(opts);
+  auto cold = Engine::create(options(target, draft, libraries, 0));
+  SubmitRequest request;
+  request.max_new_tokens = 1;
+  request.pin_prefix = true;
+  std::int32_t rewarded = 0;
+  std::int32_t neutral = 0;
+  for (std::int32_t candidate = 1; candidate <= 16; ++candidate) {
+    request.prompt_tokens.assign(65, candidate);
+    neutral = run(*warm, request).tokens.at(0);
+    if (neutral != candidate) {
+      rewarded = candidate;
+      break;
+    }
+  }
+  require(rewarded != 0, "warm penalty fixture needs a distinct neutral sample");
+
+  const auto hits_before = warm->stats().prefix_hits;
+  request.sampling = {.repetition_penalty = 1.2F,
+                      .presence_penalty = -50.0F,
+                      .frequency_penalty = -2.0F,
+                      .repetition_context_size = 8};
+  const auto cold_tokens = run(*cold, request).tokens;
+  require(cold_tokens == std::vector<std::int32_t>{rewarded},
+          "controlled logits did not reward the prompt token");
+  require(run(*warm, request).tokens == cold_tokens,
+          "warm prefix reused the previously sampled neutral token");
+  require(warm->stats().prefix_hits > hits_before,
+          "controlled request did not use its warm checkpoint");
+  request.sampling = {};
+  require(run(*warm, request).tokens == std::vector<std::int32_t>{neutral},
+          "controlled request polluted the original cached sample");
+}
 }
 int main(int argc,char **argv) {
   try{if(argc!=4)throw std::invalid_argument("tf_coupled_engine_tests TARGET DRAFT LIBRARIES");
@@ -60,6 +99,8 @@ int main(int argc,char **argv) {
       auto s=spec->stats();require(s.spec_rounds>0 && s.spec_target_verify_calls==s.spec_rounds && s.spec_replay_calls<=s.spec_rounds,"coupled spec repeated verify or Replay");
       spec->shutdown();
     }
-    ar->shutdown();std::cout<<Json({{"schema","omlx-m5-p04-tf-engine-v1"},{"cases",records},{"terminal_budget_stop_cancel_checked",true},{"error_reset_checked",true},{"passed",true}}).dump(2)<<'\n';return 0;
+    ar->shutdown();
+    test_warm_penalty_anchor(argv[1], argv[2], argv[3]);
+    std::cout<<Json({{"schema","omlx-m5-p04-tf-engine-v1"},{"controlled_warm_anchor_checked",true},{"cases",records},{"terminal_budget_stop_cancel_checked",true},{"error_reset_checked",true},{"passed",true}}).dump(2)<<'\n';return 0;
   }catch(const std::exception&e){std::cerr<<"P04-TF Engine: "<<e.what()<<'\n';return 1;}
 }

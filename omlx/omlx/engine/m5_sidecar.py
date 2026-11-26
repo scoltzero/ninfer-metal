@@ -11,6 +11,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -32,6 +33,11 @@ from typing import Any
 
 from transformers import AutoTokenizer
 
+from ..api.thinking import (
+    _convert_token_to_id,
+    _encode_prompt_ids,
+    _safe_tokenizer_attr,
+)
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
     _consolidate_system_messages,
@@ -5772,6 +5778,142 @@ class M5SidecarEngine(BaseEngine):
                 dedup.append(seq)
         return dedup
 
+    def _thinking_token_ids(self) -> tuple[list[int], list[int]] | None:
+        """Use model-declared markers or real tokenizer tokens for Qwen markers."""
+        boundaries = []
+        for side, default_tag in (("start", "<think>"), ("end", "</think>")):
+            tokenizer = self._tokenizer
+            ids = _safe_tokenizer_attr(tokenizer, f"think_{side}_tokens")
+            if ids is None:
+                token_id = _safe_tokenizer_attr(tokenizer, f"think_{side}_id")
+                if token_id is not None:
+                    ids = [token_id]
+            if ids is None:
+                tag = _safe_tokenizer_attr(tokenizer, f"think_{side}")
+                if tag:
+                    ids = _encode_prompt_ids(tokenizer, tag)
+                else:
+                    token_id = _convert_token_to_id(tokenizer, default_tag)
+                    ids = [token_id] if token_id is not None else None
+            if not ids or any(not isinstance(i, int) or not 0 <= i < self._vocab_size for i in ids):
+                return None
+            boundaries.append(list(ids))
+        start, end = boundaries
+        return (start, end) if start != end else None
+
+    def _request_sampling_contract(self) -> str:
+        return (
+            (self._last_stats or {}).get("sampling_contract_id")
+            or self._options.sampling_contract
+        )
+
+    def request_control_settings(self) -> tuple[str, ...]:
+        """Model settings the loaded daemon will apply to generation."""
+        if self._request_sampling_contract() != "position_coupled_v1":
+            return ()
+        capabilities = self._hello_info.get("capabilities") or ()
+        settings = []
+        if "thinking_budget" in capabilities and self._thinking_token_ids() is not None:
+            settings.extend(("thinking_budget_enabled", "thinking_budget_tokens"))
+        if "sampling_penalties" in capabilities:
+            settings.extend(("repetition_penalty", "presence_penalty", "frequency_penalty"))
+        return tuple(settings)
+
+    def reconcile_request_controls(
+        self,
+        options: dict[str, Any],
+        explicit_fields: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Require support for explicit controls and drop unsupported inherited values."""
+        defaults = {
+            "thinking_budget": None,
+            "repetition_penalty": 1.0,
+            "repetition_context_size": None,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+        }
+        active = [
+            name for name, default in defaults.items()
+            if options.get(name) is not None and options[name] != default
+        ]
+        if not active:
+            return []
+
+        explicit_fields = explicit_fields or {}
+        capabilities = self._hello_info.get("capabilities") or ()
+        contract = self._request_sampling_contract()
+        warnings = []
+        for name in active:
+            capability = "thinking_budget" if name == "thinking_budget" else "sampling_penalties"
+            reason = None
+            if capability not in capabilities:
+                reason = f"the selected sidecar did not advertise {capability}"
+            elif contract != "position_coupled_v1":
+                reason = "it requires sampling_contract=position_coupled_v1"
+            elif name == "thinking_budget" and self._thinking_token_ids() is None:
+                reason = "the selected tokenizer has no supported thinking marker pair"
+
+            field = explicit_fields.get(name, name)
+            value = options[name]
+            if reason is None and name in ("thinking_budget", "repetition_context_size"):
+                minimum = 0 if name == "thinking_budget" else 1
+                if not isinstance(value, int) or not minimum <= value <= 2**31 - 1:
+                    raise InvalidRequestError(
+                        f"{field} must be an integer in [{minimum}, {2**31 - 1}]", field
+                    )
+            elif reason is None:
+                try:
+                    value = struct.unpack("f", struct.pack("f", value))[0]
+                except (OverflowError, TypeError, struct.error):
+                    value = float("nan")
+                if not math.isfinite(value) or (name == "repetition_penalty" and value <= 0):
+                    requirement = "a positive finite number" if name == "repetition_penalty" else "a finite number"
+                    raise InvalidRequestError(f"{field} must be {requirement}", field)
+
+            if reason is not None:
+                message = f"{field} is unsupported because {reason}"
+                if name in explicit_fields:
+                    raise InvalidRequestError(message, field)
+                options.pop(name)
+                warnings.append(f"Inherited {message}. Using the backend default.")
+            elif name != "thinking_budget" and name != "repetition_context_size":
+                options[name] = value
+
+        self._warn_unsupported_controls(warnings)
+        return warnings
+
+    def _warn_unsupported_controls(self, warnings: Iterable[str]) -> None:
+        for warning in warnings:
+            if warning not in self._warned_request_controls:
+                self._warned_request_controls.add(warning)
+                logger.warning("%s: %s", self._model_id, warning)
+
+    def _thinking_budget_payload(self, budget: int, prompt_tokens: list[int]) -> dict[str, Any]:
+        markers = self._thinking_token_ids()
+        if markers is None:
+            raise InvalidRequestError("thinking_budget requires supported thinking marker tokens", "thinking_budget")
+        start, end = markers
+        # As in the stock template check, only the final opener with up to
+        # two tokens after it can begin this turn's reasoning.
+        opened = False
+        for tail_size in range(3):
+            end_of_start = len(prompt_tokens) - tail_size
+            beginning = end_of_start - len(start)
+            if beginning < 0 or prompt_tokens[beginning:end_of_start] != start:
+                continue
+            suffix = prompt_tokens[end_of_start:]
+            opened = not any(
+                suffix[i:i + len(end)] == end
+                for i in range(len(suffix) - len(end) + 1)
+            )
+            break
+        return {
+            "budget": budget,
+            "start_in_thinking": opened,
+            "start_token_ids": start,
+            "end_token_ids": end,
+        }
+
     def _validate_and_normalize_sampling(
         self,
         *,
@@ -5857,22 +5999,24 @@ class M5SidecarEngine(BaseEngine):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
-        unsupported = {
-            "repetition_penalty": repetition_penalty not in (None, 1.0),
-            "presence_penalty": bool(presence_penalty),
-            "frequency_penalty": bool(kwargs.get("frequency_penalty")),
-            "thinking_budget": bool(kwargs.get("thinking_budget")),
-            "no_repeat_ngram_size": bool(kwargs.get("no_repeat_ngram_size")),
-            "xtc_probability": bool(kwargs.get("xtc_probability")),
-        }
-        for key, requested in unsupported.items():
-            if requested and key not in self._warned_request_controls:
-                self._warned_request_controls.add(key)
-                logger.warning("%s does not support %s for %s", self._target.binary.label, key, self._model_id)
         if self._process is None:
             await self.start()
         if self.runtime_failed_reason is not None:
             raise RuntimeError(self.runtime_failed_reason)
+
+        controls = {
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": kwargs.get("frequency_penalty"),
+            "repetition_context_size": kwargs.get("repetition_context_size"),
+            "thinking_budget": kwargs.get("thinking_budget"),
+        }
+        self.reconcile_request_controls(controls)
+        self._warn_unsupported_controls(
+            f"{self._target.binary.label} does not support {key}"
+            for key in ("no_repeat_ngram_size", "xtc_probability")
+            if kwargs.get(key)
+        )
 
         client_req_id = str(kwargs.pop("_request_id", None) or uuid.uuid4())
         if client_req_id in self._aborted_client_ids:
@@ -5885,6 +6029,17 @@ class M5SidecarEngine(BaseEngine):
             min_p=min_p,
             kwargs=kwargs,
         )
+
+        thinking_budget = controls.pop("thinking_budget", None)
+        for name, neutral in (
+            ("repetition_penalty", 1.0),
+            ("presence_penalty", 0.0),
+            ("frequency_penalty", 0.0),
+            ("repetition_context_size", 20),
+        ):
+            value = controls.get(name)
+            if value is not None and value != neutral:
+                sampling[name] = value
 
         if isinstance(prompt, str):
             prompt_tokens = await asyncio.to_thread(
@@ -5943,6 +6098,10 @@ class M5SidecarEngine(BaseEngine):
                 "sampling": sampling,
                 "stop_token_seqs": stop_token_seqs,
             }
+            if thinking_budget is not None:
+                submit_params["thinking_budget"] = self._thinking_budget_payload(
+                    thinking_budget, prompt_tokens
+                )
             if kwargs.get("pin_prefix"):
                 submit_params["pin_prefix"] = True
             submit_res = await self._rpc(

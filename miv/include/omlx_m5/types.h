@@ -63,6 +63,23 @@ struct SamplingSpec {
   float min_p = 0.0F;
   std::int32_t top_k = 0;
   std::uint64_t seed = 0;
+  float repetition_penalty = 1.0F;
+  float presence_penalty = 0.0F;
+  float frequency_penalty = 0.0F;
+  std::int32_t repetition_context_size = 20;
+
+  [[nodiscard]] bool has_penalties() const noexcept {
+    return repetition_penalty != 1.0F || presence_penalty != 0.0F ||
+           frequency_penalty != 0.0F;
+  }
+};
+
+struct ThinkingBudget {
+  std::int32_t budget = 0;
+  bool start_in_thinking = false;
+  std::vector<std::int32_t> start_token_ids;
+  std::vector<std::int32_t> end_token_ids;
+  std::vector<std::int32_t> force_token_ids;
 };
 
 struct SubmitRequest {
@@ -71,6 +88,7 @@ struct SubmitRequest {
   SamplingSpec sampling;
   std::vector<std::vector<std::int32_t>> stop_token_seqs;
   bool pin_prefix = false;
+  std::optional<ThinkingBudget> thinking_budget;
 };
 
 struct RequestStats {

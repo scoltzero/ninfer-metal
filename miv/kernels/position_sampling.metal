@@ -943,3 +943,43 @@ kernel void omlx_m5_position_sample_logits_feed_stage2(
   result[row] = uint2(win_i, 1u);
   if (row == 0u) next_token_out[0] = win_i;
 }
+
+struct RequestPenaltyToken {
+  uint token;
+  float repetition, presence, frequency;
+};
+
+kernel void omlx_m5_position_copy_raw_logits(
+    device const bfloat *source [[buffer(0)]],
+    device bfloat *destination [[buffer(1)]],
+    constant uint2 &shape [[buffer(2)]],
+    constant uint &source_row [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  if (tid.x < shape.x && tid.y < shape.y) {
+    destination[ulong(tid.y) * shape.x + tid.x] =
+        source[ulong(source_row + tid.y) * shape.x + tid.x];
+  }
+}
+
+kernel void omlx_m5_position_apply_sparse_penalties(
+    device bfloat *logits [[buffer(0)]],
+    device const RequestPenaltyToken *tokens [[buffer(1)]],
+    constant uint2 *ranges [[buffer(2)]],
+    constant uint2 &shape [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  if (tid.y >= shape.y || tid.x >= ranges[tid.y].y) return;
+  const RequestPenaltyToken params = tokens[ranges[tid.y].x + tid.x];
+  const ulong offset = ulong(tid.y) * shape.x + params.token;
+  float score = float(logits[offset]);
+  if (params.repetition != 1.0f) {
+    score = float(bfloat(score < 0.0f ? score * params.repetition
+                                      : score / params.repetition));
+  }
+  if (params.presence != 0.0f) {
+    score = float(bfloat(score - params.presence));
+  }
+  if (params.frequency != 0.0f) {
+    score -= params.frequency;
+  }
+  logits[offset] = bfloat(score);
+}

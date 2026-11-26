@@ -17,6 +17,7 @@
 
 #include "omlx_m5/execution_contract.h"
 #include "omlx_m5/kv_page_pool.h"
+#include "omlx_m5/mtp_forward.h"
 #include "omlx_m5/qwen_forward.h"
 #include "omlx_m5/types.h"
 
@@ -69,6 +70,7 @@ public:
     std::uint64_t prompt_hash = 0;
     std::size_t source_slot = 0;
     QwenUmaContinuation continuation;
+    std::optional<MtpPrefixCheckpoint> mtp;
     std::vector<std::byte> last_logits;
     SamplingKeyType sampled_key{};
     std::uint32_t sampled_token = 0;
@@ -173,8 +175,8 @@ public:
 
   [[nodiscard]] std::optional<MatchResult>
   find_best(std::string_view execution_identity,
-            std::span<const std::uint32_t> prompt,
-            SamplingContract contract) const {
+            std::span<const std::uint32_t> prompt, SamplingContract contract,
+            bool require_mtp = false) const {
     if (budget_bytes_ == 0 || entries_.empty() || prompt.empty())
       return std::nullopt;
     const auto prompt_page_hashes = prefix_detail::compute_page_hashes(prompt);
@@ -184,7 +186,8 @@ public:
     for (std::size_t i = 0; i < entries_.size(); ++i) {
       const auto &e = entries_[i];
       const std::size_t len = e.tokens.size();
-      if (len > prompt.size() || e.identity != execution_identity)
+      if (len > prompt.size() || e.identity != execution_identity ||
+          (require_mtp && !e.mtp))
         continue;
       if (len == prompt.size() && !e.has_anchor_logits)
         continue;
@@ -274,19 +277,27 @@ public:
                                   bool pin_entry,
                                   SlotProgramFn &&program_at,
                                   bool *out_inserted = nullptr,
-                                  std::uint64_t supersede_entry_id = 0) {
+                                  std::uint64_t supersede_entry_id = 0,
+                                  std::optional<MtpPrefixCheckpoint> mtp = std::nullopt) {
     last_inserted_id_ = 0;
     if (out_inserted)
       *out_inserted = false;
     if (budget_bytes_ == 0 || tokens.empty())
       return 0;
+    if (mtp && (std::size_t(mtp->tokens) + 1U != tokens.size() ||
+                mtp->kv_allocator_id() == nullptr)) {
+      throw std::invalid_argument("MTP checkpoint does not match target prefix");
+    }
     QwenForward &prog = program_at(source_slot);
     const std::uint64_t logits_bytes =
         include_anchor_logits ? std::uint64_t(prog.vocabulary_size()) * 2ULL : 0ULL;
+    const auto mtp_non_kv = mtp ? mtp->non_kv_bytes() : 0ULL;
+    const auto mtp_kv_bytes =
+        mtp ? std::uint64_t(mtp->kv_pages.size()) * mtp->kv_page_bytes : 0ULL;
     const std::uint64_t non_kv_req =
         prog.non_kv_checkpoint_bytes() +
         std::uint64_t(tokens.size()) * sizeof(std::uint32_t) + logits_bytes +
-        execution_identity.size() + sizeof(Entry);
+        execution_identity.size() + sizeof(Entry) + mtp_non_kv;
     const std::uint64_t kv_page_bytes_all = prog.kv_page_all_layers_bytes();
     const auto *pool = prog.kv_page_pool();
     const void *alloc_id =
@@ -295,7 +306,8 @@ public:
     const std::vector<std::uint32_t> current_slots =
         pool ? pool->mapped_slots() : std::vector<std::uint32_t>{};
     const std::uint64_t full_entry_bytes =
-        non_kv_req + std::uint64_t(current_slots.size()) * kv_page_bytes_all;
+        non_kv_req + std::uint64_t(current_slots.size()) * kv_page_bytes_all +
+        mtp_kv_bytes;
     if (full_entry_bytes > budget_bytes_)
       return 0;
 
@@ -308,9 +320,24 @@ public:
           std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(),
                      tokens.begin())) {
         if (!include_anchor_logits && entries_[i].has_anchor_logits) {
-          // Already have a richer full-prompt checkpoint at this exact prefix.
-          entries_[i].pinned = entries_[i].pinned || pin_entry;
-          last_inserted_id_ = entries_[i].id;
+          // Preserve the richer target anchor. The MTP lease owns its
+          // own source and can upgrade a matching target-only entry.
+          auto &existing = entries_[i];
+          if (mtp && !existing.mtp && cached_bytes() <= budget_bytes_ &&
+              mtp_non_kv + marginal_kv_bytes(mtp->kv_allocator_id(),
+                                            mtp->kv_pages, mtp->kv_page_bytes)
+                  <= budget_bytes_ - cached_bytes()) {
+            existing.mtp = std::move(mtp);
+            existing.non_kv_bytes += mtp_non_kv;
+            existing.accounted_bytes += mtp_non_kv + mtp_kv_bytes;
+            existing.continuation.accounted_bytes = existing.accounted_bytes;
+            total_non_kv_bytes_ += mtp_non_kv;
+            retain_page_accounting(existing.mtp->kv_allocator_id(),
+                                   existing.mtp->kv_pages,
+                                   existing.mtp->kv_page_bytes);
+          }
+          existing.pinned = existing.pinned || pin_entry;
+          last_inserted_id_ = existing.id;
           if (out_inserted)
             *out_inserted = true;
           return 0;
@@ -349,16 +376,10 @@ public:
     }
 
     auto marginal_required = [&]() -> std::uint64_t {
-      if (kv_page_bytes_all == 0ULL || current_slots.empty())
-        return non_kv_req;
-      std::uint64_t unshared_pages = 0;
-      for (std::uint32_t phys : current_slots) {
-        if (retained_kv_pages_.find({alloc_id, phys}) ==
-            retained_kv_pages_.end()) {
-          ++unshared_pages;
-        }
-      }
-      return non_kv_req + unshared_pages * kv_page_bytes_all;
+      return non_kv_req +
+             marginal_kv_bytes(alloc_id, current_slots, kv_page_bytes_all) +
+             (mtp ? marginal_kv_bytes(mtp->kv_allocator_id(), mtp->kv_pages,
+                                      mtp->kv_page_bytes) : 0ULL);
     };
 
     const std::uint32_t free_p = pool ? pool->free_pages() : 0U;
@@ -403,6 +424,7 @@ public:
     entry.source_slot = source_slot;
     entry.continuation = prog.checkpoint_uma();
     entry.continuation.accounted_bytes = full_entry_bytes;
+    entry.mtp = std::move(mtp);
     if (include_anchor_logits) {
       entry.last_logits = prog.read_last_logits_bf16();
       entry.sampled_key = skey;
@@ -421,13 +443,11 @@ public:
     entry.recovery_cost = compute_recovery_cost(tokens.size());
 
     total_non_kv_bytes_ += entry.non_kv_bytes;
-    if (entry.kv_page_bytes_all_layers > 0ULL) {
-      for (std::uint32_t phys : entry.continuation.kv_pages) {
-        auto &cnt = retained_kv_pages_[{entry.kv_allocator_id, phys}];
-        if (cnt == 0U)
-          total_unique_kv_bytes_ += entry.kv_page_bytes_all_layers;
-        ++cnt;
-      }
+    retain_page_accounting(entry.kv_allocator_id, entry.continuation.kv_pages,
+                           entry.kv_page_bytes_all_layers);
+    if (entry.mtp) {
+      retain_page_accounting(entry.mtp->kv_allocator_id(), entry.mtp->kv_pages,
+                             entry.mtp->kv_page_bytes);
     }
 
     observe_mattson_stack(ph);
@@ -479,6 +499,19 @@ public:
     // Last resort under hard physical page exhaustion: allow evicting a pinned entry
     // rather than throwing an unrecoverable overflow_error mid-decode.
     return evict_best_victim(program_at, true);
+  }
+
+  template <class SlotProgramFn>
+  bool evict_for_mtp_page_pressure(SlotProgramFn &&program_at) {
+    // MTP and target have different physical arenas.
+    auto index = select_victim_index(false, std::nullopt, true);
+    if (index == entries_.size())
+      index = select_victim_index(true, std::nullopt, true);
+    if (index == entries_.size())
+      return false;
+    record_wakman_eviction(index);
+    release_entry(index, program_at, true);
+    return true;
   }
 
   template <class SlotProgramFn>
@@ -593,13 +626,16 @@ private:
 
   [[nodiscard]] std::size_t
   select_victim_index(bool allow_pinned,
-                      std::optional<std::size_t> restrict_slot = std::nullopt) const {
+                      std::optional<std::size_t> restrict_slot = std::nullopt,
+                      bool require_mtp = false) const {
     std::vector<std::size_t> cands;
     cands.reserve(entries_.size());
     for (std::size_t i = 0; i < entries_.size(); ++i) {
       if (!allow_pinned && entries_[i].pinned)
         continue;
       if (restrict_slot.has_value() && entries_[i].source_slot != *restrict_slot)
+        continue;
+      if (require_mtp && !entries_[i].mtp)
         continue;
       cands.push_back(i);
     }
@@ -701,6 +737,44 @@ private:
       ghosts_.pop_front();
   }
 
+  [[nodiscard]] std::uint64_t marginal_kv_bytes(
+      const void *allocator, std::span<const std::uint32_t> pages,
+      std::uint64_t page_bytes) const {
+    if (page_bytes == 0ULL)
+      return 0ULL;
+    std::uint64_t bytes = 0;
+    for (auto phys : pages) {
+      if (!retained_kv_pages_.contains({allocator, phys}))
+        bytes += page_bytes;
+    }
+    return bytes;
+  }
+
+  void retain_page_accounting(const void *allocator,
+                              std::span<const std::uint32_t> pages,
+                              std::uint64_t page_bytes) {
+    if (page_bytes == 0ULL)
+      return;
+    for (auto phys : pages) {
+      if (retained_kv_pages_[{allocator, phys}]++ == 0U)
+        total_unique_kv_bytes_ += page_bytes;
+    }
+  }
+
+  void release_page_accounting(const void *allocator,
+                               std::span<const std::uint32_t> pages,
+                               std::uint64_t page_bytes) {
+    if (page_bytes == 0ULL)
+      return;
+    for (auto phys : pages) {
+      const auto it = retained_kv_pages_.find({allocator, phys});
+      if (it != retained_kv_pages_.end() && --it->second == 0U) {
+        retained_kv_pages_.erase(it);
+        total_unique_kv_bytes_ -= std::min(total_unique_kv_bytes_, page_bytes);
+      }
+    }
+  }
+
   template <class SlotProgramFn>
   void release_entry(std::size_t index, SlotProgramFn &&program_at, bool update_aging) {
     auto &entry = entries_.at(index);
@@ -711,19 +785,11 @@ private:
       total_non_kv_bytes_ -= entry.non_kv_bytes;
     else
       total_non_kv_bytes_ = 0;
-    if (entry.kv_page_bytes_all_layers > 0ULL) {
-      for (std::uint32_t phys : entry.continuation.kv_pages) {
-        const auto it = retained_kv_pages_.find({entry.kv_allocator_id, phys});
-        if (it != retained_kv_pages_.end()) {
-          if (--it->second == 0U) {
-            retained_kv_pages_.erase(it);
-            if (total_unique_kv_bytes_ >= entry.kv_page_bytes_all_layers)
-              total_unique_kv_bytes_ -= entry.kv_page_bytes_all_layers;
-            else
-              total_unique_kv_bytes_ = 0;
-          }
-        }
-      }
+    release_page_accounting(entry.kv_allocator_id, entry.continuation.kv_pages,
+                            entry.kv_page_bytes_all_layers);
+    if (entry.mtp) {
+      release_page_accounting(entry.mtp->kv_allocator_id(),
+                              entry.mtp->kv_pages, entry.mtp->kv_page_bytes);
     }
     QwenForward &src_prog = program_at(entry.source_slot);
     src_prog.release_uma(entry.continuation);

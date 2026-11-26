@@ -55,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -221,6 +221,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
+from .engine.m5_sidecar import M5SidecarEngine
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -2072,9 +2073,42 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     if req_budget is not None:
         return req_budget
     ms = get_model_settings_for_request(model_id)
-    if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
+    if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens is not None:
         return ms.thinking_budget_tokens
     return None
+
+
+def _preflight_miv_request_controls(
+    engine: BaseEngine, request, options: dict[str, Any]
+) -> list[str]:
+    if not isinstance(engine, M5SidecarEngine):
+        return []
+    explicit_fields = {
+        name: name for name in options if getattr(request, name, None) is not None
+    }
+    if (
+        "thinking_budget" in options
+        and "thinking_budget" not in explicit_fields
+        and getattr(getattr(request, "thinking", None), "budget_tokens", None) is not None
+    ):
+        explicit_fields["thinking_budget"] = "thinking.budget_tokens"
+    return engine.reconcile_request_controls(options, explicit_fields)
+
+
+def _preflight_miv_thinking_budget(
+    engine: BaseEngine, request, warnings: list[str]
+) -> int | None:
+    options = {"thinking_budget": _resolve_thinking_budget(request, request.model)}
+    warnings.extend(_preflight_miv_request_controls(engine, request, options))
+    return options.get("thinking_budget")
+
+
+def _inference_warning_headers(
+    warnings: list[str], response_format_warning: str | None = None
+) -> dict[str, str]:
+    values = [response_format_warning] if response_format_warning else []
+    values.extend(f'199 omlx "{warning}"' for warning in dict.fromkeys(warnings))
+    return {"Warning": ", ".join(values)} if values else {}
 
 
 def _resolve_gpu_power_limit(request, model_id: str | None) -> int | None:
@@ -2417,7 +2451,7 @@ def _prepare_chat_prompt_for_request(
     is_partial: bool | None = None,
 ) -> tuple[int, tuple[str, list[int]] | None]:
     # Subclasses (e.g. distributed) have their own prompt handling.
-    if type(engine) in (BatchedEngine, VLMBatchedEngine):
+    if type(engine) in (BatchedEngine, VLMBatchedEngine) or isinstance(engine, M5SidecarEngine):
         prepared = engine.prepare_chat_prompt(
             messages, tools, chat_template_kwargs, is_partial
         )
@@ -2438,7 +2472,7 @@ async def _prepare_prompt_off_loop(engine: BaseEngine, prepare, *args, **kwargs)
 
     Encoding a long prompt on the event loop stalls every other stream.
     """
-    if type(engine) in (BatchedEngine, VLMBatchedEngine):
+    if type(engine) in (BatchedEngine, VLMBatchedEngine) or isinstance(engine, M5SidecarEngine):
         return await asyncio.to_thread(prepare, engine, *args, **kwargs)
     return prepare(engine, *args, **kwargs)
 
@@ -4597,6 +4631,38 @@ async def _decisions_body(
 # =============================================================================
 
 
+def _completion_generation_options(request: CompletionRequest) -> dict[str, Any]:
+    values = get_sampling_params(
+        request.temperature,
+        request.top_p,
+        request.model,
+        req_top_k=getattr(request, "top_k", None),
+        req_repetition_penalty=getattr(request, "repetition_penalty", None),
+        req_min_p=getattr(request, "min_p", None),
+        req_presence_penalty=getattr(request, "presence_penalty", None),
+        req_frequency_penalty=getattr(request, "frequency_penalty", None),
+        req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, "xtc_probability", None),
+        req_xtc_threshold=getattr(request, "xtc_threshold", None),
+    )
+    names = (
+        "temperature", "top_p", "top_k", "repetition_penalty", "min_p",
+        "presence_penalty", "frequency_penalty", "max_tokens", "xtc_probability",
+        "xtc_threshold",
+    )
+    options = dict(zip(names, values, strict=True))
+    options.update(stop=request.stop, seed=request.seed)
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        options["thinking_budget"] = thinking_budget
+    repetition_context_size = getattr(request, "repetition_context_size", None)
+    if repetition_context_size is not None:
+        options["repetition_context_size"] = repetition_context_size
+    options.update(_no_repeat_ngram_kwargs(request))
+    options.update(_ignore_eos_kwargs(request))
+    return options
+
+
 @app.post("/v1/completions")
 async def create_completion(
     request: CompletionRequest,
@@ -4617,6 +4683,10 @@ async def create_completion(
         model_load_duration = time.perf_counter() - load_start
         lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
         resolved_model = _serving_model_id(lease, request.model)
+        generation_options = _completion_generation_options(request)
+        control_warnings = _preflight_miv_request_controls(
+            engine, request, generation_options
+        )
 
         # Handle single prompt or list of prompts
         prompts = (
@@ -4661,6 +4731,7 @@ async def create_completion(
                                 response_id=response_id,
                                 inference_request_id=inference_request_id,
                                 skip_cache_store=bool(_cache_store_kwargs(http_request)),
+                                generation_options=generation_options,
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,
@@ -4676,6 +4747,7 @@ async def create_completion(
                     "X-Accel-Buffering": "no",
                     "Cache-Control": "no-cache",
                     _REQUEST_ID_HEADER: inference_request_id,
+                    **_inference_warning_headers(control_warnings),
                 },
             )
 
@@ -4688,48 +4760,10 @@ async def create_completion(
             total_prompt_tokens = 0
             total_cached_tokens = 0
 
-            (
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                min_p,
-                presence_penalty,
-                frequency_penalty,
-                max_tokens,
-                xtc_probability,
-                xtc_threshold,
-            ) = get_sampling_params(
-                request.temperature,
-                request.top_p,
-                request.model,
-                req_top_k=getattr(request, "top_k", None),
-                req_repetition_penalty=getattr(request, "repetition_penalty", None),
-                req_min_p=getattr(request, "min_p", None),
-                req_presence_penalty=getattr(request, "presence_penalty", None),
-                req_frequency_penalty=getattr(request, "frequency_penalty", None),
-                req_max_tokens=request.max_tokens,
-                req_xtc_probability=getattr(request, "xtc_probability", None),
-                req_xtc_threshold=getattr(request, "xtc_threshold", None),
-            )
-
-            gen_kwargs = {}
-            thinking_budget = _resolve_thinking_budget(request, request.model)
-            if thinking_budget is not None:
-                gen_kwargs["thinking_budget"] = thinking_budget
+            gen_kwargs = {**generation_options, **_cache_store_kwargs(http_request)}
             # A list prompt runs one engine request per prompt, so no single id.
             if len(prompts) == 1:
                 gen_kwargs["_request_id"] = inference_request_id
-            # Widen the repetition-penalty look-back window when the client
-            # asks for it (mlx-lm default window is 20 tokens).
-            repetition_context_size = getattr(
-                request, "repetition_context_size", None
-            )
-            if repetition_context_size is not None:
-                gen_kwargs["repetition_context_size"] = repetition_context_size
-            gen_kwargs.update(_no_repeat_ngram_kwargs(request))
-            gen_kwargs.update(_ignore_eos_kwargs(request))
-            gen_kwargs.update(_cache_store_kwargs(http_request))
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -4737,19 +4771,7 @@ async def create_completion(
             first_token_at = None
             for i, prompt in enumerate(prompts):
                 output = await engine.generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    min_p=min_p,
-                    repetition_penalty=repetition_penalty,
-                    presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty,
-                    xtc_probability=xtc_probability,
-                    xtc_threshold=xtc_threshold,
-                    stop=request.stop,
-                    seed=request.seed,
+                    prompt=prompt_token_ids_by_prompt[i] if isinstance(engine, M5SidecarEngine) else prompt,
                     **gen_kwargs,
                 )
                 if i == 0:
@@ -4826,11 +4848,10 @@ async def create_completion(
             http_request,
             _build_completion(),
             lease=lease,
-            headers=(
-                {_REQUEST_ID_HEADER: inference_request_id}
-                if len(prompts) == 1
-                else None
-            ),
+            headers={
+                **({_REQUEST_ID_HEADER: inference_request_id} if len(prompts) == 1 else {}),
+                **_inference_warning_headers(control_warnings),
+            },
         )
     except BaseException:
         await lease.release()
@@ -4838,9 +4859,9 @@ async def create_completion(
 
 
 def _merge_chat_template_kwargs(
-    request: ChatCompletionRequest, ms
-) -> tuple[dict, int | None]:
-    """Return the merged chat template kwargs and the thinking budget."""
+    request: ChatCompletionRequest, ms, thinking_budget: int | None
+) -> dict:
+    """Return merged chat template kwargs using the effective thinking budget."""
     merged_ct_kwargs = merge_chat_template_request_kwargs(
         ms,
         merge_reasoning_effort_chat_template_kwargs(
@@ -4854,14 +4875,13 @@ def _merge_chat_template_kwargs(
     # templates (e.g. Gemma 4) explicitly suppress thinking unless this
     # kwarg is True.  Set it before grammar compilation, which reads the
     # thinking state to build the reasoning phase.
-    thinking_budget = _resolve_thinking_budget(request, request.model)
     if (
         thinking_budget is not None
         and thinking_budget > 0
         and "enable_thinking" not in merged_ct_kwargs
     ):
         merged_ct_kwargs["enable_thinking"] = True
-    return merged_ct_kwargs, thinking_budget
+    return merged_ct_kwargs
 
 
 @dataclass
@@ -5084,7 +5104,9 @@ async def create_chat_completion(
             max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
             settings_guided_grammar = _settings_guided_grammar(ms)
-        merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
+        control_warnings = []
+        thinking_budget = _preflight_miv_thinking_budget(engine, request, control_warnings)
+        merged_ct_kwargs = _merge_chat_template_kwargs(request, ms, thinking_budget)
 
         chat_messages = _extract_chat_messages(
             request, engine, resolved_model, max_tool_result_tokens
@@ -5293,6 +5315,7 @@ async def create_chat_completion(
         # handled exception, but response already started" and the client sees
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
+        control_warnings.extend(_preflight_miv_request_controls(engine, request, chat_kwargs))
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
@@ -5316,8 +5339,7 @@ async def create_chat_completion(
                 "Cache-Control": "no-cache",
                 _REQUEST_ID_HEADER: inference_request_id,
             }
-            if response_format_warning:
-                sse_headers["Warning"] = response_format_warning
+            sse_headers.update(_inference_warning_headers(control_warnings, response_format_warning))
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -5516,8 +5538,7 @@ async def create_chat_completion(
             ).model_dump_json(exclude_none=True)
 
         json_headers = {_REQUEST_ID_HEADER: inference_request_id}
-        if response_format_warning:
-            json_headers["Warning"] = response_format_warning
+        json_headers.update(_inference_warning_headers(control_warnings, response_format_warning))
         return await _json_response_or_keepalive(
             http_request, _build_chat_completion(), lease=lease, headers=json_headers
         )
@@ -6076,6 +6097,7 @@ async def stream_completion(
     response_id: str | None = None,
     inference_request_id: str | None = None,
     skip_cache_store: bool = False,
+    generation_options: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -6089,65 +6111,24 @@ async def stream_completion(
         getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
     )
 
-    (
-        temperature,
-        top_p,
-        top_k,
-        repetition_penalty,
-        min_p,
-        presence_penalty,
-        frequency_penalty,
-        max_tokens,
-        xtc_probability,
-        xtc_threshold,
-    ) = get_sampling_params(
-        request.temperature,
-        request.top_p,
-        request.model,
-        req_top_k=getattr(request, "top_k", None),
-        req_repetition_penalty=getattr(request, "repetition_penalty", None),
-        req_min_p=getattr(request, "min_p", None),
-        req_presence_penalty=getattr(request, "presence_penalty", None),
-        req_frequency_penalty=getattr(request, "frequency_penalty", None),
-        req_max_tokens=request.max_tokens,
-        req_xtc_probability=getattr(request, "xtc_probability", None),
-        req_xtc_threshold=getattr(request, "xtc_threshold", None),
+    gen_kwargs = (
+        _completion_generation_options(request)
+        if generation_options is None else dict(generation_options)
     )
-    gen_kwargs = {}
-    thinking_budget = _resolve_thinking_budget(request, request.model)
-    if thinking_budget is not None:
-        gen_kwargs["thinking_budget"] = thinking_budget
     if inference_request_id is not None:
         gen_kwargs["_request_id"] = inference_request_id
     progress_request_id = None
     if request.return_progress:
         # The engine keys the prefill tracker by this id.
         progress_request_id = gen_kwargs.setdefault("_request_id", str(uuid.uuid4()))
-    # Widen the repetition-penalty look-back window when the client
-    # asks for it (mlx-lm default window is 20 tokens).
-    repetition_context_size = getattr(
-        request, "repetition_context_size", None
-    )
-    if repetition_context_size is not None:
-        gen_kwargs["repetition_context_size"] = repetition_context_size
-    gen_kwargs.update(_no_repeat_ngram_kwargs(request))
-    gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
     outputs = engine.stream_generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        min_p=min_p,
-        repetition_penalty=repetition_penalty,
-        presence_penalty=presence_penalty,
-        frequency_penalty=frequency_penalty,
-        xtc_probability=xtc_probability,
-        xtc_threshold=xtc_threshold,
-        stop=request.stop,
-        seed=request.seed,
+        prompt=(
+            prompt_token_ids
+            if isinstance(engine, M5SidecarEngine) and prompt_token_ids is not None
+            else prompt
+        ),
         **gen_kwargs,
     )
     if progress_request_id is not None:
@@ -7807,6 +7788,7 @@ class _AnthropicPrompt:
     native_reasoning: bool
     thinking_budget: int | None
     model_settings: object | None
+    control_warnings: list[str]
 
 
 async def _prepare_anthropic_prompt(
@@ -7907,7 +7889,8 @@ async def _prepare_anthropic_prompt(
     # Auto-set enable_thinking in chat template kwargs when a positive thinking
     # budget is active but enable_thinking was not already set (e.g. via
     # the Anthropic thinking.type field above or model settings).
-    thinking_budget = _resolve_thinking_budget(request, request.model)
+    control_warnings = []
+    thinking_budget = _preflight_miv_thinking_budget(engine, request, control_warnings)
     if (
         thinking_budget is not None
         and thinking_budget > 0
@@ -7968,6 +7951,7 @@ async def _prepare_anthropic_prompt(
         native_reasoning=native_reasoning,
         thinking_budget=thinking_budget,
         model_settings=ms,
+        control_warnings=control_warnings,
     )
 
 
@@ -8092,7 +8076,7 @@ async def create_anthropic_message(
         if prompt.thinking_budget is not None:
             chat_kwargs["thinking_budget"] = prompt.thinking_budget
 
-        if is_auto_mode_classifier_request(request):
+        if prompt.thinking_budget is None and is_auto_mode_classifier_request(request):
             # Claude Code sends no thinking field here for non-Claude model
             # names. Bound reasoning to its deadline, but do not turn it on.
             chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
@@ -8130,6 +8114,8 @@ async def create_anthropic_message(
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
+        control_warnings = prompt.control_warnings
+        control_warnings.extend(_preflight_miv_request_controls(engine, request, chat_kwargs))
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
@@ -8166,6 +8152,7 @@ async def create_anthropic_message(
                     "X-Accel-Buffering": "no",
                     "Cache-Control": "no-cache",
                     _REQUEST_ID_HEADER: inference_request_id,
+                    **_inference_warning_headers(control_warnings),
                 },
             )
 
@@ -8275,7 +8262,10 @@ async def create_anthropic_message(
             http_request,
             _build_anthropic_message(),
             lease=lease,
-            headers={_REQUEST_ID_HEADER: inference_request_id},
+            headers={
+                _REQUEST_ID_HEADER: inference_request_id,
+                **_inference_warning_headers(control_warnings),
+            },
         )
 
     except BaseException:
@@ -8432,7 +8422,8 @@ async def _tokenize_chat_messages(
     )
     ms = get_model_settings_for_request(chat_request.model)
     max_tool_result_tokens = ms.max_tool_result_tokens if ms else None
-    merged_ct_kwargs, _ = _merge_chat_template_kwargs(chat_request, ms)
+    thinking_budget = _preflight_miv_thinking_budget(engine, chat_request, [])
+    merged_ct_kwargs = _merge_chat_template_kwargs(chat_request, ms, thinking_budget)
     chat_messages = _extract_chat_messages(
         chat_request, engine, resolved_model, max_tool_result_tokens
     )
@@ -8726,7 +8717,8 @@ async def create_response(
 
         # Auto-set enable_thinking when a positive thinking budget is active.
         # Set it before grammar compilation, which reads the thinking state.
-        thinking_budget = _resolve_thinking_budget(request, request.model)
+        control_warnings = []
+        thinking_budget = _preflight_miv_thinking_budget(engine, request, control_warnings)
         if (
             thinking_budget is not None
             and thinking_budget > 0
@@ -8874,7 +8866,9 @@ async def create_response(
             request.top_p,
             request.model,
             req_top_k=getattr(request, "top_k", None),
-            req_repetition_penalty=getattr(request, "repetition_penalty", None),
+            req_repetition_penalty=request.repetition_penalty,
+            req_presence_penalty=request.presence_penalty,
+            req_frequency_penalty=request.frequency_penalty,
             req_max_tokens=request.max_output_tokens,
         )
         chat_kwargs = {
@@ -8941,6 +8935,7 @@ async def create_response(
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
+        control_warnings.extend(_preflight_miv_request_controls(engine, request, chat_kwargs))
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
@@ -8957,8 +8952,7 @@ async def create_response(
                 "Cache-Control": "no-cache",
                 _REQUEST_ID_HEADER: inference_request_id,
             }
-            if response_format_warning:
-                sse_headers["Warning"] = response_format_warning
+            sse_headers.update(_inference_warning_headers(control_warnings, response_format_warning))
             stream_state = _ResponsesStreamState()
             return StreamingResponse(
                 _release_after_stream(
@@ -9164,8 +9158,7 @@ async def create_response(
             return response_obj.model_dump_json()
 
         json_headers = {_REQUEST_ID_HEADER: inference_request_id}
-        if response_format_warning:
-            json_headers["Warning"] = response_format_warning
+        json_headers.update(_inference_warning_headers(control_warnings, response_format_warning))
         return await _json_response_or_keepalive(
             http_request, _build_responses_api(), lease=lease, headers=json_headers
         )

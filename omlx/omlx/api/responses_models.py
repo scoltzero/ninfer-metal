@@ -100,6 +100,11 @@ class ResponsesRequest(BaseModel):
     instructions: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = Field(default=None, gt=0)
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    thinking_budget: Optional[int] = Field(default=None, ge=0)
     max_output_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     tools: Optional[List[ResponsesTool]] = None

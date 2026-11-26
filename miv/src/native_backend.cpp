@@ -36,6 +36,7 @@
 #include "omlx_m5/mtp_forward.h"
 #include "omlx_m5/qwen_forward.h"
 #include "omlx_m5/target_verify_gpu.h"
+#include "native_request_controls.h"
 #include "omlx_m5/topology_profile.h"
 
 namespace omlx::m5::detail {
@@ -981,6 +982,26 @@ public:
       per_slot_extra_state += mtp_memory.state_bytes;
       memory.largest_buffer_bytes = std::max(memory.largest_buffer_bytes,
                                              mtp_memory.largest_buffer_bytes);
+      if (options.max_concurrency > 1 && prefix_cache.enabled()) {
+        const auto slots = std::uint64_t(options.max_concurrency);
+        const std::uint64_t logical_pages = (std::uint64_t(max_context) + 63U) / 64U;
+        const std::uint64_t page_bytes = kv_page_bytes(
+            kv_format, 64U, std::uint32_t(config.num_key_value_heads),
+            std::uint32_t(config.head_dim));
+        // Each slot can reach max_context; one spare page per slot covers
+        // writes to a retained partial page. Unpinned history yields under
+        // pressure through the same cache eviction path as target KV.
+        const auto desired_pages = slots * (logical_pages + 1U);
+        const auto buffer_limit = std::min<std::uint64_t>(
+            context.capabilities().max_buffer_length, 2ULL << 30);
+        if (page_bytes > 0 && desired_pages <= buffer_limit / page_bytes) {
+          mtp_shared_kv_pages = std::uint32_t(desired_pages);
+          per_slot_extra_state -= 2ULL * logical_pages * page_bytes;
+          memory.state_bytes += 2ULL * desired_pages * page_bytes;
+          memory.largest_buffer_bytes = std::max(
+              memory.largest_buffer_bytes, desired_pages * page_bytes);
+        }
+      }
       if (ext_mtp_materialization.has_value()) {
         companion_weights = ext_mtp_materialization->resident_bytes;
       }
@@ -1284,7 +1305,7 @@ public:
           program->final_norm_weight(), program->trunk_hidden_buffer(),
           program->normalization_weight_offset(), libraries,
           enable_m4_short_routes, lin_policy, sampling_contract, slot_kv_dtype,
-          &layers, &weights, nullptr);
+          &layers, &weights, nullptr, nullptr, mtp_shared_kv_pages);
       route_table_id += "+mtp-forward-v1:k" + std::to_string(mtp_draft_tokens);
       route_table_id += gpu_verifier
                             ? ":verify-gpu-" + gpu_family_tag
@@ -1337,7 +1358,8 @@ public:
             slot.program->trunk_hidden_buffer(),
             slot.program->normalization_weight_offset(), slot_libraries,
             slot_short_routes, lin_policy, sampling_contract, slot_kv_dtype,
-            &layers, &weights, &program->trunk_hidden_buffer());
+            &layers, &weights, &program->trunk_hidden_buffer(),
+            mtp_shared_kv_pages != 0U ? mtp.get() : nullptr);
       }
     }
 
@@ -1572,6 +1594,7 @@ public:
   std::string slot_kv_dtype = "bf16";
   std::uint32_t slot_dflash_draft_tokens = 0;
   std::uint32_t slot_mtp_draft_tokens = 0;
+  std::uint32_t mtp_shared_kv_pages = 0;
   bool slot_short_routes = false, slot_speculative = false,
        slot_mtp_enabled = false, slot_gpu_verify = false,
        slot_attention_split = false, slot_batch_enabled = false;
@@ -1738,6 +1761,8 @@ public:
         request_(std::move(request)), cancelled_(std::move(cancelled)),
         emit_(std::move(emit)), publisher_(request_.stop_token_seqs, emit_),
         sampling_(sampling) {
+    if (request_.sampling.has_penalties() || request_.thinking_budget)
+      controls_.emplace(request_, std::uint32_t(owner_.config.vocab_size));
     owner_.spec_controller.reset_slot(slot_);
     if (slot_ < owner_.scheduler.bypass_skips.size())
       owner_.scheduler.bypass_skips[slot_] = 0;
@@ -1748,10 +1773,11 @@ public:
       prompt_.push_back(std::uint32_t(token));
 
     bool prefix_same_slot = false;
+    bool restored_mtp_prefix = false;
     if (owner_.prefix_cache.enabled()) {
       const auto match = owner_.prefix_cache.find_best(
-          owner_.execution_identity, prompt_,
-          owner_.effective_prefill_contract());
+          owner_.execution_identity, prompt_, owner_.effective_prefill_contract(),
+          owner_.mtp_shared_kv_pages != 0U);
       if (match.has_value()) {
         bool cross_slot = false;
         auto &hit = owner_.prefix_cache.restore_into_slot(
@@ -1760,12 +1786,17 @@ public:
             cross_slot);
         prefix_same_slot = !cross_slot;
         offset_ = hit.tokens.size();
+        if (hit.mtp && owner_.mtp_shared_kv_pages != 0U) {
+          mtp()->restore_prefix(*hit.mtp, std::uint32_t(offset_ - 1U));
+          restored_mtp_prefix = true;
+        }
         matched_tokens_ = offset_;
         matched_entry_id_ = hit.id;
         matched_pinned_prefix_ = hit.pinned && (offset_ < prompt_.size());
         committed_tokens_.assign(hit.tokens.begin(), hit.tokens.end());
         if (offset_ == prompt_.size()) {
-          if (hit.sampled_key == make_sampling_key(request_.sampling)) {
+          if (!request_.sampling.has_penalties() &&
+              hit.sampled_key == make_sampling_key(request_.sampling)) {
             step_.token = hit.sampled_token;
           } else {
             pending_anchor_logits_ = hit.last_logits;
@@ -1814,8 +1845,8 @@ public:
     if (mtp()) {
       if (auto *mc = mtp_controller())
         mc->on_new_request();
-      bool reused_mtp_kv = false;
-      if (prefix_same_slot && offset_ > 0U &&
+      bool reused_mtp_kv = restored_mtp_prefix;
+      if (owner_.mtp_shared_kv_pages == 0U && prefix_same_slot && offset_ > 0U &&
           slot_ < owner_.slot_mtp_post_frontier.size()) {
         auto try_restore_mtp =
             [&](const NativeQwenState::SlotMtpFrontierSnapshot &snap) {
@@ -1885,6 +1916,7 @@ public:
       program().reset();
       if (mtp()) {
         const bool keep_mtp =
+            owner_.mtp_shared_kv_pages == 0U &&
             !unwinding && !cancelled_->load(std::memory_order_acquire) &&
             owner_.prefix_cache.enabled() &&
             slot_ < owner_.slot_mtp_post_frontier.size() &&
@@ -1926,7 +1958,62 @@ public:
     }
   }
 
+  [[nodiscard]] PositionSamplingRow controlled_row(
+      std::uint64_t position, bool valid = true) const {
+    return {.seed = sampling_.seed,
+            .position = position,
+            .top_k = sampling_.top_k,
+            .temperature = sampling_.temperature,
+            .top_p = sampling_.top_p,
+            .valid = static_cast<std::uint32_t>(valid)};
+  }
+
+  RequestGpuSampler &controlled_sampler() {
+    if (!request_sampler_) {
+      const auto vocabulary = std::uint32_t(owner_.config.vocab_size);
+      request_sampler_ = std::make_unique<RequestGpuSampler>(
+          owner_.context, owner_.slot_libraries,
+          program().verification_logits_buffer(), vocabulary,
+          std::min<std::size_t>(controls_->max_penalty_tokens(), vocabulary));
+    }
+    return *request_sampler_;
+  }
+
+  void apply_controlled_sample(QwenForwardResult &result, bool cached = false) {
+    if (!controls_)
+      return;
+    if (const auto forced = controls_->forced_token()) {
+      result.token = *forced;
+      return;
+    }
+    if (!request_.sampling.has_penalties())
+      return;
+    std::vector<RequestPenaltyToken> penalties;
+    controls_->append_penalties(penalties);
+    const auto row = controlled_row(program().position());
+    const std::array<std::uint32_t, 2> range{0U, std::uint32_t(penalties.size())};
+    auto selected =
+        cached ? controlled_sampler().sample_cached(
+                     row, pending_anchor_logits_, penalties)
+               : controlled_sampler().sample(std::span(&row, 1),
+                                             std::span(&range, 1), penalties,
+                                             program().last_logits_row());
+    result.token = selected.tokens.front();
+    result.host_read_bytes += selected.host_read_bytes;
+    result.submission.dispatch_count += selected.submission.dispatch_count;
+    result.submission.timing.gpu_ms += selected.submission.timing.gpu_ms;
+    result.submission.timing.wall_ms += selected.submission.timing.wall_ms;
+  }
+
   void resolve_anchor_if_needed() {
+    const bool controlled_sample = controls_ &&
+        (request_.sampling.has_penalties() || controls_->forced_token().has_value());
+    if (controlled_sample) {
+      apply_controlled_sample(step_, needs_anchor_resample_);
+      pending_anchor_logits_.clear();
+      needs_anchor_resample_ = false;
+      return;
+    }
     if (!needs_anchor_resample_)
       return;
     step_.token = owner_.sample_anchor(pending_anchor_logits_, prompt_.size(),
@@ -1936,6 +2023,13 @@ public:
                                              skey, step_.token);
     pending_anchor_logits_.clear();
     needs_anchor_resample_ = false;
+  }
+
+  bool publish_token(std::int32_t token) {
+    const bool continued = publisher_.push(token);
+    if (controls_ && continued)
+      controls_->accept(token);
+    return continued;
   }
 
   [[nodiscard]] bool should_pin_prefix(std::size_t token_len) const noexcept {
@@ -2008,7 +2102,7 @@ public:
         slot_, owner_.execution_identity, sub, SamplingKey{}, 0u, false,
         pin_entry,
         [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
-        &inserted);
+        &inserted, 0, checkpoint_mtp(offset_));
     if (pin_entry && inserted)
       pre_tail_pinned_ = true;
     {
@@ -2056,11 +2150,13 @@ public:
         slot_, owner_.execution_identity, sub, SamplingKey{}, 0u,
         /*include_anchor_logits=*/false, /*pin_entry=*/false,
         [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
-        &inserted, /*supersede_entry_id=*/matched_entry_id_);
+        &inserted, /*supersede_entry_id=*/matched_entry_id_,
+        checkpoint_mtp(prefix_len));
     if (inserted && slot_ < owner_.slot_rolling_think_anchor_ids.size()) {
       saved_think_anchor_id_ = owner_.prefix_cache.last_inserted_id();
       owner_.slot_rolling_think_anchor_ids[slot_] = saved_think_anchor_id_;
-      if (slot_ < owner_.slot_mtp_think_frontier.size()) {
+      if (owner_.mtp_shared_kv_pages == 0U &&
+          slot_ < owner_.slot_mtp_think_frontier.size()) {
         owner_.slot_mtp_think_frontier[slot_].clear();
         if (mtp_active() && prefix_len == offset_ && offset_ > 0U &&
             mtp()->committed_tokens() + 1U == std::uint32_t(offset_) &&
@@ -2145,12 +2241,35 @@ public:
     const auto evicted = owner_.prefix_cache.insert_checkpoint(
         slot_, owner_.execution_identity, prompt_,
         make_sampling_key(request_.sampling), step_.token, true, pin_entry,
-        [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); });
+        [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
+        nullptr, 0, checkpoint_mtp(offset_));
     {
       std::scoped_lock lock(backend_.stats_mutex_);
       backend_.backend_stats_.prefix_evictions += evicted;
       backend_.backend_stats_.prefix_pinned_entries =
           owner_.prefix_cache.pinned_count();
+    }
+  }
+
+  std::optional<MtpPrefixCheckpoint> checkpoint_mtp(std::size_t target_pos) {
+    if (owner_.mtp_shared_kv_pages == 0U || !mtp_active() || target_pos == 0U ||
+        mtp()->committed_tokens() + 1U != target_pos ||
+        !mtp()->has_pending_trunk()) {
+      return std::nullopt;
+    }
+    return mtp()->checkpoint_prefix();
+  }
+
+  void seal_mtp_after_decode(std::size_t pos) {
+    if (mtp_active() && pos > 0U &&
+        !(mtp()->committed_tokens() + 1U == pos && mtp()->has_pending_trunk()) &&
+        !last_mtp_round_committed_.empty() &&
+        mtp()->committed_tokens() + last_mtp_round_committed_.size() == pos) {
+      try {
+        (void)mtp()->seal_post_verify_frontier(last_mtp_round_committed_, true);
+      } catch (...) {
+        // A failed optional cache save does not invalidate the result.
+      }
     }
   }
 
@@ -2171,12 +2290,14 @@ public:
     }
     const std::uint64_t supersede_id =
         (saved_think_anchor_id_ != 0ULL) ? 0ULL : matched_entry_id_;
+    if (owner_.mtp_shared_kv_pages != 0U)
+      seal_mtp_after_decode(pos);
     bool inserted = false;
     const auto evicted = owner_.prefix_cache.insert_checkpoint(
         slot_, owner_.execution_identity, committed_tokens_, SamplingKey{}, 0u,
         /*include_anchor_logits=*/false, /*pin_entry=*/false,
         [&](std::size_t s) -> QwenForward & { return owner_.program_at(s); },
-        &inserted, /*supersede_entry_id=*/supersede_id);
+        &inserted, /*supersede_entry_id=*/supersede_id, checkpoint_mtp(pos));
     if (inserted && slot_ < owner_.slot_rolling_post_ids.size()) {
       owner_.slot_rolling_post_ids[slot_] =
           owner_.prefix_cache.last_inserted_id();
@@ -2186,20 +2307,11 @@ public:
           owner_.slot_mtp_think_frontier[slot_].clear();
         }
       }
-      if (slot_ < owner_.slot_mtp_post_frontier.size()) {
+      if (owner_.mtp_shared_kv_pages == 0U &&
+          slot_ < owner_.slot_mtp_post_frontier.size()) {
         owner_.slot_mtp_post_frontier[slot_].clear();
         if (mtp_active() && pos > 0U) {
-          if (!(mtp()->committed_tokens() + 1U == std::uint32_t(pos) &&
-                mtp()->has_pending_trunk()) &&
-              !last_mtp_round_committed_.empty() &&
-              mtp()->committed_tokens() + last_mtp_round_committed_.size() ==
-                  pos) {
-            try {
-              (void)mtp()->seal_post_verify_frontier(last_mtp_round_committed_,
-                                                     true);
-            } catch (...) {
-            }
-          }
+          seal_mtp_after_decode(pos);
           if (mtp()->committed_tokens() + 1U == std::uint32_t(pos) &&
               mtp()->has_pending_trunk()) {
             auto snap = mtp()->snapshot_pending_trunk();
@@ -2228,7 +2340,7 @@ public:
   }
 
   [[nodiscard]] bool batchable() const {
-    if (cancelled_->load(std::memory_order_acquire) ||
+    if (controls_ || cancelled_->load(std::memory_order_acquire) ||
         in_flight_ar_.has_value() || in_flight_prefill_.has_value() ||
         in_flight_commit_.has_value())
       return false;
@@ -2293,7 +2405,7 @@ public:
                             prompt_.end());
     } else if (!pending_verify_) {
       const auto token = std::int32_t(step_.token);
-      if (!publisher_.push(token))
+      if (!publish_token(token))
         return finish_task(ExecutionResult{.finish_reason = "stop"});
       ++produced_;
       if (produced_ == std::uint32_t(request_.max_new_tokens)) {
@@ -2333,7 +2445,9 @@ public:
               return mtp()->propose(mtp_committed_tokens_, program().position(),
                                     pending_k_, sampling_, true, tokens_only);
             });
-      } else if (remaining > 1U && available > 1U) {
+      } else if (available > 1U &&
+                 (remaining > 1U ||
+                  (owner_.mtp_shared_kv_pages != 0U && owner_.rolling_prefix_cache))) {
         pending_proposal_.submission =
             pending_cost_->measure(RoundCostRecorder::draft, [&] {
               return mtp()->fold_committed_only(mtp_committed_tokens_, true);
@@ -2568,7 +2682,9 @@ public:
                                pending_input_.begin() + std::ptrdiff_t(count));
     }
     if (pending_mtp_verify_) {
-      if (!batched_executed && count > 0) {
+      if (count > 0) {
+        // Packed verification leaves each slot's trunk rows in its own buffer.
+        // Replaying the commit ICBs together does not change those rows.
         last_mtp_round_committed_.assign(
             pending_input_.begin(),
             pending_input_.begin() + std::ptrdiff_t(count));
@@ -2630,7 +2746,7 @@ public:
                              .finish_reason = "cancelled"};
     const bool stopped = pending_cost_->measure(RoundCostRecorder::publish, [&] {
       for (std::size_t i = 0; i < count; ++i)
-        if (!publisher_.push(pc.verified.licensed_outputs[i]))
+        if (!publish_token(pc.verified.licensed_outputs[i]))
           return true;
       if (produced_ + count == std::uint32_t(request_.max_new_tokens))
         publisher_.finish();
@@ -2768,7 +2884,8 @@ public:
     if (in_flight_prefill_.has_value()) {
       flush_in_flight_prefill(had_active_decodes);
     }
-    resolve_anchor_if_needed();
+    if (produced_ == 0)
+      resolve_anchor_if_needed();
     auto out = draft() ? advance_dflash()
                        : (mtp_active() ? advance_mtp() : advance_ar());
     if (out.has_value() && out->kind == EventKind::finished) {
@@ -2906,6 +3023,62 @@ private:
       ProgT &prog, std::span<const std::uint32_t> input,
       std::span<const SelectorStep> steps, RoundCostRecorder &cost,
       TargetGpuVerifyDecision &out_selected) {
+    if (controls_) {
+      auto trial = *controls_;
+      std::array<PositionSamplingRow, 8> rows{};
+      std::array<std::optional<std::uint32_t>, 8> forced{};
+      std::array<std::array<std::uint32_t, 2>, 8> ranges{};
+      std::vector<RequestPenaltyToken> penalties;
+      const auto width = steps.size() + 1;
+      const auto pos = prog.position();
+      bool has_controls = request_.sampling.has_penalties();
+      bool needs_sample = false;
+      for (std::size_t i = 0; i < width; ++i) {
+        forced.at(i) = trial.forced_token();
+        has_controls |= forced[i].has_value();
+        needs_sample |= !forced[i];
+        rows[i] = controlled_row(pos + i + 1, !forced[i]);
+        ranges[i][0] = std::uint32_t(penalties.size());
+        if (!forced[i])
+          trial.append_penalties(penalties);
+        ranges[i][1] = std::uint32_t(penalties.size()) - ranges[i][0];
+        if (i < steps.size())
+          trial.accept(steps[i].token);
+      }
+      if (has_controls) {
+        step_ = cost.measure(RoundCostRecorder::verify, [&] {
+          return with_page_pressure([&] { return prog.verify(input, sampling_); });
+        });
+        if (cancelled_->load(std::memory_order_acquire))
+          return true;
+        const auto sample_begin = RoundCostRecorder::Clock::now();
+        PositionSamplingResult selected;
+        try {
+          if (needs_sample)
+            selected = controlled_sampler().sample(std::span(rows).first(width),
+                std::span(ranges).first(width), penalties, 0U);
+        } catch (...) {
+          prog.abort_verify();
+          throw;
+        }
+        out_selected.host_read_bytes = selected.host_read_bytes;
+        out_selected.submission = std::move(selected.submission);
+        auto &verified = out_selected.verification;
+        for (std::size_t i = 0; i < width; ++i) {
+          const auto token = forced[i] ? *forced[i] : selected.tokens[i];
+          verified.licensed_outputs.push_back(std::int32_t(token));
+          if (i == steps.size())
+            break;
+          if (std::int32_t(token) != steps[i].token) {
+            verified.used_correction = true;
+            break;
+          }
+          ++verified.accepted_proposals;
+        }
+        cost.add_select(RoundCostRecorder::milliseconds(sample_begin));
+        return true;
+      }
+    }
     if constexpr (kProgramHasAsyncVerify<ProgT>) {
       if (owner_.active_occupied_count() == 1U && verifier() != nullptr &&
           verifier()->can_enqueue_select(true) &&
@@ -2970,7 +3143,7 @@ private:
 
   std::optional<ExecutionResult> advance_ar() {
     const auto token = std::int32_t(step_.token);
-    if (!publisher_.push(token)) {
+    if (!publish_token(token)) {
       drain_in_flight_ar();
       return ExecutionResult{.finish_reason = "stop"};
     }
@@ -2983,7 +3156,7 @@ private:
     const auto ar_begin = RoundCostRecorder::Clock::now();
     const bool solo_async =
         owner_.active_occupied_count() == 1U &&
-        program().can_pipeline_ar(sampling_);
+        !controls_ && program().can_pipeline_ar(sampling_);
     const auto max_ctx = std::uint32_t(backend_.options_.max_context);
     if (in_flight_ar_.has_value()) {
       std::optional<QwenAsyncArStep> next_ar;
@@ -3014,6 +3187,7 @@ private:
     } else {
       const std::array<std::uint32_t, 1> input{std::uint32_t(token)};
       step_ = with_page_pressure([&] { return program().run(input, sampling_); });
+      apply_controlled_sample(step_);
       committed_tokens_.push_back(std::uint32_t(token));
     }
     record_ar_step();
@@ -3040,7 +3214,7 @@ private:
   std::optional<ExecutionResult> advance_dflash() {
     if (produced_ == 0) {
       anchor_ = step_.token;
-      if (!publisher_.push(std::int32_t(anchor_)))
+      if (!publish_token(std::int32_t(anchor_)))
         return ExecutionResult{.finish_reason = "stop"};
       produced_ = 1;
       if (produced_ == std::uint32_t(request_.max_new_tokens)) {
@@ -3240,7 +3414,7 @@ private:
     }
     const bool stopped = cost.measure(RoundCostRecorder::publish, [&] {
       for (std::size_t i = 0; i < count; ++i)
-        if (!publisher_.push(verified.licensed_outputs[i]))
+        if (!publish_token(verified.licensed_outputs[i]))
           return true;
       if (produced_ + count == std::uint32_t(request_.max_new_tokens))
         publisher_.finish();
@@ -3264,7 +3438,7 @@ private:
   std::optional<ExecutionResult> advance_mtp() {
     if (produced_ == 0) {
       anchor_ = step_.token;
-      if (!publisher_.push(std::int32_t(anchor_)))
+      if (!publish_token(std::int32_t(anchor_)))
         return ExecutionResult{.finish_reason = "stop"};
       produced_ = 1;
       mtp_committed_tokens_.assign(1U, anchor_);
@@ -3292,6 +3466,7 @@ private:
       const std::array<std::uint32_t, 1> input{anchor_};
       const auto ar_begin = RoundCostRecorder::Clock::now();
       step_ = with_page_pressure([&] { return program().run(input, sampling_); });
+      apply_controlled_sample(step_);
       committed_tokens_.push_back(anchor_);
       flush_in_flight_commit();
       const double ar_wall = RoundCostRecorder::milliseconds(ar_begin);
@@ -3335,6 +3510,7 @@ private:
       }
       const std::array<std::uint32_t, 1> input{anchor_};
       step_ = with_page_pressure([&] { return program().run(input, sampling_); });
+      apply_controlled_sample(step_);
       committed_tokens_.push_back(anchor_);
       if ((remaining > 1U || keep_rolling_mtp) && available > 1U) {
         last_mtp_round_committed_.assign(1U, anchor_);
@@ -3367,7 +3543,7 @@ private:
         }
       }
       const auto next_tok = std::int32_t(step_.token);
-      if (!publisher_.push(next_tok))
+      if (!publish_token(next_tok))
         return ExecutionResult{.finish_reason = "stop"};
       ++produced_;
       anchor_ = step_.token;
@@ -3570,7 +3746,7 @@ private:
     }
     const bool stopped = cost.measure(RoundCostRecorder::publish, [&] {
       for (std::size_t i = 0; i < count; ++i)
-        if (!publisher_.push(verified.licensed_outputs[i]))
+        if (!publish_token(verified.licensed_outputs[i]))
           return true;
       if (produced_ + count == std::uint32_t(request_.max_new_tokens))
         publisher_.finish();
@@ -3606,6 +3782,8 @@ private:
   EmitTokens emit_;
   TokenPublisher publisher_;
   GpuSamplingOptions sampling_;
+  std::optional<RequestControlState> controls_;
+  std::unique_ptr<RequestGpuSampler> request_sampler_;
   QwenForwardResult step_;
   std::vector<std::uint32_t> prompt_, pending_input_, mtp_committed_tokens_,
       last_mtp_round_committed_, committed_tokens_;
@@ -3648,6 +3826,23 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
   ar_program_ = std::make_unique<NativeQwenState>(
       model_dir, artifact, libraries,
       static_cast<std::uint32_t>(options.max_context), options);
+  if (ar_program_->mtp_shared_kv_pages != 0U) {
+    for (std::size_t slot = 0; slot < ar_program_->occupied.size(); ++slot) {
+      ar_program_->mtp_at(slot)->set_kv_reclaimer([this] {
+        if (!ar_program_->prefix_cache.evict_for_mtp_page_pressure(
+                [this](std::size_t s) -> QwenForward & {
+                  return ar_program_->program_at(s);
+                })) {
+          return false;
+        }
+        std::scoped_lock lock(stats_mutex_);
+        ++backend_stats_.prefix_evictions;
+        backend_stats_.prefix_pinned_entries =
+            ar_program_->prefix_cache.pinned_count();
+        return true;
+      });
+    }
+  }
   if (options_.speculative.backend == SpeculativeBackend::dflash2) {
     options_.speculative.draft_tokens = ar_program_->slot_dflash_draft_tokens;
   }
@@ -3796,7 +3991,7 @@ NativeBackend::start(SubmitRequest request,
       prompt_u32.push_back(std::uint32_t(token));
     if (const auto match = owner.prefix_cache.find_best(
             owner.execution_identity, prompt_u32,
-            owner.effective_prefill_contract())) {
+            owner.effective_prefill_contract(), owner.mtp_shared_kv_pages != 0U)) {
       if (match->preferred_slot < owner.occupied.size() &&
           !owner.occupied[match->preferred_slot]) {
         slot = match->preferred_slot; // Local zero-copy affinity when free.

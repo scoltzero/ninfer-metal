@@ -1,6 +1,7 @@
 #include "omlx_m5/engine.h"
 #include "omlx_m5/position_sampling.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -112,6 +113,35 @@ public:
     }
     if (request.sampling.top_k < 0) {
       throw std::invalid_argument("top_k must not be negative");
+    }
+    const auto &sampling = request.sampling;
+    if (!std::isfinite(sampling.repetition_penalty) ||
+        sampling.repetition_penalty <= 0 ||
+        !std::isfinite(sampling.presence_penalty) ||
+        !std::isfinite(sampling.frequency_penalty) ||
+        sampling.repetition_context_size <= 0) {
+      throw std::invalid_argument("invalid sampling penalties or repetition_context_size");
+    }
+    if ((sampling.has_penalties() || request.thinking_budget) &&
+        load_options_.sampling_contract != kDefaultServingSamplingContract) {
+      throw std::invalid_argument(
+          "sampling penalties and thinking_budget require position_coupled_v1");
+    }
+    if (const auto &thinking = request.thinking_budget) {
+      const auto has_negative = [](const auto &ids) {
+        return std::any_of(ids.begin(), ids.end(),
+                           [](std::int32_t id) { return id < 0; });
+      };
+      if (thinking->budget < 0 || thinking->end_token_ids.empty() ||
+          has_negative(thinking->start_token_ids) ||
+          has_negative(thinking->end_token_ids) ||
+          has_negative(thinking->force_token_ids) ||
+          (!thinking->force_token_ids.empty() &&
+           std::search(thinking->force_token_ids.begin(), thinking->force_token_ids.end(),
+                       thinking->end_token_ids.begin(), thinking->end_token_ids.end()) ==
+               thinking->force_token_ids.end())) {
+        throw std::invalid_argument("invalid thinking_budget or closing token sequence");
+      }
     }
     for (const auto &stop_sequence : request.stop_token_seqs) {
       if (stop_sequence.empty()) {

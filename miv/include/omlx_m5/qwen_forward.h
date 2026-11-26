@@ -403,6 +403,7 @@ public:
   [[nodiscard]] std::vector<std::byte> read_last_logits_bf16() const;
   // Shared BF16 verify output; valid after verify and before commit/abort.
   [[nodiscard]] const MetalBuffer &verification_logits_buffer() const;
+  [[nodiscard]] std::uint32_t last_logits_row() const;
   [[nodiscard]] const MetalBuffer &normed_hidden_buffer() const;
   [[nodiscard]] const MetalBuffer &trunk_hidden_buffer() const;
   [[nodiscard]] const MaterializedWeightView &final_norm_weight() const;

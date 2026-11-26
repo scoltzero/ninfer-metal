@@ -378,8 +378,14 @@ def test_stale_socket_recovery_and_signals(daemon: Path) -> None:
 
 
 def run_session(
-    daemon: Path, load: dict, *, expected: dict, load_error: str = ""
-) -> None:
+    daemon: Path,
+    load: dict,
+    *,
+    expected: dict,
+    load_error: str = "",
+    check_request_controls: bool = False,
+) -> list[int] | None:
+    controlled_tokens = None
     with tempfile.TemporaryDirectory(prefix="omlx-mseries-sidecar-") as temporary:
         socket_path = Path(temporary) / "provider.sock"
         process = subprocess.Popen(
@@ -469,6 +475,36 @@ def run_session(
                 assert request_stats["prefix_restored_tokens"] == 0
                 if stats["speculative_backend"] == "dflash2":
                     assert request_stats["spec_rounds"] > 0
+            if check_request_controls:
+                assert {"thinking_budget", "sampling_penalties"} <= set(hello["capabilities"])
+                forced_close = [7, 9, 10]
+                controlled = {
+                    **request,
+                    "sampling": {
+                        "temperature": 0.7,
+                        "top_k": 16,
+                        "top_p": 0.9,
+                        "seed": 43,
+                        "repetition_penalty": 1.35,
+                        "repetition_context_size": 24,
+                        "presence_penalty": 0.5,
+                        "frequency_penalty": 0.25,
+                    },
+                    "thinking_budget": {
+                        "budget": 0,
+                        "start_in_thinking": True,
+                        "start_token_ids": [6, 12],
+                        "end_token_ids": [9, 10],
+                        "force_token_ids": forced_close,
+                    },
+                }
+                rid = client.call("submit", controlled)["request_id"]
+                controlled_tokens, controlled_terminal = collect(client, rid)
+                assert controlled_terminal["kind"] == "finished", controlled_terminal
+                assert controlled_tokens[:len(forced_close)] == forced_close, controlled_tokens
+                assert len(controlled_tokens) == controlled["max_new_tokens"]
+                if stats["speculative_backend"] == "dflash2":
+                    assert controlled_terminal["request_stats"]["spec_rounds"] > 0
             capacity = client.call("capacity")
             assert capacity["max_concurrency"] == 1
             assert capacity["pid"] == process.pid
@@ -509,6 +545,7 @@ def run_session(
                 stdout, stderr = process.communicate()
             assert process.returncode == 0, (stdout, stderr)
             assert not socket_path.exists()
+    return controlled_tokens
 
 
 def test_lora_cli_and_spi_hot_reload(daemon: Path) -> None:
@@ -715,7 +752,7 @@ def main() -> int:
             "qwen_ar_metallib": str(qwen_metallib),
         },
     }
-    run_session(
+    controlled_ar = run_session(
         daemon,
         {
             **base,
@@ -731,6 +768,7 @@ def main() -> int:
             "actual_t": 1,
             "actual_k": 0,
         },
+        check_request_controls=True,
     )
     run_session(
         daemon,
@@ -754,7 +792,7 @@ def main() -> int:
         },
         load_error="companion/target geometry mismatch",
     )
-    run_session(
+    controlled_dflash = run_session(
         daemon,
         {
             **base,
@@ -774,7 +812,9 @@ def main() -> int:
             "model_execution_kind": "qwen_dense",
             "kernel_family": "qwen_dflash2_forward_a16_metal4",
         },
+        check_request_controls=True,
     )
+    assert controlled_dflash == controlled_ar, (controlled_ar, controlled_dflash)
     print(json.dumps({"schema": "omlx-mseries-sidecar-smoke-v1", "passed": True}))
     return 0
 

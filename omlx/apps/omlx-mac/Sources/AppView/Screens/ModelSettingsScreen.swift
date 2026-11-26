@@ -1276,7 +1276,8 @@ private struct GenerationSection: View {
                         ? vm.vlmMtpProcessorLockedReason
                         : String(localized: "settings.basic.repetition_penalty.sub",
                                  defaultValue: "Penalize repeated tokens (−2 to 2).",
-                                 comment: "Sublabel describing repetition-penalty range")) {
+                                 comment: "Sublabel describing repetition-penalty range"),
+                    mivSetting: vm.isMivSetting("repetition_penalty")) {
                     TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
@@ -1288,7 +1289,8 @@ private struct GenerationSection: View {
                         ? vm.vlmMtpProcessorLockedReason
                         : String(localized: "settings.basic.presence_penalty.sub",
                                  defaultValue: "Penalize tokens already present (−2 to 2).",
-                                 comment: "Sublabel describing presence-penalty range")) {
+                                 comment: "Sublabel describing presence-penalty range"),
+                    mivSetting: vm.isMivSetting("presence_penalty")) {
                     TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: .controlNarrow)
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
@@ -1363,7 +1365,8 @@ private struct AdvancedPage: View {
                                   comment: "Row label for the thinking budget field"),
                     sublabel: String(localized: "settings.advanced.thinking_budget.sub",
                                      defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
-                                     comment: "Sublabel for the thinking budget field")) {
+                                     comment: "Sublabel for the thinking budget field"),
+                    mivSetting: vm.isMivSetting("thinking_budget_enabled")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),

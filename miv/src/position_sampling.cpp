@@ -52,10 +52,13 @@ U32 position_sample_candidates(std::span<const U32> ids,std::span<const float> s
 }
 struct PositionKeyedSampler::Impl {
   const MetalContext &ctx;U32 vocab,max_rows;MetalBuffer parts,meta,ids,scores;Profile profile;U64 options_offset=0,geometry_offset=0;
-  Impl(const MetalContext &c,const MetalBuffer &x,U32 v,U32 rows,const std::filesystem::path &libs):ctx(c),vocab(v),max_rows(rows) {
+  Impl(const MetalContext &c,const MetalBuffer &x,U32 v,U32 rows,
+       const std::filesystem::path &libs,std::string_view plan_key):ctx(c),vocab(v),max_rows(rows) {
     if(!v||!rows||rows>128||x.size()<mul(mul(rows,v),2))throw std::invalid_argument("position sampler geometry");
     parts=c.make_buffer(U64(rows)*64*16);meta=c.make_buffer(U64(rows)*8);ids=c.make_buffer(U64(rows)*64*4);scores=c.make_buffer(ids.size());
-    static std::atomic<U64> id{0};Encoder e(c,libs,rows,"position.sampler.v2."+std::to_string(++id));
+    static std::atomic<U64> id{0};
+    Encoder e(c,libs,rows,plan_key.empty() ? "position.sampler.v2."+std::to_string(++id)
+                                          : std::string(plan_key));
     const std::vector<std::byte> init_opts(U64(rows)*sizeof(PositionSamplingRow));
     const auto init_geom=words({v,rows,rows,0});
     auto &d1=e.emit("position_sampling","omlx_m5_position_sample_logits_stage1",{.width=64U*256U,.height=rows},{.width=256},
@@ -71,7 +74,9 @@ struct PositionKeyedSampler::Impl {
       {.plan=&profile.plan,.bindings=profile.bindings,.parameters=&profile.parameters}));
   }
 };
-PositionKeyedSampler::PositionKeyedSampler(const MetalContext &c,const MetalBuffer &x,U32 v,U32 r,const std::filesystem::path &l):impl_(std::make_unique<Impl>(c,x,v,r,l)){}
+PositionKeyedSampler::PositionKeyedSampler(const MetalContext &c,const MetalBuffer &x,U32 v,U32 r,
+                                           const std::filesystem::path &l,std::string_view plan_key)
+  :impl_(std::make_unique<Impl>(c,x,v,r,l,plan_key)){}
 PositionKeyedSampler::~PositionKeyedSampler()=default;
 MetalSubmission PositionKeyedSampler::sample_device(std::span<const PositionSamplingRow> rows,bool icb) {
   auto &p=*impl_;if(rows.empty()||rows.size()>p.max_rows)throw std::invalid_argument("position rows outside installed envelope");

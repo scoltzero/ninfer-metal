@@ -26,6 +26,7 @@ NB_MODULE(omlx_m5_native, module) {
   using omlx::m5::SpeculativeOptions;
   using omlx::m5::StatsReport;
   using omlx::m5::SubmitRequest;
+  using omlx::m5::ThinkingBudget;
   using omlx::m5::TokenEvent;
 
   module.doc() = "Native and fake backends for the oMLX M5 runtime";
@@ -66,7 +67,19 @@ NB_MODULE(omlx_m5_native, module) {
       .def_rw("top_p", &SamplingSpec::top_p)
       .def_rw("min_p", &SamplingSpec::min_p)
       .def_rw("top_k", &SamplingSpec::top_k)
-      .def_rw("seed", &SamplingSpec::seed);
+      .def_rw("seed", &SamplingSpec::seed)
+      .def_rw("repetition_penalty", &SamplingSpec::repetition_penalty)
+      .def_rw("repetition_context_size", &SamplingSpec::repetition_context_size)
+      .def_rw("presence_penalty", &SamplingSpec::presence_penalty)
+      .def_rw("frequency_penalty", &SamplingSpec::frequency_penalty);
+
+  nb::class_<ThinkingBudget>(module, "ThinkingBudget")
+      .def(nb::init<>())
+      .def_rw("budget", &ThinkingBudget::budget)
+      .def_rw("start_in_thinking", &ThinkingBudget::start_in_thinking)
+      .def_rw("start_token_ids", &ThinkingBudget::start_token_ids)
+      .def_rw("end_token_ids", &ThinkingBudget::end_token_ids)
+      .def_rw("force_token_ids", &ThinkingBudget::force_token_ids);
 
   nb::class_<SubmitRequest>(module, "SubmitRequest")
       .def(nb::init<>())
@@ -74,7 +87,8 @@ NB_MODULE(omlx_m5_native, module) {
       .def_rw("max_new_tokens", &SubmitRequest::max_new_tokens)
       .def_rw("sampling", &SubmitRequest::sampling)
       .def_rw("stop_token_seqs", &SubmitRequest::stop_token_seqs)
-      .def_rw("pin_prefix", &SubmitRequest::pin_prefix);
+      .def_rw("pin_prefix", &SubmitRequest::pin_prefix)
+      .def_rw("thinking_budget", &SubmitRequest::thinking_budget);
 
   nb::class_<RequestStats>(module, "RequestStats")
       .def_ro("prefix_restored_tokens", &RequestStats::prefix_restored_tokens)

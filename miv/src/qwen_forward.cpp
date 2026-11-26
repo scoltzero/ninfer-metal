@@ -8889,12 +8889,16 @@ std::vector<float> QwenForward::read_logits(U32 count) const {
     throw std::invalid_argument("Qwen logits count");
   return bf16_values(*impl_->logits.buffer, U64(count) * impl_->v);
 }
-std::vector<std::byte> QwenForward::read_last_logits_bf16() const {
+std::uint32_t QwenForward::last_logits_row() const {
   const auto &p = *impl_;
   if (p.pending_verify || !p.has_last_logits)
     throw std::logic_error("Qwen committed last logits unavailable");
+  return p.last_logits_row;
+}
+std::vector<std::byte> QwenForward::read_last_logits_bf16() const {
+  const auto &p = *impl_;
   const U64 row_bytes = mul(p.v, 2);
-  const U64 offset = mul(p.last_logits_row, row_bytes);
+  const U64 offset = mul(last_logits_row(), row_bytes);
   if (offset + row_bytes > p.logits.bytes)
     throw std::out_of_range("Qwen last logits row outside buffer");
   return p.logits.buffer->read(offset, row_bytes);

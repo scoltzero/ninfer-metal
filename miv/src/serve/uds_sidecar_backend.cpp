@@ -392,6 +392,8 @@ struct UdsSidecarBackend::Impl {
   std::string provider_id;
   std::uint32_t protocol_version = 2;
   bool supports_subscribe_events = false;
+  bool supports_thinking_budget = false;
+  bool supports_sampling_penalties = false;
   std::filesystem::path socket_dir;
   std::filesystem::path socket_path;
 
@@ -769,10 +771,13 @@ struct UdsSidecarBackend::Impl {
         supports_subscribe_events = true;
       } else {
         for (const auto &cap : hello.at("capabilities")) {
-          if (cap.is_string() && cap.get<std::string>() == "subscribe_events") {
-            supports_subscribe_events = true;
-            break;
+          if (!cap.is_string()) {
+            continue;
           }
+          const auto &name = cap.get_ref<const std::string &>();
+          supports_subscribe_events |= name == "subscribe_events";
+          supports_thinking_budget |= name == "thinking_budget";
+          supports_sampling_penalties |= name == "sampling_penalties";
         }
       }
     }
@@ -1022,7 +1027,18 @@ UdsSidecarBackend::~UdsSidecarBackend() { shutdown(); }
 
 std::uint64_t UdsSidecarBackend::submit(SubmitRequest request) {
   impl_->ensure_event_stream_open();
-  const Json params = {
+  const bool coupled =
+      impl_->options.load_options.sampling_contract == "position_coupled_v1";
+  if (request.thinking_budget && (!impl_->supports_thinking_budget || !coupled)) {
+    throw std::invalid_argument(
+        "thinking_budget is not supported by this sidecar and sampling contract");
+  }
+  if (request.sampling.has_penalties() &&
+      (!impl_->supports_sampling_penalties || !coupled)) {
+    throw std::invalid_argument(
+        "sampling penalties are not supported by this sidecar and sampling contract");
+  }
+  Json params = {
       {"prompt_tokens", request.prompt_tokens},
       {"max_new_tokens", request.max_new_tokens},
       {"sampling",
@@ -1036,6 +1052,22 @@ std::uint64_t UdsSidecarBackend::submit(SubmitRequest request) {
       {"stop_token_seqs", request.stop_token_seqs},
       {"pin_prefix", request.pin_prefix},
   };
+  if (request.sampling.has_penalties()) {
+    auto &sampling = params.at("sampling");
+    sampling["repetition_penalty"] = request.sampling.repetition_penalty;
+    sampling["repetition_context_size"] = request.sampling.repetition_context_size;
+    sampling["presence_penalty"] = request.sampling.presence_penalty;
+    sampling["frequency_penalty"] = request.sampling.frequency_penalty;
+  }
+  if (const auto &budget = request.thinking_budget) {
+    params["thinking_budget"] = {
+        {"budget", budget->budget},
+        {"start_in_thinking", budget->start_in_thinking},
+        {"start_token_ids", budget->start_token_ids},
+        {"end_token_ids", budget->end_token_ids},
+        {"force_token_ids", budget->force_token_ids},
+    };
+  }
   const Json result = impl_->control_call("submit", params);
   const auto req_id = result.at("request_id").get<std::uint64_t>();
   {

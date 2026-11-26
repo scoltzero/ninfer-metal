@@ -610,6 +610,29 @@ omlx::m5::SubmitRequest submit_request(const Json &value) {
   result.sampling.min_p = sampling.value("min_p", 0.0F);
   result.sampling.top_k = sampling.value("top_k", 0);
   result.sampling.seed = sampling.value("seed", 0ULL);
+  result.sampling.repetition_penalty = sampling.value("repetition_penalty", 1.0F);
+  result.sampling.presence_penalty = sampling.value("presence_penalty", 0.0F);
+  result.sampling.frequency_penalty = sampling.value("frequency_penalty", 0.0F);
+  result.sampling.repetition_context_size =
+      sampling.value("repetition_context_size", 20);
+  if (value.contains("thinking_budget") && !value.at("thinking_budget").is_null()) {
+    const auto &thinking = value.at("thinking_budget");
+    if (!thinking.is_object() || !thinking.contains("budget") ||
+        !thinking.at("budget").is_number_integer()) {
+      throw std::invalid_argument("thinking_budget requires an integer budget");
+    }
+    const auto budget = thinking.at("budget").get<std::int64_t>();
+    if (budget < 0 || budget > std::numeric_limits<std::int32_t>::max()) {
+      throw std::invalid_argument("thinking_budget is outside the supported range");
+    }
+    result.thinking_budget = omlx::m5::ThinkingBudget{
+        .budget = static_cast<std::int32_t>(budget),
+        .start_in_thinking = thinking.value("start_in_thinking", false),
+        .start_token_ids = thinking.value("start_token_ids", std::vector<std::int32_t>{}),
+        .end_token_ids = thinking.at("end_token_ids").get<std::vector<std::int32_t>>(),
+        .force_token_ids = thinking.value("force_token_ids", std::vector<std::int32_t>{}),
+    };
+  }
   result.stop_token_seqs =
       value.value("stop_token_seqs", std::vector<std::vector<std::int32_t>>{});
   result.pin_prefix = value.value("pin_prefix", false);
@@ -737,8 +760,8 @@ Json provider_contract() {
       {"capabilities",
        {"ar", "mtp", "dflash2", "lora", "reload_lora", "kv_affine4_g128",
         "rolling_prefix_cache", "trim_cache", "memory_budget_bytes",
-        "set_scheduler_hint", "cancel", "stats", "capacity",
-        "subscribe_events"}},
+        "set_scheduler_hint", "cancel", "stats", "capacity", "thinking_budget",
+        "sampling_penalties", "subscribe_events"}},
       {"kv_formats", {"bf16", "affine4_g128"}},
       {"speculative_limits", {{"mtp", omlx::m5::kMaxMtpDraftTokens},
                               {"dflash2", omlx::m5::kMaxDFlash2DraftTokens}}},

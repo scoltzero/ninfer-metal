@@ -973,8 +973,51 @@ QwenForwardMemoryPlan plan_mtp_forward_memory(const QwenModelConfig &c,
 // MtpForward::Impl
 // ---------------------------------------------------------------------------
 
+struct MtpPrefixCheckpoint::Lease {
+  explicit Lease(std::shared_ptr<KvPagePool> source)
+      : pool(std::move(source)), id(pool->retain_prefix()) {}
+  ~Lease() {
+    try {
+      pool->release_prefix(id);
+    } catch (...) {
+    }
+  }
+  std::shared_ptr<KvPagePool> pool;
+  std::uint64_t id;
+};
+
+const void *MtpPrefixCheckpoint::kv_allocator_id() const noexcept {
+  return lease_ ? lease_->pool->shared_allocator().get() : nullptr;
+}
+
+std::uint64_t MtpPrefixCheckpoint::non_kv_bytes() const noexcept {
+  // The retained lease and the cross-slot mapping each store page IDs.
+  return sizeof(Lease) + pending_trunk.size() +
+         2ULL * kv_pages.size() * sizeof(std::uint32_t);
+}
+
 class MtpForward::Impl {
 public:
+  struct SharedKv {
+    SharedKv(const MetalContext &context, U32 pages, KvStorageFormat format,
+             U32 kv_heads, U32 head_dim,
+             const std::filesystem::path &libraries)
+        : allocator(std::make_shared<SharedPhysicalPageAllocator>(pages)),
+          key(context.make_buffer(kv_slab_bytes(format, pages, 64U, kv_heads,
+                                                head_dim))),
+          value(context.make_buffer(kv_slab_bytes(format, pages, 64U, kv_heads,
+                                                  head_dim))),
+          copier(context, key, value, format, 64U, kv_heads, head_dim, pages,
+                 libraries, "mtp.kv_cow." + std::string(kv_storage_format_name(format)) +
+                                "." + std::to_string(kv_heads) + "." +
+                                std::to_string(head_dim) + "." +
+                                std::to_string(pages)) {}
+    std::shared_ptr<SharedPhysicalPageAllocator> allocator;
+    MetalBuffer key;
+    MetalBuffer value;
+    KvPageCopier copier;
+  };
+
   struct StepPatchOffsets {
     U64 qk_rope_offset = 0; // word 4 = rows, word 9 = start_position
     std::vector<U64> attn_param_offsets{}; // word 3 = rows, word 4 = cache_start
@@ -1022,7 +1065,8 @@ public:
        LinearNumericPolicy lin_pol, SamplingContract samp_contract,
        std::string_view kv_dtype, const QwenLayerCatalog *tgt_catalog,
        const MaterializedModel *tgt_weights,
-       const MetalBuffer *shared_pf_trunk)
+       const MetalBuffer *shared_pf_trunk, const Impl *shared_kv_primary,
+       U32 shared_kv_pages)
       : context(ctx), mtp_weights(mtp_w), config(std::move(cfg)),
         max_context(max_ctx), embedding(emb), head(hd_w),
         target_final_norm(tgt_final_norm),
@@ -1142,7 +1186,34 @@ public:
     const auto mem_plan = plan_mtp_forward_memory(
         config, max_context, kv_format == KvStorageFormat::Affine4Group128);
     priming_cap = mem_plan.workspace_rows;
+    const U32 pages = (max_context + 63U) / 64U;
+    if (shared_kv_primary) {
+      if (!shared_kv_primary->shared_kv || shared_kv_pages != 0U ||
+          &shared_kv_primary->context != &context ||
+          shared_kv_primary->kv_format != kv_format ||
+          shared_kv_primary->config.num_key_value_heads !=
+              config.num_key_value_heads ||
+          shared_kv_primary->config.head_dim != config.head_dim ||
+          shared_kv_primary->max_context != max_context) {
+        throw std::invalid_argument("MTP shared KV geometry differs");
+      }
+      shared_kv = shared_kv_primary->shared_kv;
+    } else if (shared_kv_pages != 0U) {
+      if (shared_kv_pages <= pages)
+        throw std::invalid_argument("MTP shared KV needs spare physical pages");
+      shared_kv = std::make_shared<SharedKv>(
+          context, shared_kv_pages, kv_format, U32(config.num_key_value_heads),
+          U32(config.head_dim), libraries);
+    }
+
     for (const auto &item : mem_plan.buffers) {
+      if (shared_kv && (item.name == "mtp_cache_key" ||
+                        item.name == "mtp_cache_value")) {
+        const auto &buffer =
+            item.name == "mtp_cache_key" ? shared_kv->key : shared_kv->value;
+        refs.emplace(item.name, Ref{&buffer, 0, buffer.size()});
+        continue;
+      }
       auto buf = std::make_unique<MetalBuffer>(context.make_buffer(item.bytes));
       refs.emplace(item.name, Ref{buf.get(), 0, item.bytes});
       if (item.clear_on_reset) {
@@ -1153,9 +1224,13 @@ public:
     const_cast<MetalBuffer *>(get("zero").buffer)
         ->write(std::vector<std::byte>(256));
 
-    const U32 pages = (max_context + 63U) / 64U;
-    mtp_kv_pool =
-        std::make_unique<KvPagePool>(context, max_context, 64U, pages, kv_format);
+    if (shared_kv) {
+      mtp_kv_pool = std::make_shared<KvPagePool>(
+          context, max_context, 64U, shared_kv->allocator, kv_format);
+    } else {
+      mtp_kv_pool =
+          std::make_shared<KvPagePool>(context, max_context, 64U, pages, kv_format);
+    }
 
     affine4_nax_ok =
         config.hidden_size >= 1024 &&
@@ -2902,9 +2977,28 @@ public:
     if (append_tokens == 0U) {
       return;
     }
-    const auto copies = mtp_kv_pool->begin_append(append_tokens);
-    if (!copies.empty()) {
-      throw std::logic_error("MTP private KV pool triggered unexpected COW");
+    std::vector<KvPageCopy> copies;
+    for (;;) {
+      try {
+        copies = mtp_kv_pool->begin_append(append_tokens);
+        break;
+      } catch (const std::overflow_error &error) {
+        if (std::string_view(error.what()) !=
+                "KV physical page pool exhausted" ||
+            !kv_reclaimer || !kv_reclaimer()) {
+          throw;
+        }
+      }
+    }
+    try {
+      for (const auto &move : copies) {
+        if (!shared_kv)
+          throw std::logic_error("MTP private KV pool triggered unexpected COW");
+        (void)shared_kv->copier.execute(move);
+      }
+    } catch (...) {
+      mtp_kv_pool->abort();
+      throw;
     }
     mtp_kv_pool->commit(append_tokens);
   }
@@ -3280,7 +3374,9 @@ public:
   std::vector<std::unique_ptr<MetalBuffer>> pb_buffers;
   std::map<std::string, Ref> pb_refs;
   std::deque<PackedBatchProfile> packed_cache_;
-  std::unique_ptr<KvPagePool> mtp_kv_pool;
+  std::shared_ptr<SharedKv> shared_kv;
+  std::shared_ptr<KvPagePool> mtp_kv_pool;
+  std::function<bool()> kv_reclaimer;
 
   bool affine4_nax_ok = false;
   bool flash_nax_prefill_ok = false;
@@ -3324,12 +3420,15 @@ MtpForward::MtpForward(
     LinearNumericPolicy linear_policy, SamplingContract sampling_contract,
     std::string_view kv_dtype, const QwenLayerCatalog *target_catalog,
     const MaterializedModel *target_weights,
-    const MetalBuffer *shared_prefill_trunk)
+    const MetalBuffer *shared_prefill_trunk, const MtpForward *shared_kv_primary,
+    std::uint32_t shared_kv_pages)
     : impl_(std::make_unique<Impl>(
           context, mtp_weights, std::move(config), max_context, embedding, head,
           target_final_norm, target_trunk_hidden, target_norm_offset, libraries,
           enable_m4_short_routes, linear_policy, sampling_contract, kv_dtype,
-          target_catalog, target_weights, shared_prefill_trunk)) {}
+          target_catalog, target_weights, shared_prefill_trunk,
+          shared_kv_primary ? shared_kv_primary->impl_.get() : nullptr,
+          shared_kv_pages)) {}
 
 MtpForward::~MtpForward() = default;
 MtpForward::MtpForward(MtpForward &&) noexcept = default;
@@ -3362,6 +3461,48 @@ void MtpForward::restore_frontier(
   p.hist_offset = committed_hist_tokens;
   p.pending_trunk_valid = true;
   p.unprimed_broken = false;
+}
+
+std::optional<MtpPrefixCheckpoint> MtpForward::checkpoint_prefix() {
+  auto &p = *impl_;
+  if (!p.shared_kv || !p.pending_trunk_valid || p.unprimed_broken)
+    return std::nullopt;
+
+  p.rewind_speculative_tail();
+  if (p.mtp_kv_pool->tokens() != p.hist_offset)
+    throw std::logic_error("MTP shared prefix has an inconsistent frontier");
+
+  MtpPrefixCheckpoint snapshot;
+  snapshot.tokens = p.hist_offset;
+  snapshot.kv_page_bytes = 2ULL * kv_page_bytes(
+      p.kv_format, 64U, U32(p.config.num_key_value_heads),
+      U32(p.config.head_dim));
+  snapshot.kv_pages = p.mtp_kv_pool->mapped_slots();
+  snapshot.pending_trunk = snapshot_pending_trunk();
+  snapshot.lease_ = std::make_shared<MtpPrefixCheckpoint::Lease>(p.mtp_kv_pool);
+  return snapshot;
+}
+
+void MtpForward::restore_prefix(const MtpPrefixCheckpoint &checkpoint,
+                                std::uint32_t committed_hist_tokens) {
+  auto &p = *impl_;
+  if (!p.shared_kv || !checkpoint.lease_ ||
+      checkpoint.kv_allocator_id() != p.shared_kv->allocator.get() ||
+      checkpoint.tokens != committed_hist_tokens ||
+      checkpoint.tokens > p.max_context ||
+      checkpoint.pending_trunk.size() != mul(p.h, 2U)) {
+    throw std::invalid_argument("MTP shared prefix checkpoint is incompatible");
+  }
+  p.mtp_kv_pool->install_shared_prefix(checkpoint.tokens, checkpoint.kv_pages);
+  const_cast<MetalBuffer *>(p.get("pending_trunk_normed").buffer)
+      ->write(checkpoint.pending_trunk, 0U);
+  p.hist_offset = checkpoint.tokens;
+  p.pending_trunk_valid = true;
+  p.unprimed_broken = false;
+}
+
+void MtpForward::set_kv_reclaimer(std::function<bool()> reclaimer) {
+  impl_->kv_reclaimer = std::move(reclaimer);
 }
 
 MetalSubmission MtpForward::seal_post_verify_frontier(
