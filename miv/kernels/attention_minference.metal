@@ -233,15 +233,18 @@ static inline void minference_probe_impl(
   constexpr uint NUM_WAVES = 2u;
 
   const PagedAttentionParams p = mp.base;
-  if (mp.w_probe == 0u || p.query_heads == 0u || p.key_value_heads == 0u) {
+  if (p.tokens == 0u || mp.w_probe == 0u || p.query_heads == 0u ||
+      p.key_value_heads == 0u) {
     return;
   }
+  const uint live_w_probe = min(mp.w_probe, p.tokens);
+  const uint live_q_probe_start = p.tokens - live_w_probe;
   const uint repeat = p.query_heads / p.key_value_heads;
   if (repeat == 0u || repeat > M_TILE) {
     return;
   }
   const uint bm_tok_p = M_TILE / repeat;
-  const uint n_probe_qblks = (mp.w_probe + bm_tok_p - 1u) / bm_tok_p;
+  const uint n_probe_qblks = (live_w_probe + bm_tok_p - 1u) / bm_tok_p;
 
   const uint split = tg.x;
   const uint p_blk = tg.y / p.key_value_heads;
@@ -250,9 +253,9 @@ static inline void minference_probe_impl(
     return;
   }
 
-  const uint w_base = p_blk * bm_tok_p; // offset inside [0, w_probe)
-  const uint q_base = mp.q_probe_start + w_base;
-  const uint active_tok = min(bm_tok_p, mp.w_probe - w_base);
+  const uint w_base = p_blk * bm_tok_p; // offset inside [0, live_w_probe)
+  const uint q_base = live_q_probe_start + w_base;
+  const uint active_tok = min(bm_tok_p, live_w_probe - w_base);
   const uint active_m_rows = active_tok * repeat;
   const uint flat_tid = uint(sg) * 32u + uint(lane);
 
@@ -641,7 +644,8 @@ kernel void omlx_m5_minference_probe_reduce_and_clear(
     v_score[gid] = 0.0f;
     d_score[gid] = 0.0f;
   }
-  const uint total_rows = mp.w_probe * mp.base.query_heads;
+  const uint live_w_probe = min(mp.w_probe, mp.base.tokens);
+  const uint total_rows = live_w_probe * mp.base.query_heads;
   if (gid < total_rows) {
     const ulong base_rec = ulong(gid) * mp.split_count;
     float gm = minf::kNegInf;
@@ -720,6 +724,13 @@ kernel void omlx_m5_minference_select_topk(
     uint3 tg [[threadgroup_position_in_grid]]) {
   const uint kvh = tg.y;
   if (kvh >= mp.base.key_value_heads) {
+    return;
+  }
+  if (mp.base.tokens == 0u) {
+    if (tid == 0u) {
+      top_counts[kvh * 2u + 0u] = 0u;
+      top_counts[kvh * 2u + 1u] = 0u;
+    }
     return;
   }
 
@@ -900,14 +911,22 @@ kernel void omlx_m5_minference_build_indices(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  // Exact 1,024 B (1 KiB) SRAM bitmask covering up to 8,192 KV blocks (256K tok)!
+  // Exact 1,024 B (1 KiB) SRAM bitmask covering up to 8,192 KV blocks (256K tok)
+  // + 512 B staged per-q_blk positions (total <= 1.6 KiB SRAM).
   threadgroup atomic_uint bitmask[256];
   threadgroup uint warp_totals[8];
   threadgroup uint tg_minmax[2];
+  threadgroup uint tg_q_pos[128];
 
+  if (mp.base.tokens == 0u || mp.base.key_value_heads == 0u ||
+      mp.bm_tok == 0u) {
+    return;
+  }
+  const uint live_n_q_blocks = (mp.base.tokens + mp.bm_tok - 1u) / mp.bm_tok;
   const uint kvh = tg.y % mp.base.key_value_heads;
   const uint q_blk = tg.y / mp.base.key_value_heads;
-  if (q_blk >= mp.n_q_blocks || kvh >= mp.base.key_value_heads) {
+  if (q_blk >= live_n_q_blocks || q_blk >= mp.max_q_blocks ||
+      kvh >= mp.base.key_value_heads) {
     return;
   }
 
@@ -915,12 +934,18 @@ kernel void omlx_m5_minference_build_indices(
 
   const uint q_base = q_blk * mp.bm_tok;
   const uint active_tok = min(mp.bm_tok, mp.base.tokens - q_base);
+  const uint capped_tok = min(active_tok, 128u);
+
+  if (tid < capped_tok) {
+    tg_q_pos[tid] = positions[q_base + tid];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (tid == 0u) {
     uint lo = 0xffffffffu;
     uint hi = 0u;
-    for (uint r = 0u; r < active_tok; ++r) {
-      const uint pos = positions[q_base + r];
+    for (uint r = 0u; r < capped_tok; ++r) {
+      const uint pos = tg_q_pos[r];
       lo = min(lo, pos);
       hi = max(hi, pos);
     }
@@ -933,6 +958,8 @@ kernel void omlx_m5_minference_build_indices(
   const uint max_q_pos = tg_minmax[1];
   const uint nk_blocks_blk = min((max_q_pos + 32u) / 32u, mp.max_kv_blocks);
   const uint min_kb = min_q_pos >> 5u;
+  const uint max_kb = max_q_pos >> 5u;
+  const bool dense_local_span = (max_kb - min_kb) <= (2u * mp.n_local);
 
   // 1. Mandatory attention sink blocks: [0, N_sink)
   const uint sink_end = min(mp.n_sink, nk_blocks_blk);
@@ -941,11 +968,26 @@ kernel void omlx_m5_minference_build_indices(
                              memory_order_relaxed);
   }
 
-  // 2. Mandatory local sliding-window diagonal: [max(0, min_kb - N_local), nk_blocks_blk)
-  const uint local_start = (min_kb > mp.n_local) ? (min_kb - mp.n_local) : 0u;
-  for (uint b = local_start + tid; b < nk_blocks_blk; b += 256u) {
-    atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
-                             memory_order_relaxed);
+  // 2. Mandatory local sliding-window diagonal:
+  //    Fast range path for dense contiguous chunks; exact per-token local windows
+  //    for wide-span scattered CacheBlend q_blks (zero gap blowup, retains every
+  //    token's self-attention block!).
+  if (dense_local_span) {
+    const uint local_start = (min_kb > mp.n_local) ? (min_kb - mp.n_local) : 0u;
+    for (uint b = local_start + tid; b < nk_blocks_blk; b += 256u) {
+      atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
+                               memory_order_relaxed);
+    }
+  } else if (nk_blocks_blk > 0u) {
+    for (uint r = 0u; r < capped_tok; ++r) {
+      const uint kb_r = tg_q_pos[r] >> 5u;
+      const uint loc_lo = (kb_r > mp.n_local) ? (kb_r - mp.n_local) : 0u;
+      const uint loc_hi = min(nk_blocks_blk - 1u, kb_r);
+      for (uint b = loc_lo + tid; b <= loc_hi; b += 256u) {
+        atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
+                                 memory_order_relaxed);
+      }
+    }
   }
 
   // 3. Global Top-K_V vertical blocks
@@ -959,22 +1001,46 @@ kernel void omlx_m5_minference_build_indices(
     }
   }
 
-  // 4. Per-q_blk Top-K_S slash diagonal blocks (straddle-safe across [min_q_pos, max_q_pos])
+  // 4. Per-q_blk Top-K_S slash diagonal blocks (exact straddle-safe for both
+  //    contiguous and wide-span scattered CacheBlend q_blks)
   const uint actual_s = top_counts[kvh * 2u + 1u];
   device const ushort *s_list = top_s_lag + ulong(kvh) * mp.top_stride;
-  for (uint i = tid; i < actual_s; i += 256u) {
-    const uint lag = uint(s_list[i]);
-    const uint lag_lo_off = lag * 32u;
-    if (max_q_pos >= lag_lo_off) {
-      const uint k_hi = max_q_pos - lag_lo_off;
-      const uint lag_hi_off = (lag + 1u) * 32u - 1u;
-      const uint k_lo = (min_q_pos > lag_hi_off) ? (min_q_pos - lag_hi_off) : 0u;
-      const uint kb_lo = k_lo >> 5u;
-      const uint kb_hi = min(nk_blocks_blk - 1u, k_hi >> 5u);
-      const uint kb_lim = min(kb_hi, kb_lo + 63u);
-      for (uint b = kb_lo; b <= kb_lim; ++b) {
-        atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
-                                 memory_order_relaxed);
+  if (nk_blocks_blk > 0u) {
+    if (dense_local_span) {
+      for (uint i = tid; i < actual_s; i += 256u) {
+        const uint lag = uint(s_list[i]);
+        const uint lag_lo_off = lag * 32u;
+        if (max_q_pos >= lag_lo_off) {
+          const uint k_hi = max_q_pos - lag_lo_off;
+          const uint lag_hi_off = (lag + 1u) * 32u - 1u;
+          const uint k_lo =
+              (min_q_pos > lag_hi_off) ? (min_q_pos - lag_hi_off) : 0u;
+          const uint kb_lo = k_lo >> 5u;
+          const uint kb_hi = min(nk_blocks_blk - 1u, k_hi >> 5u);
+          for (uint b = kb_lo; b <= kb_hi; ++b) {
+            atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
+                                     memory_order_relaxed);
+          }
+        }
+      }
+    } else {
+      for (uint i = tid; i < actual_s; i += 256u) {
+        const uint lag = uint(s_list[i]);
+        const uint lag_lo_off = lag * 32u;
+        const uint lag_hi_off = (lag + 1u) * 32u - 1u;
+        for (uint r = 0u; r < capped_tok; ++r) {
+          const uint qp = tg_q_pos[r];
+          if (qp >= lag_lo_off) {
+            const uint k_hi = qp - lag_lo_off;
+            const uint k_lo = (qp > lag_hi_off) ? (qp - lag_hi_off) : 0u;
+            const uint kb_lo = k_lo >> 5u;
+            const uint kb_hi = min(nk_blocks_blk - 1u, k_hi >> 5u);
+            for (uint b = kb_lo; b <= kb_hi; ++b) {
+              atomic_fetch_or_explicit(&bitmask[b >> 5u], 1u << (b & 31u),
+                                       memory_order_relaxed);
+            }
+          }
+        }
       }
     }
   }

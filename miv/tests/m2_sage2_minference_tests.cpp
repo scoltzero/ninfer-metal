@@ -203,6 +203,11 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
     require(pi.static_threadgroup_memory_bytes <= sram_cap,
             std::string(fn) + " exceeded 28.5 KiB SRAM cap: " +
                 std::to_string(pi.static_threadgroup_memory_bytes));
+    if (std::string_view(fn) == "omlx_m5_minference_build_indices" && !sv_on) {
+      require(pi.static_threadgroup_memory_bytes <= 2048ULL,
+              "minference_build_indices exceeded 2 KiB SRAM cap: " +
+                  std::to_string(pi.static_threadgroup_memory_bytes));
+    }
     sram[fn] = pi.static_threadgroup_memory_bytes;
   }
 
@@ -943,6 +948,481 @@ Json test_minference_needle_slash(const MetalContext &ctx,
           {"mxfp8pv_cos_sim", m_mx.cos_sim}};
 }
 
+// ============================================================================
+// Test 4: Reusable-Profile Dynamic-Token Patching (capacity=256 -> live=65, 19)
+//         for MInference + SageAttention2 (Wave 2 Profile/ICB contract!)
+// ============================================================================
+Json test_minference_reusable_profile_patch(const MetalContext &ctx,
+                                            const std::filesystem::path &libs) {
+  constexpr U32 qh = 24u;
+  constexpr U32 kvh = 4u;
+  constexpr U32 repeat = 6u;
+  constexpr U32 hd = 256u;
+  constexpr U32 page_tokens = 64u;
+  constexpr U32 capacity = 256u;
+  constexpr U32 total_kv = 16384u;
+  constexpr U32 kNeedlePos = 7777u;
+  constexpr U32 kNeedleBlk = kNeedlePos / 32u; // 243
+  constexpr U32 kSlashLagFar = 2048u;
+
+  const auto cfg = make_cfg(qh, kvh, hd);
+  const U32 pages = (total_kv + page_tokens - 1u) / page_tokens;
+  const U32 q_stride = qh * hd * 2u;
+  const U32 kv_width = kvh * hd;
+  const U32 history = total_kv - capacity;
+
+  std::vector<U32> page_table(pages);
+  std::iota(page_table.begin(), page_table.end(), 0u);
+  std::reverse(page_table.begin(), page_table.end());
+
+  std::array<float, hd> dir_needle{}, dir_slash_far{}, dir_sink{};
+  for (U32 d = 0; d < hd; ++d) {
+    dir_needle[d] = (d < 64u) ? ((d & 1u) ? 0.5f : -0.5f) : 0.0f;
+    dir_slash_far[d] =
+        (d >= 64u && d < 128u) ? ((d & 2u) ? 0.5f : -0.5f) : 0.0f;
+    dir_sink[d] = (d >= 192u) ? ((d & 2u) ? 0.5f : -0.5f) : 0.0f;
+  }
+
+  // Populate 16K Affine4 KV cache once.
+  std::vector<std::uint16_t> raw_k(U64(total_kv) * kv_width);
+  std::vector<std::uint16_t> raw_v(U64(total_kv) * kv_width);
+  for (U32 pos = 0; pos < total_kv; ++pos) {
+    const bool is_needle = (pos == kNeedlePos);
+    const bool is_slash_far =
+        (pos + kSlashLagFar >= history && pos + kSlashLagFar < total_kv);
+    for (U32 h = 0; h < kvh; ++h) {
+      const U64 base = (U64(pos) * kvh + h) * hd;
+      for (U32 d = 0; d < hd; ++d) {
+        float kv =
+            float(int((pos * 19u + h * 29u + d * 5u) % 65u) - 32) / 256.0f;
+        float vv =
+            float(int((pos * 7u + h * 17u + d * 13u) % 65u) - 32) / 256.0f;
+        if (pos < 4u) {
+          kv += 4.5f * dir_sink[d];
+          vv += (d >= 192u) ? 1.5f : -0.5f;
+        }
+        if (is_needle) {
+          kv += 4.5f * dir_needle[d];
+          vv = (d < 64u) ? 2.5f : -1.5f;
+        }
+        if (is_slash_far) {
+          kv += 4.5f * dir_slash_far[d];
+          vv += (d >= 64u && d < 128u) ? 2.0f : 0.0f;
+        }
+        raw_k[base + d] = float_to_bf16(kv);
+        raw_v[base + d] = float_to_bf16(vv);
+      }
+    }
+  }
+
+  const auto ref_of = [](const MetalBuffer &b) {
+    return Ref{&b, 0u, b.size()};
+  };
+  const auto ptb = ctx.upload(std::as_bytes(std::span(page_table)));
+  const U64 pbytes = affine4_page_bytes(page_tokens, kvh, hd);
+  auto kb = ctx.make_buffer(U64(pages) * pbytes);
+  auto vb = ctx.make_buffer(U64(pages) * pbytes);
+  {
+    const auto k_in = ctx.upload(std::as_bytes(std::span(raw_k)));
+    const auto v_in = ctx.upload(std::as_bytes(std::span(raw_v)));
+    const auto app_params =
+        words({qh, kvh, hd, total_kv, 0u, pages * page_tokens, page_tokens,
+               pages, q_stride, hd * 2u, kv_width, kv_width, q_stride, hd * 2u});
+    Encoder enc_app(ctx, libs, total_kv, "m2.minf.patch.append");
+    emit_paged_kv_append_affine4_g128(enc_app, cfg, total_kv, ref_of(k_in),
+                                      ref_of(v_in), ref_of(kb), ref_of(vb),
+                                      ref_of(ptb), app_params);
+    auto prof_app = enc_app.finish();
+    exec_profile(ctx, prof_app);
+  }
+
+  auto qb = ctx.make_buffer(U64(capacity) * q_stride * 2ULL);
+  auto posb = ctx.make_buffer(U64(capacity) * sizeof(U32));
+  auto out_sp = ctx.make_buffer(U64(capacity) * qh * hd * 2ULL);
+
+  const auto lo = plan_minference_scratch(capacity, qh, kvh, total_kv);
+  auto scratch = ctx.make_buffer(lo.total_bytes);
+
+  // Compile ONE reusable Profile at capacity=256!
+  const auto cap_params = words({qh, kvh, hd, capacity, history,
+                                 pages * page_tokens, page_tokens, pages,
+                                 q_stride, hd * 2u, kv_width, kv_width,
+                                 q_stride, hd * 2u});
+  Encoder enc_sp(ctx, libs, capacity, "m2.minf.reusable.cap256");
+  emit_paged_flash_prefill_sage2(
+      enc_sp, cfg, capacity, total_kv, /*is_affine4=*/true,
+      /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
+      ref_of(kb), ref_of(vb), ref_of(out_sp), ref_of(ptb), ref_of(posb),
+      cap_params, ref_of(scratch), Sage2PvMode::Fp16);
+  auto prof_sp = enc_sp.finish();
+
+  // Verify BOTH MInference (mp_bytes) AND Sage2 (sp_bytes) registered patches!
+  require(prof_sp.patches.size() >= 4u,
+          "MInference + Sage2 profile missing dynamic (tok_word, pos_word) patches: " +
+              std::to_string(prof_sp.patches.size()));
+
+  const auto apply_patches = [](Profile &prof, U32 live_t, U32 live_pos) {
+    for (const auto &p : prof.patches) {
+      const U32 val = (p.position ? live_pos : live_t) * p.multiplier;
+      std::memcpy(prof.parameter_data.data() + p.offset +
+                      U64(p.word) * sizeof(U32),
+                  &val, sizeof(U32));
+    }
+    prof.parameters.write("step", prof.parameter_data);
+  };
+
+  const bool use_apple10_flash_ref =
+      ctx.capabilities().device_name.starts_with("Apple M5") ||
+      ctx.capabilities().profile.probe.apple_gpu_family >= 10;
+  const auto tier = select_sage2_tier(capacity, qh, kvh);
+
+  Json runs = Json::array();
+  for (const U32 live_tokens : {65u, 19u}) {
+    // Poison tail [live_tokens..capacity) with BF16 NaN in query, 0xdeadbeef in
+    // positions (OOB trap!), and 0xa5a5 sentinel in output!
+    std::vector<std::uint16_t> query_buf(U64(capacity) * q_stride, 0x7fc0u);
+    std::vector<U32> pos_buf(capacity, 0xdeadbeefu);
+    for (U32 t = 0; t < live_tokens; ++t) {
+      pos_buf[t] = history + t;
+      for (U32 h = 0; h < qh; ++h) {
+        const U32 g = h % repeat;
+        const U64 base = U64(t) * q_stride + U64(h) * 2u * hd;
+        for (U32 d = 0; d < hd; ++d) {
+          float qv =
+              float(int((t * 13u + h * 7u + d * 11u) % 65u) - 32) / 256.0f;
+          if (g == 2u) qv += 3.5f * dir_needle[d];
+          else if (g == 4u) qv += 3.5f * dir_slash_far[d];
+          else qv += 3.5f * dir_sink[d];
+          query_buf[base + d] = float_to_bf16(qv);
+          query_buf[base + hd + d] = float_to_bf16(0.5f);
+        }
+      }
+    }
+    qb.write(std::as_bytes(std::span(query_buf)));
+    posb.write(std::as_bytes(std::span(pos_buf)));
+    std::vector<std::uint16_t> sentinel(U64(capacity) * qh * hd, 0xa5a5u);
+    out_sp.write(std::as_bytes(std::span(sentinel)));
+
+    // Patch & replay the SAME capacity=256 Profile for live_tokens!
+    apply_patches(prof_sp, live_tokens, history);
+    exec_profile(ctx, prof_sp);
+
+    // Exact dense reference for live_tokens only.
+    const U64 live_elems = U64(live_tokens) * qh * hd;
+    auto out_dense = ctx.make_buffer(live_elems * 2ULL);
+    const auto live_params = words({qh, kvh, hd, live_tokens, history,
+                                    pages * page_tokens, page_tokens, pages,
+                                    q_stride, hd * 2u, kv_width, kv_width,
+                                    q_stride, hd * 2u});
+    Encoder enc_d(ctx, libs, live_tokens, "m2.minf.patch.dense");
+    if (use_apple10_flash_ref) {
+      emit_paged_flash_prefill_affine4_g128(
+          enc_d, cfg, live_tokens, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(kb), ref_of(vb), ref_of(out_dense), ref_of(ptb), ref_of(posb),
+          live_params);
+    } else {
+      emit_paged_attention_affine4_g128(
+          enc_d, cfg, live_tokens, /*split=*/false, total_kv,
+          pages * page_tokens, pages, ref_of(qb), sub(ref_of(qb), hd * 2u),
+          ref_of(kb), ref_of(vb), ref_of(out_dense), ref_of(ptb), ref_of(posb),
+          Ref{}, Ref{}, Ref{}, live_params);
+    }
+    auto prof_d = enc_d.finish();
+    exec_profile(ctx, prof_d);
+
+    const auto full_sp_bits = read_u16(out_sp, U64(capacity) * qh * hd);
+    const auto dense_bits = read_u16(out_dense, live_elems);
+
+    // Verify tail [live_tokens..capacity) was NOT overwritten!
+    for (U64 i = live_elems; i < full_sp_bits.size(); ++i) {
+      require(full_sp_bits[i] == 0xa5a5u,
+              "Patched-profile MInference+Sage2 wrote past live_tokens=" +
+                  std::to_string(live_tokens));
+    }
+
+    std::vector<std::uint16_t> live_sp_bits(full_sp_bits.begin(),
+                                            full_sp_bits.begin() + live_elems);
+    const auto m = compare_bf16_vs_bf16(live_sp_bits, dense_bits);
+    require(m.non_finite == 0u && m.cos_sim >= 0.995,
+            "Patched-profile MInference+Sage2 cos_sim < 0.995 for live_tokens=" +
+                std::to_string(live_tokens) + ": " + std::to_string(m.cos_sim));
+
+    // Verify needle & far slash retained in active_indices for live q_blks.
+    const U32 live_n_qblks = (live_tokens + tier.bm_tok - 1u) / tier.bm_tok;
+    const auto cnt_raw =
+        scratch.read(lo.active_counts_off, lo.active_counts_bytes);
+    const auto idx_raw =
+        scratch.read(lo.active_indices_off, lo.active_indices_bytes);
+    std::vector<U32> active_counts(U64(kvh) * lo.max_q_blocks);
+    std::vector<std::uint16_t> active_indices(U64(kvh) * lo.max_q_blocks *
+                                              lo.active_stride);
+    std::memcpy(active_counts.data(), cnt_raw.data(),
+                active_counts.size() * sizeof(U32));
+    std::memcpy(active_indices.data(), idx_raw.data(),
+                active_indices.size() * sizeof(std::uint16_t));
+    for (U32 h = 0; h < kvh; ++h) {
+      for (U32 qb_i = 0; qb_i < live_n_qblks; ++qb_i) {
+        const U64 slot = U64(h) * lo.max_q_blocks + qb_i;
+        const U32 cnt = active_counts[slot];
+        const std::uint16_t *arr =
+            active_indices.data() + slot * lo.active_stride;
+        bool has_needle = false, has_far = false;
+        const U32 exp_far_blk = (pos_buf[qb_i * tier.bm_tok] - kSlashLagFar) / 32u;
+        for (U32 i = 0; i < cnt; ++i) {
+          if (i > 0u) require(arr[i] > arr[i - 1u], "Non-ascending active_indices");
+          if (arr[i] == kNeedleBlk) has_needle = true;
+          if (arr[i] == exp_far_blk) has_far = true;
+        }
+        require(cnt >= 4u && arr[0] == 0u && arr[3] == 3u,
+                "Patched-profile sinks missing");
+        require(has_needle && has_far,
+                "Patched-profile missed needle or far slash at live_tokens=" +
+                    std::to_string(live_tokens));
+      }
+    }
+
+    runs.push_back({{"capacity", capacity},
+                    {"live_tokens", live_tokens},
+                    {"tail_untouched", true},
+                    {"cos_sim", m.cos_sim},
+                    {"non_finite", m.non_finite}});
+  }
+
+  return {{"patches_registered", prof_sp.patches.size()}, {"runs", runs}};
+}
+
+// ============================================================================
+// Test 5: Wide-Span Scattered CacheBlend MInference (32K KV, single q_blk
+//         spanning pos=100..32700 -> zero gap blowup, self-attn + far slash!)
+// ============================================================================
+Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
+                                          const std::filesystem::path &libs) {
+  constexpr U32 qh = 24u;
+  constexpr U32 kvh = 4u;
+  constexpr U32 repeat = 6u;
+  constexpr U32 hd = 256u;
+  constexpr U32 page_tokens = 64u;
+  constexpr U32 total_kv = 32768u;
+  constexpr U32 tokens = 32u; // WM=6 -> bm_tok=16 -> q_blk 0 has 16 tokens!
+  constexpr U32 kNeedlePos = 7777u;
+  constexpr U32 kNeedleBlk = kNeedlePos / 32u; // 243
+  constexpr U32 kSlashLagFar = 2048u;
+  constexpr U32 kSelfFarPos = 32700u;
+  constexpr U32 kSelfFarBlk = kSelfFarPos / 32u;                    // 1021
+  constexpr U32 kFarSlashBlk = (kSelfFarPos - kSlashLagFar) / 32u;  // 957
+
+  const auto cfg = make_cfg(qh, kvh, hd);
+  const U32 pages = (total_kv + page_tokens - 1u) / page_tokens;
+  const U32 q_stride = qh * hd * 2u;
+  const U32 kv_width = kvh * hd;
+
+  // q_blk 0 spans pos=100..107 (tok 0..7) AND pos=32693..32700 (tok 8..15)!
+  // q_blk 1 spans pos=32701..32716 (tok 16..31).
+  std::vector<U32> positions(tokens);
+  for (U32 t = 0; t < 8u; ++t) positions[t] = 100u + t;
+  for (U32 t = 8u; t < 16u; ++t) positions[t] = 32693u + (t - 8u);
+  for (U32 t = 16u; t < 32u; ++t) positions[t] = 32701u + (t - 16u);
+  require(positions[0] == 100u && positions[15] == kSelfFarPos,
+          "Wide-span CacheBlend positions setup error");
+
+  std::vector<U32> page_table(pages);
+  std::iota(page_table.begin(), page_table.end(), 0u);
+  std::reverse(page_table.begin(), page_table.end());
+
+  std::array<float, hd> dir_needle{}, dir_slash_far{}, dir_self{}, dir_sink{};
+  for (U32 d = 0; d < hd; ++d) {
+    dir_needle[d] = (d < 64u) ? ((d & 1u) ? 0.5f : -0.5f) : 0.0f;
+    dir_slash_far[d] =
+        (d >= 64u && d < 128u) ? ((d & 2u) ? 0.5f : -0.5f) : 0.0f;
+    dir_self[d] = (d >= 128u && d < 192u) ? ((d & 1u) ? 0.5f : -0.5f) : 0.0f;
+    dir_sink[d] = (d >= 192u) ? ((d & 2u) ? 0.5f : -0.5f) : 0.0f;
+  }
+
+  std::vector<std::uint16_t> query(U64(tokens) * q_stride);
+  for (U32 t = 0; t < tokens; ++t) {
+    for (U32 h = 0; h < qh; ++h) {
+      const U32 g = h % repeat;
+      const U64 base = U64(t) * q_stride + U64(h) * 2u * hd;
+      for (U32 d = 0; d < hd; ++d) {
+        float qv =
+            float(int((t * 13u + h * 7u + d * 11u) % 65u) - 32) / 256.0f;
+        if (g == 2u) qv += 3.5f * dir_needle[d];
+        else if (g == 4u) qv += 3.5f * dir_slash_far[d];
+        else if (g == 1u) qv += 4.0f * dir_self[d];
+        else qv += 3.5f * dir_sink[d];
+        query[base + d] = float_to_bf16(qv);
+        query[base + hd + d] = float_to_bf16(0.5f);
+      }
+    }
+  }
+
+  std::vector<std::uint16_t> raw_k(U64(total_kv) * kv_width);
+  std::vector<std::uint16_t> raw_v(U64(total_kv) * kv_width);
+  for (U32 pos = 0; pos < total_kv; ++pos) {
+    const bool is_needle = (pos == kNeedlePos);
+    const bool is_slash_far =
+        (pos + kSlashLagFar >= 32693u && pos + kSlashLagFar <= 32716u);
+    const bool is_self_far = (pos >= 32693u && pos <= 32716u);
+    const bool is_self_near = (pos >= 100u && pos <= 107u);
+    for (U32 h = 0; h < kvh; ++h) {
+      const U64 base = (U64(pos) * kvh + h) * hd;
+      for (U32 d = 0; d < hd; ++d) {
+        float kv =
+            float(int((pos * 19u + h * 29u + d * 5u) % 65u) - 32) / 256.0f;
+        float vv =
+            float(int((pos * 7u + h * 17u + d * 13u) % 65u) - 32) / 256.0f;
+        if (pos < 4u) {
+          kv += 4.5f * dir_sink[d];
+          vv += (d >= 192u) ? 1.5f : -0.5f;
+        }
+        if (is_needle) {
+          kv += 4.5f * dir_needle[d];
+          vv = (d < 64u) ? 2.5f : -1.5f;
+        }
+        if (is_slash_far) {
+          kv += 4.5f * dir_slash_far[d];
+          vv += (d >= 64u && d < 128u) ? 2.2f : 0.0f;
+        }
+        if (is_self_far) {
+          kv += 4.8f * dir_self[d];
+          vv += (d >= 128u && d < 192u) ? 3.0f : -0.8f;
+        } else if (is_self_near) {
+          kv += 4.0f * dir_self[d];
+          vv += (d >= 128u && d < 192u) ? -2.0f : 0.6f;
+        }
+        raw_k[base + d] = float_to_bf16(kv);
+        raw_v[base + d] = float_to_bf16(vv);
+      }
+    }
+  }
+
+  const auto ref_of = [](const MetalBuffer &b) {
+    return Ref{&b, 0u, b.size()};
+  };
+  const auto qb = ctx.upload(std::as_bytes(std::span(query)));
+  const auto ptb = ctx.upload(std::as_bytes(std::span(page_table)));
+  const auto posb = ctx.upload(std::as_bytes(std::span(positions)));
+  const U64 pbytes = affine4_page_bytes(page_tokens, kvh, hd);
+  auto kb = ctx.make_buffer(U64(pages) * pbytes);
+  auto vb = ctx.make_buffer(U64(pages) * pbytes);
+  {
+    const auto k_in = ctx.upload(std::as_bytes(std::span(raw_k)));
+    const auto v_in = ctx.upload(std::as_bytes(std::span(raw_v)));
+    const auto app_params =
+        words({qh, kvh, hd, total_kv, 0u, pages * page_tokens, page_tokens,
+               pages, q_stride, hd * 2u, kv_width, kv_width, q_stride, hd * 2u});
+    Encoder enc_app(ctx, libs, total_kv, "m2.minf.wide.append");
+    emit_paged_kv_append_affine4_g128(enc_app, cfg, total_kv, ref_of(k_in),
+                                      ref_of(v_in), ref_of(kb), ref_of(vb),
+                                      ref_of(ptb), app_params);
+    auto prof_app = enc_app.finish();
+    exec_profile(ctx, prof_app);
+  }
+
+  const auto params = words({qh, kvh, hd, tokens, 0u, pages * page_tokens,
+                             page_tokens, pages, q_stride, hd * 2u, kv_width,
+                             kv_width, q_stride, hd * 2u});
+  const U64 out_elems = U64(tokens) * qh * hd;
+  auto out_dense = ctx.make_buffer(out_elems * 2ULL);
+  const bool use_apple10_flash_ref =
+      ctx.capabilities().device_name.starts_with("Apple M5") ||
+      ctx.capabilities().profile.probe.apple_gpu_family >= 10;
+  Encoder enc_d(ctx, libs, tokens, "m2.minf.wide.dense");
+  if (use_apple10_flash_ref) {
+    emit_paged_flash_prefill_affine4_g128(
+        enc_d, cfg, tokens, ref_of(qb), sub(ref_of(qb), hd * 2u), ref_of(kb),
+        ref_of(vb), ref_of(out_dense), ref_of(ptb), ref_of(posb), params);
+  } else {
+    emit_paged_attention_affine4_g128(
+        enc_d, cfg, tokens, /*split=*/false, total_kv, pages * page_tokens,
+        pages, ref_of(qb), sub(ref_of(qb), hd * 2u), ref_of(kb), ref_of(vb),
+        ref_of(out_dense), ref_of(ptb), ref_of(posb), Ref{}, Ref{}, Ref{},
+        params);
+  }
+  auto prof_d = enc_d.finish();
+  exec_profile(ctx, prof_d);
+  const auto dense_bits = read_u16(out_dense, out_elems);
+
+  const auto lo = plan_minference_scratch(tokens, qh, kvh, total_kv);
+  auto scratch = ctx.make_buffer(lo.total_bytes);
+  auto out_fp16 = ctx.make_buffer(out_elems * 2ULL);
+  Encoder enc_fp16(ctx, libs, tokens, "m2.minf.wide.fp16");
+  emit_paged_flash_prefill_sage2(
+      enc_fp16, cfg, tokens, total_kv, /*is_affine4=*/true,
+      /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
+      ref_of(kb), ref_of(vb), ref_of(out_fp16), ref_of(ptb), ref_of(posb),
+      params, ref_of(scratch), Sage2PvMode::Fp16);
+  auto prof_fp16 = enc_fp16.finish();
+  exec_profile(ctx, prof_fp16);
+
+  // Inspect q_blk 0 (the wide-span block spanning pos=100..32700)!
+  const auto cnt_raw =
+      scratch.read(lo.active_counts_off, lo.active_counts_bytes);
+  const auto idx_raw =
+      scratch.read(lo.active_indices_off, lo.active_indices_bytes);
+  std::vector<U32> active_counts(U64(kvh) * lo.max_q_blocks);
+  std::vector<std::uint16_t> active_indices(U64(kvh) * lo.max_q_blocks *
+                                            lo.active_stride);
+  std::memcpy(active_counts.data(), cnt_raw.data(),
+              active_counts.size() * sizeof(U32));
+  std::memcpy(active_indices.data(), idx_raw.data(),
+              active_indices.size() * sizeof(std::uint16_t));
+
+  U32 max_qblk0_active = 0u;
+  for (U32 h = 0; h < kvh; ++h) {
+    const U64 slot0 = U64(h) * lo.max_q_blocks + 0u;
+    const U32 cnt = active_counts[slot0];
+    max_qblk0_active = std::max(max_qblk0_active, cnt);
+    require(cnt > 0u && cnt < lo.active_stride,
+            "Wide-span CacheBlend q_blk 0 overflowed active_stride (gap blowup!): cnt=" +
+                std::to_string(cnt));
+    const std::uint16_t *arr = active_indices.data() + slot0 * lo.active_stride;
+    bool has_self_far = false, has_needle = false, has_far_slash = false;
+    for (U32 i = 0; i < cnt; ++i) {
+      if (i > 0u) require(arr[i] > arr[i - 1u], "Non-ascending active_indices");
+      if (arr[i] == kSelfFarBlk) has_self_far = true;
+      if (arr[i] == kNeedleBlk) has_needle = true;
+      if (arr[i] == kFarSlashBlk) has_far_slash = true;
+    }
+    require(cnt >= 4u && arr[0] == 0u && arr[3] == 3u,
+            "Wide-span CacheBlend sinks missing");
+    require(has_self_far,
+            "Wide-span CacheBlend dropped self-attention block 1021 (pos=32700)!");
+    require(has_needle, "Wide-span CacheBlend dropped needle block 243!");
+    require(has_far_slash,
+            "Wide-span CacheBlend dropped far slash block 957 for pos=32700!");
+  }
+
+  const auto m_fp16 = compare_bf16_vs_bf16(read_u16(out_fp16, out_elems), dense_bits);
+  require(m_fp16.non_finite == 0u && m_fp16.cos_sim >= 0.995,
+          "Wide-span CacheBlend FP16 PV cos_sim < 0.995: " +
+              std::to_string(m_fp16.cos_sim));
+
+  auto out_mx = ctx.make_buffer(out_elems * 2ULL);
+  Encoder enc_mx(ctx, libs, tokens, "m2.minf.wide.mxfp8");
+  emit_paged_flash_prefill_sage2(
+      enc_mx, cfg, tokens, total_kv, /*is_affine4=*/true,
+      /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
+      ref_of(kb), ref_of(vb), ref_of(out_mx), ref_of(ptb), ref_of(posb),
+      params, ref_of(scratch), Sage2PvMode::Mxfp8);
+  auto prof_mx = enc_mx.finish();
+  exec_profile(ctx, prof_mx);
+  const auto m_mx = compare_bf16_vs_bf16(read_u16(out_mx, out_elems), dense_bits);
+  require(m_mx.non_finite == 0u && m_mx.cos_sim >= 0.995,
+          "Wide-span CacheBlend MXFP8 PV cos_sim < 0.995: " +
+              std::to_string(m_mx.cos_sim));
+
+  return {{"total_kv", total_kv},
+          {"q_blk0_span", "100..32700"},
+          {"q_blk0_max_active_blocks", max_qblk0_active},
+          {"active_stride", lo.active_stride},
+          {"self_attn_blk_1021_retained", true},
+          {"needle_blk_243_retained", true},
+          {"far_slash_blk_957_retained", true},
+          {"fp16pv_cos_sim", m_fp16.cos_sim},
+          {"mxfp8pv_cos_sim", m_mx.cos_sim}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -975,6 +1455,11 @@ int main(int argc, char **argv) {
     minf_cases.push_back(
         test_minference_needle_slash(ctx, libs, 65536u, 128u, true));
     report["minference_retrieval"] = minf_cases;
+
+    report["reusable_profile_patch"] =
+        test_minference_reusable_profile_patch(ctx, libs);
+    report["wide_span_cacheblend"] =
+        test_minference_wide_span_cacheblend(ctx, libs);
 
     report["passed"] = true;
     std::cout << report.dump(2) << '\n';

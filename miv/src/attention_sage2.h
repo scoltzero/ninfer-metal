@@ -338,7 +338,7 @@ inline void emit_minference_build_sparse_indices(
       {.width = U64(split_count) * 256u, .height = U64(n_probe_qblks) * kvh},
       {.width = 256u},
       {query, state_k, page_table, attention_positions, m_split, l_split});
-  e.dynamic(d_stats, 6, mp_bytes);
+  e.dynamic(d_stats, 6, mp_bytes, 3, 4);
 
   const U64 clear_or_rows = std::max<U64>(
       U64(w_probe) * qh, U64(kvh) * lo.max_kv_blocks);
@@ -346,7 +346,7 @@ inline void emit_minference_build_sparse_indices(
       "attention_minference", "omlx_m5_minference_probe_reduce_and_clear",
       {.width = ((clear_or_rows + 255ull) / 256ull) * 256ull}, {.width = 256u},
       {m_split, l_split, m_glob, inv_z, v_score, d_score});
-  e.dynamic(d_reduce, 6, mp_bytes);
+  e.dynamic(d_reduce, 6, mp_bytes, 3, 4);
 
   auto &d_score_op = e.emit(
       "attention_minference", score_fn,
@@ -354,19 +354,19 @@ inline void emit_minference_build_sparse_indices(
       {.width = 256u},
       {query, state_k, page_table, attention_positions, m_glob, inv_z, v_score,
        d_score});
-  e.dynamic(d_score_op, 8, mp_bytes);
+  e.dynamic(d_score_op, 8, mp_bytes, 3, 4);
 
   auto &d_topk = e.emit(
       "attention_minference", "omlx_m5_minference_select_topk",
       {.width = 256u, .height = U64(kvh)}, {.width = 256u},
       {v_score, d_score, attention_positions, top_v, top_s, top_cnt});
-  e.dynamic(d_topk, 6, mp_bytes);
+  e.dynamic(d_topk, 6, mp_bytes, 3, 4);
 
   auto &d_build = e.emit(
       "attention_minference", "omlx_m5_minference_build_indices",
       {.width = 256u, .height = U64(n_q_blocks) * kvh}, {.width = 256u},
       {attention_positions, top_v, top_s, top_cnt, act_idx, act_cnt});
-  e.dynamic(d_build, 6, mp_bytes);
+  e.dynamic(d_build, 6, mp_bytes, 3, 4);
 }
 
 inline void emit_paged_flash_prefill_sage2(
