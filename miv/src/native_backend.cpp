@@ -712,6 +712,7 @@ public:
     slot_rolling_think_anchor_ids.assign(std::size_t(options.max_concurrency),
                                          0ULL);
     slot_rolling_post_ids.assign(std::size_t(options.max_concurrency), 0ULL);
+    slot_request_samplers.resize(std::size_t(options.max_concurrency));
     if (const auto it = options.path_overrides.find("batch_mode");
         it != options.path_overrides.end()) {
       if (it->second != "on" && it->second != "off")
@@ -982,26 +983,6 @@ public:
       per_slot_extra_state += mtp_memory.state_bytes;
       memory.largest_buffer_bytes = std::max(memory.largest_buffer_bytes,
                                              mtp_memory.largest_buffer_bytes);
-      if (options.max_concurrency > 1 && prefix_cache.enabled()) {
-        const auto slots = std::uint64_t(options.max_concurrency);
-        const std::uint64_t logical_pages = (std::uint64_t(max_context) + 63U) / 64U;
-        const std::uint64_t page_bytes = kv_page_bytes(
-            kv_format, 64U, std::uint32_t(config.num_key_value_heads),
-            std::uint32_t(config.head_dim));
-        // Each slot can reach max_context; one spare page per slot covers
-        // writes to a retained partial page. Unpinned history yields under
-        // pressure through the same cache eviction path as target KV.
-        const auto desired_pages = slots * (logical_pages + 1U);
-        const auto buffer_limit = std::min<std::uint64_t>(
-            context.capabilities().max_buffer_length, 2ULL << 30);
-        if (page_bytes > 0 && desired_pages <= buffer_limit / page_bytes) {
-          mtp_shared_kv_pages = std::uint32_t(desired_pages);
-          per_slot_extra_state -= 2ULL * logical_pages * page_bytes;
-          memory.state_bytes += 2ULL * desired_pages * page_bytes;
-          memory.largest_buffer_bytes = std::max(
-              memory.largest_buffer_bytes, desired_pages * page_bytes);
-        }
-      }
       if (ext_mtp_materialization.has_value()) {
         companion_weights = ext_mtp_materialization->resident_bytes;
       }
@@ -1152,6 +1133,51 @@ public:
       memory.largest_buffer_bytes = std::max(
           memory.largest_buffer_bytes,
           std::uint64_t(shared_kv_pages) * kv_page_b);
+    }
+    if (mtp_enabled && prefix_cache.enabled()) {
+      // Enable CoW shared MTP KV arena for BOTH B=1 (multi-conversation /
+      // pinned-prefix retention) and B>=2 (cross-slot sharing), sized to cover
+      // all active slots plus target prefix-cache headroom so MTP pages do not
+      // starve before target KV pages.
+      const auto slots = std::uint64_t(options.max_concurrency);
+      const std::uint64_t logical_pages = std::uint64_t(logical_kv_pages);
+      const std::uint64_t mtp_page_bytes = kv_page_bytes(
+          kv_format, 64U, std::uint32_t(config.num_key_value_heads),
+          std::uint32_t(config.head_dim));
+      const std::uint64_t min_shared_pages = slots * (logical_pages + 1ULL);
+      const std::uint64_t target_extra_pages =
+          (shared_kv_pages > logical_kv_pages + 1u)
+              ? std::uint64_t(shared_kv_pages - (logical_kv_pages + 1u))
+              : 0ULL;
+      const auto buffer_limit = std::min<std::uint64_t>(
+          context.capabilities().max_buffer_length, 2ULL << 30);
+      if (mtp_page_bytes > 0ULL && min_shared_pages <= buffer_limit / mtp_page_bytes) {
+        const std::uint64_t max_buf_pages = buffer_limit / mtp_page_bytes;
+        const std::uint64_t target_added_bytes =
+            (shared_kv_pages > logical_kv_pages + 1u && per_page_all_layers > 0ULL)
+                ? std::uint64_t(shared_kv_pages - (logical_kv_pages + 1u)) *
+                      per_page_all_layers
+                : 0ULL;
+        const std::uint64_t used_before_mtp_extra =
+            base_required_bytes + target_added_bytes;
+        const std::uint64_t avail_for_mtp =
+            base_budget.available_bytes > used_before_mtp_extra
+                ? (base_budget.available_bytes - used_before_mtp_extra)
+                : 0ULL;
+        const std::uint64_t baseline_mtp_pages = slots * logical_pages;
+        const std::uint64_t max_ws_pages =
+            baseline_mtp_pages + avail_for_mtp / (2ULL * mtp_page_bytes);
+        const std::uint64_t desired_pages = std::min<std::uint64_t>(
+            {min_shared_pages + target_extra_pages, max_buf_pages,
+             std::max(min_shared_pages, max_ws_pages)});
+        if (desired_pages >= min_shared_pages && desired_pages <= UINT32_MAX - 1) {
+          mtp_shared_kv_pages = std::uint32_t(desired_pages);
+          memory.state_bytes +=
+              2ULL * (desired_pages - baseline_mtp_pages) * mtp_page_bytes;
+          memory.largest_buffer_bytes = std::max(
+              memory.largest_buffer_bytes, desired_pages * mtp_page_bytes);
+        }
+      }
     }
     if (memory.largest_buffer_bytes > context.capabilities().max_buffer_length)
       throw std::invalid_argument("Qwen planned buffer exceeds device limit");
@@ -1495,6 +1521,22 @@ public:
     return index ? extra_slots.at(index - 1).verifier.get()
                  : gpu_verifier.get();
   }
+  RequestGpuSampler &request_sampler_at(std::size_t index, bool need_penalties) {
+    auto &entry = slot_request_samplers.at(index);
+    const auto vocabulary = std::uint32_t(config.vocab_size);
+    const auto cap =
+        need_penalties
+            ? std::min<std::size_t>(kMaxRepetitionContextSize, vocabulary)
+            : 0U;
+    if (!entry) {
+      entry = std::make_unique<RequestGpuSampler>(
+          context, slot_libraries,
+          program_at(index).verification_logits_buffer(), vocabulary, cap);
+    } else if (need_penalties) {
+      entry->ensure_penalty_capacity(cap);
+    }
+    return *entry;
+  }
   [[nodiscard]] std::size_t active_occupied_count() const noexcept {
     std::size_t n = 0;
     for (bool occ : occupied)
@@ -1621,6 +1663,7 @@ public:
   std::optional<MetalBuffer> anchor_logits;
   std::unique_ptr<PositionKeyedSampler> coupled_anchor_sampler;
   std::unique_ptr<LegacyAnchorSampler> legacy_anchor_sampler;
+  std::vector<std::unique_ptr<RequestGpuSampler>> slot_request_samplers;
   bool shared_head_enabled = false;
   bool lm_head_tied = false;
   std::uint32_t primary_ws_rows = 1024;
@@ -1969,14 +2012,7 @@ public:
   }
 
   RequestGpuSampler &controlled_sampler() {
-    if (!request_sampler_) {
-      const auto vocabulary = std::uint32_t(owner_.config.vocab_size);
-      request_sampler_ = std::make_unique<RequestGpuSampler>(
-          owner_.context, owner_.slot_libraries,
-          program().verification_logits_buffer(), vocabulary,
-          std::min<std::size_t>(controls_->max_penalty_tokens(), vocabulary));
-    }
-    return *request_sampler_;
+    return owner_.request_sampler_at(slot_, controls_->max_penalty_tokens() > 0);
   }
 
   void apply_controlled_sample(QwenForwardResult &result, bool cached = false) {
@@ -2340,22 +2376,33 @@ public:
   }
 
   [[nodiscard]] bool batchable() const {
-    if (controls_ || cancelled_->load(std::memory_order_acquire) ||
+    if (cancelled_->load(std::memory_order_acquire) ||
         in_flight_ar_.has_value() || in_flight_prefill_.has_value() ||
         in_flight_commit_.has_value())
       return false;
     if (offset_ < prompt_.size()) {
+      if (controls_ && controls_->needs_intervention_within(1U))
+        return false;
       if (const std::size_t ta = open_thinking_anchor_offset(); ta > offset_)
         return false;
       return prompt_.size() - offset_ <= 8;
     }
     if (mtp_active()) {
+      if (controls_ && controls_->needs_intervention_within(5U))
+        return false;
       if (const auto *mc = owner_.mtp_controller_at(slot_);
           mc && mc->should_exit())
         return false;
       return produced_ > 0;
     }
-    return !draft() || produced_ > 0;
+    if (draft()) {
+      if (controls_ && controls_->needs_intervention_within(8U))
+        return false;
+      return produced_ > 0;
+    }
+    if (controls_ && controls_->needs_intervention_within(2U))
+      return false;
+    return true;
   }
 
   [[nodiscard]] bool is_spec_verify_ready() const {
@@ -3156,7 +3203,8 @@ private:
     const auto ar_begin = RoundCostRecorder::Clock::now();
     const bool solo_async =
         owner_.active_occupied_count() == 1U &&
-        !controls_ && program().can_pipeline_ar(sampling_);
+        (!controls_ || !controls_->needs_intervention_within(2U)) &&
+        program().can_pipeline_ar(sampling_);
     const auto max_ctx = std::uint32_t(backend_.options_.max_context);
     if (in_flight_ar_.has_value()) {
       std::optional<QwenAsyncArStep> next_ar;
@@ -3783,7 +3831,6 @@ private:
   TokenPublisher publisher_;
   GpuSamplingOptions sampling_;
   std::optional<RequestControlState> controls_;
-  std::unique_ptr<RequestGpuSampler> request_sampler_;
   QwenForwardResult step_;
   std::vector<std::uint32_t> prompt_, pending_input_, mtp_committed_tokens_,
       last_mtp_round_committed_, committed_tokens_;

@@ -119,7 +119,8 @@ public:
         sampling.repetition_penalty <= 0 ||
         !std::isfinite(sampling.presence_penalty) ||
         !std::isfinite(sampling.frequency_penalty) ||
-        sampling.repetition_context_size <= 0) {
+        sampling.repetition_context_size <= 0 ||
+        sampling.repetition_context_size > kMaxRepetitionContextSize) {
       throw std::invalid_argument("invalid sampling penalties or repetition_context_size");
     }
     if ((sampling.has_penalties() || request.thinking_budget) &&

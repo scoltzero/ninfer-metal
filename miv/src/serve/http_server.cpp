@@ -28,7 +28,7 @@
 #include <vector>
 
 #ifndef NINFER_METAL_DISPLAY_VERSION
-#define NINFER_METAL_DISPLAY_VERSION "miv-v0.02"
+#define NINFER_METAL_DISPLAY_VERSION "miv-v0.03"
 #endif
 
 namespace omlx::m5::serve {
@@ -107,18 +107,19 @@ std::vector<std::string> parse_stop_strings(const Json &body) {
   throw std::invalid_argument("stop must be a string or an array of strings");
 }
 
-std::int32_t parse_control_integer(const Json &value, std::string_view field,
-                                   std::int32_t minimum) {
+std::int32_t parse_control_integer(
+    const Json &value, std::string_view field, std::int32_t minimum,
+    std::int32_t maximum = std::numeric_limits<std::int32_t>::max()) {
   const auto invalid = [&] {
     return std::invalid_argument(std::string(field) + " must be an integer in [" +
                                  std::to_string(minimum) + ", " +
-                                 std::to_string(std::numeric_limits<std::int32_t>::max()) + "]");
+                                 std::to_string(maximum) + "]");
   };
   if (!value.is_number_integer()) {
     throw invalid();
   }
   const double number = value.get<double>();
-  if (number < minimum || number > std::numeric_limits<std::int32_t>::max()) {
+  if (number < minimum || number > maximum) {
     throw invalid();
   }
   return static_cast<std::int32_t>(number);
@@ -204,8 +205,8 @@ SamplingSpec parse_sampling_spec(const Json &body) {
   }
   if (const auto value = body.find("repetition_context_size");
       value != body.end() && !value->is_null()) {
-    spec.repetition_context_size =
-        parse_control_integer(*value, "repetition_context_size", 1);
+    spec.repetition_context_size = parse_control_integer(
+        *value, "repetition_context_size", 1, kMaxRepetitionContextSize);
   }
   return spec;
 }

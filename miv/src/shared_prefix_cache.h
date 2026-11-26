@@ -176,24 +176,32 @@ public:
   [[nodiscard]] std::optional<MatchResult>
   find_best(std::string_view execution_identity,
             std::span<const std::uint32_t> prompt, SamplingContract contract,
-            bool require_mtp = false) const {
+            bool prefer_mtp = false) const {
     if (budget_bytes_ == 0 || entries_.empty() || prompt.empty())
       return std::nullopt;
     const auto prompt_page_hashes = prefix_detail::compute_page_hashes(prompt);
-    std::size_t best_idx = entries_.size();
-    std::size_t best_len = 0;
+    std::size_t best_any_idx = entries_.size();
+    std::size_t best_any_len = 0;
+    std::size_t best_mtp_idx = entries_.size();
+    std::size_t best_mtp_len = 0;
 
     for (std::size_t i = 0; i < entries_.size(); ++i) {
       const auto &e = entries_[i];
       const std::size_t len = e.tokens.size();
-      if (len > prompt.size() || e.identity != execution_identity ||
-          (require_mtp && !e.mtp))
+      if (len > prompt.size() || e.identity != execution_identity)
         continue;
       if (len == prompt.size() && !e.has_anchor_logits)
         continue;
       if (!prefill_checkpoint_compatible(len, prompt.size(), contract))
         continue;
-      if (best_idx != entries_.size() && len < best_len)
+      const bool has_mtp = e.mtp.has_value();
+      if (prefer_mtp && !has_mtp && best_mtp_idx != entries_.size())
+        continue;
+      const std::size_t cur_best_idx =
+          (prefer_mtp && has_mtp) ? best_mtp_idx : best_any_idx;
+      const std::size_t cur_best_len =
+          (prefer_mtp && has_mtp) ? best_mtp_len : best_any_len;
+      if (cur_best_idx != entries_.size() && len < cur_best_len)
         continue;
       // Fast O(L/64) page-hash filter before exact token equality check.
       const std::size_t pages = e.page_hashes.size();
@@ -204,19 +212,33 @@ public:
       if (!std::equal(e.tokens.begin(), e.tokens.end(), prompt.begin()))
         continue;
       // Tie-break equal-length matches toward more recently accessed entry.
-      if (best_idx == entries_.size() || len > best_len ||
-          e.last_access_tick >= entries_[best_idx].last_access_tick) {
-        best_idx = i;
-        best_len = len;
+      if (best_any_idx == entries_.size() || len > best_any_len ||
+          (len == best_any_len &&
+           e.last_access_tick >= entries_[best_any_idx].last_access_tick)) {
+        best_any_idx = i;
+        best_any_len = len;
+      }
+      if (has_mtp &&
+          (best_mtp_idx == entries_.size() || len > best_mtp_len ||
+           (len == best_mtp_len &&
+            e.last_access_tick >= entries_[best_mtp_idx].last_access_tick))) {
+        best_mtp_idx = i;
+        best_mtp_len = len;
       }
     }
-    if (best_idx == entries_.size())
+    const std::size_t chosen_idx =
+        (prefer_mtp && best_mtp_idx != entries_.size()) ? best_mtp_idx
+                                                        : best_any_idx;
+    if (chosen_idx == entries_.size())
       return std::nullopt;
+    const std::size_t chosen_len =
+        (prefer_mtp && best_mtp_idx != entries_.size()) ? best_mtp_len
+                                                        : best_any_len;
     return MatchResult{
-        .entry_index = best_idx,
-        .matched_tokens = best_len,
-        .preferred_slot = entries_[best_idx].source_slot,
-        .exact_prompt = (best_len == prompt.size()),
+        .entry_index = chosen_idx,
+        .matched_tokens = chosen_len,
+        .preferred_slot = entries_[chosen_idx].source_slot,
+        .exact_prompt = (chosen_len == prompt.size()),
         .cross_slot_shared = false,
     };
   }

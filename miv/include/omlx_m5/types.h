@@ -11,6 +11,7 @@ namespace omlx::m5 {
 inline constexpr char kDefaultServingSamplingContract[] = "position_coupled_v1";
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 4;
 inline constexpr std::uint32_t kMaxDFlash2DraftTokens = 7;
+inline constexpr std::int32_t kMaxRepetitionContextSize = 4096;
 
 enum class SpeculativeBackend {
   none,

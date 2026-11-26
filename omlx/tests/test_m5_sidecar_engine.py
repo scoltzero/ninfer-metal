@@ -4033,3 +4033,136 @@ def test_sidecar_stop_ignores_streamed_think_text(opened):
     emitted = "".join(matcher.push_text(x) for x in prefix + ["STOP ex", "ample</th", "ink>visible ST", "OP hidden"])
     assert emitted == ("<think>" if not opened else "") + "STOP example</think>visible "
     assert matcher.stopped
+
+
+def test_sidecar_stop_supports_custom_thinking_markers():
+    matcher = m5_mod._StopMatcher(
+        [],
+        ["STOP"],
+        skip_reasoning=True,
+        prompt_opens_think=False,
+        think_open="<|thought|>",
+        think_close="<|/thought|>",
+    )
+    chunks = ["<|tho", "ught|>STOP inside<|/th", "ought|>answer ST", "OP tail"]
+    emitted = "".join(matcher.push_text(c) for c in chunks)
+    assert emitted == "<|thought|>STOP inside<|/thought|>answer "
+    assert matcher.stopped
+
+
+def test_sync_m5rt_ui_kv_setting_normalizes_leftover_stock_affine8():
+    from omlx.admin.routes import ModelSettingsRequest
+
+    settings = ModelSettings(
+        external_engine="m5rt",
+        turboquant_kv_enabled=True,
+        turboquant_kv_scheme="affine8",
+        turboquant_kv_bits=8.0,
+        m5rt_options={"kv_dtype": "bf16"},
+        external_engine_options={"m5rt": {"kv_dtype": "bf16"}},
+    )
+    req = ModelSettingsRequest(turboquant_kv_enabled=True)
+    m5_mod.apply_m5rt_model_settings_update(
+        settings, req, req.model_fields_set, is_diffusion_model=False,
+    )
+    assert settings.turboquant_kv_scheme == "affine4"
+    assert settings.turboquant_kv_bits == 4.0
+    assert settings.m5rt_options is None
+    assert settings.external_engine_options is None
+    assert m5_mod._resolve_effective_kv_dtype({}, settings) == "affine4_g128"
+
+    # Switching from Stock MLX (with 6-bit turboquant enabled) to m5rt also normalizes.
+    switched = ModelSettings(
+        external_engine=None,
+        turboquant_kv_enabled=True,
+        turboquant_kv_scheme="turboquant",
+        turboquant_kv_bits=6.0,
+    )
+    req_switch = ModelSettingsRequest(external_engine="m5rt")
+    m5_mod.apply_m5rt_model_settings_update(
+        switched, req_switch, req_switch.model_fields_set, is_diffusion_model=False,
+    )
+    assert switched.turboquant_kv_scheme == "affine4"
+    assert switched.turboquant_kv_bits == 4.0
+    assert m5_mod._resolve_effective_kv_dtype({}, switched) == "affine4_g128"
+
+
+def test_m5rt_repetition_context_size_rejects_oversized_window():
+    engine = M5SidecarEngine.__new__(M5SidecarEngine)
+    engine._model_id = "test-model"
+    engine._options = M5Options(sampling_contract="position_coupled_v1")
+    engine._last_stats = {"sampling_contract_id": "position_coupled_v1"}
+    engine._hello_info = {"capabilities": ["sampling_penalties", "thinking_budget"]}
+    engine._warned_request_controls = set()
+    engine._tokenizer = None
+    engine._vocab_size = 32000
+
+    with pytest.raises(InvalidRequestError):
+        engine.reconcile_request_controls(
+            {"repetition_penalty": 1.1, "repetition_context_size": m5_mod.M5RT_MAX_REPETITION_CONTEXT_SIZE + 1},
+            {"repetition_context_size": "repetition_context_size"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_sidecar_string_stop_cancel_waits_for_async_request_stats(tmp_path):
+    model_dir = _write_test_model(tmp_path / "cancel-stats")
+    tok = _build_bpe_chat_tokenizer(model_dir)
+    bin_path = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
+    m5_bin, _ = find_m5rt_binary(str(bin_path))
+    assert m5_bin is not None
+    engine = M5SidecarEngine(
+        model_name=str(model_dir),
+        model_id="cancel-stats",
+        target=M5Target(binary=m5_bin, artifact_path=model_dir / "model.omlxm5", metallib_dir=None),
+        log_dir=tmp_path / "logs",
+        options=M5Options(max_context=4096, sampling_contract="position_coupled_v1"),
+    )
+    engine._tokenizer = tok
+    engine._vocab_size = len(tok)
+    engine._eos_token_ids = [tok.eos_token_id] if tok.eos_token_id is not None else [0]
+    engine._process = SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None)  # type: ignore[assignment]
+    engine._hello_info = {"capabilities": ["subscribe_events"]}
+
+    hello_ids = tok.encode("hello STOP world", add_special_tokens=False)
+
+    async def fake_rpc(method: str, params: dict | None = None, timeout: float = 30.0):
+        if method == "submit":
+            q = engine._request_queues.setdefault(42, asyncio.Queue())
+            q.put_nowait(m5_mod._SidecarEvent(request_id=42, kind="tokens", tokens=tuple(hello_ids)))
+            return {"request_id": 42}
+        return {"ok": True}
+
+    async def fake_cancel(backend_id: int) -> bool:
+        async def push_later():
+            await asyncio.sleep(0.02)
+            q = engine._request_queues.get(backend_id)
+            if q is not None:
+                q.put_nowait(
+                    m5_mod._SidecarEvent(
+                        request_id=backend_id,
+                        kind="aborted",
+                        finish_reason="cancelled",
+                        request_stats={
+                            "prefix_restored_tokens": 5,
+                            "spec_rounds": 2,
+                            "ar_steps": 0,
+                            "decode_mode": "mtp",
+                            "fallback_reason": "",
+                        },
+                    )
+                )
+
+        asyncio.create_task(push_later())
+        return True
+
+    engine._rpc = fake_rpc  # type: ignore[assignment]
+    engine._cancel_backend_request = fake_cancel  # type: ignore[assignment]
+
+    final = None
+    async for chunk in engine.stream_generate([1, 2, 3, 4, 5, 6, 7], max_tokens=32, stop=["STOP"]):
+        final = chunk
+    assert final is not None
+    assert final.finished is True
+    assert final.finish_reason == "stop"
+    assert final.cached_tokens == 5

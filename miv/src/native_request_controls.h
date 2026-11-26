@@ -118,6 +118,21 @@ public:
 
   [[nodiscard]] std::size_t max_penalty_tokens() const { return window_; }
 
+  // Returns true if this request may require penalty adjustment or a forced
+  // thinking close within the next `lookahead` sampled tokens.
+  [[nodiscard]] bool needs_intervention_within(std::size_t lookahead) const noexcept {
+    if (window_ != 0)
+      return true;
+    if (!budget_)
+      return false;
+    const std::int64_t limit = std::max<std::int32_t>(0, budget_->budget - 1);
+    if (thinking_open_)
+      return std::int64_t(thinking_count_) + std::int64_t(lookahead) > limit;
+    if (budget_->start_token_ids.empty())
+      return false;
+    return std::int64_t(lookahead) > limit + 1;
+  }
+
 private:
   [[nodiscard]] const std::vector<std::int32_t> &force_sequence() const {
     return budget_->force_token_ids.empty() ? budget_->end_token_ids
@@ -165,6 +180,17 @@ public:
     }
   }
 
+  void ensure_penalty_capacity(std::size_t capacity) {
+    if (capacity == 0 || (penalties_ && capacity <= max_penalties_))
+      return;
+    max_penalties_ = std::min<std::size_t>(
+        std::max<std::size_t>(capacity, max_penalties_), vocabulary_);
+    penalties_.emplace(context_.make_buffer(
+        std::uint64_t(max_penalties_) * 8U * sizeof(RequestPenaltyToken)));
+    for (auto &adjust : adjustments_)
+      adjust.reset();
+  }
+
   [[nodiscard]] PositionSamplingResult sample(
       std::span<const PositionSamplingRow> rows,
       std::span<const std::array<std::uint32_t, 2>> ranges,
@@ -178,7 +204,9 @@ public:
     copy->profile.parameters.write("step", copy->profile.parameter_data);
     MetalSubmission pre = dispatch(copy->profile);
     if (!entries.empty()) {
-      if (entries.size_bytes() > penalties_->size())
+      ensure_penalty_capacity(
+          std::min<std::size_t>(kMaxRepetitionContextSize, vocabulary_));
+      if (!penalties_ || entries.size_bytes() > penalties_->size())
         throw std::logic_error("request penalty staging exceeded");
       penalties_->write(std::as_bytes(entries));
       auto &adjust = adjustments_.at(width - 1);
@@ -207,7 +235,9 @@ public:
     scratch_.write(raw);
     MetalSubmission updated{};
     if (!entries.empty()) {
-      if (entries.size_bytes() > penalties_->size())
+      ensure_penalty_capacity(
+          std::min<std::size_t>(kMaxRepetitionContextSize, vocabulary_));
+      if (!penalties_ || entries.size_bytes() > penalties_->size())
         throw std::logic_error("cached request penalty staging exceeded");
       penalties_->write(std::as_bytes(entries));
       auto &adjust = adjustments_.front();

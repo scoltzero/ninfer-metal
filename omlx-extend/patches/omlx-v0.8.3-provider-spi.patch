@@ -6997,7 +6997,7 @@ index 83b42a6..9b1ab47 100644
  The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
  
 diff --git a/omlx/admin/routes.py b/omlx/admin/routes.py
-index 39132d8..beeea82 100644
+index 39132d8..7f5c328 100644
 --- a/omlx/admin/routes.py
 +++ b/omlx/admin/routes.py
 @@ -24,9 +24,11 @@ import subprocess
@@ -7769,7 +7769,7 @@ index 39132d8..beeea82 100644
              )
              if not compat_ok:
                  raise HTTPException(status_code=400, detail=compat_reason)
-@@ -3572,6 +4008,28 @@ async def update_model_settings(
+@@ -3572,6 +4008,41 @@ async def update_model_settings(
                      detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                  )
          current_settings.mtp_enabled = new_mtp_enabled
@@ -7794,11 +7794,24 @@ index 39132d8..beeea82 100644
 +                opts.pop("spec_backend", None)
 +                opts["speculative_backend"] = policy
 +                current_settings.m5rt_options = opts
++                ext = dict(current_settings.external_engine_options or {})
++                updated_alias = False
++                for eng_key in ("m5rt", "io.ninfer.metal", "ninfer-metal", "ninfer_metal"):
++                    nested = ext.get(eng_key)
++                    if isinstance(nested, dict):
++                        nested_copy = dict(nested)
++                        nested_copy.pop("spec_backend", None)
++                        nested_copy["speculative_backend"] = policy
++                        ext[eng_key] = nested_copy
++                        updated_alias = True
++                if not updated_alias:
++                    ext[M5RT_ENGINE_ID] = {"speculative_backend": policy}
++                current_settings.external_engine_options = ext
 +
  
      # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
      if "vlm_mtp_enabled" in sent:
-@@ -3754,26 +4212,26 @@ async def update_model_settings(
+@@ -3754,26 +4225,26 @@ async def update_model_settings(
              model_id,
          )
  
@@ -7842,7 +7855,7 @@ index 39132d8..beeea82 100644
      )
      auto_unloaded = False
      auto_reloaded = False
-@@ -3909,6 +4367,30 @@ def _raise_if_alias_conflicts_exposed_profiles(
+@@ -3909,6 +4380,30 @@ def _raise_if_alias_conflicts_exposed_profiles(
              )
  
  
@@ -7873,7 +7886,7 @@ index 39132d8..beeea82 100644
  def _validate_model_settings(entry, settings):
      from ..model_settings import validate_moe_expert_offload
  
-@@ -3918,7 +4400,8 @@ def _validate_model_settings(entry, settings):
+@@ -3918,7 +4413,8 @@ def _validate_model_settings(entry, settings):
                  status_code=400,
                  detail="A LoRA adapter applies only to language and VLM models.",
              )
@@ -7883,7 +7896,7 @@ index 39132d8..beeea82 100644
          if conflict:
              raise HTTPException(
                  status_code=400,
-@@ -4003,9 +4486,13 @@ async def create_model_profile(
+@@ -4003,9 +4499,13 @@ async def create_model_profile(
  
      mgr = _require_settings_manager()
      entry = _require_model(model_id)
@@ -7900,7 +7913,7 @@ index 39132d8..beeea82 100644
      _validate_model_settings(entry, settings)
      # A profile that turns a feature on owns its draft: an exposed profile is
      # applied at request time, so its content must be loadable too. A profile
-@@ -4060,10 +4547,15 @@ async def update_model_profile(
+@@ -4060,10 +4560,15 @@ async def update_model_profile(
  
      mgr = _require_settings_manager()
      entry = _require_model(model_id)
@@ -7919,7 +7932,7 @@ index 39132d8..beeea82 100644
      )
      stored = mgr.get_profile(model_id, name) or {}
      draft_problem = _profile_draft_problem(
-@@ -4394,7 +4886,8 @@ async def _apply_settings_snapshot(
+@@ -4394,7 +4899,8 @@ async def _apply_settings_snapshot(
      _note_conflict("vlm_mtp", conflicts, skipped)
      candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
      _note_conflict("a8_prefill", conflicts, skipped)
@@ -7929,7 +7942,7 @@ index 39132d8..beeea82 100644
      for name in conflicts:
          feature = name.removesuffix("_enabled").removesuffix("_node_id")
          _note_conflict(feature, ["lora_adapter"], skipped)
-@@ -4884,8 +5377,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
+@@ -4884,8 +5390,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
          raise HTTPException(status_code=503, detail="Server not initialized")
  
      # The first look at a launcher runs it once; keep that off the loop.
@@ -7943,7 +7956,7 @@ index 39132d8..beeea82 100644
      )
      return _global_settings_response(global_settings)
  
-@@ -4938,6 +5435,103 @@ def _splash_status(global_settings) -> dict:
+@@ -4938,6 +5448,103 @@ def _splash_status(global_settings) -> dict:
      }
  
  
@@ -8047,7 +8060,7 @@ index 39132d8..beeea82 100644
  def _global_settings_response(global_settings):
      from ..settings import get_auto_ssd_cache_size
  
-@@ -5113,8 +5707,12 @@ def _global_settings_response(global_settings):
+@@ -5113,8 +5720,12 @@ def _global_settings_response(global_settings):
              "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
              "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
              "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -8061,7 +8074,7 @@ index 39132d8..beeea82 100644
          "system": {
              "total_memory_bytes": memory_info["total_bytes"],
              "total_memory": memory_info["total_formatted"],
-@@ -6071,6 +6669,25 @@ async def update_global_settings(
+@@ -6071,6 +6682,25 @@ async def update_global_settings(
              request.splash_ane_prefill
          )
          integrations_changed = True
@@ -8087,7 +8100,7 @@ index 39132d8..beeea82 100644
      if "markitdown_enabled" in request.model_fields_set:
          global_settings.integrations.markitdown_enabled = bool(
              request.markitdown_enabled
-@@ -10290,3 +10907,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
+@@ -10290,3 +10920,115 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
      if not success:
          raise HTTPException(status_code=404, detail="Task not found or still active")
      return {"success": True}
@@ -8243,10 +8256,10 @@ index 7b0e787..e06e4de 100644
          """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..112e201
+index 0000000..5bb7353
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7466 @@
+@@ -0,0 +1,7582 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -8546,6 +8559,7 @@ index 0000000..112e201
 +VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
 +M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
 +M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
++M5RT_MAX_REPETITION_CONTEXT_SIZE = 4096
 +M5RT_REQUEST_SETTINGS = ("max_tokens", "temperature", "top_p", "top_k")
 +VALID_SAMPLING_CONTRACTS = frozenset({"legacy_rejection_v1", "position_coupled_v1"})
 +VALID_SPEC_BACKENDS = frozenset({"auto", "none", "dflash2", "mtp"})
@@ -9422,7 +9436,16 @@ index 0000000..112e201
 +    sent: set[str] | frozenset[str],
 +) -> None:
 +    """Persist an explicit UI KV-compression toggle for `m5rt` so disabling overrides shared TOML."""
-+    if "turboquant_kv_enabled" not in sent:
++    target_engine = (
++        getattr(request, "external_engine", None)
++        if "external_engine" in sent
++        else getattr(current_settings, "external_engine", None)
++    )
++    switched_to_m5rt = (
++        "external_engine" in sent
++        and canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
++    )
++    if "turboquant_kv_enabled" not in sent and not switched_to_m5rt:
 +        return
 +    req_explicit_kv = False
 +    if "m5rt_options" in sent and isinstance(getattr(request, "m5rt_options", None), dict):
@@ -9439,7 +9462,12 @@ index 0000000..112e201
 +    if req_explicit_kv:
 +        return
 +
-+    if not bool(getattr(request, "turboquant_kv_enabled", False)):
++    kv_enabled = (
++        bool(getattr(request, "turboquant_kv_enabled", False))
++        if "turboquant_kv_enabled" in sent
++        else bool(getattr(current_settings, "turboquant_kv_enabled", False))
++    )
++    if "turboquant_kv_enabled" in sent and not kv_enabled:
 +        opts_copy = dict(getattr(current_settings, "m5rt_options", None) or {})
 +        opts_copy["kv_dtype"] = "bf16"
 +        current_settings.m5rt_options = opts_copy
@@ -9456,28 +9484,45 @@ index 0000000..112e201
 +                    updated_ext = True
 +            if updated_ext:
 +                current_settings.external_engine_options = ext_copy
-+    else:
-+        existing_opts = getattr(current_settings, "m5rt_options", None)
-+        if isinstance(existing_opts, dict) and existing_opts.get("kv_dtype") == "bf16":
-+            opts_copy = dict(existing_opts)
-+            opts_copy.pop("kv_dtype", None)
-+            current_settings.m5rt_options = opts_copy or None
-+        existing_ext = getattr(current_settings, "external_engine_options", None)
-+        if isinstance(existing_ext, dict):
-+            ext_copy = dict(existing_ext)
-+            updated_ext = False
-+            for eng_key in M5RT_OPTION_KEYS:
-+                nested = ext_copy.get(eng_key)
-+                if isinstance(nested, dict) and nested.get("kv_dtype") == "bf16":
-+                    nested_copy = dict(nested)
-+                    nested_copy.pop("kv_dtype", None)
-+                    if nested_copy:
-+                        ext_copy[eng_key] = nested_copy
-+                    else:
-+                        ext_copy.pop(eng_key, None)
-+                    updated_ext = True
-+            if updated_ext:
-+                current_settings.external_engine_options = ext_copy or None
++    elif kv_enabled:
++        if "turboquant_kv_enabled" in sent:
++            existing_opts = getattr(current_settings, "m5rt_options", None)
++            if isinstance(existing_opts, dict) and existing_opts.get("kv_dtype") == "bf16":
++                opts_copy = dict(existing_opts)
++                opts_copy.pop("kv_dtype", None)
++                current_settings.m5rt_options = opts_copy or None
++            existing_ext = getattr(current_settings, "external_engine_options", None)
++            if isinstance(existing_ext, dict):
++                ext_copy = dict(existing_ext)
++                updated_ext = False
++                for eng_key in M5RT_OPTION_KEYS:
++                    nested = ext_copy.get(eng_key)
++                    if isinstance(nested, dict) and nested.get("kv_dtype") == "bf16":
++                        nested_copy = dict(nested)
++                        nested_copy.pop("kv_dtype", None)
++                        if nested_copy:
++                            ext_copy[eng_key] = nested_copy
++                        else:
++                            ext_copy.pop(eng_key, None)
++                        updated_ext = True
++                if updated_ext:
++                    current_settings.external_engine_options = ext_copy or None
++        # Web hides scheme/bitwidth pickers for miv; normalize leftover Stock
++        # MLX values (e.g. affine8 or 6/8-bit) when the user did not explicitly
++        # send them so turning on 4-bit KV is never silently trapped in bf16.
++        if "turboquant_kv_scheme" not in sent and "turboquant_kv_bits" not in sent:
++            scheme = str(getattr(current_settings, "turboquant_kv_scheme", "") or "").strip().lower()
++            raw_bits = getattr(current_settings, "turboquant_kv_bits", None)
++            unsupported_bits = (
++                isinstance(raw_bits, (int, float))
++                and not isinstance(raw_bits, bool)
++                and float(raw_bits) > 4.0
++            )
++            if scheme not in ("", "affine4", "turboquant") or unsupported_bits:
++                if hasattr(current_settings, "turboquant_kv_scheme"):
++                    current_settings.turboquant_kv_scheme = "affine4"
++                if hasattr(current_settings, "turboquant_kv_bits"):
++                    current_settings.turboquant_kv_bits = 4.0
 +
 +
 +def _validate_external_engine_option_fields(engine_key: str, fields: Any) -> dict[str, Any]:
@@ -11043,10 +11088,10 @@ index 0000000..112e201
 +            and "affine4_g128" in allowed
 +        ):
 +            return "affine4_g128"
-+        # CRITICAL: Do NOT map "affine8" to "int8_g64" — miv-v0.01 only implements
++        # CRITICAL: Do NOT map "affine8" to "int8_g64" — miv only implements
 +        # bf16 and affine4_g128 in kv_page_pool.cpp.
 +        logger.warning(
-+            "miv Core Backend: turboquant_kv_scheme=%r (bits=%r) is not implemented in miv-v0.01 "
++            "miv Core Backend: turboquant_kv_scheme=%r (bits=%r) is not implemented in miv "
 +            "(only 4-bit 'affine4'/'turboquant' -> 'affine4_g128' or disabled -> 'bf16'); using 'bf16'",
 +            scheme,
 +            raw_bits,
@@ -12594,7 +12639,11 @@ index 0000000..112e201
 +        *,
 +        skip_reasoning: bool = False,
 +        prompt_opens_think: bool = False,
++        think_open: str = "<think>",
++        think_close: str = "</think>",
 +    ) -> None:
++        self._think_open = think_open or "<think>"
++        self._think_close = think_close or "</think>"
 +        self._think_state = "answer"
 +        if skip_reasoning:
 +            self._think_state = "thinking" if prompt_opens_think else "leading"
@@ -12639,7 +12688,7 @@ index 0000000..112e201
 +
 +        buf = self._think_pending + piece
 +        self._think_pending = ""
-+        opened, closed = "<think>", "</think>"
++        opened, closed = self._think_open, self._think_close
 +        prefix = ""
 +        if self._think_state == "leading":
 +            start = buf.lstrip()
@@ -14060,6 +14109,51 @@ index 0000000..112e201
 +        start, end = boundaries
 +        return (start, end) if start != end else None
 +
++    def _thinking_marker_strings(self) -> tuple[str, str]:
++        """Resolve literal thinking open/close markers for reasoning-aware stop matching."""
++        tokenizer = self._tokenizer
++        start_tag = _safe_tokenizer_attr(tokenizer, "think_start")
++        end_tag = _safe_tokenizer_attr(tokenizer, "think_end")
++        if (
++            isinstance(start_tag, str)
++            and start_tag
++            and isinstance(end_tag, str)
++            and end_tag
++            and start_tag != end_tag
++        ):
++            return start_tag, end_tag
++        markers = self._thinking_token_ids()
++        if markers is not None and tokenizer is not None and hasattr(tokenizer, "decode"):
++            with contextlib.suppress(Exception):
++                dec_start = tokenizer.decode(markers[0], skip_special_tokens=False)
++                dec_end = tokenizer.decode(markers[1], skip_special_tokens=False)
++                if (
++                    isinstance(dec_start, str)
++                    and dec_start
++                    and isinstance(dec_end, str)
++                    and dec_end
++                    and dec_start != dec_end
++                ):
++                    return dec_start, dec_end
++        return "<think>", "</think>"
++
++    def _prompt_tokens_open_think(self, prompt_tokens: list[int]) -> bool:
++        markers = self._thinking_token_ids()
++        if markers is None:
++            return False
++        start, end = markers
++        for tail_size in range(3):
++            end_of_start = len(prompt_tokens) - tail_size
++            beginning = end_of_start - len(start)
++            if beginning < 0 or prompt_tokens[beginning:end_of_start] != start:
++                continue
++            suffix = prompt_tokens[end_of_start:]
++            return not any(
++                suffix[i : i + len(end)] == end
++                for i in range(len(suffix) - len(end) + 1)
++            )
++        return False
++
 +    def _request_sampling_contract(self) -> str:
 +        return (
 +            (self._last_stats or {}).get("sampling_contract_id")
@@ -14116,9 +14210,18 @@ index 0000000..112e201
 +            value = options[name]
 +            if reason is None and name in ("thinking_budget", "repetition_context_size"):
 +                minimum = 0 if name == "thinking_budget" else 1
-+                if not isinstance(value, int) or not minimum <= value <= 2**31 - 1:
++                maximum = (
++                    2**31 - 1
++                    if name == "thinking_budget"
++                    else M5RT_MAX_REPETITION_CONTEXT_SIZE
++                )
++                if (
++                    isinstance(value, bool)
++                    or not isinstance(value, int)
++                    or not minimum <= value <= maximum
++                ):
 +                    raise InvalidRequestError(
-+                        f"{field} must be an integer in [{minimum}, {2**31 - 1}]", field
++                        f"{field} must be an integer in [{minimum}, {maximum}]", field
 +                    )
 +            elif reason is None:
 +                try:
@@ -14324,10 +14427,26 @@ index 0000000..112e201
 +            ignore_eos=ignore_eos,
 +            extra_token_seqs=kwargs.get("stop_token_seqs"),
 +        )
++        skip_reasoning = bool(kwargs.get("stop_skips_reasoning"))
++        think_open, think_close = (
++            self._thinking_marker_strings() if skip_reasoning else ("<think>", "</think>")
++        )
++        if "_prompt_opens_think" in kwargs:
++            prompt_opens_think = bool(kwargs.get("_prompt_opens_think"))
++        elif skip_reasoning:
++            if isinstance(prompt, str):
++                prompt_opens_think = prompt.rfind(think_open) > prompt.rfind(think_close)
++            else:
++                prompt_opens_think = self._prompt_tokens_open_think(prompt_tokens)
++        else:
++            prompt_opens_think = False
 +        stop_matcher = _StopMatcher(
-+            stop_token_seqs, stop_strings,
-+            skip_reasoning=bool(kwargs.get("stop_skips_reasoning")),
-+            prompt_opens_think=bool(kwargs.get("_prompt_opens_think")),
++            stop_token_seqs,
++            stop_strings,
++            skip_reasoning=skip_reasoning,
++            prompt_opens_think=prompt_opens_think,
++            think_open=think_open,
++            think_close=think_close,
 +        )
 +        special_ids = set() if ignore_eos else set(self._eos_token_ids)
 +        detok = _IncrementalDetokenizer(self._tokenizer, self._path, special_ids)
@@ -14452,8 +14571,15 @@ index 0000000..112e201
 +            if not terminal_seen and backend_id is not None:
 +                await self._cancel_backend_request(backend_id)
 +                terminal_seen = True
-+                while not queue.empty():
-+                    event = queue.get_nowait()
++                deadline = time.monotonic() + 0.25
++                while True:
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        break
++                    try:
++                        event = await asyncio.wait_for(queue.get(), timeout=remaining)
++                    except asyncio.TimeoutError:
++                        break
 +                    if event.kind != "tokens":
 +                        request_stats = event.request_stats or {}
 +                        break
@@ -14579,7 +14705,10 @@ index 0000000..112e201
 +                is_partial,
 +            )
 +        if kwargs.get("stop_skips_reasoning") and isinstance(prompt_text, str):
-+            kwargs["_prompt_opens_think"] = prompt_text.rfind("<think>") > prompt_text.rfind("</think>")
++            think_open, think_close = self._thinking_marker_strings()
++            kwargs["_prompt_opens_think"] = (
++                prompt_text.rfind(think_open) > prompt_text.rfind(think_close)
++            )
 +        async for output in self.stream_generate(
 +            prompt=token_ids,
 +            max_tokens=max_tokens,
@@ -19126,10 +19255,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..8a4624a
+index 0000000..18769f0
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4035 @@
+@@ -0,0 +1,4168 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -23165,6 +23294,139 @@ index 0000000..8a4624a
 +    emitted = "".join(matcher.push_text(x) for x in prefix + ["STOP ex", "ample</th", "ink>visible ST", "OP hidden"])
 +    assert emitted == ("<think>" if not opened else "") + "STOP example</think>visible "
 +    assert matcher.stopped
++
++
++def test_sidecar_stop_supports_custom_thinking_markers():
++    matcher = m5_mod._StopMatcher(
++        [],
++        ["STOP"],
++        skip_reasoning=True,
++        prompt_opens_think=False,
++        think_open="<|thought|>",
++        think_close="<|/thought|>",
++    )
++    chunks = ["<|tho", "ught|>STOP inside<|/th", "ought|>answer ST", "OP tail"]
++    emitted = "".join(matcher.push_text(c) for c in chunks)
++    assert emitted == "<|thought|>STOP inside<|/thought|>answer "
++    assert matcher.stopped
++
++
++def test_sync_m5rt_ui_kv_setting_normalizes_leftover_stock_affine8():
++    from omlx.admin.routes import ModelSettingsRequest
++
++    settings = ModelSettings(
++        external_engine="m5rt",
++        turboquant_kv_enabled=True,
++        turboquant_kv_scheme="affine8",
++        turboquant_kv_bits=8.0,
++        m5rt_options={"kv_dtype": "bf16"},
++        external_engine_options={"m5rt": {"kv_dtype": "bf16"}},
++    )
++    req = ModelSettingsRequest(turboquant_kv_enabled=True)
++    m5_mod.apply_m5rt_model_settings_update(
++        settings, req, req.model_fields_set, is_diffusion_model=False,
++    )
++    assert settings.turboquant_kv_scheme == "affine4"
++    assert settings.turboquant_kv_bits == 4.0
++    assert settings.m5rt_options is None
++    assert settings.external_engine_options is None
++    assert m5_mod._resolve_effective_kv_dtype({}, settings) == "affine4_g128"
++
++    # Switching from Stock MLX (with 6-bit turboquant enabled) to m5rt also normalizes.
++    switched = ModelSettings(
++        external_engine=None,
++        turboquant_kv_enabled=True,
++        turboquant_kv_scheme="turboquant",
++        turboquant_kv_bits=6.0,
++    )
++    req_switch = ModelSettingsRequest(external_engine="m5rt")
++    m5_mod.apply_m5rt_model_settings_update(
++        switched, req_switch, req_switch.model_fields_set, is_diffusion_model=False,
++    )
++    assert switched.turboquant_kv_scheme == "affine4"
++    assert switched.turboquant_kv_bits == 4.0
++    assert m5_mod._resolve_effective_kv_dtype({}, switched) == "affine4_g128"
++
++
++def test_m5rt_repetition_context_size_rejects_oversized_window():
++    engine = M5SidecarEngine.__new__(M5SidecarEngine)
++    engine._model_id = "test-model"
++    engine._options = M5Options(sampling_contract="position_coupled_v1")
++    engine._last_stats = {"sampling_contract_id": "position_coupled_v1"}
++    engine._hello_info = {"capabilities": ["sampling_penalties", "thinking_budget"]}
++    engine._warned_request_controls = set()
++    engine._tokenizer = None
++    engine._vocab_size = 32000
++
++    with pytest.raises(InvalidRequestError):
++        engine.reconcile_request_controls(
++            {"repetition_penalty": 1.1, "repetition_context_size": m5_mod.M5RT_MAX_REPETITION_CONTEXT_SIZE + 1},
++            {"repetition_context_size": "repetition_context_size"},
++        )
++
++
++@pytest.mark.asyncio
++async def test_sidecar_string_stop_cancel_waits_for_async_request_stats(tmp_path):
++    model_dir = _write_test_model(tmp_path / "cancel-stats")
++    tok = _build_bpe_chat_tokenizer(model_dir)
++    bin_path = _fake_daemon_script(tmp_path / "bin" / "mseries_backendd", "miv-v0.03", protocol=2)
++    m5_bin, _ = find_m5rt_binary(str(bin_path))
++    assert m5_bin is not None
++    engine = M5SidecarEngine(
++        model_name=str(model_dir),
++        model_id="cancel-stats",
++        target=M5Target(binary=m5_bin, artifact_path=model_dir / "model.omlxm5", metallib_dir=None),
++        log_dir=tmp_path / "logs",
++        options=M5Options(max_context=4096, sampling_contract="position_coupled_v1"),
++    )
++    engine._tokenizer = tok
++    engine._vocab_size = len(tok)
++    engine._eos_token_ids = [tok.eos_token_id] if tok.eos_token_id is not None else [0]
++    engine._process = SimpleNamespace(pid=os.getpid(), poll=lambda: None, returncode=None)  # type: ignore[assignment]
++    engine._hello_info = {"capabilities": ["subscribe_events"]}
++
++    hello_ids = tok.encode("hello STOP world", add_special_tokens=False)
++
++    async def fake_rpc(method: str, params: dict | None = None, timeout: float = 30.0):
++        if method == "submit":
++            q = engine._request_queues.setdefault(42, asyncio.Queue())
++            q.put_nowait(m5_mod._SidecarEvent(request_id=42, kind="tokens", tokens=tuple(hello_ids)))
++            return {"request_id": 42}
++        return {"ok": True}
++
++    async def fake_cancel(backend_id: int) -> bool:
++        async def push_later():
++            await asyncio.sleep(0.02)
++            q = engine._request_queues.get(backend_id)
++            if q is not None:
++                q.put_nowait(
++                    m5_mod._SidecarEvent(
++                        request_id=backend_id,
++                        kind="aborted",
++                        finish_reason="cancelled",
++                        request_stats={
++                            "prefix_restored_tokens": 5,
++                            "spec_rounds": 2,
++                            "ar_steps": 0,
++                            "decode_mode": "mtp",
++                            "fallback_reason": "",
++                        },
++                    )
++                )
++
++        asyncio.create_task(push_later())
++        return True
++
++    engine._rpc = fake_rpc  # type: ignore[assignment]
++    engine._cancel_backend_request = fake_cancel  # type: ignore[assignment]
++
++    final = None
++    async for chunk in engine.stream_generate([1, 2, 3, 4, 5, 6, 7], max_tokens=32, stop=["STOP"]):
++        final = chunk
++    assert final is not None
++    assert final.finished is True
++    assert final.finish_reason == "stop"
++    assert final.cached_tokens == 5
 diff --git a/tests/test_microkernel_manager.py b/tests/test_microkernel_manager.py
 new file mode 100644
 index 0000000..b90774c

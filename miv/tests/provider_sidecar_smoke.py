@@ -398,9 +398,9 @@ def run_session(
         try:
             hello = client.call("hello")
             assert hello["provider_id"] == "io.ninfer.metal"
-            assert hello["provider_version"] == "miv-v0.02"
+            assert hello["provider_version"] == "miv-v0.03"
             assert hello["codename"] == "miv"
-            assert hello["semver"] == "0.0.2"
+            assert hello["semver"] == "0.0.3"
             assert hello["core_abi"] == 1
             assert hello["protocol_version"] == 2
             for cap in (
@@ -728,7 +728,7 @@ def main() -> int:
         Path(value).resolve() for value in sys.argv[1:]
     )
     version = subprocess.check_output([str(daemon), "--version"], text=True)
-    assert "protocol=2" in version and "miv-v0.02" in version, version
+    assert "protocol=2" in version and "miv-v0.03" in version, version
 
     test_pipelined_jsonl_and_reconnect(daemon)
     test_dual_connection_subscribe_and_cancel(daemon)

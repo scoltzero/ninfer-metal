@@ -297,6 +297,7 @@ VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
 VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
 M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
 M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
+M5RT_MAX_REPETITION_CONTEXT_SIZE = 4096
 M5RT_REQUEST_SETTINGS = ("max_tokens", "temperature", "top_p", "top_k")
 VALID_SAMPLING_CONTRACTS = frozenset({"legacy_rejection_v1", "position_coupled_v1"})
 VALID_SPEC_BACKENDS = frozenset({"auto", "none", "dflash2", "mtp"})
@@ -1173,7 +1174,16 @@ def sync_m5rt_ui_kv_setting(
     sent: set[str] | frozenset[str],
 ) -> None:
     """Persist an explicit UI KV-compression toggle for `m5rt` so disabling overrides shared TOML."""
-    if "turboquant_kv_enabled" not in sent:
+    target_engine = (
+        getattr(request, "external_engine", None)
+        if "external_engine" in sent
+        else getattr(current_settings, "external_engine", None)
+    )
+    switched_to_m5rt = (
+        "external_engine" in sent
+        and canonical_external_engine_id(target_engine) == M5RT_ENGINE_ID
+    )
+    if "turboquant_kv_enabled" not in sent and not switched_to_m5rt:
         return
     req_explicit_kv = False
     if "m5rt_options" in sent and isinstance(getattr(request, "m5rt_options", None), dict):
@@ -1190,7 +1200,12 @@ def sync_m5rt_ui_kv_setting(
     if req_explicit_kv:
         return
 
-    if not bool(getattr(request, "turboquant_kv_enabled", False)):
+    kv_enabled = (
+        bool(getattr(request, "turboquant_kv_enabled", False))
+        if "turboquant_kv_enabled" in sent
+        else bool(getattr(current_settings, "turboquant_kv_enabled", False))
+    )
+    if "turboquant_kv_enabled" in sent and not kv_enabled:
         opts_copy = dict(getattr(current_settings, "m5rt_options", None) or {})
         opts_copy["kv_dtype"] = "bf16"
         current_settings.m5rt_options = opts_copy
@@ -1207,28 +1222,45 @@ def sync_m5rt_ui_kv_setting(
                     updated_ext = True
             if updated_ext:
                 current_settings.external_engine_options = ext_copy
-    else:
-        existing_opts = getattr(current_settings, "m5rt_options", None)
-        if isinstance(existing_opts, dict) and existing_opts.get("kv_dtype") == "bf16":
-            opts_copy = dict(existing_opts)
-            opts_copy.pop("kv_dtype", None)
-            current_settings.m5rt_options = opts_copy or None
-        existing_ext = getattr(current_settings, "external_engine_options", None)
-        if isinstance(existing_ext, dict):
-            ext_copy = dict(existing_ext)
-            updated_ext = False
-            for eng_key in M5RT_OPTION_KEYS:
-                nested = ext_copy.get(eng_key)
-                if isinstance(nested, dict) and nested.get("kv_dtype") == "bf16":
-                    nested_copy = dict(nested)
-                    nested_copy.pop("kv_dtype", None)
-                    if nested_copy:
-                        ext_copy[eng_key] = nested_copy
-                    else:
-                        ext_copy.pop(eng_key, None)
-                    updated_ext = True
-            if updated_ext:
-                current_settings.external_engine_options = ext_copy or None
+    elif kv_enabled:
+        if "turboquant_kv_enabled" in sent:
+            existing_opts = getattr(current_settings, "m5rt_options", None)
+            if isinstance(existing_opts, dict) and existing_opts.get("kv_dtype") == "bf16":
+                opts_copy = dict(existing_opts)
+                opts_copy.pop("kv_dtype", None)
+                current_settings.m5rt_options = opts_copy or None
+            existing_ext = getattr(current_settings, "external_engine_options", None)
+            if isinstance(existing_ext, dict):
+                ext_copy = dict(existing_ext)
+                updated_ext = False
+                for eng_key in M5RT_OPTION_KEYS:
+                    nested = ext_copy.get(eng_key)
+                    if isinstance(nested, dict) and nested.get("kv_dtype") == "bf16":
+                        nested_copy = dict(nested)
+                        nested_copy.pop("kv_dtype", None)
+                        if nested_copy:
+                            ext_copy[eng_key] = nested_copy
+                        else:
+                            ext_copy.pop(eng_key, None)
+                        updated_ext = True
+                if updated_ext:
+                    current_settings.external_engine_options = ext_copy or None
+        # Web hides scheme/bitwidth pickers for miv; normalize leftover Stock
+        # MLX values (e.g. affine8 or 6/8-bit) when the user did not explicitly
+        # send them so turning on 4-bit KV is never silently trapped in bf16.
+        if "turboquant_kv_scheme" not in sent and "turboquant_kv_bits" not in sent:
+            scheme = str(getattr(current_settings, "turboquant_kv_scheme", "") or "").strip().lower()
+            raw_bits = getattr(current_settings, "turboquant_kv_bits", None)
+            unsupported_bits = (
+                isinstance(raw_bits, (int, float))
+                and not isinstance(raw_bits, bool)
+                and float(raw_bits) > 4.0
+            )
+            if scheme not in ("", "affine4", "turboquant") or unsupported_bits:
+                if hasattr(current_settings, "turboquant_kv_scheme"):
+                    current_settings.turboquant_kv_scheme = "affine4"
+                if hasattr(current_settings, "turboquant_kv_bits"):
+                    current_settings.turboquant_kv_bits = 4.0
 
 
 def _validate_external_engine_option_fields(engine_key: str, fields: Any) -> dict[str, Any]:
@@ -2794,10 +2826,10 @@ def _resolve_effective_kv_dtype(
             and "affine4_g128" in allowed
         ):
             return "affine4_g128"
-        # CRITICAL: Do NOT map "affine8" to "int8_g64" — miv-v0.01 only implements
+        # CRITICAL: Do NOT map "affine8" to "int8_g64" — miv only implements
         # bf16 and affine4_g128 in kv_page_pool.cpp.
         logger.warning(
-            "miv Core Backend: turboquant_kv_scheme=%r (bits=%r) is not implemented in miv-v0.01 "
+            "miv Core Backend: turboquant_kv_scheme=%r (bits=%r) is not implemented in miv "
             "(only 4-bit 'affine4'/'turboquant' -> 'affine4_g128' or disabled -> 'bf16'); using 'bf16'",
             scheme,
             raw_bits,
@@ -4345,7 +4377,11 @@ class _StopMatcher:
         *,
         skip_reasoning: bool = False,
         prompt_opens_think: bool = False,
+        think_open: str = "<think>",
+        think_close: str = "</think>",
     ) -> None:
+        self._think_open = think_open or "<think>"
+        self._think_close = think_close or "</think>"
         self._think_state = "answer"
         if skip_reasoning:
             self._think_state = "thinking" if prompt_opens_think else "leading"
@@ -4390,7 +4426,7 @@ class _StopMatcher:
 
         buf = self._think_pending + piece
         self._think_pending = ""
-        opened, closed = "<think>", "</think>"
+        opened, closed = self._think_open, self._think_close
         prefix = ""
         if self._think_state == "leading":
             start = buf.lstrip()
@@ -5811,6 +5847,51 @@ class M5SidecarEngine(BaseEngine):
         start, end = boundaries
         return (start, end) if start != end else None
 
+    def _thinking_marker_strings(self) -> tuple[str, str]:
+        """Resolve literal thinking open/close markers for reasoning-aware stop matching."""
+        tokenizer = self._tokenizer
+        start_tag = _safe_tokenizer_attr(tokenizer, "think_start")
+        end_tag = _safe_tokenizer_attr(tokenizer, "think_end")
+        if (
+            isinstance(start_tag, str)
+            and start_tag
+            and isinstance(end_tag, str)
+            and end_tag
+            and start_tag != end_tag
+        ):
+            return start_tag, end_tag
+        markers = self._thinking_token_ids()
+        if markers is not None and tokenizer is not None and hasattr(tokenizer, "decode"):
+            with contextlib.suppress(Exception):
+                dec_start = tokenizer.decode(markers[0], skip_special_tokens=False)
+                dec_end = tokenizer.decode(markers[1], skip_special_tokens=False)
+                if (
+                    isinstance(dec_start, str)
+                    and dec_start
+                    and isinstance(dec_end, str)
+                    and dec_end
+                    and dec_start != dec_end
+                ):
+                    return dec_start, dec_end
+        return "<think>", "</think>"
+
+    def _prompt_tokens_open_think(self, prompt_tokens: list[int]) -> bool:
+        markers = self._thinking_token_ids()
+        if markers is None:
+            return False
+        start, end = markers
+        for tail_size in range(3):
+            end_of_start = len(prompt_tokens) - tail_size
+            beginning = end_of_start - len(start)
+            if beginning < 0 or prompt_tokens[beginning:end_of_start] != start:
+                continue
+            suffix = prompt_tokens[end_of_start:]
+            return not any(
+                suffix[i : i + len(end)] == end
+                for i in range(len(suffix) - len(end) + 1)
+            )
+        return False
+
     def _request_sampling_contract(self) -> str:
         return (
             (self._last_stats or {}).get("sampling_contract_id")
@@ -5867,9 +5948,18 @@ class M5SidecarEngine(BaseEngine):
             value = options[name]
             if reason is None and name in ("thinking_budget", "repetition_context_size"):
                 minimum = 0 if name == "thinking_budget" else 1
-                if not isinstance(value, int) or not minimum <= value <= 2**31 - 1:
+                maximum = (
+                    2**31 - 1
+                    if name == "thinking_budget"
+                    else M5RT_MAX_REPETITION_CONTEXT_SIZE
+                )
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not minimum <= value <= maximum
+                ):
                     raise InvalidRequestError(
-                        f"{field} must be an integer in [{minimum}, {2**31 - 1}]", field
+                        f"{field} must be an integer in [{minimum}, {maximum}]", field
                     )
             elif reason is None:
                 try:
@@ -6075,10 +6165,26 @@ class M5SidecarEngine(BaseEngine):
             ignore_eos=ignore_eos,
             extra_token_seqs=kwargs.get("stop_token_seqs"),
         )
+        skip_reasoning = bool(kwargs.get("stop_skips_reasoning"))
+        think_open, think_close = (
+            self._thinking_marker_strings() if skip_reasoning else ("<think>", "</think>")
+        )
+        if "_prompt_opens_think" in kwargs:
+            prompt_opens_think = bool(kwargs.get("_prompt_opens_think"))
+        elif skip_reasoning:
+            if isinstance(prompt, str):
+                prompt_opens_think = prompt.rfind(think_open) > prompt.rfind(think_close)
+            else:
+                prompt_opens_think = self._prompt_tokens_open_think(prompt_tokens)
+        else:
+            prompt_opens_think = False
         stop_matcher = _StopMatcher(
-            stop_token_seqs, stop_strings,
-            skip_reasoning=bool(kwargs.get("stop_skips_reasoning")),
-            prompt_opens_think=bool(kwargs.get("_prompt_opens_think")),
+            stop_token_seqs,
+            stop_strings,
+            skip_reasoning=skip_reasoning,
+            prompt_opens_think=prompt_opens_think,
+            think_open=think_open,
+            think_close=think_close,
         )
         special_ids = set() if ignore_eos else set(self._eos_token_ids)
         detok = _IncrementalDetokenizer(self._tokenizer, self._path, special_ids)
@@ -6203,8 +6309,15 @@ class M5SidecarEngine(BaseEngine):
             if not terminal_seen and backend_id is not None:
                 await self._cancel_backend_request(backend_id)
                 terminal_seen = True
-                while not queue.empty():
-                    event = queue.get_nowait()
+                deadline = time.monotonic() + 0.25
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
                     if event.kind != "tokens":
                         request_stats = event.request_stats or {}
                         break
@@ -6330,7 +6443,10 @@ class M5SidecarEngine(BaseEngine):
                 is_partial,
             )
         if kwargs.get("stop_skips_reasoning") and isinstance(prompt_text, str):
-            kwargs["_prompt_opens_think"] = prompt_text.rfind("<think>") > prompt_text.rfind("</think>")
+            think_open, think_close = self._thinking_marker_strings()
+            kwargs["_prompt_opens_think"] = (
+                prompt_text.rfind(think_open) > prompt_text.rfind(think_close)
+            )
         async for output in self.stream_generate(
             prompt=token_ids,
             max_tokens=max_tokens,

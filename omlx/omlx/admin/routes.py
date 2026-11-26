@@ -4029,6 +4029,19 @@ async def update_model_settings(
                 opts.pop("spec_backend", None)
                 opts["speculative_backend"] = policy
                 current_settings.m5rt_options = opts
+                ext = dict(current_settings.external_engine_options or {})
+                updated_alias = False
+                for eng_key in ("m5rt", "io.ninfer.metal", "ninfer-metal", "ninfer_metal"):
+                    nested = ext.get(eng_key)
+                    if isinstance(nested, dict):
+                        nested_copy = dict(nested)
+                        nested_copy.pop("spec_backend", None)
+                        nested_copy["speculative_backend"] = policy
+                        ext[eng_key] = nested_copy
+                        updated_alias = True
+                if not updated_alias:
+                    ext[M5RT_ENGINE_ID] = {"speculative_backend": policy}
+                current_settings.external_engine_options = ext
 
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)

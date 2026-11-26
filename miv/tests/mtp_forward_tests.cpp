@@ -1261,6 +1261,108 @@ Json test_end_to_end_engine_parity(const std::filesystem::path &qwen_fixtures,
               "Evicting a retained checkpoint corrupted a live MTP prefix");
       ++total_parity_checks;
     }
+
+    // B=1 multi-conversation MTP CoW retention: running unrelated requests
+    // (controlled + Thread B) on slot 0 must NOT evict Thread A's retained
+    // t2+out2 MTP prefix checkpoint, so returning to Thread A (t3) stays on
+    // MTP with 0-ULP parity against pure AR!
+    {
+      SubmitRequest thread_b;
+      thread_b.prompt_tokens = make_prompt_i32(19U, 101U, 257U);
+      thread_b.max_new_tokens = 12;
+      (void)collect_request(*roll_mtp, roll_mtp->submit(thread_b));
+
+      SubmitRequest t3;
+      t3.prompt_tokens = t2.prompt_tokens;
+      t3.prompt_tokens.insert(t3.prompt_tokens.end(), mtp_t2.tokens.begin(),
+                              mtp_t2.tokens.end());
+      const auto t3_prefix = std::uint64_t(t3.prompt_tokens.size() - 1U);
+      const auto t3_suffix = make_prompt_i32(7U, 149U, 257U);
+      t3.prompt_tokens.insert(t3.prompt_tokens.end(), t3_suffix.begin(),
+                              t3_suffix.end());
+      t3.max_new_tokens = 18;
+
+      const auto ar_t3 = collect_request(*roll_ar, roll_ar->submit(t3));
+      const auto mtp_t3_after_b = collect_request(*roll_mtp, roll_mtp->submit(t3));
+      require(mtp_t3_after_b.tokens == ar_t3.tokens,
+              "B=1 interleaved A->B->A MTP greedy parity mismatch");
+      const auto rs = mtp_t3_after_b.request_stats.value_or(RequestStats{});
+      require(mtp_t3_after_b.request_stats &&
+                  rs.prefix_restored_tokens >= t3_prefix &&
+                  rs.spec_rounds > 0U && rs.fallback_reason.empty(),
+              "B=1 interleaved A->B->A dropped out of MTP instead of retaining CoW prefix: "
+              "cached=" +
+                  std::to_string(rs.prefix_restored_tokens) + "/" +
+                  std::to_string(t3_prefix) +
+                  " rounds=" + std::to_string(rs.spec_rounds) +
+                  " fallback=" + rs.fallback_reason);
+      ++total_parity_checks;
+    }
+
+    // Request controls validation: repetition_context_size above kMaxRepetitionContextSize
+    // must be rejected cleanly, and a high thinking_budget stays batchable in B=2.
+    {
+      SubmitRequest oversized = t1;
+      oversized.sampling.repetition_penalty = 1.1F;
+      oversized.sampling.repetition_context_size = kMaxRepetitionContextSize + 1;
+      bool rejected = false;
+      try {
+        (void)roll_mtp->submit(oversized);
+      } catch (const std::invalid_argument &) {
+        rejected = true;
+      }
+      require(rejected, "Engine accepted repetition_context_size > kMaxRepetitionContextSize");
+
+      LoadOptions batch_opts = roll_mtp_opts;
+      batch_opts.max_concurrency = 2;
+      batch_opts.path_overrides["batch_mode"] = "on";
+      auto batch_mtp = Engine::create(batch_opts);
+      SubmitRequest high_budget = t1;
+      high_budget.max_new_tokens = 18;
+      high_budget.thinking_budget = ThinkingBudget{
+          .budget = 200,
+          .start_in_thinking = true,
+          .end_token_ids = {18, 19},
+      };
+      SubmitRequest peer = t1;
+      peer.prompt_tokens.push_back(77);
+      peer.max_new_tokens = 18;
+      const auto id_a = batch_mtp->submit(high_budget);
+      const auto id_b = batch_mtp->submit(peer);
+      RunOutcome out_a;
+      RunOutcome out_b;
+      bool done_a = false;
+      bool done_b = false;
+      while (!done_a || !done_b) {
+        for (auto &ev : batch_mtp->poll_events(std::chrono::milliseconds(50))) {
+          const bool is_a = (ev.request_id == id_a);
+          const bool is_b = (ev.request_id == id_b);
+          if (!is_a && !is_b)
+            continue;
+          RunOutcome &dst = is_a ? out_a : out_b;
+          if (ev.kind == EventKind::tokens) {
+            dst.tokens.insert(dst.tokens.end(), ev.tokens.begin(), ev.tokens.end());
+          } else {
+            dst.terminal_kind = ev.kind;
+            dst.finish_reason = ev.finish_reason;
+            dst.request_stats = std::move(ev.request_stats);
+            if (ev.kind == EventKind::failed) {
+              throw std::runtime_error("Engine request failed: " + ev.error);
+            }
+            if (is_a)
+              done_a = true;
+            else
+              done_b = true;
+          }
+        }
+      }
+      require(out_a.tokens == ar_t1.tokens,
+              "High thinking_budget B=2 MTP output differs from AR");
+      require(out_b.tokens.size() == 18U, "B=2 peer request incomplete");
+      require(batch_mtp->stats().batched_verify_rounds > 0U,
+              "High thinking_budget unexpectedly disabled B=2 batched MTP verification");
+      ++total_parity_checks;
+    }
   }
 
   return {{"parity_checks_passed", total_parity_checks},

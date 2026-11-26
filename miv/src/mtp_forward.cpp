@@ -2241,7 +2241,7 @@ public:
             sp.get("mtp_cache_value"), slot_mixer, table_ref, attn_pos_ref,
             std::move(attn_params));
       } else {
-        const bool use_split = sp.split_attn_ok && rows <= 8U;
+        const bool use_split = rows <= 8U;
         emit_paged_attention_affine4_g128(
             e, config, rows, use_split, sp.max_context, sp.max_context,
             sp.mtp_kv_pool->physical_pages(), slot_q, gate_ref,
