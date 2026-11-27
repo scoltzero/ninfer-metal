@@ -61489,26 +61489,26 @@
         }
       }
     },
-    "settings.miv.prefill.preset.long_fast" : {
-      "comment" : "Preset pill for W4A8 + Sage2 + MInference long-context prefill",
+    "settings.miv.prefill.preset.gpu_full" : {
+      "comment" : "Preset pill enabling all GPU prefill accelerations (W4A8 + Sage2 + MInference + CacheBlend, Dual-ANE off)",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Long 64K+ Fast"
+            "value" : "GPU Full"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "超长 64K+ 极速"
+            "value" : "GPU 全速"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "超長 64K+ 極速"
+            "value" : "GPU 全速"
           }
         }
       }

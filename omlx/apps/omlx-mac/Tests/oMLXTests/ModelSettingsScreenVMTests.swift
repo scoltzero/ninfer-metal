@@ -1283,14 +1283,16 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(minfKeys, ["prefill_sparse_minference"])
         XCTAssertFalse(vm.externalEnginePrefillToggleValue(for: minfOpt))
 
-        // Long 64K+ Fast preset turns on W4A8 + Sage2 + MInference orthogonally.
-        let staged = vm.stageMivPrefillPreset(.longFast)
+        // GPU Full preset turns on all 4 GPU switches (W4A8 + Sage2 + MInference + CacheBlend) with Dual-ANE off.
+        let staged = vm.stageMivPrefillPreset(.gpuFull)
         XCTAssertEqual(staged.count, 5)
-        XCTAssertEqual(vm.activeMivPrefillPreset, .longFast)
+        XCTAssertEqual(vm.activeMivPrefillPreset, .gpuFull)
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_attention_mode"]?.value as? String, "sage2")
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
-        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 3)
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_cache_blend"]?.value as? Bool, true)
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_ane_offload"]?.value as? Bool, false)
+        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 4)
 
         // Verify live telemetry decoding on MivEffectiveSettings.
         let decoder = JSONDecoder()

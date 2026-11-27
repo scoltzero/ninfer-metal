@@ -1211,13 +1211,17 @@ public:
     if (prefill_options_.sparse_minference) {
       base_fields.emplace("prefill_sparse_minference", "1");
     }
+    base_shared_contract_identity_ = execution_identity_digest(base_fields);
+    // CacheBlend and Dual-ANE are single-slot prefill-only paths disabled on
+    // secondary slots (Slot 1+) to avoid duplicating per-slot chunk/IOSurface
+    // pools; keep them out of shared_contract_identity so B>=2 packed decode
+    // across Slot 0 and Slot 1+ remains contract-compatible.
     if (prefill_options_.cache_blend) {
       base_fields.emplace("prefill_cache_blend", "1");
     }
     if (prefill_options_.ane_offload) {
       base_fields.emplace("prefill_ane_offload", "1");
     }
-    base_shared_contract_identity_ = execution_identity_digest(base_fields);
     base_fields.emplace("owner", std::to_string(owner_id));
     base_execution_identity_ = execution_identity_digest(base_fields);
     refresh_lora_execution_identity();

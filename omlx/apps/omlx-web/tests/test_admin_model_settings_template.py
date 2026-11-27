@@ -1345,16 +1345,17 @@ assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), f
 app.toggleExternalEngineOption(opts.prefill_sparse_minference);
 assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), false);
 
-// Presets apply cleanly without locking orthogonal toggles
+// Presets apply cleanly without locking orthogonal toggles (GPU Full = all 4 GPU switches ON, ANE OFF)
 const presets = Object.fromEntries(app.externalEnginePrefillPresets().map(p => [p.id, p]));
-app.applyExternalEnginePrefillPreset(presets.long_sparse);
-assert.equal(app.isExternalEnginePrefillPresetActive(presets.long_sparse), true);
+app.applyExternalEnginePrefillPreset(presets.gpu_full);
+assert.equal(app.isExternalEnginePrefillPresetActive(presets.gpu_full), true);
 assert.equal(app.getExternalEngineOption(opts.prefill_linear_mode), 'w4a8');
 assert.equal(app.getExternalEngineOption(opts.prefill_attention_mode), 'sage2');
 assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), true);
+assert.equal(app.getExternalEngineOption(opts.prefill_cache_blend), true);
+assert.equal(app.getExternalEngineOption(opts.prefill_ane_offload), false);
 
-// Enabling CacheBlend + Dual-ANE composes orthogonally with W4A8 + Sage2 + MInference
-app.toggleExternalEngineOption(opts.prefill_cache_blend);
+// Enabling Dual-ANE composes orthogonally with GPU Full (W4A8 + Sage2 + MInference + CacheBlend)
 app.toggleExternalEngineOption(opts.prefill_ane_offload);
 app.setExternalEngineOption(maxCtxOpt, '262144');
 

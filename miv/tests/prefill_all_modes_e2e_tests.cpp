@@ -1351,6 +1351,48 @@ int main(int argc, char **argv) {
           {"recomputed_tokens", st_warm.prefill_cache_blend_recomputed_tokens},
       };
 
+      // Concurrent B=2 packed decode with CacheBlend + Dual-ANE enabled on Slot 0
+      // and disabled on Slot 1+: shared_contract_identity must match across slots
+      // so concurrent requests never fail with "Qwen packed batch slot differs in
+      // execution contract".
+      {
+        auto b2_opts = make_load_options(
+            dense_oq, libs, static_cast<std::int32_t>(kCtx),
+            PrefillLinearMode::W4A8, PrefillAttentionMode::Sage2, false, true,
+            true, true);
+        b2_opts.max_concurrency = 2;
+        auto eng_b2 = Engine::create(b2_opts);
+        SubmitRequest sr1;
+        sr1.prompt_tokens = to_i32(req1);
+        sr1.max_new_tokens = 8;
+        sr1.sampling.temperature = 0.0F;
+        sr1.sampling.seed = 42ULL;
+        SubmitRequest sr2 = sr1;
+        sr2.prompt_tokens = to_i32(req2);
+        const auto id1 = eng_b2->submit(sr1);
+        const auto id2 = eng_b2->submit(sr2);
+        std::size_t c1 = 0, c2 = 0;
+        bool d1 = false, d2 = false;
+        const auto deadline = std::chrono::steady_clock::now() + 180s;
+        while ((!d1 || !d2) && std::chrono::steady_clock::now() < deadline) {
+          for (const auto &ev : eng_b2->poll_events(10ms)) {
+            if (ev.kind == EventKind::tokens) {
+              if (ev.request_id == id1) c1 += ev.tokens.size();
+              else if (ev.request_id == id2) c2 += ev.tokens.size();
+            } else if (ev.kind == EventKind::finished) {
+              if (ev.request_id == id1) d1 = true;
+              else if (ev.request_id == id2) d2 = true;
+            } else {
+              throw std::runtime_error("Concurrent B=2 CacheBlend+ANE failed: " + ev.error);
+            }
+          }
+        }
+        require(d1 && d2 && c1 == 8U && c2 == 8U,
+                "Concurrent B=2 CacheBlend+ANE did not finish cleanly");
+        eng_b2->shutdown();
+        case6["concurrent_b2_cache_blend_ane"] = "passed";
+      }
+
       // Multi-window CacheBlend (suffix_len = 3200 > workspace_rows_ = 2048):
       // 3 x 1024-tok docs + 128-tok query, cold populate -> warm reordered [C][A][B][Q]!
       {

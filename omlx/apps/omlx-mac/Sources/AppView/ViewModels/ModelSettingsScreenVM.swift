@@ -1612,7 +1612,7 @@ final class ModelSettingsScreenVM {
     enum MivPrefillPreset: String, CaseIterable, Identifiable {
         case lossless
         case balanced
-        case longFast
+        case gpuFull
         case ragBlend
 
         var id: String { rawValue }
@@ -1627,10 +1627,10 @@ final class ModelSettingsScreenVM {
                 return String(localized: "settings.miv.prefill.preset.balanced",
                               defaultValue: "W4A8 Balanced",
                               comment: "Preset pill for W4A8 linear + exact attention prefill")
-            case .longFast:
-                return String(localized: "settings.miv.prefill.preset.long_fast",
-                              defaultValue: "Long 64K+ Fast",
-                              comment: "Preset pill for W4A8 + Sage2 + MInference long-context prefill")
+            case .gpuFull:
+                return String(localized: "settings.miv.prefill.preset.gpu_full",
+                              defaultValue: "GPU Full",
+                              comment: "Preset pill enabling all GPU prefill accelerations (W4A8 + Sage2 + MInference + CacheBlend, Dual-ANE off)")
             case .ragBlend:
                 return String(localized: "settings.miv.prefill.preset.rag_blend",
                               defaultValue: "RAG Reuse",
@@ -1749,7 +1749,7 @@ final class ModelSettingsScreenVM {
         let ane = byKey["prefill_ane_offload"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
         if !w4a8 && !sage2 && !blend && !ane { return .lossless }
         if w4a8 && !sage2 && !blend && !ane { return .balanced }
-        if w4a8 && sage2 && minf && !blend && !ane { return .longFast }
+        if w4a8 && sage2 && minf && blend && !ane { return .gpuFull }
         if w4a8 && !sage2 && blend && !ane { return .ragBlend }
         return nil
     }
@@ -1775,12 +1775,12 @@ final class ModelSettingsScreenVM {
                 "prefill_cache_blend": false,
                 "prefill_ane_offload": false,
             ]
-        case .longFast:
+        case .gpuFull:
             target = [
                 "prefill_linear_mode": "w4a8",
                 "prefill_attention_mode": "sage2",
                 "prefill_sparse_minference": true,
-                "prefill_cache_blend": false,
+                "prefill_cache_blend": true,
                 "prefill_ane_offload": false,
             ]
         case .ragBlend:

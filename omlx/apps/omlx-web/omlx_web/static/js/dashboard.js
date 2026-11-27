@@ -5090,21 +5090,21 @@
                         },
                     },
                     {
-                        id: 'long_sparse',
-                        label: zh ? '超长极速 (64K+)' : 'Long 64K+',
+                        id: 'gpu_full',
+                        label: zh ? 'GPU 全速' : 'GPU Full',
                         values: {
                             prefill_linear_mode: 'w4a8',
                             prefill_attention_mode: 'sage2',
                             prefill_sparse_minference: true,
-                            prefill_cache_blend: false,
+                            prefill_cache_blend: true,
                             prefill_ane_offload: false,
                         },
                     },
                     {
                         id: 'rag_blend',
-                        label: zh ? 'RAG 复用' : 'RAG Blend',
+                        label: zh ? 'RAG 复用' : 'RAG Reuse',
                         values: {
-                            prefill_linear_mode: 'bf16',
+                            prefill_linear_mode: 'w4a8',
                             prefill_attention_mode: 'exact_nax',
                             prefill_sparse_minference: false,
                             prefill_cache_blend: true,
