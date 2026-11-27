@@ -517,6 +517,13 @@ void reconcile_qwen_config_with_artifact(QwenModelConfig &config,
   };
 
   for (std::size_t layer = 0; layer < config.layer_types.size(); ++layer) {
+    if (find_text_suffix("layers." + std::to_string(layer) +
+                         ".linear_attn.in_proj_qkv") != nullptr) {
+      config.layer_types[layer] = LayerType::linear_attention;
+    }
+  }
+
+  for (std::size_t layer = 0; layer < config.layer_types.size(); ++layer) {
     if (config.layer_types[layer] != LayerType::full_attention) {
       continue;
     }
@@ -560,6 +567,12 @@ void reconcile_qwen_config_with_artifact(QwenModelConfig &config,
     if (exp_gate == nullptr) {
       exp_gate = find_text_suffix("layers.0.mlp.switch_mlp.gate_proj");
     }
+    if (exp_gate == nullptr) {
+      exp_gate = find_text_suffix(".mlp.experts.gate_proj");
+    }
+    if (exp_gate == nullptr) {
+      exp_gate = find_text_suffix("layers.0.mlp.experts.gate_proj");
+    }
     if (exp_gate != nullptr && exp_gate->shape.size() == 3 &&
         exp_gate->shape[1] > 0) {
       config.intermediate_size =
@@ -569,6 +582,12 @@ void reconcile_qwen_config_with_artifact(QwenModelConfig &config,
         find_text_suffix(".mlp.shared_expert.gate_proj");
     if (sh_gate_proj == nullptr) {
       sh_gate_proj = find_text_suffix("layers.0.mlp.shared_expert.gate_proj");
+    }
+    if (sh_gate_proj == nullptr) {
+      sh_gate_proj = find_text_suffix(".mlp.shared_experts.gate_proj");
+    }
+    if (sh_gate_proj == nullptr) {
+      sh_gate_proj = find_text_suffix("layers.0.mlp.shared_experts.gate_proj");
     }
     if (sh_gate_proj == nullptr) {
       config.shared_expert_intermediate_size = 0;

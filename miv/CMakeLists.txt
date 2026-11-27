@@ -3111,3 +3111,15 @@ add_test(
     $<TARGET_FILE:omlx_m5_universal_capability_tests>
     "${OMLX_M5_METAL_OUTPUT_DIR}"
     $<TARGET_FILE:mseries_backendd>)
+
+if(Python_EXECUTABLE)
+  add_test(
+    NAME omlx_m5_universal_e2e_pipeline
+    COMMAND
+      ${CMAKE_COMMAND} -E env
+      "OMLX_M5_DAEMON_BIN=$<TARGET_FILE:mseries_backendd>"
+      ${Python_EXECUTABLE} -m pytest
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_universal_e2e_pipeline.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capability_repack_planner.py"
+      -q)
+endif()

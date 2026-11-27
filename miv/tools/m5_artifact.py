@@ -1345,6 +1345,7 @@ def _plan_repack_layers(
     is_dflash2: bool,
     nax_pretile: bool,
     artifact_version: int,
+    strip_non_text: bool = True,
 ) -> dict[str, Any]:
     """Layer 2: Per-tensor quantization & layout repack planner."""
     skipped_tensors: list[str] = []
@@ -1391,7 +1392,7 @@ def _plan_repack_layers(
 
     active_tensors: dict[str, TensorInfo] = {}
     for tname in sorted(tensors):
-        if _is_non_text_tensor_name(tname):
+        if strip_non_text and _is_non_text_tensor_name(tname):
             skipped_tensors.append(tname)
             tensor_cat_counts["skip_non_text"] += 1
             cat_counts["skip_non_text"] += 1
@@ -1922,7 +1923,11 @@ def _evaluate_graph_capability_gate(
             or text_mt.lower() in KNOWN_MODEL_TYPE_HINTS
         )
     )
-    active_names = [n for n in sorted(tensors) if not _is_non_text_tensor_name(n)]
+    active_names = [
+        n
+        for n in sorted(tensors)
+        if not (require_complete_model and _is_non_text_tensor_name(n))
+    ]
     text_names = [n for n in active_names if not _is_mtp_object_name(n)]
 
     base_gate: dict[str, Any] = {
@@ -2278,10 +2283,10 @@ def _evaluate_graph_capability_gate(
             )
         head_dim = h // q_heads
     base_gate["head_dim"] = head_dim
-    if head_dim not in (64, 128, 256):
+    if head_dim < 2 or head_dim > 256 or (head_dim % 2) != 0:
         return _fail(
             "unsupported_head_dim",
-            f"Unsupported head_dim={head_dim}; miv NAX/exact attention supports head_dim in (64, 128, 256)",
+            f"Unsupported head_dim={head_dim}; miv requires an even head_dim in 2..256",
         )
 
     # RoPE validation (both rope_parameters object and top-level rope_theta / partial_rotary_factor)
@@ -2650,6 +2655,7 @@ def _evaluate_two_layer_capability_and_plan(
         is_dflash2=is_dflash2,
         nax_pretile=nax_pretile,
         artifact_version=artifact_version,
+        strip_non_text=require_complete_model,
     )
     graph_gate = _evaluate_graph_capability_gate(
         raw_config,
@@ -3323,7 +3329,10 @@ def _build_all_quantized_recipes(
 ) -> tuple[list[ObjectRecipe], set[str]]:
     recipes: list[ObjectRecipe] = []
     consumed: set[str] = set()
-    active_names = [n for n in sorted(source.tensors) if not _is_non_text_tensor_name(n)]
+    strip_non_text = _has_full_model_arch_config(source.config)
+    active_names = [
+        n for n in sorted(source.tensors) if not (strip_non_text and _is_non_text_tensor_name(n))
+    ]
     for packed_name in (n for n in active_names if n.endswith(".weight_packed")):
         module = packed_name[: -len(".weight_packed")]
         recipe, src_names = _build_compressed_mxfp4_module_recipe(source, module)
@@ -3371,10 +3380,12 @@ def build_compressed_mxfp4_recipes(
 ) -> tuple[list[ObjectRecipe], set[str]]:
     recipes: list[ObjectRecipe] = []
     consumed: set[str] = set()
+    strip_non_text = _has_full_model_arch_config(source.config)
     for packed_name in sorted(
         name
         for name in source.tensors
-        if name.endswith(".weight_packed") and not _is_non_text_tensor_name(name)
+        if name.endswith(".weight_packed")
+        and not (strip_non_text and _is_non_text_tensor_name(name))
     ):
         module = packed_name[: -len(".weight_packed")]
         recipe, source_names = _build_compressed_mxfp4_module_recipe(source, module)
@@ -3386,7 +3397,7 @@ def build_compressed_mxfp4_recipes(
         for name in source.tensors
         if name.endswith(".weight")
         and name not in consumed
-        and not _is_non_text_tensor_name(name)
+        and not (strip_non_text and _is_non_text_tensor_name(name))
     ):
         module = weight_name[: -len(".weight")]
         scales_name = module + ".scales"
@@ -3410,8 +3421,9 @@ def build_direct_recipes(
     source: SafeTensorSource, consumed: set[str]
 ) -> list[ObjectRecipe]:
     recipes: list[ObjectRecipe] = []
+    strip_non_text = _has_full_model_arch_config(source.config)
     for name in sorted(set(source.tensors) - consumed):
-        if _is_non_text_tensor_name(name):
+        if strip_non_text and _is_non_text_tensor_name(name):
             continue
         info = source.tensors[name]
         if info.dtype in ("F16", "F32"):

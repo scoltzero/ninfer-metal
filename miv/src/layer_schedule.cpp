@@ -357,7 +357,9 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
       const auto mlp = layer.prefix + ".mlp";
       add_linear(layer, resolver, "moe_router", mlp + ".gate");
       add_kernel_stage(layer, LayerStageKind::router, "moe_top8", 1);
-      const auto expert = mlp + ".switch_mlp";
+      const auto expert = resolver.has(mlp + ".switch_mlp.gate_proj")
+                              ? (mlp + ".switch_mlp")
+                              : (mlp + ".experts");
       add_linear(layer, resolver, "moe_expert_gate", expert + ".gate_proj");
       add_linear(layer, resolver, "moe_expert_up", expert + ".up_proj");
       add_kernel_stage(layer, LayerStageKind::swiglu, "moe_swiglu", 1,
@@ -372,7 +374,9 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
           add_linear(layer, resolver, "moe_shared_gate",
                      mlp + ".shared_expert_gate");
         }
-        const auto shared = mlp + ".shared_expert";
+        const auto shared = resolver.has(mlp + ".shared_expert.gate_proj")
+                                ? (mlp + ".shared_expert")
+                                : (mlp + ".shared_experts");
         add_linear(layer, resolver, "moe_shared_mlp_gate",
                    shared + ".gate_proj");
         add_linear(layer, resolver, "moe_shared_mlp_up", shared + ".up_proj");

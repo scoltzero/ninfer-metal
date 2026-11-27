@@ -8036,7 +8036,9 @@ def inspect_m5rt_source_fast(
                 repack_counts=base_counts,
                 first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
             )
-        if tname.endswith(".weight_scale_inv") or tdtype in ("F8_E4M3", "F8_E5M2"):
+        if tname.endswith(".weight_scale_inv") or (
+            tdtype.startswith("F8_") and tdtype != "F8_E8M0"
+        ):
             reason = (
                 f"FP8 quantization is not supported by {M5RT_ENGINE_LABEL} "
                 f"(found tensor {tname!r} with dtype={tdtype!r}, shape={list(tshape)})"
@@ -8304,11 +8306,11 @@ def inspect_m5rt_source_fast(
         head_dim = hidden_size // num_q_heads
     else:
         head_dim = None
-    if head_dim not in (64, 128, 256):
+    if head_dim is None or head_dim < 2 or head_dim > 256 or (head_dim % 2) != 0:
         return _finish(
             False,
             blocker_code="invalid_head_dim",
-            reason=f"Unsupported head_dim={head_dim!r} (expected one of 64, 128, 256)",
+            reason=f"Unsupported head_dim={head_dim!r} (expected even integer in 2..256)",
             model_type=raw_mt,
             text_model_type=raw_text_mt,
             model_type_hint_matched=hint_matched,
