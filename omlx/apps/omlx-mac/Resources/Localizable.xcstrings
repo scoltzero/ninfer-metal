@@ -61392,6 +61392,438 @@
           }
         }
       }
+    },
+    "settings.miv.prefill.section.title" : {
+      "comment" : "Section header above the per-model miv Prefill Acceleration card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill Acceleration (miv)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 加速 (miv)"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 加速 (miv)"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.section.sub" : {
+      "comment" : "Subtitle for the miv Prefill Acceleration card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Orthogonal toggles that stack freely — changes save immediately and reload the model."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正交开关可自由叠加组合；修改后立即保存并重载模型生效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正交開關可自由疊加組合；修改後立即儲存並重載模型生效。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.preset.lossless" : {
+      "comment" : "Preset pill for lossless exact miv prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lossless Default"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无损默认"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無損預設"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.preset.balanced" : {
+      "comment" : "Preset pill for W4A8 linear + exact attention prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 Balanced"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 均衡"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 均衡"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.preset.long_fast" : {
+      "comment" : "Preset pill for W4A8 + Sage2 + MInference long-context prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Long 64K+ Fast"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超长 64K+ 极速"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超長 64K+ 極速"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.preset.rag_blend" : {
+      "comment" : "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG Reuse"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG 复用"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG 複用"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.linear" : {
+      "comment" : "Short switch title for W4A8 prefill linear acceleration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 Linear"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 线性"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 線性"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.sage2" : {
+      "comment" : "Short switch title for SageAttention2 low-bit prefill attention",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2 Attention"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2 注意力"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2 注意力"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.minference" : {
+      "comment" : "Short switch title for MInference dynamic block sparsity under Sage2",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MInference Sparse"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MInference 稀疏"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MInference 稀疏"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.cache_blend" : {
+      "comment" : "Short switch title for cross-chunk KV cache blend reuse",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend Reuse"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend 复用"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend 複用"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.ane" : {
+      "comment" : "Short switch title for GPU + Dual-ANE hybrid prefill offload",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dual-ANE Offload"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "双 ANE 协同"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "雙 ANE 協同"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.linear" : {
+      "comment" : "Subtle trade-off note under the W4A8 Linear prefill switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 启用 INT8 激活量化（Decode 仍为 W4A16 无损），精度几乎无损，偶有轻微输出差异。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 啟用 INT8 激活量化（Decode 仍為 W4A16 無損），精度幾乎無損，偶有輕微輸出差異。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.sage2" : {
+      "comment" : "Subtle trade-off note under the Sage2 Attention prefill switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "低位宽 INT8 QK + FP16 PV 注意力；单独开启长文本偏慢，64K+ 需配合下方 MInference 稀疏。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "低位寬 INT8 QK + FP16 PV 注意力；單獨開啟長文本偏慢，64K+ 需配合下方 MInference 稀疏。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.minference" : {
+      "comment" : "Subtle trade-off note under the MInference Sparse prefill switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有轻微精度损失，但开启 Sage2 时不开会掉速严重（≥4K 长上下文自动跳过低权注意力块）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重（≥4K 長上下文自動跳過低權注意力塊）。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.minference_disabled" : {
+      "comment" : "Subtle note under MInference when Sage2 is currently off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需先开启上方 Sage2 注意力。有轻微精度损失，但开启 Sage2 时不开会掉速严重。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需先開啟上方 Sage2 注意力。有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.cache_blend" : {
+      "comment" : "Subtle trade-off note under the CacheBlend Reuse prefill switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG/多文档非连续片段跨块复用 KV（仅重算约 15%），有轻微精度折中，冷启动无额外加速。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG/多文件非連續片段跨塊複用 KV（僅重算約 15%），有輕微精度折衷，冷啟動無額外加速。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.ane" : {
+      "comment" : "Subtle trade-off note under the Dual-ANE Offload prefill switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 与双 ANE 并行分流稠密 MLP，可与 W4A8/Sage2 叠加；首次编译耗时，MoE 模型自动跳过。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 與雙 ANE 並行分流稠密 MLP，可與 W4A8/Sage2 疊加；首次編譯耗時，MoE 模型自動跳過。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.ane_moe" : {
+      "comment" : "Subtle note under Dual-ANE Offload for MoE models",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅作用于稠密 MLP，当前 MoE 模型会自动跳过（保持 GPU 执行，与 W4A8/Sage2 互不冲突）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "僅作用於稠密 MLP，目前 MoE 模型會自動跳過（保持 GPU 執行，與 W4A8/Sage2 互不衝突）。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

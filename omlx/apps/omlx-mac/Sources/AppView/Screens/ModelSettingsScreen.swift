@@ -60,10 +60,12 @@ struct ModelSettingsScreen: View {
             if let config = vm.model?.mivEffectiveSettings {
                 let backend = config.speculativeBackend == "none"
                     ? "AR" : "\(config.speculativeBackend.uppercased()) K=\(config.maxDraftTokens)"
+                let prefillSuffix = mivPrefillSummary(config)
                 Text(String(localized: "settings.miv.loaded", defaultValue: "Loaded by miv")
                      + ": \(backend) · \(config.kvDtype) · \(config.maxContext) tokens"
                      + " · B=\(config.maxConcurrency) (\(mivConcurrencySource(config.concurrencySource)))"
-                     + " · \(config.samplingContractId)")
+                     + " · \(config.samplingContractId)"
+                     + prefillSuffix)
             }
         }
         .font(.caption)
@@ -71,6 +73,20 @@ struct ModelSettingsScreen: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 18)
         .padding(.top, 12)
+    }
+
+    private func mivPrefillSummary(_ config: MivEffectiveSettings) -> String {
+        var tags: [String] = []
+        if config.prefillLinearMode == "w4a8" { tags.append("W4A8") }
+        if config.prefillAttentionMode == "sage2" {
+            tags.append(config.prefillSparseMinferenceEffective == true ? "Sage2+MInf" : "Sage2")
+        }
+        if config.prefillCacheBlend == true { tags.append("CacheBlend") }
+        if config.prefillAneOffload == true {
+            tags.append(config.prefillAneActive == true ? "Dual-ANE" : "ANE(idle)")
+        }
+        guard !tags.isEmpty else { return "" }
+        return " · Prefill: " + tags.joined(separator: "+")
     }
 
     private func mivConcurrencySource(_ source: String) -> String {
@@ -117,6 +133,9 @@ struct ModelSettingsScreen: View {
             EnginePage(vm: vm, supportedPageKeys: ["mtp_enabled", "dflash_enabled"]) {
                 VStack(alignment: .leading, spacing: 16) {
                     AccelerationSection(vm: vm, client: services.client)
+                    if vm.usesMiv && !vm.externalEnginePrefillOptions.isEmpty {
+                        MivPrefillAccelerationCard(vm: vm, client: services.client)
+                    }
                     if vm.prefillHelperSupported {
                         PrefillAcceleratorGroup(vm: vm, client: services.client) {
                             // Pairing lives in the web dashboard's Cluster tab.
@@ -2776,7 +2795,8 @@ private struct AccelerationSection: View {
                 .opacity(vm.externalEngineSupports("qwen4_gdn_decode_wide_proj") ? 1 : 0.4)
             }
             // The A8 rows do not depend on an ANE backend, which several A8 families lack.
-            if vm.showsA8Prefill {
+            // Hidden under miv where the dedicated Prefill Acceleration card owns W4A8/Sage2/ANE.
+            if vm.showsA8Prefill && !vm.usesMiv {
                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
                                   defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
@@ -2809,7 +2829,7 @@ private struct AccelerationSection: View {
     }
 
     private var hasFamilyRows: Bool {
-        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsA8Prefill
+        vm.isDeepseekV41 || vm.isQwen4Exp || (vm.showsA8Prefill && !vm.usesMiv)
     }
 
     private var a8PrefillSublabel: String {
@@ -2875,6 +2895,83 @@ private struct AccelerationSection: View {
         return String(localized: "settings.experimental.vlm_mtp.sub",
                       defaultValue: "External drafter (Gemma 4 assistant or Qwen MTP) speeds up single requests.",
                       comment: "Default sublabel for the VLM MTP toggle")
+    }
+}
+
+// MARK: - miv Prefill Acceleration Card
+
+private struct MivPrefillAccelerationCard: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHeader(
+                String(localized: "settings.miv.prefill.section.title",
+                       defaultValue: "Prefill Acceleration (miv)",
+                       comment: "Section header above the per-model miv Prefill Acceleration card"),
+                subtitle: String(localized: "settings.miv.prefill.section.sub",
+                                 defaultValue: "Orthogonal toggles that stack freely — changes save immediately and reload the model.",
+                                 comment: "Subtitle for the miv Prefill Acceleration card")
+            )
+            ListGroup {
+                FreeRow {
+                    HStack(spacing: 6) {
+                        ForEach(ModelSettingsScreenVM.MivPrefillPreset.allCases) { preset in
+                            let selected = vm.activeMivPrefillPreset == preset
+                            Button(preset.title) {
+                                Task { await vm.applyMivPrefillPreset(preset, client: client) }
+                            }
+                            .buttonStyle(.omlx(selected ? .primary : .normal, size: .small))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                let opts = vm.externalEnginePrefillOptions
+                ForEach(Array(opts.enumerated()), id: \.element.id) { index, opt in
+                    let isSubToggle = opt.key == "prefill_sparse_minference"
+                    let isDisabled = isSubToggle && !vm.isExternalEngineSage2Active
+                    let isLast = index == opts.count - 1
+                    FreeRow(isLast: isLast) {
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 5) {
+                                    if isSubToggle {
+                                        Text("↳")
+                                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                            .foregroundStyle(theme.textSecondary.opacity(0.75))
+                                    }
+                                    Text(vm.externalEngineOptionDisplayLabel(opt))
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                        .foregroundStyle(theme.text)
+                                    Circle()
+                                        .fill(theme.text)
+                                        .frame(width: 5, height: 5)
+                                        .accessibilityHidden(true)
+                                }
+                                Text(vm.externalEnginePrefillCautionHint(opt))
+                                    .font(.omlxText(11))
+                                    .foregroundStyle(theme.textSecondary.opacity(0.68))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.leading, isSubToggle ? 12 : 0)
+                            Spacer(minLength: 12)
+                            RowSwitch(isOn: Binding(
+                                get: { vm.externalEnginePrefillToggleValue(for: opt) },
+                                set: { newValue in
+                                    let keys = vm.setExternalEnginePrefillToggle(opt, isOn: newValue)
+                                    Task { await vm.saveExternalEngineOptionsPatch(keys: keys, client: client) }
+                                }
+                            ))
+                            .disabled(isDisabled)
+                        }
+                        .opacity(isDisabled ? 0.45 : 1.0)
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -5011,29 +5011,150 @@
                 return schema.find(s => s && s.key === 'lora_mode' && s.type === 'enum') || null;
             },
 
+            externalEnginePrefillOptionKeys() {
+                return [
+                    'prefill_linear_mode',
+                    'prefill_attention_mode',
+                    'prefill_sparse_minference',
+                    'prefill_cache_blend',
+                    'prefill_ane_offload',
+                ];
+            },
+
+            externalEnginePrefillOptionsSchema() {
+                const entry = this.activeExternalEngineEntry();
+                const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
+                const order = this.externalEnginePrefillOptionKeys();
+                const byKey = new Map();
+                for (const item of schema) {
+                    if (item && typeof item === 'object' && order.includes(item.key)) {
+                        byKey.set(item.key, item);
+                    }
+                }
+                return order.map(key => byKey.get(key)).filter(Boolean);
+            },
+
             externalEngineGeneralOptionsSchema() {
                 const entry = this.activeExternalEngineEntry();
                 const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
+                const prefillKeys = new Set(this.externalEnginePrefillOptionKeys());
                 return schema.filter(
                     s => s && typeof s === 'object' && s.key && s.key !== 'lora_mode'
+                        && !prefillKeys.has(s.key)
                         && ['int', 'bool', 'bytes_gb', 'enum', 'string', 'float', 'number'].includes(s.type)
                 );
             },
 
+            isExternalEngineZh() {
+                return (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
+            },
+
+            isMoeExternalEngineModel() {
+                const type = String(this.selectedModel?.config_model_type || '').toLowerCase();
+                return type.includes('moe');
+            },
+
+            externalEnginePrefillCardTitle() {
+                return this.isExternalEngineZh() ? 'Prefill 预填加速' : 'Prefill Acceleration';
+            },
+
+            externalEnginePrefillCardSubtitle() {
+                return this.isExternalEngineZh()
+                    ? '长上下文冷启动加速项，支持自由正交组合（解码阶段保持全精度 W4A16）。'
+                    : 'Orthogonal long-context prefill switches (decode stays exact W4A16).';
+            },
+
+            externalEnginePrefillPresets() {
+                const zh = this.isExternalEngineZh();
+                return [
+                    {
+                        id: 'lossless',
+                        label: zh ? '无损默认' : 'Lossless',
+                        values: {
+                            prefill_linear_mode: 'bf16',
+                            prefill_attention_mode: 'exact_nax',
+                            prefill_sparse_minference: false,
+                            prefill_cache_blend: false,
+                            prefill_ane_offload: false,
+                        },
+                    },
+                    {
+                        id: 'w4a8',
+                        label: zh ? 'W4A8 均衡' : 'W4A8',
+                        values: {
+                            prefill_linear_mode: 'w4a8',
+                            prefill_attention_mode: 'exact_nax',
+                            prefill_sparse_minference: false,
+                            prefill_cache_blend: false,
+                            prefill_ane_offload: false,
+                        },
+                    },
+                    {
+                        id: 'long_sparse',
+                        label: zh ? '超长极速 (64K+)' : 'Long 64K+',
+                        values: {
+                            prefill_linear_mode: 'w4a8',
+                            prefill_attention_mode: 'sage2',
+                            prefill_sparse_minference: true,
+                            prefill_cache_blend: false,
+                            prefill_ane_offload: false,
+                        },
+                    },
+                    {
+                        id: 'rag_blend',
+                        label: zh ? 'RAG 复用' : 'RAG Blend',
+                        values: {
+                            prefill_linear_mode: 'bf16',
+                            prefill_attention_mode: 'exact_nax',
+                            prefill_sparse_minference: false,
+                            prefill_cache_blend: true,
+                            prefill_ane_offload: false,
+                        },
+                    },
+                ];
+            },
+
+            isExternalEnginePrefillPresetActive(preset) {
+                if (!preset || !preset.values) return false;
+                const schema = this.externalEnginePrefillOptionsSchema();
+                const byKey = new Map(schema.map(s => [s.key, s]));
+                for (const [k, expected] of Object.entries(preset.values)) {
+                    const item = byKey.get(k);
+                    if (!item) continue;
+                    const actual = this.getExternalEngineOption(item);
+                    if (k === 'prefill_sparse_minference' && preset.values.prefill_attention_mode !== 'sage2') {
+                        continue;
+                    }
+                    if (actual !== expected) return false;
+                }
+                return true;
+            },
+
+            applyExternalEnginePrefillPreset(preset) {
+                if (!preset || !preset.values) return;
+                const schema = this.externalEnginePrefillOptionsSchema();
+                const byKey = new Map(schema.map(s => [s.key, s]));
+                for (const [k, val] of Object.entries(preset.values)) {
+                    const item = byKey.get(k);
+                    if (item) {
+                        this.setExternalEngineOption(item, val, { autoCouple: false });
+                    }
+                }
+            },
+
             externalEngineOptionLabel(item) {
                 if (!item || !item.key) return '';
-                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-                if (zh) {
+                if (this.isExternalEngineZh()) {
                     const zhLabels = {
                         max_concurrency: '并发槽位 (B/C)',
                         max_context: '最大上下文长度 (Tokens)',
                         rolling_prefix_cache: '滚动前缀缓存',
                         prefix_cache_gb: '前缀缓存预算 (GiB)',
-                        prefill_linear_mode: '预填充线性层精度 (BF16 / W4A8)',
-                        prefill_attention_mode: '预填充注意力内核 (Exact NAX / Sage2)',
-                        prefill_sparse_minference: '  ↳ MInference 动态稀疏注意力 (需开启 Sage2)',
-                        prefill_cache_blend: '跨分块非连续 KV 复用 (CacheBlend)',
-                        prefill_ane_offload: '双 ANE 神经网络引擎协同预填充',
+                        prefill_linear_mode: 'W4A8 线性',
+                        prefill_attention_mode: 'Sage2 注意力',
+                        prefill_sparse_minference: '↳ MInference 稀疏',
+                        prefill_cache_blend: 'CacheBlend 复用',
+                        prefill_ane_offload: '双 ANE 协同',
                         sampling_contract: '采样协议 (Sampling Contract)',
                         artifact_path: '权重产物路径 (.miv)',
                         draft_artifact_path: '草稿产物路径 (.miv)',
@@ -5042,14 +5163,77 @@
                 }
                 const enLabels = {
                     max_context: 'Max Context Window',
-                    prefill_linear_mode: 'Prefill Linear Precision',
-                    prefill_attention_mode: 'Prefill Attention Kernel',
-                    prefill_sparse_minference: '  ↳ MInference Sparse Tiles (Sage2)',
-                    prefill_cache_blend: 'Cross-Chunk CacheBlend (RAG)',
-                    prefill_ane_offload: 'Dual-ANE Co-Execution Offload',
+                    prefill_linear_mode: 'W4A8 Linear',
+                    prefill_attention_mode: 'Sage2 Attention',
+                    prefill_sparse_minference: '↳ MInference Sparse',
+                    prefill_cache_blend: 'CacheBlend Reuse',
+                    prefill_ane_offload: 'Dual-ANE Offload',
                 };
                 if (enLabels[item.key]) return enLabels[item.key];
                 return item.label || item.key;
+            },
+
+            externalEngineOptionHint(item) {
+                if (!item || !item.key) return '';
+                if (this.isExternalEngineZh()) {
+                    const zhHints = {
+                        prefill_linear_mode: '仅加速预填线性层（oQ4e 收益明显，down_proj 默认保留 W4A16 防掉点），解码阶段无损。',
+                        prefill_attention_mode: '低位宽 INT8 QK 注意力；开启时默认联动下方 MInference，单开不选稀疏会明显掉速。',
+                        prefill_sparse_minference: '64K–256K 动态跳过无关 KV 块（提速 2.1x–2.35x）；有些许精度损失，但在 Sage2 下不开会严重掉速。',
+                        prefill_cache_blend: '多文档/RAG 非连续分块 KV+GDN 复用（乱序命中提速 4.3x–4.5x）；长文档建议调大前缀缓存预算（如 16–32 GiB）。',
+                        prefill_ane_offload: '独立正交开关（不强制关 W4A8/Sage2），仅对 Dense 生效并自动跳过 GDN 递归层；80 核 M5 Ultra 上纯 GPU 更快。',
+                    };
+                    if (zhHints[item.key]) {
+                        if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
+                            return zhHints[item.key] + ' 当前为 MoE 模型，此项自动跳过。';
+                        }
+                        return zhHints[item.key];
+                    }
+                }
+                const enHints = {
+                    prefill_linear_mode: 'INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). Decode remains exact.',
+                    prefill_attention_mode: 'Low-bit INT8 QK attention; auto-enables MInference below (dense Sage2 alone is slower on affine4 KV).',
+                    prefill_sparse_minference: 'Skips low-weight KV blocks (2.1x–2.35x faster at 64K–256K). Slight quality loss, but turning it off under Sage2 causes severe slowdown.',
+                    prefill_cache_blend: 'Non-contiguous RAG chunk KV+GDN reuse (4.3x–4.5x warmer TTFT). Raise Prefix Cache Budget (e.g. 16–32 GiB) for long docs.',
+                    prefill_ane_offload: 'Orthogonal (never disables W4A8/Sage2); Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra.',
+                };
+                if (enHints[item.key]) {
+                    if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
+                        return enHints[item.key] + ' MoE models stay GPU-only.';
+                    }
+                    return enHints[item.key];
+                }
+                return item.description || '';
+            },
+
+            externalEngineOptionIsToggle(item) {
+                if (!item) return false;
+                if (item.type === 'bool') return true;
+                if (item.type === 'enum' && Array.isArray(item.options) && item.options.length === 2) {
+                    return item.key === 'prefill_linear_mode' || item.key === 'prefill_attention_mode';
+                }
+                return false;
+            },
+
+            externalEngineOptionToggleChecked(item) {
+                if (!item) return false;
+                const val = this.getExternalEngineOption(item);
+                if (item.type === 'bool') return Boolean(val);
+                if (item.key === 'prefill_linear_mode') return val === 'w4a8';
+                if (item.key === 'prefill_attention_mode') return val === 'sage2';
+                return Boolean(val);
+            },
+
+            toggleExternalEngineOption(item) {
+                if (!item || this.externalEngineOptionDisabled(item)) return;
+                const nextChecked = !this.externalEngineOptionToggleChecked(item);
+                if (item.type === 'bool') {
+                    this.setExternalEngineOption(item, nextChecked);
+                } else if (item.key === 'prefill_linear_mode') {
+                    this.setExternalEngineOption(item, nextChecked ? 'w4a8' : 'bf16');
+                } else if (item.key === 'prefill_attention_mode') {
+                    this.setExternalEngineOption(item, nextChecked ? 'sage2' : 'exact_nax');
+                }
             },
 
             externalEngineOptionIndented(item) {
@@ -5058,7 +5242,7 @@
 
             externalEngineOptionDisabled(item) {
                 if (!item || item.key !== 'prefill_sparse_minference') return false;
-                const schema = this.externalEngineGeneralOptionsSchema();
+                const schema = this.externalEnginePrefillOptionsSchema();
                 const attnItem = schema.find(s => s && s.key === 'prefill_attention_mode')
                     || { key: 'prefill_attention_mode', type: 'enum', default: 'exact_nax' };
                 return this.getExternalEngineOption(attnItem) !== 'sage2';
@@ -5066,21 +5250,33 @@
 
             externalEngineOptionTooltip(item) {
                 if (!this.externalEngineOptionDisabled(item)) return '';
-                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-                return zh
-                    ? '需将「预填充注意力内核」设为 sage2 时生效'
-                    : 'Active when Prefill Attention Kernel is set to sage2';
+                return this.isExternalEngineZh()
+                    ? '开启上方「Sage2 注意力」后可用'
+                    : 'Active when Sage2 Attention is enabled';
             },
 
             externalEngineOptionContainerClass(item) {
                 const classes = [];
                 if (this.externalEngineOptionIndented(item)) {
-                    classes.push('pl-4', 'border-l-2', 'border-neutral-200');
+                    classes.push('pl-4', 'ml-1', 'border-l-2', 'border-neutral-200');
                 }
                 if (this.externalEngineOptionDisabled(item)) {
                     classes.push('opacity-50');
                 }
                 return classes.join(' ');
+            },
+
+            mivEffectivePrefillBadges(eff) {
+                if (!eff || typeof eff !== 'object') return [];
+                const badges = [];
+                if (eff.prefill_linear_mode === 'w4a8') badges.push('W4A8');
+                if (eff.prefill_attention_mode === 'sage2') {
+                    badges.push(eff.prefill_sparse_minference_effective ? 'SAGE2+MINF' : 'SAGE2');
+                }
+                if (eff.prefill_cache_blend) badges.push('BLEND');
+                if (eff.prefill_ane_active) badges.push('ANE');
+                else if (eff.prefill_ane_offload) badges.push('ANE(off)');
+                return badges;
             },
 
             externalEngineEnumOptionLabel(item, opt) {
@@ -5112,10 +5308,11 @@
                 return resolved === null || resolved === undefined ? '' : String(resolved);
             },
 
-            setExternalEngineOption(item, rawValue) {
+            setExternalEngineOption(item, rawValue, { autoCouple = true } = {}) {
                 if (!item || !item.key) return;
                 const active = this.effectiveExternalEngine();
                 if (!active) return;
+                const prevValue = this.getExternalEngineOption(item);
                 let value = rawValue;
                 if (item.type === 'bool') {
                     value = Boolean(rawValue);
@@ -5146,6 +5343,14 @@
                     }
                 }
                 opts[active] = { ...(opts[active] || {}), [item.key]: value };
+                // Switching Attention into sage2 defaults MInference ON so users avoid
+                // dense-Sage2 slowdown; MInference stays freely toggleable off afterwards.
+                if (autoCouple && item.key === 'prefill_attention_mode' && prevValue !== 'sage2' && value === 'sage2') {
+                    const minfItem = this.externalEnginePrefillOptionsSchema().find(s => s && s.key === 'prefill_sparse_minference');
+                    if (minfItem && !this.getExternalEngineOption(minfItem)) {
+                        this.setExternalEngineOption(minfItem, true, { autoCouple: false });
+                    }
+                }
             },
 
             externalEngineLoraModeOptionLabel(opt) {

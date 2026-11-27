@@ -224,62 +224,65 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "prefill_linear_mode",
-        "label": "Prefill Linear Precision",
+        "label": "W4A8 Linear",
         "type": "enum",
         "options": ["bf16", "w4a8"],
         "option_labels": {
-            "bf16": "BF16 NAX (Default / Exact)",
-            "w4a8": "W4A8 INT8/FP8 TensorOps",
+            "bf16": "BF16 (Exact)",
+            "w4a8": "W4A8 (INT8 Prefill)",
         },
         "description": (
-            "Prefill dense linear GEMM precision route (BF16 NAX vs W4A8 INT8/FP8 TensorOps)."
+            "INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). "
+            "Decode remains exact W4A16."
         ),
         "default": "bf16",
         "reload_required": True,
     },
     {
         "key": "prefill_attention_mode",
-        "label": "Prefill Attention Kernel",
+        "label": "Sage2 Attention",
         "type": "enum",
         "options": ["exact_nax", "sage2"],
         "option_labels": {
-            "exact_nax": "Exact NAX Flash (Default)",
-            "sage2": "SageAttention2 (INT8 QK + FP8 PV)",
+            "exact_nax": "Exact NAX",
+            "sage2": "Sage2 (INT8 QK + FP16 PV)",
         },
         "description": (
-            "Prefill full-attention kernel route (Exact NAX vs SageAttention2 INT8 QK + FP8 PV)."
+            "Low-bit INT8 QK prefill attention; pair with MInference below "
+            "(dense Sage2 alone is slower on affine4 KV)."
         ),
         "default": "exact_nax",
         "reload_required": True,
     },
     {
         "key": "prefill_sparse_minference",
-        "label": "MInference Sparse Tiles (Sage2)",
+        "label": "MInference Sparse",
         "type": "bool",
         "description": (
-            "Enable MInference vertical-slash dynamic sparse attention tiles when "
-            "prefill_attention_mode is sage2."
+            "Skips low-weight KV blocks (2.1x-2.35x faster at 64K-256K). "
+            "Slight quality loss, but turning it off under Sage2 causes severe slowdown."
         ),
         "default": False,
         "reload_required": True,
     },
     {
         "key": "prefill_cache_blend",
-        "label": "Cross-Chunk CacheBlend (RAG)",
+        "label": "CacheBlend Reuse",
         "type": "bool",
         "description": (
-            "Enable cross-chunk non-contiguous RAG KV+GDN cache reuse with ~15% HKVD "
-            "selective recomputation."
+            "Non-contiguous RAG chunk KV+GDN reuse (4.3x-4.5x warmer TTFT). "
+            "Increase Prefix Cache Budget (e.g. 16-32 GiB) for long docs."
         ),
         "default": False,
         "reload_required": True,
     },
     {
         "key": "prefill_ane_offload",
-        "label": "Dual-ANE Co-Execution Offload",
+        "label": "Dual-ANE Offload",
         "type": "bool",
         "description": (
-            "Enable Dual-ANE output-channel-split co-execution alongside GPU BF16 or W4A8 prefill."
+            "Orthogonal Dual-ANE co-execution (never disables W4A8/Sage2); "
+            "Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra."
         ),
         "default": False,
         "reload_required": True,
@@ -6869,8 +6872,29 @@ class M5SidecarEngine(BaseEngine):
         if not last.get("max_context") or not last.get("speculative_backend"):
             return None
         keys = (
-            "max_context", "max_concurrency", "kv_dtype", "sampling_contract_id",
-            "speculative_backend", "max_draft_tokens",
+            "max_context",
+            "max_concurrency",
+            "kv_dtype",
+            "sampling_contract_id",
+            "speculative_backend",
+            "max_draft_tokens",
+            "prefill_linear_mode",
+            "prefill_attention_mode",
+            "prefill_sparse_minference",
+            "prefill_sparse_minference_effective",
+            "prefill_sparse_minference_inactive_reason",
+            "prefill_cache_blend",
+            "prefill_ane_offload",
+            "prefill_ane_active",
+            "prefill_ane_split_alpha",
+            "prefill_w4a8_tokens",
+            "prefill_sage2_tokens",
+            "prefill_minference_blocks_skipped",
+            "prefill_minference_blocks_total",
+            "prefill_cache_blend_hit_tokens",
+            "prefill_cache_blend_recomputed_tokens",
+            "prefill_ane_offload_tokens",
+            "prefill_ane_fallback_tokens",
         )
         return {
             **{k: last[k] for k in keys if k in last},

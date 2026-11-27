@@ -313,7 +313,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/apps/omlx-mac/Resources/Localizable.xcstrings b/apps/omlx-mac/Resources/Localizable.xcstrings
-index a9c9fb7..eee0e6f 100644
+index a9c9fb7..483a4eb 100644
 --- a/apps/omlx-mac/Resources/Localizable.xcstrings
 +++ b/apps/omlx-mac/Resources/Localizable.xcstrings
 @@ -14660,6 +14660,18 @@
@@ -426,7 +426,7 @@ index a9c9fb7..eee0e6f 100644
          }
        }
      },
-@@ -60020,6 +60086,1312 @@
+@@ -60020,6 +60086,1744 @@
            }
          }
        }
@@ -1736,6 +1736,438 @@ index a9c9fb7..eee0e6f 100644
 +          }
 +        }
 +      }
++    },
++    "settings.miv.prefill.section.title" : {
++      "comment" : "Section header above the per-model miv Prefill Acceleration card",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Prefill Acceleration (miv)"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Prefill 加速 (miv)"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Prefill 加速 (miv)"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.section.sub" : {
++      "comment" : "Subtitle for the miv Prefill Acceleration card",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Orthogonal toggles that stack freely — changes save immediately and reload the model."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正交开关可自由叠加组合；修改后立即保存并重载模型生效。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "正交開關可自由疊加組合；修改後立即儲存並重載模型生效。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.preset.lossless" : {
++      "comment" : "Preset pill for lossless exact miv prefill",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Lossless Default"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "无损默认"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "無損預設"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.preset.balanced" : {
++      "comment" : "Preset pill for W4A8 linear + exact attention prefill",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 Balanced"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 均衡"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 均衡"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.preset.long_fast" : {
++      "comment" : "Preset pill for W4A8 + Sage2 + MInference long-context prefill",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Long 64K+ Fast"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "超长 64K+ 极速"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "超長 64K+ 極速"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.preset.rag_blend" : {
++      "comment" : "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "RAG Reuse"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "RAG 复用"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "RAG 複用"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.opt.linear" : {
++      "comment" : "Short switch title for W4A8 prefill linear acceleration",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 Linear"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 线性"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "W4A8 線性"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.opt.sage2" : {
++      "comment" : "Short switch title for SageAttention2 low-bit prefill attention",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Sage2 Attention"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Sage2 注意力"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Sage2 注意力"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.opt.minference" : {
++      "comment" : "Short switch title for MInference dynamic block sparsity under Sage2",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "MInference Sparse"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "MInference 稀疏"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "MInference 稀疏"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.opt.cache_blend" : {
++      "comment" : "Short switch title for cross-chunk KV cache blend reuse",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "CacheBlend Reuse"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "CacheBlend 复用"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "CacheBlend 複用"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.opt.ane" : {
++      "comment" : "Short switch title for GPU + Dual-ANE hybrid prefill offload",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Dual-ANE Offload"
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "双 ANE 协同"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "雙 ANE 協同"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.linear" : {
++      "comment" : "Subtle trade-off note under the W4A8 Linear prefill switch",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Prefill 启用 INT8 激活量化（Decode 仍为 W4A16 无损），精度几乎无损，偶有轻微输出差异。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Prefill 啟用 INT8 激活量化（Decode 仍為 W4A16 無損），精度幾乎無損，偶有輕微輸出差異。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.sage2" : {
++      "comment" : "Subtle trade-off note under the Sage2 Attention prefill switch",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "低位宽 INT8 QK + FP16 PV 注意力；单独开启长文本偏慢，64K+ 需配合下方 MInference 稀疏。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "低位寬 INT8 QK + FP16 PV 注意力；單獨開啟長文本偏慢，64K+ 需配合下方 MInference 稀疏。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.minference" : {
++      "comment" : "Subtle trade-off note under the MInference Sparse prefill switch",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens)."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "有轻微精度损失，但开启 Sage2 时不开会掉速严重（≥4K 长上下文自动跳过低权注意力块）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重（≥4K 長上下文自動跳過低權注意力塊）。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.minference_disabled" : {
++      "comment" : "Subtle note under MInference when Sage2 is currently off",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "需先开启上方 Sage2 注意力。有轻微精度损失，但开启 Sage2 时不开会掉速严重。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "需先開啟上方 Sage2 注意力。有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.cache_blend" : {
++      "comment" : "Subtle trade-off note under the CacheBlend Reuse prefill switch",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "RAG/多文档非连续片段跨块复用 KV（仅重算约 15%），有轻微精度折中，冷启动无额外加速。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "RAG/多文件非連續片段跨塊複用 KV（僅重算約 15%），有輕微精度折衷，冷啟動無額外加速。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.ane" : {
++      "comment" : "Subtle trade-off note under the Dual-ANE Offload prefill switch",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "GPU 与双 ANE 并行分流稠密 MLP，可与 W4A8/Sage2 叠加；首次编译耗时，MoE 模型自动跳过。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "GPU 與雙 ANE 並行分流稠密 MLP，可與 W4A8/Sage2 疊加；首次編譯耗時，MoE 模型自動跳過。"
++          }
++        }
++      }
++    },
++    "settings.miv.prefill.hint.ane_moe" : {
++      "comment" : "Subtle note under Dual-ANE Offload for MoE models",
++      "extractionState" : "manual",
++      "localizations" : {
++        "en" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2)."
++          }
++        },
++        "zh-Hans" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "仅作用于稠密 MLP，当前 MoE 模型会自动跳过（保持 GPU 执行，与 W4A8/Sage2 互不冲突）。"
++          }
++        },
++        "zh-Hant" : {
++          "stringUnit" : {
++            "state" : "translated",
++            "value" : "僅作用於稠密 MLP，目前 MoE 模型會自動跳過（保持 GPU 執行，與 W4A8/Sage2 互不衝突）。"
++          }
++        }
++      }
      }
    },
    "version" : "1.0"
@@ -2229,7 +2661,7 @@ index 2291b42..db09ba1 100644
  
  private struct MarkItDownSection: View {
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
-index 2cc8864..e777f21 100644
+index 2cc8864..6e60fda 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
 +++ b/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift
 @@ -25,6 +25,9 @@ struct ModelSettingsScreen: View {
@@ -2242,7 +2674,7 @@ index 2cc8864..e777f21 100644
                  page
                  FooterBar(error: vm.lastError)
              }
-@@ -50,11 +53,49 @@ struct ModelSettingsScreen: View {
+@@ -50,11 +53,65 @@ struct ModelSettingsScreen: View {
          }
      }
  
@@ -2253,10 +2685,12 @@ index 2cc8864..e777f21 100644
 +            if let config = vm.model?.mivEffectiveSettings {
 +                let backend = config.speculativeBackend == "none"
 +                    ? "AR" : "\(config.speculativeBackend.uppercased()) K=\(config.maxDraftTokens)"
++                let prefillSuffix = mivPrefillSummary(config)
 +                Text(String(localized: "settings.miv.loaded", defaultValue: "Loaded by miv")
 +                     + ": \(backend) · \(config.kvDtype) · \(config.maxContext) tokens"
 +                     + " · B=\(config.maxConcurrency) (\(mivConcurrencySource(config.concurrencySource)))"
-+                     + " · \(config.samplingContractId)")
++                     + " · \(config.samplingContractId)"
++                     + prefillSuffix)
 +            }
 +        }
 +        .font(.caption)
@@ -2264,6 +2698,20 @@ index 2cc8864..e777f21 100644
 +        .frame(maxWidth: .infinity, alignment: .leading)
 +        .padding(.horizontal, 18)
 +        .padding(.top, 12)
++    }
++
++    private func mivPrefillSummary(_ config: MivEffectiveSettings) -> String {
++        var tags: [String] = []
++        if config.prefillLinearMode == "w4a8" { tags.append("W4A8") }
++        if config.prefillAttentionMode == "sage2" {
++            tags.append(config.prefillSparseMinferenceEffective == true ? "Sage2+MInf" : "Sage2")
++        }
++        if config.prefillCacheBlend == true { tags.append("CacheBlend") }
++        if config.prefillAneOffload == true {
++            tags.append(config.prefillAneActive == true ? "Dual-ANE" : "ANE(idle)")
++        }
++        guard !tags.isEmpty else { return "" }
++        return " · Prefill: " + tags.joined(separator: "+")
 +    }
 +
 +    private func mivConcurrencySource(_ source: String) -> String {
@@ -2293,7 +2741,7 @@ index 2cc8864..e777f21 100644
              TopPage(vm: vm, client: services.client) { services.modelDetailPage = $0 }
          case .profiles:
              ProfilesTab(
-@@ -73,7 +114,7 @@ struct ModelSettingsScreen: View {
+@@ -73,9 +130,12 @@ struct ModelSettingsScreen: View {
              )
              .padding(.top, 14)
          case .acceleration:
@@ -2301,8 +2749,13 @@ index 2cc8864..e777f21 100644
 +            EnginePage(vm: vm, supportedPageKeys: ["mtp_enabled", "dflash_enabled"]) {
                  VStack(alignment: .leading, spacing: 16) {
                      AccelerationSection(vm: vm, client: services.client)
++                    if vm.usesMiv && !vm.externalEnginePrefillOptions.isEmpty {
++                        MivPrefillAccelerationCard(vm: vm, client: services.client)
++                    }
                      if vm.prefillHelperSupported {
-@@ -87,11 +128,15 @@ struct ModelSettingsScreen: View {
+                         PrefillAcceleratorGroup(vm: vm, client: services.client) {
+                             // Pairing lives in the web dashboard's Cluster tab.
+@@ -87,11 +147,15 @@ struct ModelSettingsScreen: View {
                                  NSWorkspace.shared.open(url)
                              }
                          }
@@ -2319,7 +2772,7 @@ index 2cc8864..e777f21 100644
          case .advanced:
              AdvancedPage(vm: vm, client: services.client)
          case .experimental:
-@@ -125,6 +170,12 @@ struct ModelSettingsScreen: View {
+@@ -125,6 +189,12 @@ struct ModelSettingsScreen: View {
  
  private struct Header: View {
      let model: ModelDTO?
@@ -2332,7 +2785,7 @@ index 2cc8864..e777f21 100644
      @Environment(\.omlxTheme) private var theme
  
      var body: some View {
-@@ -152,7 +203,40 @@ private struct Header: View {
+@@ -152,7 +222,40 @@ private struct Header: View {
                  }
              }
              .layoutPriority(1)
@@ -2374,7 +2827,7 @@ index 2cc8864..e777f21 100644
          }
          .padding(.horizontal, 14)
          .padding(.bottom, 10)
-@@ -972,11 +1056,20 @@ private struct TopPage: View {
+@@ -972,11 +1075,20 @@ private struct TopPage: View {
      private func pageRow(
          _ page: ModelSettingsPage, symbol: String, gradient: [Color], isLast: Bool = false
      ) -> some View {
@@ -2397,7 +2850,7 @@ index 2cc8864..e777f21 100644
                        action: { open(page) }) {
              Squircle(systemSymbol: symbol, gradient: gradient)
          }
-@@ -1027,7 +1120,8 @@ private struct BasicSection: View {
+@@ -1027,7 +1139,8 @@ private struct BasicSection: View {
                                   comment: "Sublabel for the context window field of a reranker model")
                          : String(localized: "settings.basic.embedding_context_window.sub",
                                   defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
@@ -2407,7 +2860,7 @@ index 2cc8864..e777f21 100644
                      TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
                  }
              }
-@@ -1120,7 +1214,8 @@ private struct GenerationSection: View {
+@@ -1120,7 +1233,8 @@ private struct GenerationSection: View {
                                comment: "Row label for the context window field"),
                  sublabel: String(localized: "settings.basic.context_window.sub",
                                   defaultValue: "Sets the total context size the model can handle. Longer prompts are rejected.",
@@ -2417,7 +2870,7 @@ index 2cc8864..e777f21 100644
                  TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
              }
              Row(label: String(localized: "settings.basic.max_tokens.label",
-@@ -1128,7 +1223,8 @@ private struct GenerationSection: View {
+@@ -1128,7 +1242,8 @@ private struct GenerationSection: View {
                                comment: "Row label for the max generated tokens field"),
                  sublabel: String(localized: "settings.basic.max_tokens.sub",
                                   defaultValue: "Limits how many tokens the model generates in one turn when the request does not set max_tokens.",
@@ -2427,7 +2880,7 @@ index 2cc8864..e777f21 100644
                  TextInput(text: vm.bindProfile($vm.maxTokens),
                            placeholder: String(localized: "settings.basic.max_tokens.placeholder",
                                                defaultValue: "Default",
-@@ -1141,6 +1237,7 @@ private struct GenerationSection: View {
+@@ -1141,6 +1256,7 @@ private struct GenerationSection: View {
                  sublabel: String(localized: "settings.basic.temperature.sub",
                                   defaultValue: "Sampling randomness (≥ 0). 0 = deterministic.",
                                   comment: "Sublabel describing the temperature field range"),
@@ -2435,7 +2888,7 @@ index 2cc8864..e777f21 100644
                  isLast: vm.isDiffusionModel) {
                  TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: .controlNarrow)
              }
-@@ -1151,7 +1248,8 @@ private struct GenerationSection: View {
+@@ -1151,7 +1267,8 @@ private struct GenerationSection: View {
                                    comment: "Row label for the top-p nucleus sampling field"),
                      sublabel: String(localized: "settings.basic.top_p.sub",
                                       defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
@@ -2445,7 +2898,7 @@ index 2cc8864..e777f21 100644
                      TextInput(text: vm.bindProfile($vm.topP), mono: true, width: .controlNarrow)
                  }
                  Row(label: String(localized: "settings.basic.top_k.label",
-@@ -1159,7 +1257,8 @@ private struct GenerationSection: View {
+@@ -1159,7 +1276,8 @@ private struct GenerationSection: View {
                                    comment: "Row label for the top-k sampling field"),
                      sublabel: String(localized: "settings.basic.top_k.sub",
                                       defaultValue: "Limit candidates to top K (0 turns it off).",
@@ -2455,7 +2908,7 @@ index 2cc8864..e777f21 100644
                      TextInput(text: vm.bindProfile($vm.topK), mono: true, width: .controlNarrow)
                  }
                  Row(label: String(localized: "settings.basic.min_p.label",
-@@ -1177,7 +1276,8 @@ private struct GenerationSection: View {
+@@ -1177,7 +1295,8 @@ private struct GenerationSection: View {
                          ? vm.vlmMtpProcessorLockedReason
                          : String(localized: "settings.basic.repetition_penalty.sub",
                                   defaultValue: "Penalize repeated tokens (−2 to 2).",
@@ -2465,7 +2918,7 @@ index 2cc8864..e777f21 100644
                      TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: .controlNarrow)
                          .disabled(vm.vlmMtpEnabled)
                          .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
-@@ -1189,7 +1289,8 @@ private struct GenerationSection: View {
+@@ -1189,7 +1308,8 @@ private struct GenerationSection: View {
                          ? vm.vlmMtpProcessorLockedReason
                          : String(localized: "settings.basic.presence_penalty.sub",
                                   defaultValue: "Penalize tokens already present (−2 to 2).",
@@ -2475,7 +2928,7 @@ index 2cc8864..e777f21 100644
                      TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: .controlNarrow)
                          .disabled(vm.vlmMtpEnabled)
                          .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
-@@ -1225,6 +1326,9 @@ private struct AdvancedPage: View {
+@@ -1225,6 +1345,9 @@ private struct AdvancedPage: View {
          ListGroup {
              if showsLLMRows, let engines = vm.model?.externalEngines, !engines.isEmpty {
                  ExternalEngineRow(vm: vm, client: client, engines: engines)
@@ -2485,7 +2938,7 @@ index 2cc8864..e777f21 100644
              }
              // Security-sensitive row — flagged red to match the HTML
              // editor's visual treatment. HF custom-code execution gives
-@@ -1261,7 +1365,8 @@ private struct AdvancedPage: View {
+@@ -1261,7 +1384,8 @@ private struct AdvancedPage: View {
                                    comment: "Row label for the thinking budget field"),
                      sublabel: String(localized: "settings.advanced.thinking_budget.sub",
                                       defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
@@ -2495,7 +2948,7 @@ index 2cc8864..e777f21 100644
                      HStack(spacing: 8) {
                          if vm.thinkingBudgetEnabled {
                              TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
-@@ -1370,17 +1475,47 @@ private struct AdvancedPage: View {
+@@ -1370,17 +1494,47 @@ private struct AdvancedPage: View {
                                   defaultValue: "Apply a LoRA adapter from the model folders on top of these weights.",
                                   comment: "Subtitle for the LoRA adapter section")
              )
@@ -2544,7 +2997,7 @@ index 2cc8864..e777f21 100644
                  }
              }
          }
-@@ -1451,15 +1586,23 @@ private struct GrammarEditor: View {
+@@ -1451,15 +1605,23 @@ private struct GrammarEditor: View {
  
  // MARK: - Engine pages
  
@@ -2571,7 +3024,7 @@ index 2cc8864..e777f21 100644
                  HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
                                        defaultValue: "These settings do not apply while an external engine serves this model.",
                                        comment: "Note above MLX-only settings while an external engine serves the model"),
-@@ -1468,7 +1611,7 @@ private struct EnginePage<Content: View>: View {
+@@ -1468,7 +1630,7 @@ private struct EnginePage<Content: View>: View {
                      .padding(.bottom, 8)
              }
              content()
@@ -2580,7 +3033,7 @@ index 2cc8864..e777f21 100644
          }
          .padding(.top, 14)
      }
-@@ -1801,8 +1944,9 @@ private struct MemorySavingSection: View {
+@@ -1801,8 +1963,9 @@ private struct MemorySavingSection: View {
                      RowSwitch(isOn: vm.bind($vm.ssdNgramOffload, save: {
                          Task { await vm.save(.ssdNgramOffload, client: client) }
                      }))
@@ -2591,7 +3044,7 @@ index 2cc8864..e777f21 100644
              }
              if vm.moeExpertOffloadSupported {
                  Row(label: String(localized: "settings.memory.moe_offload.label",
-@@ -1810,9 +1954,10 @@ private struct MemorySavingSection: View {
+@@ -1810,9 +1973,10 @@ private struct MemorySavingSection: View {
                                    comment: "Row label for the MoE expert offload toggle"),
                      sublabel: moeSublabel) {
                      RowSwitch(isOn: vm.bindProfile($vm.moeExpertOffloadEnabled))
@@ -2603,7 +3056,7 @@ index 2cc8864..e777f21 100644
                  if vm.moeExpertOffloadEnabled {
                      Row(label: String(localized: "settings.memory.moe_offload.resident.label",
                                        defaultValue: "Resident Experts",
-@@ -1824,16 +1969,19 @@ private struct MemorySavingSection: View {
+@@ -1824,16 +1988,19 @@ private struct MemorySavingSection: View {
                                       comment: "Sublabel for the MoE resident expert share")) {
                          TextInput(text: vm.bindProfile($vm.moeExpertOffloadResidentPercent),
                                    placeholder: "25", mono: true, suffix: "%", width: .controlCompact)
@@ -2624,7 +3077,7 @@ index 2cc8864..e777f21 100644
                          Popup(
                              selection: vm.bindProfile($vm.turboquantKvScheme),
                              width: .controlMedium,
-@@ -1847,11 +1995,23 @@ private struct MemorySavingSection: View {
+@@ -1847,11 +2014,23 @@ private struct MemorySavingSection: View {
                              )
                          }
                      }
@@ -2650,7 +3103,7 @@ index 2cc8864..e777f21 100644
          }
      }
  
-@@ -1873,6 +2033,10 @@ private struct MemorySavingSection: View {
+@@ -1873,6 +2052,10 @@ private struct MemorySavingSection: View {
      }
  
      private var turboquantSublabel: String {
@@ -2661,7 +3114,7 @@ index 2cc8864..e777f21 100644
          if vm.vlmMtpEnabled { return ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason }
          return String(localized: "settings.experimental.turboquant.sub",
                        defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-@@ -1895,6 +2059,7 @@ private struct ExternalEngineRow: View {
+@@ -1895,6 +2078,7 @@ private struct ExternalEngineRow: View {
      }
  
      private var isGGUF: Bool { vm.model?.isGGUF == true }
@@ -2669,7 +3122,7 @@ index 2cc8864..e777f21 100644
  
      private var draftRepo: String? {
          let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
-@@ -1902,12 +2067,67 @@ private struct ExternalEngineRow: View {
+@@ -1902,12 +2086,67 @@ private struct ExternalEngineRow: View {
          return engine.draftRepo
      }
  
@@ -2737,7 +3190,7 @@ index 2cc8864..e777f21 100644
          if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
              return reason
          }
-@@ -1941,21 +2161,39 @@ private struct ExternalEngineRow: View {
+@@ -1941,21 +2180,39 @@ private struct ExternalEngineRow: View {
                      .disabled(draftStarted)
                      .help(draftError ?? "")
                  }
@@ -2785,7 +3238,7 @@ index 2cc8864..e777f21 100644
              }
          }
      }
-@@ -1975,6 +2213,99 @@ private struct ExternalEngineRow: View {
+@@ -1975,6 +2232,99 @@ private struct ExternalEngineRow: View {
      }
  }
  
@@ -2885,7 +3338,7 @@ index 2cc8864..e777f21 100644
  // MARK: - Chat-template kwargs editor
  
  private struct ChatTemplateKwargsEditor: View {
-@@ -2228,24 +2559,31 @@ private struct AccelerationSection: View {
+@@ -2228,24 +2578,31 @@ private struct AccelerationSection: View {
              Row(label: String(localized: "settings.acceleration.mtp.label",
                                defaultValue: "Lightning MTP",
                                comment: "Row label for the Lightning MTP toggle"),
@@ -2921,7 +3374,7 @@ index 2cc8864..e777f21 100644
              }
  
              if vm.canImportMtplxSidecar {
-@@ -2275,21 +2613,26 @@ private struct AccelerationSection: View {
+@@ -2275,21 +2632,26 @@ private struct AccelerationSection: View {
              Row(label: String(localized: "settings.experimental.dflash.label",
                                defaultValue: "DFlash",
                                comment: "Row label for the DFlash toggle"),
@@ -2951,7 +3404,7 @@ index 2cc8864..e777f21 100644
                  Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
                                    defaultValue: "Draft Quantization",
                                    comment: "Row label for the DFlash draft quantization toggle"),
-@@ -2298,6 +2641,8 @@ private struct AccelerationSection: View {
+@@ -2298,6 +2660,8 @@ private struct AccelerationSection: View {
                                       comment: "Sublabel for the DFlash draft quantization toggle")) {
                      RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                  }
@@ -2960,7 +3413,7 @@ index 2cc8864..e777f21 100644
                  if vm.dflashDraftQuantEnabled {
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
                                        defaultValue: "Weight Bits",
-@@ -2308,6 +2653,8 @@ private struct AccelerationSection: View {
+@@ -2308,6 +2672,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
                          )
                      }
@@ -2969,7 +3422,7 @@ index 2cc8864..e777f21 100644
                      Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
                                        defaultValue: "Group Size",
                                        comment: "Row label for the DFlash draft quantization group size picker")) {
-@@ -2317,6 +2664,8 @@ private struct AccelerationSection: View {
+@@ -2317,6 +2683,8 @@ private struct AccelerationSection: View {
                              options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
                          )
                      }
@@ -2978,7 +3431,7 @@ index 2cc8864..e777f21 100644
                  }
                  Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                    defaultValue: "Verify Mode",
-@@ -2330,6 +2679,8 @@ private struct AccelerationSection: View {
+@@ -2330,6 +2698,8 @@ private struct AccelerationSection: View {
                          options: ModelSettingsScreenVM.dflashVerifyModeOptions
                      )
                  }
@@ -2987,7 +3440,7 @@ index 2cc8864..e777f21 100644
                  Row(label: String(localized: "settings.experimental.dflash.window_size.label",
                                    defaultValue: "Draft Window Size",
                                    comment: "Row label for the DFlash draft sliding-attention window size field"),
-@@ -2339,15 +2690,20 @@ private struct AccelerationSection: View {
+@@ -2339,15 +2709,20 @@ private struct AccelerationSection: View {
                      TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
                                placeholder: "2048", mono: true, width: .controlCompact)
                  }
@@ -3009,7 +3462,7 @@ index 2cc8864..e777f21 100644
              }
  
              // VLM MTP reveals the draft-model picker and block-size field
-@@ -2358,9 +2714,10 @@ private struct AccelerationSection: View {
+@@ -2358,9 +2733,10 @@ private struct AccelerationSection: View {
                  sublabel: vlmMtpSublabel,
                  isLast: !vm.vlmMtpEnabled && !hasFamilyRows) {
                  RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
@@ -3021,7 +3474,7 @@ index 2cc8864..e777f21 100644
              if vm.vlmMtpEnabled {
                  Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
                                    defaultValue: "VLM Draft Model",
-@@ -2400,6 +2757,8 @@ private struct AccelerationSection: View {
+@@ -2400,6 +2776,8 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                      }))
                  }
@@ -3030,7 +3483,7 @@ index 2cc8864..e777f21 100644
              }
              if vm.isQwen4Exp {
                  Row(label: String(localized: "settings.acceleration.qwen4_wide_decode.label",
-@@ -2413,6 +2772,8 @@ private struct AccelerationSection: View {
+@@ -2413,9 +2791,12 @@ private struct AccelerationSection: View {
                          Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                      }))
                  }
@@ -3038,8 +3491,13 @@ index 2cc8864..e777f21 100644
 +                .opacity(vm.externalEngineSupports("qwen4_gdn_decode_wide_proj") ? 1 : 0.4)
              }
              // The A8 rows do not depend on an ANE backend, which several A8 families lack.
-             if vm.showsA8Prefill {
-@@ -2425,9 +2786,10 @@ private struct AccelerationSection: View {
+-            if vm.showsA8Prefill {
++            // Hidden under miv where the dedicated Prefill Acceleration card owns W4A8/Sage2/ANE.
++            if vm.showsA8Prefill && !vm.usesMiv {
+                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                   defaultValue: "INT8 Activation Prefill",
+                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
+@@ -2425,9 +2806,10 @@ private struct AccelerationSection: View {
                                      comment: "Warning on the INT8 prefill row: INT8 activations can lower output quality"),
                      isLast: !vm.a8PrefillEnabled) {
                      RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
@@ -3051,6 +3509,99 @@ index 2cc8864..e777f21 100644
                  if vm.a8PrefillEnabled {
                      Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
                                        defaultValue: "Minimum Prompt Tokens",
+@@ -2447,7 +2829,7 @@ private struct AccelerationSection: View {
+     }
+ 
+     private var hasFamilyRows: Bool {
+-        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsA8Prefill
++        vm.isDeepseekV41 || vm.isQwen4Exp || (vm.showsA8Prefill && !vm.usesMiv)
+     }
+ 
+     private var a8PrefillSublabel: String {
+@@ -2516,6 +2898,83 @@ private struct AccelerationSection: View {
+     }
+ }
+ 
++// MARK: - miv Prefill Acceleration Card
++
++private struct MivPrefillAccelerationCard: View {
++    @Bindable var vm: ModelSettingsScreenVM
++    let client: OMLXClient
++
++    @Environment(\.omlxTheme) private var theme
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 6) {
++            SectionHeader(
++                String(localized: "settings.miv.prefill.section.title",
++                       defaultValue: "Prefill Acceleration (miv)",
++                       comment: "Section header above the per-model miv Prefill Acceleration card"),
++                subtitle: String(localized: "settings.miv.prefill.section.sub",
++                                 defaultValue: "Orthogonal toggles that stack freely — changes save immediately and reload the model.",
++                                 comment: "Subtitle for the miv Prefill Acceleration card")
++            )
++            ListGroup {
++                FreeRow {
++                    HStack(spacing: 6) {
++                        ForEach(ModelSettingsScreenVM.MivPrefillPreset.allCases) { preset in
++                            let selected = vm.activeMivPrefillPreset == preset
++                            Button(preset.title) {
++                                Task { await vm.applyMivPrefillPreset(preset, client: client) }
++                            }
++                            .buttonStyle(.omlx(selected ? .primary : .normal, size: .small))
++                        }
++                        Spacer(minLength: 0)
++                    }
++                }
++                let opts = vm.externalEnginePrefillOptions
++                ForEach(Array(opts.enumerated()), id: \.element.id) { index, opt in
++                    let isSubToggle = opt.key == "prefill_sparse_minference"
++                    let isDisabled = isSubToggle && !vm.isExternalEngineSage2Active
++                    let isLast = index == opts.count - 1
++                    FreeRow(isLast: isLast) {
++                        HStack(alignment: .center, spacing: 12) {
++                            VStack(alignment: .leading, spacing: 3) {
++                                HStack(spacing: 5) {
++                                    if isSubToggle {
++                                        Text("↳")
++                                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
++                                            .foregroundStyle(theme.textSecondary.opacity(0.75))
++                                    }
++                                    Text(vm.externalEngineOptionDisplayLabel(opt))
++                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
++                                        .foregroundStyle(theme.text)
++                                    Circle()
++                                        .fill(theme.text)
++                                        .frame(width: 5, height: 5)
++                                        .accessibilityHidden(true)
++                                }
++                                Text(vm.externalEnginePrefillCautionHint(opt))
++                                    .font(.omlxText(11))
++                                    .foregroundStyle(theme.textSecondary.opacity(0.68))
++                                    .fixedSize(horizontal: false, vertical: true)
++                            }
++                            .padding(.leading, isSubToggle ? 12 : 0)
++                            Spacer(minLength: 12)
++                            RowSwitch(isOn: Binding(
++                                get: { vm.externalEnginePrefillToggleValue(for: opt) },
++                                set: { newValue in
++                                    let keys = vm.setExternalEnginePrefillToggle(opt, isOn: newValue)
++                                    Task { await vm.saveExternalEngineOptionsPatch(keys: keys, client: client) }
++                                }
++                            ))
++                            .disabled(isDisabled)
++                        }
++                        .opacity(isDisabled ? 0.45 : 1.0)
++                    }
++                }
++            }
++        }
++    }
++}
++
+ // MARK: - Experimental section
+ 
+ private struct ExperimentalSection: View {
 diff --git a/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift b/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift
 index 8a940ec..bec2063 100644
 --- a/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift
@@ -3524,7 +4075,7 @@ index 0f7a2eb..5011218 100644
          let models = try await client.listModels().models
          availableModels = models.map { $0.id }
 diff --git a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
-index 0fd23d0..eb5bb67 100644
+index 0fd23d0..fb901d3 100644
 --- a/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
 +++ b/apps/omlx-mac/Sources/AppView/ViewModels/ModelSettingsScreenVM.swift
 @@ -68,7 +68,7 @@ final class ModelSettingsScreenVM {
@@ -3751,7 +4302,39 @@ index 0fd23d0..eb5bb67 100644
          }
          if thinkingForced { patch.enableThinking = .some(nil) }
          let targetModelID = modelID
-@@ -1374,6 +1494,261 @@ final class ModelSettingsScreenVM {
+@@ -1117,6 +1237,31 @@ final class ModelSettingsScreenVM {
+         }
+     }
+ 
++    /// Saves multiple external-engine options atomically in one PATCH request
++    /// (used by the miv Prefill Acceleration presets and Sage2 auto-coupled toggles).
++    func saveExternalEngineOptionsPatch(keys: [String], client: OMLXClient) async {
++        let active = effectiveExternalEngine
++        guard !active.isEmpty else { return }
++        var updates: [String: AnyCodable] = [:]
++        for key in keys {
++            if let value = externalEngineOptions[active]?[key] {
++                updates[key] = value
++            }
++        }
++        guard !updates.isEmpty else { return }
++        var patch = ModelSettingsPatch()
++        patch.externalEngineOptionsPatch = [active: updates]
++        if thinkingForced { patch.enableThinking = .some(nil) }
++        let targetModelID = modelID
++        do {
++            _ = try await client.updateModelSettings(id: targetModelID, patch: patch)
++            self.lastError = nil
++        } catch {
++            await reportFailedSave(error, modelID: targetModelID, client: client,
++                                   preservingEdits: true)
++        }
++    }
++
+     // MARK: - Prefill Accelerator
+ 
+     func loadPrefillHelperCandidates(client: OMLXClient) async {
+@@ -1374,6 +1519,478 @@ final class ModelSettingsScreenVM {
                        comment: "Sublabel for the LoRA adapter picker")
      }
  
@@ -3837,7 +4420,45 @@ index 0fd23d0..eb5bb67 100644
 +        return keys
 +    }
 +
-+    var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
++    static let externalEnginePrefillOptionKeys: [String] = [
++        "prefill_linear_mode",
++        "prefill_attention_mode",
++        "prefill_sparse_minference",
++        "prefill_cache_blend",
++        "prefill_ane_offload",
++    ]
++
++    enum MivPrefillPreset: String, CaseIterable, Identifiable {
++        case lossless
++        case balanced
++        case longFast
++        case ragBlend
++
++        var id: String { rawValue }
++
++        var title: String {
++            switch self {
++            case .lossless:
++                return String(localized: "settings.miv.prefill.preset.lossless",
++                              defaultValue: "Lossless Default",
++                              comment: "Preset pill for lossless exact miv prefill")
++            case .balanced:
++                return String(localized: "settings.miv.prefill.preset.balanced",
++                              defaultValue: "W4A8 Balanced",
++                              comment: "Preset pill for W4A8 linear + exact attention prefill")
++            case .longFast:
++                return String(localized: "settings.miv.prefill.preset.long_fast",
++                              defaultValue: "Long 64K+ Fast",
++                              comment: "Preset pill for W4A8 + Sage2 + MInference long-context prefill")
++            case .ragBlend:
++                return String(localized: "settings.miv.prefill.preset.rag_blend",
++                              defaultValue: "RAG Reuse",
++                              comment: "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse")
++            }
++        }
++    }
++
++    private func allExternalEngineSchemaOptions() -> [ExternalEngineSchemaOption] {
 +        let active = effectiveExternalEngine
 +        guard !active.isEmpty,
 +              let row = model?.externalEngines?.first(where: { $0.id == active }),
@@ -3884,8 +4505,149 @@ index 0fd23d0..eb5bb67 100644
 +        }
 +    }
 +
++    /// Prefill acceleration switches rendered in the dedicated Acceleration card.
++    var externalEnginePrefillOptions: [ExternalEngineSchemaOption] {
++        let byKey = Dictionary(uniqueKeysWithValues: allExternalEngineSchemaOptions().map { ($0.key, $0) })
++        return Self.externalEnginePrefillOptionKeys.compactMap { byKey[$0] }
++    }
++
++    var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
++        let prefillSet = Set(Self.externalEnginePrefillOptionKeys)
++        return allExternalEngineSchemaOptions().filter { !prefillSet.contains($0.key) }
++    }
++
++    var isExternalEngineSage2Active: Bool {
++        guard let opt = externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }) else {
++            return false
++        }
++        return externalEngineEnumOption(opt) == "sage2"
++    }
++
++    func externalEnginePrefillToggleValue(for opt: ExternalEngineSchemaOption) -> Bool {
++        switch opt.key {
++        case "prefill_linear_mode":
++            return externalEngineEnumOption(opt) == "w4a8"
++        case "prefill_attention_mode":
++            return externalEngineEnumOption(opt) == "sage2"
++        default:
++            return externalEngineBoolOption(opt)
++        }
++    }
++
++    /// Updates a miv prefill toggle locally and returns all option keys to persist.
++    /// Turning on Sage2 convenience-enables MInference so long prompts don't stall,
++    /// while leaving MInference freely toggleable afterwards.
++    @discardableResult
++    func setExternalEnginePrefillToggle(_ opt: ExternalEngineSchemaOption, isOn: Bool) -> [String] {
++        switch opt.key {
++        case "prefill_linear_mode":
++            writeExternalEngineOptionValue(isOn ? "w4a8" : "bf16", forKey: opt.key)
++            return [opt.key]
++        case "prefill_attention_mode":
++            let wasSage2 = externalEngineEnumOption(opt) == "sage2"
++            writeExternalEngineOptionValue(isOn ? "sage2" : "exact_nax", forKey: opt.key)
++            if isOn && !wasSage2,
++               externalEnginePrefillOptions.contains(where: { $0.key == "prefill_sparse_minference" }) {
++                writeExternalEngineOptionValue(true, forKey: "prefill_sparse_minference")
++                return ["prefill_attention_mode", "prefill_sparse_minference"]
++            }
++            return [opt.key]
++        default:
++            writeExternalEngineOptionValue(isOn, forKey: opt.key)
++            return [opt.key]
++        }
++    }
++
++    var activeMivPrefillPreset: MivPrefillPreset? {
++        guard !externalEnginePrefillOptions.isEmpty else { return nil }
++        let byKey = Dictionary(uniqueKeysWithValues: externalEnginePrefillOptions.map { ($0.key, $0) })
++        let w4a8 = byKey["prefill_linear_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
++        let sage2 = byKey["prefill_attention_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
++        let minf = byKey["prefill_sparse_minference"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
++        let blend = byKey["prefill_cache_blend"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
++        let ane = byKey["prefill_ane_offload"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
++        if !w4a8 && !sage2 && !blend && !ane { return .lossless }
++        if w4a8 && !sage2 && !blend && !ane { return .balanced }
++        if w4a8 && sage2 && minf && !blend && !ane { return .longFast }
++        if w4a8 && !sage2 && blend && !ane { return .ragBlend }
++        return nil
++    }
++
++    @discardableResult
++    func stageMivPrefillPreset(_ preset: MivPrefillPreset) -> [String] {
++        let available = Set(externalEnginePrefillOptions.map(\.key))
++        let target: [String: any Sendable]
++        switch preset {
++        case .lossless:
++            target = [
++                "prefill_linear_mode": "bf16",
++                "prefill_attention_mode": "exact_nax",
++                "prefill_sparse_minference": false,
++                "prefill_cache_blend": false,
++                "prefill_ane_offload": false,
++            ]
++        case .balanced:
++            target = [
++                "prefill_linear_mode": "w4a8",
++                "prefill_attention_mode": "exact_nax",
++                "prefill_sparse_minference": false,
++                "prefill_cache_blend": false,
++                "prefill_ane_offload": false,
++            ]
++        case .longFast:
++            target = [
++                "prefill_linear_mode": "w4a8",
++                "prefill_attention_mode": "sage2",
++                "prefill_sparse_minference": true,
++                "prefill_cache_blend": false,
++                "prefill_ane_offload": false,
++            ]
++        case .ragBlend:
++            target = [
++                "prefill_linear_mode": "w4a8",
++                "prefill_attention_mode": "exact_nax",
++                "prefill_sparse_minference": false,
++                "prefill_cache_blend": true,
++                "prefill_ane_offload": false,
++            ]
++        }
++        var changed: [String] = []
++        for key in Self.externalEnginePrefillOptionKeys where available.contains(key) {
++            if let val = target[key] {
++                writeExternalEngineOptionValue(val, forKey: key)
++                changed.append(key)
++            }
++        }
++        return changed
++    }
++
++    func applyMivPrefillPreset(_ preset: MivPrefillPreset, client: OMLXClient) async {
++        let keys = stageMivPrefillPreset(preset)
++        await saveExternalEngineOptionsPatch(keys: keys, client: client)
++    }
++
 +    func externalEngineOptionDisplayLabel(_ opt: ExternalEngineSchemaOption) -> String {
 +        switch opt.key {
++        case "prefill_linear_mode":
++            return String(localized: "settings.miv.prefill.opt.linear",
++                          defaultValue: "W4A8 Linear",
++                          comment: "Short switch title for W4A8 prefill linear acceleration")
++        case "prefill_attention_mode":
++            return String(localized: "settings.miv.prefill.opt.sage2",
++                          defaultValue: "Sage2 Attention",
++                          comment: "Short switch title for SageAttention2 low-bit prefill attention")
++        case "prefill_sparse_minference":
++            return String(localized: "settings.miv.prefill.opt.minference",
++                          defaultValue: "MInference Sparse",
++                          comment: "Short switch title for MInference dynamic block sparsity under Sage2")
++        case "prefill_cache_blend":
++            return String(localized: "settings.miv.prefill.opt.cache_blend",
++                          defaultValue: "CacheBlend Reuse",
++                          comment: "Short switch title for cross-chunk KV cache blend reuse")
++        case "prefill_ane_offload":
++            return String(localized: "settings.miv.prefill.opt.ane",
++                          defaultValue: "Dual-ANE Offload",
++                          comment: "Short switch title for GPU + Dual-ANE hybrid prefill offload")
 +        case "max_concurrency":
 +            return String(localized: "settings.advanced.external_engine.opt.max_concurrency",
 +                          defaultValue: "Concurrency (B/C)",
@@ -3912,6 +4674,44 @@ index 0fd23d0..eb5bb67 100644
 +                          comment: "External engine option label for custom draft artifact path")
 +        default:
 +            return opt.label
++        }
++    }
++
++    func externalEnginePrefillCautionHint(_ opt: ExternalEngineSchemaOption) -> String {
++        switch opt.key {
++        case "prefill_linear_mode":
++            return String(localized: "settings.miv.prefill.hint.linear",
++                          defaultValue: "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift.",
++                          comment: "Subtle trade-off note under the W4A8 Linear prefill switch")
++        case "prefill_attention_mode":
++            return String(localized: "settings.miv.prefill.hint.sage2",
++                          defaultValue: "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups.",
++                          comment: "Subtle trade-off note under the Sage2 Attention prefill switch")
++        case "prefill_sparse_minference":
++            if !isExternalEngineSage2Active {
++                return String(localized: "settings.miv.prefill.hint.minference_disabled",
++                              defaultValue: "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown.",
++                              comment: "Subtle note under MInference when Sage2 is currently off")
++            }
++            return String(localized: "settings.miv.prefill.hint.minference",
++                          defaultValue: "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens).",
++                          comment: "Subtle trade-off note under the MInference Sparse prefill switch")
++        case "prefill_cache_blend":
++            return String(localized: "settings.miv.prefill.hint.cache_blend",
++                          defaultValue: "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup.",
++                          comment: "Subtle trade-off note under the CacheBlend Reuse prefill switch")
++        case "prefill_ane_offload":
++            let isMoE = (model?.configModelType ?? "").lowercased().contains("moe")
++            if isMoE {
++                return String(localized: "settings.miv.prefill.hint.ane_moe",
++                              defaultValue: "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2).",
++                              comment: "Subtle note under Dual-ANE Offload for MoE models")
++            }
++            return String(localized: "settings.miv.prefill.hint.ane",
++                          defaultValue: "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE.",
++                          comment: "Subtle trade-off note under the Dual-ANE Offload prefill switch")
++        default:
++            return opt.description ?? ""
 +        }
 +    }
 +
@@ -4013,7 +4813,7 @@ index 0fd23d0..eb5bb67 100644
      static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
          guard model.id != currentModelID else { return false }
  
-@@ -1542,6 +1917,29 @@ final class ModelSettingsScreenVM {
+@@ -1542,6 +2159,29 @@ final class ModelSettingsScreenVM {
          }
      }
  
@@ -4043,7 +4843,7 @@ index 0fd23d0..eb5bb67 100644
      /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
      /// other speculative-decoding / KV-quant features. Mirrors the HTML
      /// editor's gating so the toggle disables itself and surfaces why.
-@@ -1632,7 +2030,17 @@ final class ModelSettingsScreenVM {
+@@ -1632,7 +2272,17 @@ final class ModelSettingsScreenVM {
                                comment: "Profile banner title when the model uses server defaults")
              }
              return profileDisplayName(scope: activeProfileScope, name: name)
@@ -4062,7 +4862,26 @@ index 0fd23d0..eb5bb67 100644
              if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
              return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
          case .advanced:
-@@ -1696,9 +2104,11 @@ final class ModelSettingsScreenVM {
+@@ -1672,11 +2322,17 @@ final class ModelSettingsScreenVM {
+                                     defaultValue: "Extended Fused Decode",
+                                     comment: "Short name of Qwen4 extended fused decode in the Acceleration row value"))
+             }
+-            if showsA8Prefill && a8PrefillEnabled {
++            if showsA8Prefill && !usesMiv && a8PrefillEnabled {
+                 items.append(String(localized: "settings.summary.qwen_oq_a8",
+                                     defaultValue: "INT8 Prefill",
+                                     comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
+             }
++            if usesMiv {
++                for opt in externalEnginePrefillOptions where externalEnginePrefillToggleValue(for: opt) {
++                    if opt.key == "prefill_sparse_minference" && !isExternalEngineSage2Active { continue }
++                    items.append(externalEngineOptionDisplayLabel(opt))
++                }
++            }
+         case .memory:
+             if ssdNgramOffloadSupported && ssdNgramOffload {
+                 items.append(String(localized: "settings.memory.ssd_ngram_offload.label",
+@@ -1696,9 +2352,11 @@ final class ModelSettingsScreenVM {
              }
          case .advanced:
              if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
@@ -4077,7 +4896,7 @@ index 0fd23d0..eb5bb67 100644
              }
              if trustRemoteCode {
                  items.append(String(localized: "settings.advanced.trust_remote_code.label",
-@@ -2155,7 +2565,9 @@ final class ModelSettingsScreenVM {
+@@ -2155,7 +2813,9 @@ final class ModelSettingsScreenVM {
          guard validateWorkingSettings() else { return }
          let saved = currentSettingsDict()
          do {
@@ -4088,7 +4907,7 @@ index 0fd23d0..eb5bb67 100644
              guard modelID == targetModelID else { return }
              // Edits made during the request stay unsaved for the next write.
              loadedSettings = saved
-@@ -2181,7 +2593,7 @@ final class ModelSettingsScreenVM {
+@@ -2181,7 +2841,7 @@ final class ModelSettingsScreenVM {
  
      /// PUT body for `saveWorkingToModel`. A profile omits empty fields,
      /// but a settings write must send null to clear them.
@@ -4097,7 +4916,7 @@ index 0fd23d0..eb5bb67 100644
          var body = currentSettingsDict()
          let clearable = [
              ProfileSettingsKey.maxContextWindow, ProfileSettingsKey.maxTokens,
-@@ -2203,7 +2615,17 @@ final class ModelSettingsScreenVM {
+@@ -2203,7 +2863,17 @@ final class ModelSettingsScreenVM {
              if !indexCacheEnabled {
                  body[ProfileSettingsKey.indexCacheFreq] = AnyCodable(0)
              }
@@ -4391,7 +5210,7 @@ index 3092c54..8e83021 100644
      /// an MCP config file consumed by every integration launcher (Claude
      /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
 diff --git a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
-index b7902d2..62ded39 100644
+index b7902d2..b0a5d64 100644
 --- a/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 +++ b/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift
 @@ -54,6 +54,15 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
@@ -4430,7 +5249,7 @@ index b7902d2..62ded39 100644
      /// True for builtin virtual entries (e.g. the MarkItDown document
      /// converter) that have no real load/unload lifecycle.
      let virtual: Bool?
-@@ -108,6 +127,202 @@ extension ModelDTO {
+@@ -108,6 +127,219 @@ extension ModelDTO {
  
      var isInHFCache: Bool { sourceType == "hf_cache" }
      var isGGUF: Bool { modelFormat == "gguf" }
@@ -4630,10 +5449,27 @@ index b7902d2..62ded39 100644
 +    let speculativeBackend: String
 +    let maxDraftTokens: Int
 +    let concurrencySource: String
++    var prefillLinearMode: String? = nil
++    var prefillAttentionMode: String? = nil
++    var prefillSparseMinference: Bool? = nil
++    var prefillSparseMinferenceEffective: Bool? = nil
++    var prefillSparseMinferenceInactiveReason: String? = nil
++    var prefillCacheBlend: Bool? = nil
++    var prefillAneOffload: Bool? = nil
++    var prefillAneActive: Bool? = nil
++    var prefillAneSplitAlpha: Double? = nil
++    var prefillW4a8Tokens: Int? = nil
++    var prefillSage2Tokens: Int? = nil
++    var prefillMinferenceBlocksSkipped: Int? = nil
++    var prefillMinferenceBlocksTotal: Int? = nil
++    var prefillCacheBlendHitTokens: Int? = nil
++    var prefillCacheBlendRecomputedTokens: Int? = nil
++    var prefillAneOffloadTokens: Int? = nil
++    var prefillAneFallbackTokens: Int? = nil
  }
  
  /// One entry of `external_engines` in GET /admin/api/models.
-@@ -118,6 +333,16 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
+@@ -118,6 +350,16 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
      let reason: String?
      /// Hugging Face repo of the draft the engine lacks, when one provides it.
      var draftRepo: String? = nil
@@ -4650,7 +5486,7 @@ index b7902d2..62ded39 100644
  }
  
  struct ModelSettingsDTO: Codable, Equatable, Sendable {
-@@ -216,6 +441,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
+@@ -216,6 +458,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
      let vlmMtpDraftBlockSize: Int?
      // LoRA adapter folder applied on top of the weights at load.
      let loraAdapter: String?
@@ -4661,7 +5497,7 @@ index b7902d2..62ded39 100644
  }
  
  /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
-@@ -232,7 +461,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
+@@ -232,7 +478,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
      var minP: Double? = nil
      var presencePenalty: Double? = nil
      var repetitionPenalty: Double? = nil
@@ -4670,7 +5506,7 @@ index b7902d2..62ded39 100644
      var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
      var qwen4PleSsdOffload: Bool? = nil
      var qwen4GdnDecodeWideProj: Bool? = nil
-@@ -307,6 +536,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
+@@ -307,6 +553,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
      var vlmMtpDraftModel: String? = nil
      var vlmMtpDraftBlockSize: Int? = nil
      var loraAdapter: String? = nil // "" clears the adapter.
@@ -5461,7 +6297,7 @@ index 0039ee7..25eefaa 100644
          // Direct file-level parse so a catalog corruption (extra trailing
          // comma, bad nesting) shows up here rather than as a missing-string
 diff --git a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
-index 2e40221..fc3d08f 100644
+index 2e40221..47833bf 100644
 --- a/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
 +++ b/apps/omlx-mac/Tests/oMLXTests/ModelSettingsScreenVMTests.swift
 @@ -844,10 +844,27 @@ final class ModelSettingsScreenVMTests: XCTestCase {
@@ -5493,7 +6329,7 @@ index 2e40221..fc3d08f 100644
      func testLoRAAdapterPickerAndWorkingBody() throws {
          let vm = ModelSettingsScreenVM()
          vm.model = makeModel(id: "m", configModelType: "qwen3_5")
-@@ -983,6 +1000,240 @@ final class ModelSettingsScreenVMTests: XCTestCase {
+@@ -983,6 +1000,331 @@ final class ModelSettingsScreenVMTests: XCTestCase {
          model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
          return model
      }
@@ -5731,6 +6567,97 @@ index 2e40221..fc3d08f 100644
 +        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["max_concurrency"]?.value as? Int, 1)
 +        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
 +    }
++
++    func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportPresetsAndTelemetry() throws {
++        let vm = ModelSettingsScreenVM()
++        let m5Opt = ExternalEngineOption(
++            id: "m5rt",
++            label: "miv Core Backend (ninfer-metal)",
++            compatible: true,
++            reason: nil,
++            supportedStandardSettings: ["max_context_window", "dflash_enabled", "mtp_enabled"],
++            providerId: "io.ninfer.metal",
++            optionsSchema: [
++                ["key": AnyCodable("max_concurrency"), "label": AnyCodable("Concurrency"), "type": AnyCodable("int"), "default": AnyCodable(1)],
++                ["key": AnyCodable("prefill_linear_mode"), "label": AnyCodable("W4A8"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("bf16"), AnyCodable("w4a8")]), "default": AnyCodable("bf16")],
++                ["key": AnyCodable("prefill_attention_mode"), "label": AnyCodable("Sage2"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("exact_nax"), AnyCodable("sage2")]), "default": AnyCodable("exact_nax")],
++                ["key": AnyCodable("prefill_sparse_minference"), "label": AnyCodable("MInference"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
++                ["key": AnyCodable("prefill_cache_blend"), "label": AnyCodable("CacheBlend"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
++                ["key": AnyCodable("prefill_ane_offload"), "label": AnyCodable("Dual-ANE"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
++            ]
++        )
++        var model = makeModel(id: "Qwen3.8-27B-oQ4e-mtp", configModelType: "qwen3_5")
++        model.externalEngines = [m5Opt]
++        model.autoExternalEngine = "m5rt"
++        vm.model = model
++        vm.externalEngine = ""
++
++        XCTAssertEqual(vm.externalEngineGeneralOptions.map(\.key), ["max_concurrency"])
++        XCTAssertEqual(vm.externalEnginePrefillOptions.map(\.key), [
++            "prefill_linear_mode",
++            "prefill_attention_mode",
++            "prefill_sparse_minference",
++            "prefill_cache_blend",
++            "prefill_ane_offload",
++        ])
++        XCTAssertEqual(vm.activeMivPrefillPreset, .lossless)
++        XCTAssertFalse(vm.isExternalEngineSage2Active)
++
++        // Turning on Sage2 auto-enables MInference and returns both keys for atomic PATCH.
++        let sageOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }))
++        let sageKeys = vm.setExternalEnginePrefillToggle(sageOpt, isOn: true)
++        XCTAssertEqual(sageKeys, ["prefill_attention_mode", "prefill_sparse_minference"])
++        XCTAssertTrue(vm.isExternalEngineSage2Active)
++        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
++
++        // MInference remains independently toggleable off afterwards.
++        let minfOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_sparse_minference" }))
++        let minfKeys = vm.setExternalEnginePrefillToggle(minfOpt, isOn: false)
++        XCTAssertEqual(minfKeys, ["prefill_sparse_minference"])
++        XCTAssertFalse(vm.externalEnginePrefillToggleValue(for: minfOpt))
++
++        // Long 64K+ Fast preset turns on W4A8 + Sage2 + MInference orthogonally.
++        let staged = vm.stageMivPrefillPreset(.longFast)
++        XCTAssertEqual(staged.count, 5)
++        XCTAssertEqual(vm.activeMivPrefillPreset, .longFast)
++        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
++        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_attention_mode"]?.value as? String, "sage2")
++        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
++        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 3)
++
++        // Verify live telemetry decoding on MivEffectiveSettings.
++        let decoder = JSONDecoder()
++        decoder.keyDecodingStrategy = .convertFromSnakeCase
++        let eff = try decoder.decode(
++            MivEffectiveSettings.self,
++            from: Data(#"""
++            {
++              "max_context": 262144,
++              "max_concurrency": 1,
++              "kv_dtype": "affine4_g128",
++              "sampling_contract_id": "position_coupled_v1",
++              "speculative_backend": "mtp",
++              "max_draft_tokens": 4,
++              "concurrency_source": "default",
++              "prefill_linear_mode": "w4a8",
++              "prefill_attention_mode": "sage2",
++              "prefill_sparse_minference": true,
++              "prefill_sparse_minference_effective": true,
++              "prefill_cache_blend": false,
++              "prefill_ane_offload": true,
++              "prefill_ane_active": true,
++              "prefill_w4a8_tokens": 8192,
++              "prefill_sage2_tokens": 8192,
++              "prefill_minference_blocks_skipped": 420
++            }
++            """#.utf8)
++        )
++        XCTAssertEqual(eff.prefillLinearMode, "w4a8")
++        XCTAssertEqual(eff.prefillAttentionMode, "sage2")
++        XCTAssertEqual(eff.prefillSparseMinferenceEffective, true)
++        XCTAssertEqual(eff.prefillAneActive, true)
++        XCTAssertEqual(eff.prefillMinferenceBlocksSkipped, 420)
++    }
  }
  
  /// Serves one model with Lightning MTP on and rejects its settings writes
@@ -5844,7 +6771,7 @@ index 75fd00b..58869e6 100644
    "modal.model_settings.trust_remote_code": "信任远程代码",
    "modal.model_settings.trust_remote_code_hint": "允许模型仓库在加载时运行任意 Python 代码。请仅对可信的发布者启用。",
 diff --git a/apps/omlx-web/omlx_web/static/js/dashboard.js b/apps/omlx-web/omlx_web/static/js/dashboard.js
-index 62235bb..22a1c5c 100644
+index 62235bb..d1d81da 100644
 --- a/apps/omlx-web/omlx_web/static/js/dashboard.js
 +++ b/apps/omlx-web/omlx_web/static/js/dashboard.js
 @@ -332,6 +332,7 @@
@@ -5989,7 +6916,7 @@ index 62235bb..22a1c5c 100644
                      }
                      const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                          method: 'PUT',
-@@ -4848,13 +4887,305 @@
+@@ -4848,13 +4887,510 @@
                  return this.modelSettings.model_format === 'gguf';
              },
  
@@ -6118,29 +7045,150 @@ index 62235bb..22a1c5c 100644
 +                return schema.find(s => s && s.key === 'lora_mode' && s.type === 'enum') || null;
 +            },
 +
++            externalEnginePrefillOptionKeys() {
++                return [
++                    'prefill_linear_mode',
++                    'prefill_attention_mode',
++                    'prefill_sparse_minference',
++                    'prefill_cache_blend',
++                    'prefill_ane_offload',
++                ];
++            },
++
++            externalEnginePrefillOptionsSchema() {
++                const entry = this.activeExternalEngineEntry();
++                const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
++                const order = this.externalEnginePrefillOptionKeys();
++                const byKey = new Map();
++                for (const item of schema) {
++                    if (item && typeof item === 'object' && order.includes(item.key)) {
++                        byKey.set(item.key, item);
++                    }
++                }
++                return order.map(key => byKey.get(key)).filter(Boolean);
++            },
++
 +            externalEngineGeneralOptionsSchema() {
 +                const entry = this.activeExternalEngineEntry();
 +                const schema = Array.isArray(entry?.options_schema) ? entry.options_schema : [];
++                const prefillKeys = new Set(this.externalEnginePrefillOptionKeys());
 +                return schema.filter(
 +                    s => s && typeof s === 'object' && s.key && s.key !== 'lora_mode'
++                        && !prefillKeys.has(s.key)
 +                        && ['int', 'bool', 'bytes_gb', 'enum', 'string', 'float', 'number'].includes(s.type)
 +                );
 +            },
 +
++            isExternalEngineZh() {
++                return (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
++            },
++
++            isMoeExternalEngineModel() {
++                const type = String(this.selectedModel?.config_model_type || '').toLowerCase();
++                return type.includes('moe');
++            },
++
++            externalEnginePrefillCardTitle() {
++                return this.isExternalEngineZh() ? 'Prefill 预填加速' : 'Prefill Acceleration';
++            },
++
++            externalEnginePrefillCardSubtitle() {
++                return this.isExternalEngineZh()
++                    ? '长上下文冷启动加速项，支持自由正交组合（解码阶段保持全精度 W4A16）。'
++                    : 'Orthogonal long-context prefill switches (decode stays exact W4A16).';
++            },
++
++            externalEnginePrefillPresets() {
++                const zh = this.isExternalEngineZh();
++                return [
++                    {
++                        id: 'lossless',
++                        label: zh ? '无损默认' : 'Lossless',
++                        values: {
++                            prefill_linear_mode: 'bf16',
++                            prefill_attention_mode: 'exact_nax',
++                            prefill_sparse_minference: false,
++                            prefill_cache_blend: false,
++                            prefill_ane_offload: false,
++                        },
++                    },
++                    {
++                        id: 'w4a8',
++                        label: zh ? 'W4A8 均衡' : 'W4A8',
++                        values: {
++                            prefill_linear_mode: 'w4a8',
++                            prefill_attention_mode: 'exact_nax',
++                            prefill_sparse_minference: false,
++                            prefill_cache_blend: false,
++                            prefill_ane_offload: false,
++                        },
++                    },
++                    {
++                        id: 'long_sparse',
++                        label: zh ? '超长极速 (64K+)' : 'Long 64K+',
++                        values: {
++                            prefill_linear_mode: 'w4a8',
++                            prefill_attention_mode: 'sage2',
++                            prefill_sparse_minference: true,
++                            prefill_cache_blend: false,
++                            prefill_ane_offload: false,
++                        },
++                    },
++                    {
++                        id: 'rag_blend',
++                        label: zh ? 'RAG 复用' : 'RAG Blend',
++                        values: {
++                            prefill_linear_mode: 'bf16',
++                            prefill_attention_mode: 'exact_nax',
++                            prefill_sparse_minference: false,
++                            prefill_cache_blend: true,
++                            prefill_ane_offload: false,
++                        },
++                    },
++                ];
++            },
++
++            isExternalEnginePrefillPresetActive(preset) {
++                if (!preset || !preset.values) return false;
++                const schema = this.externalEnginePrefillOptionsSchema();
++                const byKey = new Map(schema.map(s => [s.key, s]));
++                for (const [k, expected] of Object.entries(preset.values)) {
++                    const item = byKey.get(k);
++                    if (!item) continue;
++                    const actual = this.getExternalEngineOption(item);
++                    if (k === 'prefill_sparse_minference' && preset.values.prefill_attention_mode !== 'sage2') {
++                        continue;
++                    }
++                    if (actual !== expected) return false;
++                }
++                return true;
++            },
++
++            applyExternalEnginePrefillPreset(preset) {
++                if (!preset || !preset.values) return;
++                const schema = this.externalEnginePrefillOptionsSchema();
++                const byKey = new Map(schema.map(s => [s.key, s]));
++                for (const [k, val] of Object.entries(preset.values)) {
++                    const item = byKey.get(k);
++                    if (item) {
++                        this.setExternalEngineOption(item, val, { autoCouple: false });
++                    }
++                }
++            },
++
 +            externalEngineOptionLabel(item) {
 +                if (!item || !item.key) return '';
-+                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-+                if (zh) {
++                if (this.isExternalEngineZh()) {
 +                    const zhLabels = {
 +                        max_concurrency: '并发槽位 (B/C)',
 +                        max_context: '最大上下文长度 (Tokens)',
 +                        rolling_prefix_cache: '滚动前缀缓存',
 +                        prefix_cache_gb: '前缀缓存预算 (GiB)',
-+                        prefill_linear_mode: '预填充线性层精度 (BF16 / W4A8)',
-+                        prefill_attention_mode: '预填充注意力内核 (Exact NAX / Sage2)',
-+                        prefill_sparse_minference: '  ↳ MInference 动态稀疏注意力 (需开启 Sage2)',
-+                        prefill_cache_blend: '跨分块非连续 KV 复用 (CacheBlend)',
-+                        prefill_ane_offload: '双 ANE 神经网络引擎协同预填充',
++                        prefill_linear_mode: 'W4A8 线性',
++                        prefill_attention_mode: 'Sage2 注意力',
++                        prefill_sparse_minference: '↳ MInference 稀疏',
++                        prefill_cache_blend: 'CacheBlend 复用',
++                        prefill_ane_offload: '双 ANE 协同',
 +                        sampling_contract: '采样协议 (Sampling Contract)',
 +                        artifact_path: '权重产物路径 (.miv)',
 +                        draft_artifact_path: '草稿产物路径 (.miv)',
@@ -6149,14 +7197,77 @@ index 62235bb..22a1c5c 100644
 +                }
 +                const enLabels = {
 +                    max_context: 'Max Context Window',
-+                    prefill_linear_mode: 'Prefill Linear Precision',
-+                    prefill_attention_mode: 'Prefill Attention Kernel',
-+                    prefill_sparse_minference: '  ↳ MInference Sparse Tiles (Sage2)',
-+                    prefill_cache_blend: 'Cross-Chunk CacheBlend (RAG)',
-+                    prefill_ane_offload: 'Dual-ANE Co-Execution Offload',
++                    prefill_linear_mode: 'W4A8 Linear',
++                    prefill_attention_mode: 'Sage2 Attention',
++                    prefill_sparse_minference: '↳ MInference Sparse',
++                    prefill_cache_blend: 'CacheBlend Reuse',
++                    prefill_ane_offload: 'Dual-ANE Offload',
 +                };
 +                if (enLabels[item.key]) return enLabels[item.key];
 +                return item.label || item.key;
++            },
++
++            externalEngineOptionHint(item) {
++                if (!item || !item.key) return '';
++                if (this.isExternalEngineZh()) {
++                    const zhHints = {
++                        prefill_linear_mode: '仅加速预填线性层（oQ4e 收益明显，down_proj 默认保留 W4A16 防掉点），解码阶段无损。',
++                        prefill_attention_mode: '低位宽 INT8 QK 注意力；开启时默认联动下方 MInference，单开不选稀疏会明显掉速。',
++                        prefill_sparse_minference: '64K–256K 动态跳过无关 KV 块（提速 2.1x–2.35x）；有些许精度损失，但在 Sage2 下不开会严重掉速。',
++                        prefill_cache_blend: '多文档/RAG 非连续分块 KV+GDN 复用（乱序命中提速 4.3x–4.5x）；长文档建议调大前缀缓存预算（如 16–32 GiB）。',
++                        prefill_ane_offload: '独立正交开关（不强制关 W4A8/Sage2），仅对 Dense 生效并自动跳过 GDN 递归层；80 核 M5 Ultra 上纯 GPU 更快。',
++                    };
++                    if (zhHints[item.key]) {
++                        if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
++                            return zhHints[item.key] + ' 当前为 MoE 模型，此项自动跳过。';
++                        }
++                        return zhHints[item.key];
++                    }
++                }
++                const enHints = {
++                    prefill_linear_mode: 'INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). Decode remains exact.',
++                    prefill_attention_mode: 'Low-bit INT8 QK attention; auto-enables MInference below (dense Sage2 alone is slower on affine4 KV).',
++                    prefill_sparse_minference: 'Skips low-weight KV blocks (2.1x–2.35x faster at 64K–256K). Slight quality loss, but turning it off under Sage2 causes severe slowdown.',
++                    prefill_cache_blend: 'Non-contiguous RAG chunk KV+GDN reuse (4.3x–4.5x warmer TTFT). Raise Prefix Cache Budget (e.g. 16–32 GiB) for long docs.',
++                    prefill_ane_offload: 'Orthogonal (never disables W4A8/Sage2); Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra.',
++                };
++                if (enHints[item.key]) {
++                    if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
++                        return enHints[item.key] + ' MoE models stay GPU-only.';
++                    }
++                    return enHints[item.key];
++                }
++                return item.description || '';
++            },
++
++            externalEngineOptionIsToggle(item) {
++                if (!item) return false;
++                if (item.type === 'bool') return true;
++                if (item.type === 'enum' && Array.isArray(item.options) && item.options.length === 2) {
++                    return item.key === 'prefill_linear_mode' || item.key === 'prefill_attention_mode';
++                }
++                return false;
++            },
++
++            externalEngineOptionToggleChecked(item) {
++                if (!item) return false;
++                const val = this.getExternalEngineOption(item);
++                if (item.type === 'bool') return Boolean(val);
++                if (item.key === 'prefill_linear_mode') return val === 'w4a8';
++                if (item.key === 'prefill_attention_mode') return val === 'sage2';
++                return Boolean(val);
++            },
++
++            toggleExternalEngineOption(item) {
++                if (!item || this.externalEngineOptionDisabled(item)) return;
++                const nextChecked = !this.externalEngineOptionToggleChecked(item);
++                if (item.type === 'bool') {
++                    this.setExternalEngineOption(item, nextChecked);
++                } else if (item.key === 'prefill_linear_mode') {
++                    this.setExternalEngineOption(item, nextChecked ? 'w4a8' : 'bf16');
++                } else if (item.key === 'prefill_attention_mode') {
++                    this.setExternalEngineOption(item, nextChecked ? 'sage2' : 'exact_nax');
++                }
 +            },
 +
 +            externalEngineOptionIndented(item) {
@@ -6165,7 +7276,7 @@ index 62235bb..22a1c5c 100644
 +
 +            externalEngineOptionDisabled(item) {
 +                if (!item || item.key !== 'prefill_sparse_minference') return false;
-+                const schema = this.externalEngineGeneralOptionsSchema();
++                const schema = this.externalEnginePrefillOptionsSchema();
 +                const attnItem = schema.find(s => s && s.key === 'prefill_attention_mode')
 +                    || { key: 'prefill_attention_mode', type: 'enum', default: 'exact_nax' };
 +                return this.getExternalEngineOption(attnItem) !== 'sage2';
@@ -6173,21 +7284,33 @@ index 62235bb..22a1c5c 100644
 +
 +            externalEngineOptionTooltip(item) {
 +                if (!this.externalEngineOptionDisabled(item)) return '';
-+                const zh = (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-+                return zh
-+                    ? '需将「预填充注意力内核」设为 sage2 时生效'
-+                    : 'Active when Prefill Attention Kernel is set to sage2';
++                return this.isExternalEngineZh()
++                    ? '开启上方「Sage2 注意力」后可用'
++                    : 'Active when Sage2 Attention is enabled';
 +            },
 +
 +            externalEngineOptionContainerClass(item) {
 +                const classes = [];
 +                if (this.externalEngineOptionIndented(item)) {
-+                    classes.push('pl-4', 'border-l-2', 'border-neutral-200');
++                    classes.push('pl-4', 'ml-1', 'border-l-2', 'border-neutral-200');
 +                }
 +                if (this.externalEngineOptionDisabled(item)) {
 +                    classes.push('opacity-50');
 +                }
 +                return classes.join(' ');
++            },
++
++            mivEffectivePrefillBadges(eff) {
++                if (!eff || typeof eff !== 'object') return [];
++                const badges = [];
++                if (eff.prefill_linear_mode === 'w4a8') badges.push('W4A8');
++                if (eff.prefill_attention_mode === 'sage2') {
++                    badges.push(eff.prefill_sparse_minference_effective ? 'SAGE2+MINF' : 'SAGE2');
++                }
++                if (eff.prefill_cache_blend) badges.push('BLEND');
++                if (eff.prefill_ane_active) badges.push('ANE');
++                else if (eff.prefill_ane_offload) badges.push('ANE(off)');
++                return badges;
 +            },
 +
 +            externalEngineEnumOptionLabel(item, opt) {
@@ -6219,10 +7342,11 @@ index 62235bb..22a1c5c 100644
 +                return resolved === null || resolved === undefined ? '' : String(resolved);
 +            },
 +
-+            setExternalEngineOption(item, rawValue) {
++            setExternalEngineOption(item, rawValue, { autoCouple = true } = {}) {
 +                if (!item || !item.key) return;
 +                const active = this.effectiveExternalEngine();
 +                if (!active) return;
++                const prevValue = this.getExternalEngineOption(item);
 +                let value = rawValue;
 +                if (item.type === 'bool') {
 +                    value = Boolean(rawValue);
@@ -6253,6 +7377,14 @@ index 62235bb..22a1c5c 100644
 +                    }
 +                }
 +                opts[active] = { ...(opts[active] || {}), [item.key]: value };
++                // Switching Attention into sage2 defaults MInference ON so users avoid
++                // dense-Sage2 slowdown; MInference stays freely toggleable off afterwards.
++                if (autoCouple && item.key === 'prefill_attention_mode' && prevValue !== 'sage2' && value === 'sage2') {
++                    const minfItem = this.externalEnginePrefillOptionsSchema().find(s => s && s.key === 'prefill_sparse_minference');
++                    if (minfItem && !this.getExternalEngineOption(minfItem)) {
++                        this.setExternalEngineOption(minfItem, true, { autoCouple: false });
++                    }
++                }
 +            },
 +
 +            externalEngineLoraModeOptionLabel(opt) {
@@ -6297,7 +7429,7 @@ index 62235bb..22a1c5c 100644
                  const engines = this.modelSettings.external_engines || [];
                  const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
 diff --git a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
-index 2e9a43b..950e091 100644
+index 2e9a43b..2cd9de6 100644
 --- a/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 +++ b/apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html
 @@ -1,3 +1,7 @@
@@ -6308,7 +7440,7 @@ index 2e9a43b..950e091 100644
      <!-- Model Settings Modal -->
      <dialog x-effect="showModelSettingsModal ? $el.showModal() : $el.close()" x-cloak
           class="dashboard-dialog fixed inset-0 z-50 overflow-y-auto"
-@@ -17,6 +21,21 @@
+@@ -17,6 +21,24 @@
                      <div class="min-w-0">
                          <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
                          <h4 id="model-settings-modal-title" tabindex="-1" autofocus class="text-xl font-bold tracking-tight text-neutral-900 break-words" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
@@ -6326,11 +7458,14 @@ index 2e9a43b..950e091 100644
 +                            <span x-text="'B=' + selectedModel?.miv_effective_settings?.max_concurrency
 +                                + ' (' + t('modal.model_settings.miv_source_' + selectedModel?.miv_effective_settings?.concurrency_source) + ')'"></span>
 +                            <span x-text="selectedModel?.miv_effective_settings?.sampling_contract_id"></span>
++                            <template x-for="badge in mivEffectivePrefillBadges(selectedModel?.miv_effective_settings)" :key="badge">
++                                <span class="px-1.5 py-0.5 text-[11px] font-mono font-medium rounded bg-neutral-200/80 text-neutral-800" x-text="badge"></span>
++                            </template>
 +                        </div>
                      </div>
                      <div class="flex items-start gap-2 flex-shrink-0 max-sm:flex-shrink max-sm:min-w-0 max-sm:max-w-full max-sm:justify-end max-sm:ml-auto max-sm:pr-9">
                          <!-- Snapshot actions: reset / optimal (omlx.ai) / custom recipe -->
-@@ -369,7 +388,7 @@
+@@ -369,7 +391,7 @@
                          <!-- Embedding context window -->
                          <label class="{{ ms_row }}" x-show="selectedModel?.model_type === 'embedding'" x-cloak>
                              <span class="min-w-0">
@@ -6339,7 +7474,7 @@ index 2e9a43b..950e091 100644
                                  <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.embedding_context_window_hint') }}</span>
                              </span>
                              <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
-@@ -378,7 +397,7 @@
+@@ -378,7 +400,7 @@
                          <!-- Reranker context window -->
                          <label class="{{ ms_row }}" x-show="selectedModel?.model_type === 'reranker'" x-cloak>
                              <span class="min-w-0">
@@ -6348,7 +7483,7 @@ index 2e9a43b..950e091 100644
                                  <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.reranker_context_window_hint') }}</span>
                              </span>
                              <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
-@@ -445,7 +464,7 @@
+@@ -445,7 +467,7 @@
                          <div class="{{ ms_rows }}">
                              <label class="{{ ms_row }}" x-show="!modelSettings.is_diffusion_model">
                                  <span class="min-w-0">
@@ -6357,7 +7492,7 @@ index 2e9a43b..950e091 100644
                                      <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.max_context_window_hint') }}</span>
                                  </span>
                                  <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
-@@ -453,24 +472,24 @@
+@@ -453,24 +475,24 @@
                              </label>
                              <label class="{{ ms_row }}" x-show="!modelSettings.is_diffusion_model">
                                  <span class="min-w-0">
@@ -6386,7 +7521,7 @@ index 2e9a43b..950e091 100644
                                  <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                         class="{{ ms_field_short }}">
                              </label>
-@@ -480,14 +499,14 @@
+@@ -480,14 +502,14 @@
                                         class="{{ ms_field_short }}">
                              </label>
                              <label class="{{ ms_row }}" x-show="!modelSettings.is_diffusion_model">
@@ -6403,7 +7538,7 @@ index 2e9a43b..950e091 100644
                                  <input type="number" x-model.number="modelSettings.presence_penalty" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                         :disabled="modelSettings.vlm_mtp_enabled"
                                         :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
-@@ -521,13 +540,13 @@
+@@ -521,13 +543,13 @@
                  <!-- Acceleration -->
                  <section id="ms-acceleration" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                      <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h3>
@@ -6421,7 +7556,7 @@ index 2e9a43b..950e091 100644
                                      <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lightning_mtp_hint') }}</p>
                                      <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
                                         class="text-xs text-amber-700 mt-1"
-@@ -566,24 +585,24 @@
+@@ -566,24 +588,24 @@
                              <div x-show="modelSettings.mtp_enabled" x-transition
                                   class="flex items-center justify-between gap-3 pt-1">
                                  <div class="min-w-0">
@@ -6450,7 +7585,7 @@ index 2e9a43b..950e091 100644
                                      <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_hint') }}</p>
                                      <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                         class="text-xs text-amber-700 mt-1"
-@@ -612,7 +631,7 @@
+@@ -612,7 +634,7 @@
                              </div>
                              <div x-show="modelSettings.dflash_enabled" x-transition class="space-y-3 pt-1">
                                  <div>
@@ -6459,7 +7594,7 @@ index 2e9a43b..950e091 100644
                                      <select x-model="modelSettings.dflash_draft_model"
                                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                          <option value="">{{ t('modal.model_settings.draft_model_placeholder') }}</option>
-@@ -667,8 +686,8 @@
+@@ -667,8 +689,8 @@
                                          <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_draft_window_hint') }}</p>
                                      </div>
                                      <div>
@@ -6470,16 +7605,89 @@ index 2e9a43b..950e091 100644
                                                 class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                          <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_block_size_hint') }}</p>
                                      </div>
-@@ -687,7 +706,7 @@
+@@ -686,8 +708,80 @@
+                             </div>
                          </div>
  
++                        <!-- miv Prefill Acceleration Card -->
++                        <div class="px-4 py-4 space-y-3 bg-neutral-50/60"
++                             x-show="mivSettingIsForwarded() && externalEnginePrefillOptionsSchema().length > 0"
++                             x-cloak>
++                            <div class="flex flex-wrap items-start justify-between gap-2">
++                                <div class="min-w-0">
++                                    <div class="flex items-baseline gap-1">
++                                        <span class="text-sm font-semibold text-neutral-800" x-text="externalEnginePrefillCardTitle()"></span>{{ miv_dot() }}
++                                    </div>
++                                    <p class="text-xs text-neutral-400/90 mt-0.5" x-text="externalEnginePrefillCardSubtitle()"></p>
++                                </div>
++                                <div class="flex flex-wrap items-center gap-1.5">
++                                    <template x-for="preset in externalEnginePrefillPresets()" :key="preset.id">
++                                        <button type="button"
++                                                @click="applyExternalEnginePrefillPreset(preset)"
++                                                :class="isExternalEnginePrefillPresetActive(preset)
++                                                    ? 'bg-neutral-900 text-white border-neutral-900'
++                                                    : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'"
++                                                class="px-2.5 py-1 text-xs font-medium rounded-full border transition-all"
++                                                x-text="preset.label"></button>
++                                    </template>
++                                </div>
++                            </div>
++                            <div class="rounded-xl bg-white border border-neutral-200/80 divide-y divide-neutral-100">
++                                <template x-for="opt in externalEnginePrefillOptionsSchema()" :key="opt.key">
++                                    <div class="px-3.5 py-3"
++                                         :class="externalEngineOptionContainerClass(opt)"
++                                         :title="externalEngineOptionTooltip(opt)">
++                                        <template x-if="externalEngineOptionIsToggle(opt)">
++                                            <div class="flex items-start justify-between gap-3">
++                                                <div class="min-w-0">
++                                                    <div class="flex items-baseline gap-1">
++                                                        <span class="text-sm font-medium text-neutral-700" x-text="externalEngineOptionLabel(opt)"></span>
++                                                    </div>
++                                                    <p x-show="externalEngineOptionHint(opt)"
++                                                       class="text-xs text-neutral-400/80 leading-relaxed mt-0.5"
++                                                       x-text="externalEngineOptionHint(opt)"></p>
++                                                </div>
++                                                <button type="button" role="switch"
++                                                        :disabled="externalEngineOptionDisabled(opt)"
++                                                        :aria-disabled="externalEngineOptionDisabled(opt) ? 'true' : 'false'"
++                                                        :aria-checked="externalEngineOptionToggleChecked(opt) ? 'true' : 'false'"
++                                                        @click="toggleExternalEngineOption(opt)"
++                                                        :class="[externalEngineOptionToggleChecked(opt) ? 'bg-black' : 'bg-neutral-200', externalEngineOptionDisabled(opt) ? 'cursor-not-allowed' : '']"
++                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
++                                                    <span :class="externalEngineOptionToggleChecked(opt) ? 'translate-x-5' : 'translate-x-0'"
++                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
++                                                </button>
++                                            </div>
++                                        </template>
++                                        <template x-if="!externalEngineOptionIsToggle(opt) && opt.type === 'enum'">
++                                            <div>
++                                                <label class="block text-sm font-medium text-neutral-700 mb-1" x-text="externalEngineOptionLabel(opt)"></label>
++                                                <select :value="getExternalEngineOption(opt)"
++                                                        @change="setExternalEngineOption(opt, $event.target.value)"
++                                                        class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
++                                                    <template x-for="choice in (opt.options || [])" :key="choice">
++                                                        <option :value="choice"
++                                                                :selected="getExternalEngineOption(opt) === choice"
++                                                                x-text="externalEngineEnumOptionLabel(opt, choice)"></option>
++                                                    </template>
++                                                </select>
++                                                <p x-show="externalEngineOptionHint(opt)"
++                                                   class="text-xs text-neutral-400/80 leading-relaxed mt-1"
++                                                   x-text="externalEngineOptionHint(opt)"></p>
++                                            </div>
++                                        </template>
++                                    </div>
++                                </template>
++                            </div>
++                        </div>
++
                          <!-- VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter) -->
 -                        <div class="px-4 py-3.5 space-y-3">
 +                        <div class="px-4 py-3.5 space-y-3" :class="externalEngineBlocksSetting('vlm_mtp_enabled') ? 'opacity-40 pointer-events-none' : ''">
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
                                      <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.vlm_mtp') }}</span>
-@@ -733,6 +752,7 @@
+@@ -733,6 +827,7 @@
  
                          <!-- DeepSeek V4.1 CED Prefill -->
                          <div class="px-4 py-3.5"
@@ -6487,7 +7695,7 @@ index 2e9a43b..950e091 100644
                               x-show="modelSettings.deepseek_v41_ced_prefill_supported" x-cloak>
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
-@@ -753,6 +773,7 @@
+@@ -753,6 +848,7 @@
  
                          <!-- Qwen4 Extended Fused Decode -->
                          <div class="px-4 py-3.5"
@@ -6495,16 +7703,16 @@ index 2e9a43b..950e091 100644
                               x-show="modelSettings.qwen4_gdn_decode_wide_proj_supported" x-cloak>
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
-@@ -773,7 +794,7 @@
+@@ -773,7 +869,7 @@
  
                          <!-- INT8-activation (A8) prefill kernels -->
                          <template x-if="showsA8Prefill(selectedModel)">
 -                            <div class="px-4 py-3.5 space-y-4">
-+                            <div class="px-4 py-3.5 space-y-4" :class="externalEngineBlocksSetting('a8_prefill_enabled') ? 'opacity-40 pointer-events-none' : ''">
++                            <div class="px-4 py-3.5 space-y-4" x-show="!mivSettingIsForwarded()" :class="externalEngineBlocksSetting('a8_prefill_enabled') ? 'opacity-40 pointer-events-none' : ''">
                                  <div class="flex items-start justify-between gap-3">
                                      <div class="min-w-0">
                                          <div class="flex flex-wrap items-center gap-2">
-@@ -809,7 +830,7 @@
+@@ -809,7 +905,7 @@
                          </template>
  
                          <!-- Prefill Accelerator: a paired Mac runs the first layers -->
@@ -6513,7 +7721,7 @@ index 2e9a43b..950e091 100644
                              <div class="min-w-0">
                                  <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.prefill_helper') }}</span>
                                  <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.prefill_helper_hint') }}</p>
-@@ -889,10 +910,11 @@
+@@ -889,10 +985,11 @@
                  <!-- Memory Saving -->
                  <section id="ms-memory" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                      <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.memory_label') }}</h3>
@@ -6527,7 +7735,7 @@ index 2e9a43b..950e091 100644
                               x-show="ssdNgramOffloadKey()" x-cloak>
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
-@@ -919,7 +941,7 @@
+@@ -919,7 +1016,7 @@
  
                          <!-- MoE Expert Offload -->
                          <template x-if="selectedModel?.moe_expert_offload_supported === true">
@@ -6536,7 +7744,7 @@ index 2e9a43b..950e091 100644
                                  <div class="flex items-start justify-between gap-3">
                                      <div class="min-w-0">
                                          <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload') }}</span>
-@@ -962,14 +984,14 @@
+@@ -962,14 +1059,14 @@
                          </template>
  
                          <!-- KV Cache Compression -->
@@ -6554,7 +7762,7 @@ index 2e9a43b..950e091 100644
                                          :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                          :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_compression_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                          :class="[
-@@ -983,7 +1005,10 @@
+@@ -983,7 +1080,10 @@
                                            class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                  </button>
                              </div>
@@ -6566,7 +7774,7 @@ index 2e9a43b..950e091 100644
                                  <div>
                                      <label for="kv-compression-format" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.kv_compression_format') }}</label>
                                      <select id="kv-compression-format" x-model="modelSettings.turboquant_kv_scheme"
-@@ -1034,13 +1059,20 @@
+@@ -1034,13 +1134,20 @@
                                          <i data-lucide="download" class="w-3 h-3"></i>
                                          <span x-text="window.t('modal.model_settings.external_engine_get_draft').replace('{repo_id}', externalEngineDraftRepo())"></span>
                                      </button>
@@ -6589,7 +7797,7 @@ index 2e9a43b..950e091 100644
                                          ]"
                                          role="switch"
                                          :aria-checked="effectiveExternalEngine() ? 'true' : 'false'"
-@@ -1061,6 +1093,78 @@
+@@ -1061,6 +1168,78 @@
                                  </select>
                                  <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.external_engine_select_hint') }}</p>
                              </div>
@@ -6668,7 +7876,7 @@ index 2e9a43b..950e091 100644
                          </div>
  
                          <!-- Trust Remote Code (security-sensitive) -->
-@@ -1087,7 +1191,7 @@
+@@ -1087,7 +1266,7 @@
                               x-show="!modelSettings.is_diffusion_model" x-cloak>
                              <div class="flex items-start justify-between gap-3">
                                  <div class="min-w-0">
@@ -6677,7 +7885,7 @@ index 2e9a43b..950e091 100644
                                      <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                  </div>
                                  <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
-@@ -1365,25 +1469,47 @@
+@@ -1365,25 +1544,47 @@
  
                          <!-- LoRA Adapter -->
                          <div class="px-4 py-3.5 space-y-2" x-show="!modelSettings.is_diffusion_model" x-cloak>
@@ -6742,7 +7950,7 @@ index 2e9a43b..950e091 100644
                          </div>
                      </div>
  
-@@ -1779,7 +1905,7 @@
+@@ -1779,7 +1980,7 @@
                              </div>
                              <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                  <div>
@@ -6833,7 +8041,7 @@ index 86dbd45..4cf4072 100644
          await app.saveModelSettings();
          assert.equal(payload.mtp_adaptive_max_depth, depth);
 diff --git a/apps/omlx-web/tests/test_admin_model_settings_template.py b/apps/omlx-web/tests/test_admin_model_settings_template.py
-index d0ed9da..3b82da0 100644
+index d0ed9da..ca4b929 100644
 --- a/apps/omlx-web/tests/test_admin_model_settings_template.py
 +++ b/apps/omlx-web/tests/test_admin_model_settings_template.py
 @@ -702,10 +702,39 @@ test('Save sends only fields edited since the modal opened', async () => {
@@ -6877,7 +8085,7 @@ index d0ed9da..3b82da0 100644
  test('Apply response cannot replace another model editor', async () => {
      let resolve;
      const state = setup(() => new Promise(r => {resolve=r;}));
-@@ -1059,3 +1088,252 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
+@@ -1059,3 +1088,300 @@ def test_reranker_context_window_i18n_key_exists_in_every_locale():
      for path in sorted(i18n_dir.glob("*.json")):
          catalog = json.loads(path.read_text())
          assert key in catalog, f"{path.name} is missing {key}"
@@ -7036,9 +8244,16 @@ index d0ed9da..3b82da0 100644
 +
 +def test_external_engine_prefill_switches_orthogonality_labels_and_minference_gating():
 +    template = _model_settings_template()
++    acceleration = _section(template, "<!-- Acceleration -->", "<!-- Memory Saving -->")
++    assert "<!-- miv Prefill Acceleration Card -->" in acceleration
++    assert "externalEnginePrefillOptionsSchema()" in acceleration
++    assert "externalEnginePrefillPresets()" in acceleration
++    assert "externalEngineOptionHint(opt)" in acceleration
++    assert "toggleExternalEngineOption(opt)" in acceleration
 +    assert "externalEngineOptionContainerClass(opt)" in template
 +    assert "externalEngineOptionDisabled(opt)" in template
 +    assert "externalEngineOptionTooltip(opt)" in template
++    assert "mivEffectivePrefillBadges(selectedModel?.miv_effective_settings)" in template
 +
 +    node = shutil.which("node")
 +    if node is None:
@@ -7061,41 +8276,61 @@ index d0ed9da..3b82da0 100644
 +    compatible: true,
 +    options_schema: [
 +        {key: 'max_context', label: 'Max Context Window', type: 'int', min: 1024, max: 1048576, default: 262144},
-+        {key: 'prefill_linear_mode', label: 'Prefill Linear Precision', type: 'enum', options: ['bf16', 'w4a8'], default: 'bf16'},
-+        {key: 'prefill_attention_mode', label: 'Prefill Attention Kernel', type: 'enum', options: ['exact_nax', 'sage2'], default: 'exact_nax'},
-+        {key: 'prefill_sparse_minference', label: 'MInference Sparse Tiles (Sage2)', type: 'bool', default: false},
-+        {key: 'prefill_cache_blend', label: 'Cross-Chunk CacheBlend (RAG)', type: 'bool', default: false},
-+        {key: 'prefill_ane_offload', label: 'Dual-ANE Co-Execution Offload', type: 'bool', default: false},
++        {key: 'prefill_linear_mode', label: 'W4A8 Linear', type: 'enum', options: ['bf16', 'w4a8'], default: 'bf16'},
++        {key: 'prefill_attention_mode', label: 'Sage2 Attention', type: 'enum', options: ['exact_nax', 'sage2'], default: 'exact_nax'},
++        {key: 'prefill_sparse_minference', label: 'MInference Sparse', type: 'bool', default: false},
++        {key: 'prefill_cache_blend', label: 'CacheBlend Reuse', type: 'bool', default: false},
++        {key: 'prefill_ane_offload', label: 'Dual-ANE Offload', type: 'bool', default: false},
 +    ],
 +};
++app.selectedModel = {id: 'qwen3.8-27b', config_model_type: 'qwen3_8'};
 +app.modelSettings = app.buildModelSettingsState(
 +    {external_engines: [m5EngineRow], auto_external_engine: 'm5rt'},
 +    {}
 +);
-+const opts = Object.fromEntries(app.externalEngineGeneralOptionsSchema().map(o => [o.key, o]));
 +
-+// EN labels
-+assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'Prefill Linear Precision');
-+assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Prefill Attention Kernel');
-+assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference Sparse Tiles'));
-+assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'Cross-Chunk CacheBlend (RAG)');
-+assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), 'Dual-ANE Co-Execution Offload');
++// Prefill switches live in the dedicated Acceleration card, NOT duplicated in ms-advanced general list
++const generalKeys = app.externalEngineGeneralOptionsSchema().map(o => o.key);
++assert.deepEqual(generalKeys, ['max_context']);
++const prefillSchema = app.externalEnginePrefillOptionsSchema();
++const opts = Object.fromEntries(prefillSchema.map(o => [o.key, o]));
++const maxCtxOpt = app.externalEngineGeneralOptionsSchema()[0];
 +
-+// ZH labels
-+globalThis.document.documentElement.lang = 'zh-CN';
-+assert.ok(app.externalEngineOptionLabel(opts.prefill_linear_mode).includes('BF16 / W4A8'));
-+assert.ok(app.externalEngineOptionLabel(opts.prefill_attention_mode).includes('Exact NAX / Sage2'));
++// Short EN labels + subtle hint text
++assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'W4A8 Linear');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Sage2 Attention');
 +assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
-+assert.ok(app.externalEngineOptionLabel(opts.prefill_cache_blend).includes('CacheBlend'));
-+assert.ok(app.externalEngineOptionLabel(opts.prefill_ane_offload).includes('ANE'));
++assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'CacheBlend Reuse');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), 'Dual-ANE Offload');
++assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).toLowerCase().includes('slowdown'));
++assert.ok(app.externalEngineOptionHint(opts.prefill_ane_offload).includes('W4A8'));
++
++// Short ZH labels + subtle caution text (including MInference trade-off & slowdown warning)
++globalThis.document.documentElement.lang = 'zh-CN';
++assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'W4A8 线性');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Sage2 注意力');
++assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
++assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'CacheBlend 复用');
++assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), '双 ANE 协同');
++assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).includes('掉速'));
++assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).includes('精度'));
++app.selectedModel = {id: 'qwen3.6-35b-a3b', config_model_type: 'qwen3_6_moe'};
++assert.ok(app.externalEngineOptionHint(opts.prefill_ane_offload).includes('MoE'));
++app.selectedModel = {id: 'qwen3.8-27b', config_model_type: 'qwen3_8'};
 +globalThis.document.documentElement.lang = 'en';
++
++// Binary enum + bool options render as toggles in the Prefill card
++for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_sparse_minference', 'prefill_cache_blend', 'prefill_ane_offload']) {
++    assert.equal(app.externalEngineOptionIsToggle(opts[k]), true);
++    assert.equal(app.externalEngineOptionToggleChecked(opts[k]), false);
++}
 +
 +// When prefill_attention_mode === 'exact_nax', ONLY prefill_sparse_minference is indented & disabled/dimmed
 +assert.equal(app.externalEngineOptionIndented(opts.prefill_sparse_minference), true);
 +assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), true);
 +assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
 +assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('pl-4'));
-+assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), 'Active when Prefill Attention Kernel is set to sage2');
++assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), 'Active when Sage2 Attention is enabled');
 +
 +// All other switches stay 100% independent and never disabled
 +for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_cache_blend', 'prefill_ane_offload']) {
@@ -7103,17 +8338,26 @@ index d0ed9da..3b82da0 100644
 +    assert.equal(app.externalEngineOptionIndented(opts[k]), false);
 +}
 +
-+// Enabling sage2 enables prefill_sparse_minference; enabling prefill_ane_offload NEVER disables any other switch
-+app.setExternalEngineOption(opts.prefill_linear_mode, 'w4a8');
-+app.setExternalEngineOption(opts.prefill_attention_mode, 'sage2');
++// Toggling Sage2 ON auto-enables MInference, while MInference can still be manually toggled OFF afterwards
++app.toggleExternalEngineOption(opts.prefill_attention_mode);
++assert.equal(app.getExternalEngineOption(opts.prefill_attention_mode), 'sage2');
++assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), true);
 +assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), false);
-+assert.ok(!app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
-+assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), '');
++app.toggleExternalEngineOption(opts.prefill_sparse_minference);
++assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), false);
 +
-+app.setExternalEngineOption(opts.prefill_sparse_minference, true);
-+app.setExternalEngineOption(opts.prefill_cache_blend, true);
-+app.setExternalEngineOption(opts.prefill_ane_offload, true);
-+app.setExternalEngineOption(opts.max_context, '262144');
++// Presets apply cleanly without locking orthogonal toggles
++const presets = Object.fromEntries(app.externalEnginePrefillPresets().map(p => [p.id, p]));
++app.applyExternalEnginePrefillPreset(presets.long_sparse);
++assert.equal(app.isExternalEnginePrefillPresetActive(presets.long_sparse), true);
++assert.equal(app.getExternalEngineOption(opts.prefill_linear_mode), 'w4a8');
++assert.equal(app.getExternalEngineOption(opts.prefill_attention_mode), 'sage2');
++assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), true);
++
++// Enabling CacheBlend + Dual-ANE composes orthogonally with W4A8 + Sage2 + MInference
++app.toggleExternalEngineOption(opts.prefill_cache_blend);
++app.toggleExternalEngineOption(opts.prefill_ane_offload);
++app.setExternalEngineOption(maxCtxOpt, '262144');
 +
 +const payload = app.buildModelSettingsPayload(app.modelSettings);
 +assert.equal(payload.external_engine_options.m5rt.max_context, 262144);
@@ -7122,6 +8366,18 @@ index d0ed9da..3b82da0 100644
 +assert.equal(payload.external_engine_options.m5rt.prefill_sparse_minference, true);
 +assert.equal(payload.external_engine_options.m5rt.prefill_cache_blend, true);
 +assert.equal(payload.external_engine_options.m5rt.prefill_ane_offload, true);
++
++// Live header badge helper
++assert.deepEqual(
++    app.mivEffectivePrefillBadges({
++        prefill_linear_mode: 'w4a8',
++        prefill_attention_mode: 'sage2',
++        prefill_sparse_minference_effective: true,
++        prefill_cache_blend: true,
++        prefill_ane_active: true,
++    }),
++    ['W4A8', 'SAGE2+MINF', 'BLEND', 'ANE']
++);
 +"""
 +    )
 +    result = subprocess.run(
@@ -8403,10 +9659,10 @@ index 7b0e787..e06e4de 100644
          """Delete a stored response. Returns True if found."""
 diff --git a/omlx/engine/m5_sidecar.py b/omlx/engine/m5_sidecar.py
 new file mode 100644
-index 0000000..30a0b5b
+index 0000000..ff3090c
 --- /dev/null
 +++ b/omlx/engine/m5_sidecar.py
-@@ -0,0 +1,7902 @@
+@@ -0,0 +1,7926 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""miv Core Backend (`ninfer-metal`) external sidecar engine (`mseries_backendd` over Unix domain sockets)
 +and lightweight `entry_points(group="omlx.external_engines")` plugin discovery.
@@ -8633,62 +9889,65 @@ index 0000000..30a0b5b
 +    },
 +    {
 +        "key": "prefill_linear_mode",
-+        "label": "Prefill Linear Precision",
++        "label": "W4A8 Linear",
 +        "type": "enum",
 +        "options": ["bf16", "w4a8"],
 +        "option_labels": {
-+            "bf16": "BF16 NAX (Default / Exact)",
-+            "w4a8": "W4A8 INT8/FP8 TensorOps",
++            "bf16": "BF16 (Exact)",
++            "w4a8": "W4A8 (INT8 Prefill)",
 +        },
 +        "description": (
-+            "Prefill dense linear GEMM precision route (BF16 NAX vs W4A8 INT8/FP8 TensorOps)."
++            "INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). "
++            "Decode remains exact W4A16."
 +        ),
 +        "default": "bf16",
 +        "reload_required": True,
 +    },
 +    {
 +        "key": "prefill_attention_mode",
-+        "label": "Prefill Attention Kernel",
++        "label": "Sage2 Attention",
 +        "type": "enum",
 +        "options": ["exact_nax", "sage2"],
 +        "option_labels": {
-+            "exact_nax": "Exact NAX Flash (Default)",
-+            "sage2": "SageAttention2 (INT8 QK + FP8 PV)",
++            "exact_nax": "Exact NAX",
++            "sage2": "Sage2 (INT8 QK + FP16 PV)",
 +        },
 +        "description": (
-+            "Prefill full-attention kernel route (Exact NAX vs SageAttention2 INT8 QK + FP8 PV)."
++            "Low-bit INT8 QK prefill attention; pair with MInference below "
++            "(dense Sage2 alone is slower on affine4 KV)."
 +        ),
 +        "default": "exact_nax",
 +        "reload_required": True,
 +    },
 +    {
 +        "key": "prefill_sparse_minference",
-+        "label": "MInference Sparse Tiles (Sage2)",
++        "label": "MInference Sparse",
 +        "type": "bool",
 +        "description": (
-+            "Enable MInference vertical-slash dynamic sparse attention tiles when "
-+            "prefill_attention_mode is sage2."
++            "Skips low-weight KV blocks (2.1x-2.35x faster at 64K-256K). "
++            "Slight quality loss, but turning it off under Sage2 causes severe slowdown."
 +        ),
 +        "default": False,
 +        "reload_required": True,
 +    },
 +    {
 +        "key": "prefill_cache_blend",
-+        "label": "Cross-Chunk CacheBlend (RAG)",
++        "label": "CacheBlend Reuse",
 +        "type": "bool",
 +        "description": (
-+            "Enable cross-chunk non-contiguous RAG KV+GDN cache reuse with ~15% HKVD "
-+            "selective recomputation."
++            "Non-contiguous RAG chunk KV+GDN reuse (4.3x-4.5x warmer TTFT). "
++            "Increase Prefix Cache Budget (e.g. 16-32 GiB) for long docs."
 +        ),
 +        "default": False,
 +        "reload_required": True,
 +    },
 +    {
 +        "key": "prefill_ane_offload",
-+        "label": "Dual-ANE Co-Execution Offload",
++        "label": "Dual-ANE Offload",
 +        "type": "bool",
 +        "description": (
-+            "Enable Dual-ANE output-channel-split co-execution alongside GPU BF16 or W4A8 prefill."
++            "Orthogonal Dual-ANE co-execution (never disables W4A8/Sage2); "
++            "Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra."
 +        ),
 +        "default": False,
 +        "reload_required": True,
@@ -15278,8 +16537,29 @@ index 0000000..30a0b5b
 +        if not last.get("max_context") or not last.get("speculative_backend"):
 +            return None
 +        keys = (
-+            "max_context", "max_concurrency", "kv_dtype", "sampling_contract_id",
-+            "speculative_backend", "max_draft_tokens",
++            "max_context",
++            "max_concurrency",
++            "kv_dtype",
++            "sampling_contract_id",
++            "speculative_backend",
++            "max_draft_tokens",
++            "prefill_linear_mode",
++            "prefill_attention_mode",
++            "prefill_sparse_minference",
++            "prefill_sparse_minference_effective",
++            "prefill_sparse_minference_inactive_reason",
++            "prefill_cache_blend",
++            "prefill_ane_offload",
++            "prefill_ane_active",
++            "prefill_ane_split_alpha",
++            "prefill_w4a8_tokens",
++            "prefill_sage2_tokens",
++            "prefill_minference_blocks_skipped",
++            "prefill_minference_blocks_total",
++            "prefill_cache_blend_hit_tokens",
++            "prefill_cache_blend_recomputed_tokens",
++            "prefill_ane_offload_tokens",
++            "prefill_ane_fallback_tokens",
 +        )
 +        return {
 +            **{k: last[k] for k in keys if k in last},
@@ -19773,10 +21053,10 @@ index e547dd2..33a1f3e 100644
          )
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..fa87009
+index 0000000..d57b03b
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4567 @@
+@@ -0,0 +1,4618 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -24342,6 +25622,57 @@ index 0000000..fa87009
 +    expected_ws = max(64 * 1024**2, 1024 * 248320 * 2 * 4)
 +    assert est_auto == weights_sz + expected_kv + expected_ws
 +    assert est_auto < 10 * (1 << 30)  # Far below old 64 GiB bf16*B overestimate!
++
++
++def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path) -> None:
++    engine = m5_mod.M5SidecarEngine.__new__(m5_mod.M5SidecarEngine)
++    engine._options = m5_mod.M5Options(
++        max_context=262144,
++        max_concurrency=4,
++        kv_dtype="affine4_g128",
++        concurrency_source="model",
++        prefill_linear_mode="w4a8",
++        prefill_attention_mode="sage2",
++        prefill_sparse_minference=True,
++        prefill_cache_blend=True,
++        prefill_ane_offload=True,
++    )
++    engine._last_stats = {
++        "max_context": 262144,
++        "max_concurrency": 4,
++        "kv_dtype": "affine4_g128",
++        "sampling_contract_id": "position_coupled_v1",
++        "speculative_backend": "dflash2",
++        "max_draft_tokens": 7,
++        "prefill_linear_mode": "w4a8",
++        "prefill_attention_mode": "sage2",
++        "prefill_sparse_minference": True,
++        "prefill_sparse_minference_effective": True,
++        "prefill_cache_blend": True,
++        "prefill_ane_offload": True,
++        "prefill_ane_active": True,
++        "prefill_ane_split_alpha": 0.03,
++        "prefill_w4a8_tokens": 4096,
++        "prefill_sage2_tokens": 4096,
++        "prefill_minference_blocks_skipped": 120,
++        "prefill_minference_blocks_total": 256,
++        "prefill_cache_blend_hit_tokens": 2048,
++        "prefill_cache_blend_recomputed_tokens": 384,
++        "prefill_ane_offload_tokens": 4096,
++        "prefill_ane_fallback_tokens": 0,
++    }
++    eff = engine.effective_load_settings()
++    assert eff is not None
++    assert eff["prefill_linear_mode"] == "w4a8"
++    assert eff["prefill_attention_mode"] == "sage2"
++    assert eff["prefill_sparse_minference_effective"] is True
++    assert eff["prefill_cache_blend"] is True
++    assert eff["prefill_ane_active"] is True
++    assert eff["prefill_w4a8_tokens"] == 4096
++    assert eff["prefill_minference_blocks_skipped"] == 120
++    assert eff["prefill_cache_blend_hit_tokens"] == 2048
++    assert eff["prefill_ane_offload_tokens"] == 4096
++
 +
 +
 diff --git a/tests/test_microkernel_manager.py b/tests/test_microkernel_manager.py

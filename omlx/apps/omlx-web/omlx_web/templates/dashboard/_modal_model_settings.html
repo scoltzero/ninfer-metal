@@ -35,6 +35,9 @@
                             <span x-text="'B=' + selectedModel?.miv_effective_settings?.max_concurrency
                                 + ' (' + t('modal.model_settings.miv_source_' + selectedModel?.miv_effective_settings?.concurrency_source) + ')'"></span>
                             <span x-text="selectedModel?.miv_effective_settings?.sampling_contract_id"></span>
+                            <template x-for="badge in mivEffectivePrefillBadges(selectedModel?.miv_effective_settings)" :key="badge">
+                                <span class="px-1.5 py-0.5 text-[11px] font-mono font-medium rounded bg-neutral-200/80 text-neutral-800" x-text="badge"></span>
+                            </template>
                         </div>
                     </div>
                     <div class="flex items-start gap-2 flex-shrink-0 max-sm:flex-shrink max-sm:min-w-0 max-sm:max-w-full max-sm:justify-end max-sm:ml-auto max-sm:pr-9">
@@ -705,6 +708,78 @@
                             </div>
                         </div>
 
+                        <!-- miv Prefill Acceleration Card -->
+                        <div class="px-4 py-4 space-y-3 bg-neutral-50/60"
+                             x-show="mivSettingIsForwarded() && externalEnginePrefillOptionsSchema().length > 0"
+                             x-cloak>
+                            <div class="flex flex-wrap items-start justify-between gap-2">
+                                <div class="min-w-0">
+                                    <div class="flex items-baseline gap-1">
+                                        <span class="text-sm font-semibold text-neutral-800" x-text="externalEnginePrefillCardTitle()"></span>{{ miv_dot() }}
+                                    </div>
+                                    <p class="text-xs text-neutral-400/90 mt-0.5" x-text="externalEnginePrefillCardSubtitle()"></p>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-1.5">
+                                    <template x-for="preset in externalEnginePrefillPresets()" :key="preset.id">
+                                        <button type="button"
+                                                @click="applyExternalEnginePrefillPreset(preset)"
+                                                :class="isExternalEnginePrefillPresetActive(preset)
+                                                    ? 'bg-neutral-900 text-white border-neutral-900'
+                                                    : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'"
+                                                class="px-2.5 py-1 text-xs font-medium rounded-full border transition-all"
+                                                x-text="preset.label"></button>
+                                    </template>
+                                </div>
+                            </div>
+                            <div class="rounded-xl bg-white border border-neutral-200/80 divide-y divide-neutral-100">
+                                <template x-for="opt in externalEnginePrefillOptionsSchema()" :key="opt.key">
+                                    <div class="px-3.5 py-3"
+                                         :class="externalEngineOptionContainerClass(opt)"
+                                         :title="externalEngineOptionTooltip(opt)">
+                                        <template x-if="externalEngineOptionIsToggle(opt)">
+                                            <div class="flex items-start justify-between gap-3">
+                                                <div class="min-w-0">
+                                                    <div class="flex items-baseline gap-1">
+                                                        <span class="text-sm font-medium text-neutral-700" x-text="externalEngineOptionLabel(opt)"></span>
+                                                    </div>
+                                                    <p x-show="externalEngineOptionHint(opt)"
+                                                       class="text-xs text-neutral-400/80 leading-relaxed mt-0.5"
+                                                       x-text="externalEngineOptionHint(opt)"></p>
+                                                </div>
+                                                <button type="button" role="switch"
+                                                        :disabled="externalEngineOptionDisabled(opt)"
+                                                        :aria-disabled="externalEngineOptionDisabled(opt) ? 'true' : 'false'"
+                                                        :aria-checked="externalEngineOptionToggleChecked(opt) ? 'true' : 'false'"
+                                                        @click="toggleExternalEngineOption(opt)"
+                                                        :class="[externalEngineOptionToggleChecked(opt) ? 'bg-black' : 'bg-neutral-200', externalEngineOptionDisabled(opt) ? 'cursor-not-allowed' : '']"
+                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    <span :class="externalEngineOptionToggleChecked(opt) ? 'translate-x-5' : 'translate-x-0'"
+                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                </button>
+                                            </div>
+                                        </template>
+                                        <template x-if="!externalEngineOptionIsToggle(opt) && opt.type === 'enum'">
+                                            <div>
+                                                <label class="block text-sm font-medium text-neutral-700 mb-1" x-text="externalEngineOptionLabel(opt)"></label>
+                                                <select :value="getExternalEngineOption(opt)"
+                                                        @change="setExternalEngineOption(opt, $event.target.value)"
+                                                        class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
+                                                    <template x-for="choice in (opt.options || [])" :key="choice">
+                                                        <option :value="choice"
+                                                                :selected="getExternalEngineOption(opt) === choice"
+                                                                x-text="externalEngineEnumOptionLabel(opt, choice)"></option>
+                                                    </template>
+                                                </select>
+                                                <p x-show="externalEngineOptionHint(opt)"
+                                                   class="text-xs text-neutral-400/80 leading-relaxed mt-1"
+                                                   x-text="externalEngineOptionHint(opt)"></p>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
                         <!-- VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter) -->
                         <div class="px-4 py-3.5 space-y-3" :class="externalEngineBlocksSetting('vlm_mtp_enabled') ? 'opacity-40 pointer-events-none' : ''">
                             <div class="flex items-start justify-between gap-3">
@@ -794,7 +869,7 @@
 
                         <!-- INT8-activation (A8) prefill kernels -->
                         <template x-if="showsA8Prefill(selectedModel)">
-                            <div class="px-4 py-3.5 space-y-4" :class="externalEngineBlocksSetting('a8_prefill_enabled') ? 'opacity-40 pointer-events-none' : ''">
+                            <div class="px-4 py-3.5 space-y-4" x-show="!mivSettingIsForwarded()" :class="externalEngineBlocksSetting('a8_prefill_enabled') ? 'opacity-40 pointer-events-none' : ''">
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <div class="flex flex-wrap items-center gap-2">

@@ -323,6 +323,23 @@ struct MivEffectiveSettings: Codable, Equatable, Sendable {
     let speculativeBackend: String
     let maxDraftTokens: Int
     let concurrencySource: String
+    var prefillLinearMode: String? = nil
+    var prefillAttentionMode: String? = nil
+    var prefillSparseMinference: Bool? = nil
+    var prefillSparseMinferenceEffective: Bool? = nil
+    var prefillSparseMinferenceInactiveReason: String? = nil
+    var prefillCacheBlend: Bool? = nil
+    var prefillAneOffload: Bool? = nil
+    var prefillAneActive: Bool? = nil
+    var prefillAneSplitAlpha: Double? = nil
+    var prefillW4a8Tokens: Int? = nil
+    var prefillSage2Tokens: Int? = nil
+    var prefillMinferenceBlocksSkipped: Int? = nil
+    var prefillMinferenceBlocksTotal: Int? = nil
+    var prefillCacheBlendHitTokens: Int? = nil
+    var prefillCacheBlendRecomputedTokens: Int? = nil
+    var prefillAneOffloadTokens: Int? = nil
+    var prefillAneFallbackTokens: Int? = nil
 }
 
 /// One entry of `external_engines` in GET /admin/api/models.

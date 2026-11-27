@@ -4565,3 +4565,54 @@ def test_m4a_c5_max_context_policy_unclamping_and_c6_shared_kv_memory_estimate(
     assert est_auto < 10 * (1 << 30)  # Far below old 64 GiB bf16*B overestimate!
 
 
+def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path) -> None:
+    engine = m5_mod.M5SidecarEngine.__new__(m5_mod.M5SidecarEngine)
+    engine._options = m5_mod.M5Options(
+        max_context=262144,
+        max_concurrency=4,
+        kv_dtype="affine4_g128",
+        concurrency_source="model",
+        prefill_linear_mode="w4a8",
+        prefill_attention_mode="sage2",
+        prefill_sparse_minference=True,
+        prefill_cache_blend=True,
+        prefill_ane_offload=True,
+    )
+    engine._last_stats = {
+        "max_context": 262144,
+        "max_concurrency": 4,
+        "kv_dtype": "affine4_g128",
+        "sampling_contract_id": "position_coupled_v1",
+        "speculative_backend": "dflash2",
+        "max_draft_tokens": 7,
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_sparse_minference_effective": True,
+        "prefill_cache_blend": True,
+        "prefill_ane_offload": True,
+        "prefill_ane_active": True,
+        "prefill_ane_split_alpha": 0.03,
+        "prefill_w4a8_tokens": 4096,
+        "prefill_sage2_tokens": 4096,
+        "prefill_minference_blocks_skipped": 120,
+        "prefill_minference_blocks_total": 256,
+        "prefill_cache_blend_hit_tokens": 2048,
+        "prefill_cache_blend_recomputed_tokens": 384,
+        "prefill_ane_offload_tokens": 4096,
+        "prefill_ane_fallback_tokens": 0,
+    }
+    eff = engine.effective_load_settings()
+    assert eff is not None
+    assert eff["prefill_linear_mode"] == "w4a8"
+    assert eff["prefill_attention_mode"] == "sage2"
+    assert eff["prefill_sparse_minference_effective"] is True
+    assert eff["prefill_cache_blend"] is True
+    assert eff["prefill_ane_active"] is True
+    assert eff["prefill_w4a8_tokens"] == 4096
+    assert eff["prefill_minference_blocks_skipped"] == 120
+    assert eff["prefill_cache_blend_hit_tokens"] == 2048
+    assert eff["prefill_ane_offload_tokens"] == 4096
+
+
+

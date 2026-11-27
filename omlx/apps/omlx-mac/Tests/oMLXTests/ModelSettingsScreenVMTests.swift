@@ -1234,6 +1234,97 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["max_concurrency"]?.value as? Int, 1)
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
     }
+
+    func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportPresetsAndTelemetry() throws {
+        let vm = ModelSettingsScreenVM()
+        let m5Opt = ExternalEngineOption(
+            id: "m5rt",
+            label: "miv Core Backend (ninfer-metal)",
+            compatible: true,
+            reason: nil,
+            supportedStandardSettings: ["max_context_window", "dflash_enabled", "mtp_enabled"],
+            providerId: "io.ninfer.metal",
+            optionsSchema: [
+                ["key": AnyCodable("max_concurrency"), "label": AnyCodable("Concurrency"), "type": AnyCodable("int"), "default": AnyCodable(1)],
+                ["key": AnyCodable("prefill_linear_mode"), "label": AnyCodable("W4A8"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("bf16"), AnyCodable("w4a8")]), "default": AnyCodable("bf16")],
+                ["key": AnyCodable("prefill_attention_mode"), "label": AnyCodable("Sage2"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("exact_nax"), AnyCodable("sage2")]), "default": AnyCodable("exact_nax")],
+                ["key": AnyCodable("prefill_sparse_minference"), "label": AnyCodable("MInference"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
+                ["key": AnyCodable("prefill_cache_blend"), "label": AnyCodable("CacheBlend"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
+                ["key": AnyCodable("prefill_ane_offload"), "label": AnyCodable("Dual-ANE"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
+            ]
+        )
+        var model = makeModel(id: "Qwen3.8-27B-oQ4e-mtp", configModelType: "qwen3_5")
+        model.externalEngines = [m5Opt]
+        model.autoExternalEngine = "m5rt"
+        vm.model = model
+        vm.externalEngine = ""
+
+        XCTAssertEqual(vm.externalEngineGeneralOptions.map(\.key), ["max_concurrency"])
+        XCTAssertEqual(vm.externalEnginePrefillOptions.map(\.key), [
+            "prefill_linear_mode",
+            "prefill_attention_mode",
+            "prefill_sparse_minference",
+            "prefill_cache_blend",
+            "prefill_ane_offload",
+        ])
+        XCTAssertEqual(vm.activeMivPrefillPreset, .lossless)
+        XCTAssertFalse(vm.isExternalEngineSage2Active)
+
+        // Turning on Sage2 auto-enables MInference and returns both keys for atomic PATCH.
+        let sageOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }))
+        let sageKeys = vm.setExternalEnginePrefillToggle(sageOpt, isOn: true)
+        XCTAssertEqual(sageKeys, ["prefill_attention_mode", "prefill_sparse_minference"])
+        XCTAssertTrue(vm.isExternalEngineSage2Active)
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
+
+        // MInference remains independently toggleable off afterwards.
+        let minfOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_sparse_minference" }))
+        let minfKeys = vm.setExternalEnginePrefillToggle(minfOpt, isOn: false)
+        XCTAssertEqual(minfKeys, ["prefill_sparse_minference"])
+        XCTAssertFalse(vm.externalEnginePrefillToggleValue(for: minfOpt))
+
+        // Long 64K+ Fast preset turns on W4A8 + Sage2 + MInference orthogonally.
+        let staged = vm.stageMivPrefillPreset(.longFast)
+        XCTAssertEqual(staged.count, 5)
+        XCTAssertEqual(vm.activeMivPrefillPreset, .longFast)
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_attention_mode"]?.value as? String, "sage2")
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
+        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 3)
+
+        // Verify live telemetry decoding on MivEffectiveSettings.
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let eff = try decoder.decode(
+            MivEffectiveSettings.self,
+            from: Data(#"""
+            {
+              "max_context": 262144,
+              "max_concurrency": 1,
+              "kv_dtype": "affine4_g128",
+              "sampling_contract_id": "position_coupled_v1",
+              "speculative_backend": "mtp",
+              "max_draft_tokens": 4,
+              "concurrency_source": "default",
+              "prefill_linear_mode": "w4a8",
+              "prefill_attention_mode": "sage2",
+              "prefill_sparse_minference": true,
+              "prefill_sparse_minference_effective": true,
+              "prefill_cache_blend": false,
+              "prefill_ane_offload": true,
+              "prefill_ane_active": true,
+              "prefill_w4a8_tokens": 8192,
+              "prefill_sage2_tokens": 8192,
+              "prefill_minference_blocks_skipped": 420
+            }
+            """#.utf8)
+        )
+        XCTAssertEqual(eff.prefillLinearMode, "w4a8")
+        XCTAssertEqual(eff.prefillAttentionMode, "sage2")
+        XCTAssertEqual(eff.prefillSparseMinferenceEffective, true)
+        XCTAssertEqual(eff.prefillAneActive, true)
+        XCTAssertEqual(eff.prefillMinferenceBlocksSkipped, 420)
+    }
 }
 
 /// Serves one model with Lightning MTP on and rejects its settings writes

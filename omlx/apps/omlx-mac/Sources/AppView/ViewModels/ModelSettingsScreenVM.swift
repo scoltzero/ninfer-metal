@@ -1237,6 +1237,31 @@ final class ModelSettingsScreenVM {
         }
     }
 
+    /// Saves multiple external-engine options atomically in one PATCH request
+    /// (used by the miv Prefill Acceleration presets and Sage2 auto-coupled toggles).
+    func saveExternalEngineOptionsPatch(keys: [String], client: OMLXClient) async {
+        let active = effectiveExternalEngine
+        guard !active.isEmpty else { return }
+        var updates: [String: AnyCodable] = [:]
+        for key in keys {
+            if let value = externalEngineOptions[active]?[key] {
+                updates[key] = value
+            }
+        }
+        guard !updates.isEmpty else { return }
+        var patch = ModelSettingsPatch()
+        patch.externalEngineOptionsPatch = [active: updates]
+        if thinkingForced { patch.enableThinking = .some(nil) }
+        let targetModelID = modelID
+        do {
+            _ = try await client.updateModelSettings(id: targetModelID, patch: patch)
+            self.lastError = nil
+        } catch {
+            await reportFailedSave(error, modelID: targetModelID, client: client,
+                                   preservingEdits: true)
+        }
+    }
+
     // MARK: - Prefill Accelerator
 
     func loadPrefillHelperCandidates(client: OMLXClient) async {
@@ -1576,7 +1601,45 @@ final class ModelSettingsScreenVM {
         return keys
     }
 
-    var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
+    static let externalEnginePrefillOptionKeys: [String] = [
+        "prefill_linear_mode",
+        "prefill_attention_mode",
+        "prefill_sparse_minference",
+        "prefill_cache_blend",
+        "prefill_ane_offload",
+    ]
+
+    enum MivPrefillPreset: String, CaseIterable, Identifiable {
+        case lossless
+        case balanced
+        case longFast
+        case ragBlend
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .lossless:
+                return String(localized: "settings.miv.prefill.preset.lossless",
+                              defaultValue: "Lossless Default",
+                              comment: "Preset pill for lossless exact miv prefill")
+            case .balanced:
+                return String(localized: "settings.miv.prefill.preset.balanced",
+                              defaultValue: "W4A8 Balanced",
+                              comment: "Preset pill for W4A8 linear + exact attention prefill")
+            case .longFast:
+                return String(localized: "settings.miv.prefill.preset.long_fast",
+                              defaultValue: "Long 64K+ Fast",
+                              comment: "Preset pill for W4A8 + Sage2 + MInference long-context prefill")
+            case .ragBlend:
+                return String(localized: "settings.miv.prefill.preset.rag_blend",
+                              defaultValue: "RAG Reuse",
+                              comment: "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse")
+            }
+        }
+    }
+
+    private func allExternalEngineSchemaOptions() -> [ExternalEngineSchemaOption] {
         let active = effectiveExternalEngine
         guard !active.isEmpty,
               let row = model?.externalEngines?.first(where: { $0.id == active }),
@@ -1623,8 +1686,149 @@ final class ModelSettingsScreenVM {
         }
     }
 
+    /// Prefill acceleration switches rendered in the dedicated Acceleration card.
+    var externalEnginePrefillOptions: [ExternalEngineSchemaOption] {
+        let byKey = Dictionary(uniqueKeysWithValues: allExternalEngineSchemaOptions().map { ($0.key, $0) })
+        return Self.externalEnginePrefillOptionKeys.compactMap { byKey[$0] }
+    }
+
+    var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
+        let prefillSet = Set(Self.externalEnginePrefillOptionKeys)
+        return allExternalEngineSchemaOptions().filter { !prefillSet.contains($0.key) }
+    }
+
+    var isExternalEngineSage2Active: Bool {
+        guard let opt = externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }) else {
+            return false
+        }
+        return externalEngineEnumOption(opt) == "sage2"
+    }
+
+    func externalEnginePrefillToggleValue(for opt: ExternalEngineSchemaOption) -> Bool {
+        switch opt.key {
+        case "prefill_linear_mode":
+            return externalEngineEnumOption(opt) == "w4a8"
+        case "prefill_attention_mode":
+            return externalEngineEnumOption(opt) == "sage2"
+        default:
+            return externalEngineBoolOption(opt)
+        }
+    }
+
+    /// Updates a miv prefill toggle locally and returns all option keys to persist.
+    /// Turning on Sage2 convenience-enables MInference so long prompts don't stall,
+    /// while leaving MInference freely toggleable afterwards.
+    @discardableResult
+    func setExternalEnginePrefillToggle(_ opt: ExternalEngineSchemaOption, isOn: Bool) -> [String] {
+        switch opt.key {
+        case "prefill_linear_mode":
+            writeExternalEngineOptionValue(isOn ? "w4a8" : "bf16", forKey: opt.key)
+            return [opt.key]
+        case "prefill_attention_mode":
+            let wasSage2 = externalEngineEnumOption(opt) == "sage2"
+            writeExternalEngineOptionValue(isOn ? "sage2" : "exact_nax", forKey: opt.key)
+            if isOn && !wasSage2,
+               externalEnginePrefillOptions.contains(where: { $0.key == "prefill_sparse_minference" }) {
+                writeExternalEngineOptionValue(true, forKey: "prefill_sparse_minference")
+                return ["prefill_attention_mode", "prefill_sparse_minference"]
+            }
+            return [opt.key]
+        default:
+            writeExternalEngineOptionValue(isOn, forKey: opt.key)
+            return [opt.key]
+        }
+    }
+
+    var activeMivPrefillPreset: MivPrefillPreset? {
+        guard !externalEnginePrefillOptions.isEmpty else { return nil }
+        let byKey = Dictionary(uniqueKeysWithValues: externalEnginePrefillOptions.map { ($0.key, $0) })
+        let w4a8 = byKey["prefill_linear_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
+        let sage2 = byKey["prefill_attention_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
+        let minf = byKey["prefill_sparse_minference"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
+        let blend = byKey["prefill_cache_blend"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
+        let ane = byKey["prefill_ane_offload"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
+        if !w4a8 && !sage2 && !blend && !ane { return .lossless }
+        if w4a8 && !sage2 && !blend && !ane { return .balanced }
+        if w4a8 && sage2 && minf && !blend && !ane { return .longFast }
+        if w4a8 && !sage2 && blend && !ane { return .ragBlend }
+        return nil
+    }
+
+    @discardableResult
+    func stageMivPrefillPreset(_ preset: MivPrefillPreset) -> [String] {
+        let available = Set(externalEnginePrefillOptions.map(\.key))
+        let target: [String: any Sendable]
+        switch preset {
+        case .lossless:
+            target = [
+                "prefill_linear_mode": "bf16",
+                "prefill_attention_mode": "exact_nax",
+                "prefill_sparse_minference": false,
+                "prefill_cache_blend": false,
+                "prefill_ane_offload": false,
+            ]
+        case .balanced:
+            target = [
+                "prefill_linear_mode": "w4a8",
+                "prefill_attention_mode": "exact_nax",
+                "prefill_sparse_minference": false,
+                "prefill_cache_blend": false,
+                "prefill_ane_offload": false,
+            ]
+        case .longFast:
+            target = [
+                "prefill_linear_mode": "w4a8",
+                "prefill_attention_mode": "sage2",
+                "prefill_sparse_minference": true,
+                "prefill_cache_blend": false,
+                "prefill_ane_offload": false,
+            ]
+        case .ragBlend:
+            target = [
+                "prefill_linear_mode": "w4a8",
+                "prefill_attention_mode": "exact_nax",
+                "prefill_sparse_minference": false,
+                "prefill_cache_blend": true,
+                "prefill_ane_offload": false,
+            ]
+        }
+        var changed: [String] = []
+        for key in Self.externalEnginePrefillOptionKeys where available.contains(key) {
+            if let val = target[key] {
+                writeExternalEngineOptionValue(val, forKey: key)
+                changed.append(key)
+            }
+        }
+        return changed
+    }
+
+    func applyMivPrefillPreset(_ preset: MivPrefillPreset, client: OMLXClient) async {
+        let keys = stageMivPrefillPreset(preset)
+        await saveExternalEngineOptionsPatch(keys: keys, client: client)
+    }
+
     func externalEngineOptionDisplayLabel(_ opt: ExternalEngineSchemaOption) -> String {
         switch opt.key {
+        case "prefill_linear_mode":
+            return String(localized: "settings.miv.prefill.opt.linear",
+                          defaultValue: "W4A8 Linear",
+                          comment: "Short switch title for W4A8 prefill linear acceleration")
+        case "prefill_attention_mode":
+            return String(localized: "settings.miv.prefill.opt.sage2",
+                          defaultValue: "Sage2 Attention",
+                          comment: "Short switch title for SageAttention2 low-bit prefill attention")
+        case "prefill_sparse_minference":
+            return String(localized: "settings.miv.prefill.opt.minference",
+                          defaultValue: "MInference Sparse",
+                          comment: "Short switch title for MInference dynamic block sparsity under Sage2")
+        case "prefill_cache_blend":
+            return String(localized: "settings.miv.prefill.opt.cache_blend",
+                          defaultValue: "CacheBlend Reuse",
+                          comment: "Short switch title for cross-chunk KV cache blend reuse")
+        case "prefill_ane_offload":
+            return String(localized: "settings.miv.prefill.opt.ane",
+                          defaultValue: "Dual-ANE Offload",
+                          comment: "Short switch title for GPU + Dual-ANE hybrid prefill offload")
         case "max_concurrency":
             return String(localized: "settings.advanced.external_engine.opt.max_concurrency",
                           defaultValue: "Concurrency (B/C)",
@@ -1651,6 +1855,44 @@ final class ModelSettingsScreenVM {
                           comment: "External engine option label for custom draft artifact path")
         default:
             return opt.label
+        }
+    }
+
+    func externalEnginePrefillCautionHint(_ opt: ExternalEngineSchemaOption) -> String {
+        switch opt.key {
+        case "prefill_linear_mode":
+            return String(localized: "settings.miv.prefill.hint.linear",
+                          defaultValue: "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift.",
+                          comment: "Subtle trade-off note under the W4A8 Linear prefill switch")
+        case "prefill_attention_mode":
+            return String(localized: "settings.miv.prefill.hint.sage2",
+                          defaultValue: "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups.",
+                          comment: "Subtle trade-off note under the Sage2 Attention prefill switch")
+        case "prefill_sparse_minference":
+            if !isExternalEngineSage2Active {
+                return String(localized: "settings.miv.prefill.hint.minference_disabled",
+                              defaultValue: "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown.",
+                              comment: "Subtle note under MInference when Sage2 is currently off")
+            }
+            return String(localized: "settings.miv.prefill.hint.minference",
+                          defaultValue: "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens).",
+                          comment: "Subtle trade-off note under the MInference Sparse prefill switch")
+        case "prefill_cache_blend":
+            return String(localized: "settings.miv.prefill.hint.cache_blend",
+                          defaultValue: "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup.",
+                          comment: "Subtle trade-off note under the CacheBlend Reuse prefill switch")
+        case "prefill_ane_offload":
+            let isMoE = (model?.configModelType ?? "").lowercased().contains("moe")
+            if isMoE {
+                return String(localized: "settings.miv.prefill.hint.ane_moe",
+                              defaultValue: "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2).",
+                              comment: "Subtle note under Dual-ANE Offload for MoE models")
+            }
+            return String(localized: "settings.miv.prefill.hint.ane",
+                          defaultValue: "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE.",
+                          comment: "Subtle trade-off note under the Dual-ANE Offload prefill switch")
+        default:
+            return opt.description ?? ""
         }
     }
 
@@ -2080,10 +2322,16 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "Extended Fused Decode",
                                     comment: "Short name of Qwen4 extended fused decode in the Acceleration row value"))
             }
-            if showsA8Prefill && a8PrefillEnabled {
+            if showsA8Prefill && !usesMiv && a8PrefillEnabled {
                 items.append(String(localized: "settings.summary.qwen_oq_a8",
                                     defaultValue: "INT8 Prefill",
                                     comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
+            }
+            if usesMiv {
+                for opt in externalEnginePrefillOptions where externalEnginePrefillToggleValue(for: opt) {
+                    if opt.key == "prefill_sparse_minference" && !isExternalEngineSage2Active { continue }
+                    items.append(externalEngineOptionDisplayLabel(opt))
+                }
             }
         case .memory:
             if ssdNgramOffloadSupported && ssdNgramOffload {
