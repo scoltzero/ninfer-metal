@@ -642,7 +642,7 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
     ++compiled;
   }
   for (const char *gs : {"g64", "g128"}) {
-    for (const char *tag : {"q4", "q56", "q3", "q8"}) {
+    for (const char *tag : {"q4", "q4_int4b", "q56", "q3", "q8"}) {
       for (const char *bns : {"bns16", "bns32"}) {
         const std::string fn = std::string("omlx_m5_affine_w4a8_nax_") + tag +
                                "_" + gs + "_bm64_bn64_" + bns + "_sk1";
@@ -657,7 +657,7 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
         ++compiled;
       }
     }
-    for (const char *tag : {"q4", "q56", "q3", "q8", "q4_q56", "q56_q4"}) {
+    for (const char *tag : {"q4", "q4_int4b", "q56", "q3", "q8", "q4_q56", "q56_q4"}) {
       for (const char *sfx : {"_swiglu_bm64_bn64_out64_sk1",
                               "_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
         const std::string fn =
@@ -3042,6 +3042,366 @@ Json test_miv2_fwht64_and_all_runtime_consumers(const MetalContext &ctx,
   return {{"checks", checks}, {"min_w4a8_cos_sim", min_w4a8_cos}, {"passed", true}};
 }
 
+// ============================================================================
+// Test 7 (WP 3B): oQ4e Native int8 x int4b Bit-Exact Parity & Dual-Channel
+// Verifies 0-ULP / bit-exact equivalence between default 2x 32x32x32 int8 x int8
+// and OMLX_M5_OQ4_INT4B=1 native int8_t x int4b_format across:
+//   - Linear (bns16 & bns32, g64 & g128, M=65 non-mult64, N=96, row_offset slicing, icb=0/1)
+//   - SwiGLU Mode A & Mode B (+ FWHT-64 + GS64 A8, also_write_bf16=true/false, row_offset)
+//   - Mixed-layer q4 + q5 sequence sharing identical (qa, sa, ra) buffers.
+// ============================================================================
+Json test_wp3b_oq4e_dual_channel_and_int4b_exact(
+    const MetalContext &ctx, const std::filesystem::path &libs) {
+  constexpr U32 kMaxM = 128u;
+  constexpr U32 kLiveM = 65u;
+  constexpr U32 kK = 512u;
+  constexpr U32 kNFull = 256u;
+  constexpr U32 kNOdd = 96u;
+  constexpr double kMinCos = 0.9985;
+  U32 checks = 0;
+  U32 wid = 9000u;
+
+  std::vector<std::uint16_t> x_u16;
+  const auto x_f32 = make_activations(kMaxM, kK, 911u, x_u16);
+  auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+  auto zero_buf = ctx.make_buffer(256);
+  zero_buf.write(std::vector<std::byte>(256));
+  Ref x_ref{&x_buf, 0, x_buf.size()};
+  Ref zero_ref{&zero_buf, 0, zero_buf.size()};
+
+  const auto a8_lay = w4a8_nax_workspace_layout(kMaxM, kK);
+  auto qa_buf = ctx.make_buffer(a8_lay.qa_bytes);
+  auto sa_buf = ctx.make_buffer(a8_lay.sa_bytes);
+  auto ra_buf = ctx.make_buffer(a8_lay.ra_bytes);
+  Ref qa_ref{&qa_buf, 0, qa_buf.size()};
+  Ref sa_ref{&sa_buf, 0, sa_buf.size()};
+  Ref ra_ref{&ra_buf, 0, ra_buf.size()};
+
+  {
+    Encoder eq(ctx, libs, kMaxM, "wp3b.quant_x");
+    eq.begin_stage("quant");
+    emit_quantize_a8_g64(eq, x_ref, qa_ref, sa_ref, ra_ref, kK);
+    auto pq = eq.finish();
+    submit_profile(ctx, pq, kLiveM, false);
+  }
+
+  auto y_def = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+  auto y_i4b = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+
+  // 7a. Linear q4: bns16 & bns32, g64 & g128, full + odd N=96 + Dual-ANE row_offset slicing, icb=0/1
+  for (U32 gs : {64u, 128u}) {
+    for (U32 bn : {16u, 32u}) {
+      for (U32 n_dim : {kNFull, kNOdd}) {
+        auto wq4 = make_affine_weight(ctx, wid++, n_dim, kK, 4u, gs,
+                                      9100u + gs + bn + n_dim, true, bn, false, true);
+        AffineNaxCache ac;
+        TiledAffineWeight tw_direct{};
+        const TiledAffineWeight *tw = nullptr;
+        if (bn == 16u) {
+          ac.register_weight(wq4.view, zero_ref);
+          ac.build(ctx, libs, zero_ref);
+          tw = ac.find(wq4.view.object_id);
+        } else {
+          // Construct bns32 TiledAffineWeight directly from pre-tiled bn=32 planes.
+          const U32 padded_n = ((n_dim + bn - 1u) / bn) * bn;
+          tw_direct.codes = plane(wq4.view, "nax_codes");
+          tw_direct.high2 = zero_ref;
+          tw_direct.sb = plane(wq4.view, "nax_sb");
+          tw_direct.sb_tiled = zero_ref;
+          tw_direct.n = n_dim;
+          tw_direct.k = kK;
+          tw_direct.padded_n = padded_n;
+          tw_direct.bn = bn;
+          tw_direct.bits = 4u;
+          tw_direct.group_size = gs;
+          tw = &tw_direct;
+        }
+        require(tw != nullptr && tw->bits == 4u && tw->bn == bn,
+                "wp3b 7a missing tiled q4 weight");
+
+        auto run_lin = [&](bool enable_i4b, MetalBuffer &dst, bool use_icb,
+                           U32 roff, U32 stride, U32 sn) {
+          ScopedEnv env("OMLX_M5_OQ4_INT4B", enable_i4b ? "1" : "0");
+          fill_sentinel_bf16(dst, U64(kMaxM) * stride);
+          Encoder e(ctx, libs, kMaxM, "wp3b.lin");
+          e.begin_stage("lin");
+          linear_affine_w4a8_nax(e, *tw, qa_ref, sa_ref, ra_ref,
+                                 Ref{&dst, 0, U64(kMaxM) * stride * 2ULL},
+                                 {}, roff, stride, sn);
+          e.record_weight(wq4.view, n_dim, kK, "w4a8", "test", "");
+          auto p = e.finish(use_icb);
+          const std::string &fn = p.weight_routes.back().function;
+          const bool has_i4b = fn.find("q4_int4b") != std::string::npos;
+          require(has_i4b == enable_i4b,
+                  "wp3b 7a unexpected dispatch routing: " + fn);
+          submit_profile(ctx, p, kLiveM, use_icb);
+        };
+
+        // Full matrix (icb=false and icb=true)
+        for (bool use_icb : {false, true}) {
+          run_lin(false, y_def, use_icb, 0u, n_dim, 0u);
+          run_lin(true, y_i4b, use_icb, 0u, n_dim, 0u);
+          const auto got_def = read_u16(y_def, U64(kLiveM) * n_dim);
+          const auto got_i4b = read_u16(y_i4b, U64(kLiveM) * n_dim);
+          require(got_def == got_i4b,
+                  "wp3b 7a q4 linear int4b != default i8xi8 (must be 0-diff bit-exact!)");
+          check_tail_sentinel(y_def, U64(kLiveM) * n_dim, U64(kMaxM) * n_dim, "wp3b 7a def");
+          check_tail_sentinel(y_i4b, U64(kLiveM) * n_dim, U64(kMaxM) * n_dim, "wp3b 7a i4b");
+          const auto ref = cpu_linear_ref(std::span(x_f32).first(U64(kLiveM) * kK),
+                                          wq4.ref_w, kLiveM, n_dim, kK);
+          const double cs = cosine_similarity_bf16(got_i4b, ref, "wp3b 7a q4_int4b");
+          require(cs >= kMinCos, "wp3b 7a q4_int4b cos_sim=" + std::to_string(cs));
+          ++checks;
+        }
+
+        // Dual-ANE row_offset + out_stride + slice_n slicing check on N=256
+        if (n_dim == kNFull) {
+          run_lin(false, y_def, true, 64u, kNFull, 128u);
+          run_lin(true, y_i4b, true, 64u, kNFull, 128u);
+          const auto got_def = read_u16(y_def, U64(kMaxM) * kNFull);
+          const auto got_i4b = read_u16(y_i4b, U64(kMaxM) * kNFull);
+          require(got_def == got_i4b,
+                  "wp3b 7a q4 sliced linear int4b != default i8xi8");
+          for (U32 r = 0u; r < kLiveM; ++r) {
+            for (U32 c = 0u; c < 64u; ++c) {
+              require(got_i4b[U64(r) * kNFull + c] == 0xA5A5u,
+                      "wp3b 7a slice clobbered prefix");
+            }
+            for (U32 c = 192u; c < kNFull; ++c) {
+              require(got_i4b[U64(r) * kNFull + c] == 0xA5A5u,
+                      "wp3b 7a slice clobbered suffix");
+            }
+          }
+          ++checks;
+        }
+      }
+    }
+  }
+
+  // 7b. SwiGLU Mode A & Mode B (+ FWHT-64 + GS64 A8): g64 & g128, full + odd N=96 + row_offset
+  const auto mid_lay = w4a8_nax_workspace_layout(kMaxM, kNFull);
+  auto qao_def = ctx.make_buffer(mid_lay.qa_bytes);
+  auto sao_def = ctx.make_buffer(mid_lay.sa_bytes);
+  auto rao_def = ctx.make_buffer(mid_lay.ra_bytes);
+  auto qao_i4b = ctx.make_buffer(mid_lay.qa_bytes);
+  auto sao_i4b = ctx.make_buffer(mid_lay.sa_bytes);
+  auto rao_i4b = ctx.make_buffer(mid_lay.ra_bytes);
+
+  for (U32 gs : {64u, 128u}) {
+    // Mode A on N=96 (non-multiple of 64) & N=256 (with row_offset slice)
+    for (U32 n_dim : {kNOdd, kNFull}) {
+      auto wg = make_affine_weight(ctx, wid++, n_dim, kK, 4u, gs, 9200u + gs + n_dim, true, 16u, false, true);
+      auto wu = make_affine_weight(ctx, wid++, n_dim, kK, 4u, gs, 9300u + gs + n_dim, true, 16u, false, true);
+      AffineNaxCache ac;
+      ac.register_weight(wg.view, zero_ref);
+      ac.register_weight(wu.view, zero_ref);
+      ac.build(ctx, libs, zero_ref);
+      const auto *twg = ac.find(wg.view.object_id);
+      const auto *twu = ac.find(wu.view.object_id);
+
+      auto run_swi_a = [&](bool enable_i4b, MetalBuffer &dst, U32 roff, U32 stride, U32 sn, bool use_icb) {
+        ScopedEnv env("OMLX_M5_OQ4_INT4B", enable_i4b ? "1" : "0");
+        fill_sentinel_bf16(dst, U64(kMaxM) * stride);
+        Encoder e(ctx, libs, kMaxM, "wp3b.swiA");
+        e.begin_stage("swiA");
+        linear_affine_w4a8_nax_swiglu(e, *twg, *twu, qa_ref, sa_ref, ra_ref,
+                                      Ref{&dst, 0, U64(kMaxM) * stride * 2ULL},
+                                      {}, roff, stride, sn);
+        e.record_weight(wg.view, n_dim, kK, "w4a8", "test", "");
+        auto p = e.finish(use_icb);
+        const std::string &fn = p.weight_routes.back().function;
+        require((fn.find("q4_int4b") != std::string::npos) == enable_i4b,
+                "wp3b 7b ModeA unexpected routing: " + fn);
+        submit_profile(ctx, p, kLiveM, use_icb);
+      };
+
+      run_swi_a(false, y_def, 0u, n_dim, 0u, true);
+      run_swi_a(true, y_i4b, 0u, n_dim, 0u, true);
+      const auto got_def = read_u16(y_def, U64(kLiveM) * n_dim);
+      const auto got_i4b = read_u16(y_i4b, U64(kLiveM) * n_dim);
+      require(got_def == got_i4b, "wp3b 7b SwiGLU ModeA int4b != default i8xi8");
+      const auto ref = cpu_swiglu_ref(std::span(x_f32).first(U64(kLiveM) * kK),
+                                      wg.ref_w, wu.ref_w, kLiveM, n_dim, kK);
+      require(cosine_similarity_bf16(got_i4b, ref, "wp3b 7b swiA") >= kMinCos,
+              "wp3b 7b SwiGLU ModeA cos_sim too low");
+      ++checks;
+
+      if (n_dim == kNFull) {
+        run_swi_a(false, y_def, 64u, kNFull, 128u, false);
+        run_swi_a(true, y_i4b, 64u, kNFull, 128u, false);
+        require(read_u16(y_def, U64(kMaxM) * kNFull) ==
+                    read_u16(y_i4b, U64(kMaxM) * kNFull),
+                "wp3b 7b SwiGLU ModeA slice int4b != default i8xi8");
+        ++checks;
+
+        // Mode B (+ FWHT-64 + GS64 A8): full + row_offset slice, also_write_bf16=true/false
+        for (bool also_bf16 : {false, true}) {
+          for (bool sliced : {false, true}) {
+            const U32 roff = sliced ? 64u : 0u;
+            const U32 sn = sliced ? 128u : 0u;
+            auto run_swi_b = [&](bool enable_i4b, MetalBuffer &qao,
+                                 MetalBuffer &sao, MetalBuffer &rao,
+                                 MetalBuffer &yb) {
+              ScopedEnv env("OMLX_M5_OQ4_INT4B", enable_i4b ? "1" : "0");
+              qao.write(std::vector<std::byte>(qao.size(), std::byte{0x5A}));
+              sao.write(std::vector<std::byte>(sao.size(), std::byte{0x5A}));
+              rao.write(std::vector<std::byte>(rao.size(), std::byte{0x5A}));
+              fill_sentinel_bf16(yb, U64(kMaxM) * kNFull);
+              Encoder e(ctx, libs, kMaxM, "wp3b.swiB");
+              e.begin_stage("swiB");
+              linear_affine_w4a8_nax_swiglu_fwht64_a8(
+                  e, *twg, *twu, qa_ref, sa_ref, ra_ref,
+                  Ref{&qao, 0, qao.size()}, Ref{&sao, 0, sao.size()},
+                  Ref{&rao, 0, rao.size()}, Ref{&yb, 0, yb.size()},
+                  also_bf16, {}, roff, kNFull, sn);
+              e.record_weight(wg.view, kNFull, kK, "w4a8", "test", "");
+              auto p = e.finish(true);
+              const std::string &fn = p.weight_routes.back().function;
+              require((fn.find("q4_int4b") != std::string::npos) == enable_i4b,
+                      "wp3b 7b ModeB unexpected routing: " + fn);
+              submit_profile(ctx, p, kLiveM, true);
+            };
+            run_swi_b(false, qao_def, sao_def, rao_def, y_def);
+            run_swi_b(true, qao_i4b, sao_i4b, rao_i4b, y_i4b);
+            require(read_i8(qao_def, mid_lay.qa_bytes) ==
+                        read_i8(qao_i4b, mid_lay.qa_bytes),
+                    "wp3b 7b ModeB qa_out int4b != default");
+            require(read_f32(sao_def, mid_lay.sa_bytes / 4ULL) ==
+                        read_f32(sao_i4b, mid_lay.sa_bytes / 4ULL),
+                    "wp3b 7b ModeB sa_out int4b != default");
+            require(read_f32(rao_def, mid_lay.ra_bytes / 4ULL) ==
+                        read_f32(rao_i4b, mid_lay.ra_bytes / 4ULL),
+                    "wp3b 7b ModeB ra_out int4b != default");
+            if (also_bf16) {
+              require(read_u16(y_def, U64(kMaxM) * kNFull) ==
+                          read_u16(y_i4b, U64(kMaxM) * kNFull),
+                      "wp3b 7b ModeB opt_y_bf16 int4b != default");
+            }
+            // Verify padded rows [kLiveM, mp) in written groups are strictly zero!
+            const auto qa_got = read_i8(qao_i4b, mid_lay.qa_bytes);
+            const auto sa_got = read_f32(sao_i4b, mid_lay.sa_bytes / 4ULL);
+            const auto ra_got = read_f32(rao_i4b, mid_lay.ra_bytes / 4ULL);
+            const U32 g_start = roff / 64u;
+            const U32 g_count = (sn > 0u ? sn : kNFull) / 64u;
+            for (U32 r = kLiveM; r < mid_lay.mp; ++r) {
+              for (U32 g = g_start; g < g_start + g_count; ++g) {
+                require(sa_got[U64(g) * mid_lay.mp + r] == 0.0f &&
+                            ra_got[U64(g) * mid_lay.mp + r] == 0.0f,
+                        "wp3b 7b ModeB padded sa/ra non-zero");
+                for (U32 j = 0u; j < 64u; ++j) {
+                  require(qa_got[U64(r) * kNFull + g * 64u + j] == 0,
+                          "wp3b 7b ModeB padded qa non-zero");
+                }
+              }
+            }
+            ++checks;
+          }
+        }
+      }
+    }
+  }
+
+  // 7c. Seamless Dual-Channel Mixed-Layer Sequence (q4 + q5 sharing identical a8 buffers):
+  //   (1) q4 QKVZ Linear -> q4_int4b
+  //   (2) q5 O-proj Linear -> q56 (i8xi8)
+  //   (3) (q4, q5) mixed SwiGLU Mode A -> q4_q56 (i8xi8)
+  //   (4) (q4, q4) Gate+Up SwiGLU Mode B (q4_int4b) -> q5 FWHT-64 Down Linear (q56 i8xi8)
+  {
+    constexpr U32 kNMid = 512u;
+    auto w_q4_lin = make_affine_weight(ctx, wid++, kNFull, kK, 4u, 64u, 9401u, true, 16u, false, true);
+    auto w_q5_lin = make_affine_weight(ctx, wid++, kNFull, kK, 5u, 64u, 9402u, true, 16u, false, true);
+    auto w_q4_g   = make_affine_weight(ctx, wid++, kNMid, kK, 4u, 64u, 9403u, true, 16u, false, true);
+    auto w_q4_u   = make_affine_weight(ctx, wid++, kNMid, kK, 4u, 64u, 9404u, true, 16u, false, true);
+    auto w_q5_u   = make_affine_weight(ctx, wid++, kNMid, kK, 5u, 64u, 9405u, true, 16u, false, true);
+    auto w_q5_dn  = make_affine_weight(ctx, wid++, kK, kNMid, 5u, 64u, 9406u, true, 16u, false, true, true);
+    AffineNaxCache ac;
+    for (const auto *w : {&w_q4_lin, &w_q5_lin, &w_q4_g, &w_q4_u, &w_q5_u, &w_q5_dn}) {
+      ac.register_weight(w->view, zero_ref);
+    }
+    ac.build(ctx, libs, zero_ref);
+    const auto *tw_q4_lin = ac.find(w_q4_lin.view.object_id);
+    const auto *tw_q5_lin = ac.find(w_q5_lin.view.object_id);
+    const auto *tw_q4_g   = ac.find(w_q4_g.view.object_id);
+    const auto *tw_q4_u   = ac.find(w_q4_u.view.object_id);
+    const auto *tw_q5_u   = ac.find(w_q5_u.view.object_id);
+    const auto *tw_q5_dn  = ac.find(w_q5_dn.view.object_id);
+    require(tw_q4_lin && tw_q5_lin && tw_q4_g && tw_q4_u && tw_q5_u && tw_q5_dn,
+            "wp3b 7c missing tiled weight");
+
+    const auto mid512_lay = w4a8_nax_workspace_layout(kMaxM, kNMid);
+    auto qao_512 = ctx.make_buffer(mid512_lay.qa_bytes);
+    auto sao_512 = ctx.make_buffer(mid512_lay.sa_bytes);
+    auto rao_512 = ctx.make_buffer(mid512_lay.ra_bytes);
+    auto y512_tmp = ctx.make_buffer(U64(kMaxM) * kNMid * 2ULL);
+
+    auto o1_def = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+    auto o2_def = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+    auto o3_def = ctx.make_buffer(U64(kMaxM) * kNMid * 2ULL);
+    auto o4_def = ctx.make_buffer(U64(kMaxM) * kK * 2ULL);
+    auto o1_i4b = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+    auto o2_i4b = ctx.make_buffer(U64(kMaxM) * kNFull * 2ULL);
+    auto o3_i4b = ctx.make_buffer(U64(kMaxM) * kNMid * 2ULL);
+    auto o4_i4b = ctx.make_buffer(U64(kMaxM) * kK * 2ULL);
+
+    auto run_seq = [&](bool enable_i4b, MetalBuffer &o1, MetalBuffer &o2,
+                       MetalBuffer &o3, MetalBuffer &o4) {
+      ScopedEnv env("OMLX_M5_OQ4_INT4B", enable_i4b ? "1" : "0");
+      Encoder e(ctx, libs, kMaxM, "wp3b.dual_seq");
+      e.begin_stage("dual_seq");
+      linear_affine_w4a8_nax(e, *tw_q4_lin, qa_ref, sa_ref, ra_ref, Ref{&o1, 0, o1.size()});
+      e.record_weight(w_q4_lin.view, kNFull, kK, "w4a8", "test", "");
+      linear_affine_w4a8_nax(e, *tw_q5_lin, qa_ref, sa_ref, ra_ref, Ref{&o2, 0, o2.size()});
+      e.record_weight(w_q5_lin.view, kNFull, kK, "w4a8", "test", "");
+      linear_affine_w4a8_nax_swiglu(e, *tw_q4_g, *tw_q5_u, qa_ref, sa_ref, ra_ref, Ref{&o3, 0, o3.size()});
+      e.record_weight(w_q4_g.view, kNMid, kK, "w4a8", "test", "");
+      linear_affine_w4a8_nax_swiglu_fwht64_a8(
+          e, *tw_q4_g, *tw_q4_u, qa_ref, sa_ref, ra_ref,
+          Ref{&qao_512, 0, qao_512.size()}, Ref{&sao_512, 0, sao_512.size()},
+          Ref{&rao_512, 0, rao_512.size()}, Ref{&y512_tmp, 0, y512_tmp.size()}, false);
+      e.record_weight(w_q4_g.view, kNMid, kK, "w4a8", "test", "");
+      linear_affine_w4a8_nax(e, *tw_q5_dn,
+                             Ref{&qao_512, 0, qao_512.size()},
+                             Ref{&sao_512, 0, sao_512.size()},
+                             Ref{&rao_512, 0, rao_512.size()},
+                             Ref{&o4, 0, o4.size()});
+      e.record_weight(w_q5_dn.view, kK, kNMid, "w4a8", "test", "");
+      auto p = e.finish(true);
+      require(p.weight_routes.size() == 5u, "wp3b 7c expected 5 routes");
+      require((p.weight_routes[0].function.find("q4_int4b") != std::string::npos) == enable_i4b,
+              "wp3b 7c dispatch[0] q4 routing mismatch: " + p.weight_routes[0].function);
+      require(p.weight_routes[1].function.find("_q56_") != std::string::npos,
+              "wp3b 7c dispatch[1] q56 routing mismatch: " + p.weight_routes[1].function);
+      require(p.weight_routes[2].function.find("_q4_q56_") != std::string::npos,
+              "wp3b 7c dispatch[2] mixed q4_q56 routing mismatch: " + p.weight_routes[2].function);
+      require((p.weight_routes[3].function.find("q4_int4b") != std::string::npos) == enable_i4b,
+              "wp3b 7c dispatch[3] q4 SwiGLU ModeB routing mismatch: " + p.weight_routes[3].function);
+      require(p.weight_routes[4].function.find("_q56_") != std::string::npos,
+              "wp3b 7c dispatch[4] q56 Down routing mismatch: " + p.weight_routes[4].function);
+      submit_profile(ctx, p, kLiveM, true);
+    };
+
+    run_seq(false, o1_def, o2_def, o3_def, o4_def);
+    run_seq(true, o1_i4b, o2_i4b, o3_i4b, o4_i4b);
+    require(read_u16(o1_def, U64(kLiveM) * kNFull) == read_u16(o1_i4b, U64(kLiveM) * kNFull),
+            "wp3b 7c q4 QKVZ dual-channel diff");
+    require(read_u16(o2_def, U64(kLiveM) * kNFull) == read_u16(o2_i4b, U64(kLiveM) * kNFull),
+            "wp3b 7c q5 O-proj dual-channel diff");
+    require(read_u16(o3_def, U64(kLiveM) * kNMid) == read_u16(o3_i4b, U64(kLiveM) * kNMid),
+            "wp3b 7c mixed (q4,q5) SwiGLU dual-channel diff");
+    require(read_u16(o4_def, U64(kLiveM) * kK) == read_u16(o4_i4b, U64(kLiveM) * kK),
+            "wp3b 7c q4 SwiGLU ModeB -> q5 Down dual-channel diff");
+    const auto swi_ref = cpu_swiglu_ref(std::span(x_f32).first(U64(kLiveM) * kK),
+                                        w_q4_g.ref_w, w_q4_u.ref_w, kLiveM, kNMid, kK);
+    const auto dn_ref = cpu_linear_ref(swi_ref, w_q5_dn.ref_w, kLiveM, kK, kNMid);
+    const double cs_dn = cosine_similarity_bf16(read_u16(o4_i4b, U64(kLiveM) * kK),
+                                                dn_ref, "wp3b 7c q4_swiB_to_q5_dn");
+    require(cs_dn >= kMinCos, "wp3b 7c q4->q5 pipeline cos_sim=" + std::to_string(cs_dn));
+    ++checks;
+  }
+
+  return {{"checks", checks}, {"bit_exact_diffs", 0}, {"passed", true}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -3073,6 +3433,8 @@ int main(int argc, char **argv) {
     report["moe_out64_and_w4a8"] = test_moe_out64_and_w4a8(ctx, libs);
     report["miv2_fwht64_all_consumers"] =
         test_miv2_fwht64_and_all_runtime_consumers(ctx, libs);
+    report["wp3b_oq4e_dual_channel_and_int4b_exact"] =
+        test_wp3b_oq4e_dual_channel_and_int4b_exact(ctx, libs);
     report["all_passed"] = true;
     std::cout << report.dump(2) << "\n";
     return 0;
