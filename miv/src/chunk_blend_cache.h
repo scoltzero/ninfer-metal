@@ -235,7 +235,7 @@ fnv1a_64_blend_tokens(std::span<const std::uint32_t> tokens,
     std::string_view prefill_linear_mode,
     std::string_view prefill_attention_mode,
     bool prefill_sparse_minference = false,
-    bool prefill_ane_offload = false) noexcept;
+    std::string_view prefill_ane_mode = "off") noexcept;
 
 [[nodiscard]] std::vector<BlendChunkSegment>
 segment_blend_chunks(std::span<const std::uint32_t> tokens,

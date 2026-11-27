@@ -264,10 +264,21 @@ Json test_host_segmentation_and_lru() {
   // 4. Byte-capped LRU eviction, exact token equality guard, exec-hash isolation,
   //    and multi-threaded safety.
   const U64 h_bf16 = compute_blend_model_exec_hash(
-      "sha256:abc", "affine4_g128", "bf16", "exact_nax", false, false);
+      "sha256:abc", "affine4_g128", "bf16", "exact_nax", false, "off");
   const U64 h_w4a8 = compute_blend_model_exec_hash(
-      "sha256:abc", "affine4_g128", "w4a8", "exact_nax", false, false);
-  require(h_bf16 != h_w4a8, "model_exec_hash failed to isolate linear_mode");
+      "sha256:abc", "affine4_g128", "w4a8", "exact_nax", false, "off");
+  const U64 h_w4a4 = compute_blend_model_exec_hash(
+      "sha256:abc", "affine4_g128", "w4a4", "exact_nax", false, "off");
+  const U64 h_ane_int8 = compute_blend_model_exec_hash(
+      "sha256:abc", "affine4_g128", "bf16", "exact_nax", false, "compact_int8");
+  const U64 h_ane_ultra = compute_blend_model_exec_hash(
+      "sha256:abc", "affine4_g128", "bf16", "exact_nax", false,
+      "ultra_fp16_swiglu");
+  require(h_bf16 != h_w4a8 && h_w4a8 != h_w4a4 && h_bf16 != h_w4a4,
+          "model_exec_hash failed to isolate linear_mode");
+  require(h_bf16 != h_ane_int8 && h_bf16 != h_ane_ultra &&
+              h_ane_int8 != h_ane_ultra,
+          "model_exec_hash failed to isolate prefill_ane_mode");
 
   ChunkBlendCache cache(2500ULL); // Fits at most 2 entries of 1000 B each
   auto make_entry = [&](U64 exec_h, std::vector<U32> toks, U64 bytes) {
@@ -1090,7 +1101,7 @@ Json test_hybrid_e2e_reordered_stitch(const MetalContext &ctx,
   // Phase A: Pre-warm ChunkBlendCache with Doc A and Doc B in isolation (pos=0)
   // --------------------------------------------------------------------------
   const U64 exec_hash = compute_blend_model_exec_hash(
-      "sha256:hybrid_e2e", "affine4_g128", "bf16", "exact_nax", false, false);
+      "sha256:hybrid_e2e", "affine4_g128", "bf16", "exact_nax", false, "off");
   ChunkBlendCache blend_cache(256ULL * 1024ULL * 1024ULL);
 
   auto populate_isolated_chunk = [&](std::span<const U32> toks,

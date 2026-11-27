@@ -615,6 +615,7 @@ def main() -> int:
         "prefill_attention_mode",
         "prefill_sparse_minference",
         "prefill_cache_blend",
+        "prefill_ane_mode",
         "prefill_ane_offload",
     ):
         if default_config["engine"].get(key) != contract["load_defaults"][key]:

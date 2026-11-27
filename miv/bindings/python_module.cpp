@@ -20,6 +20,9 @@ NB_MODULE(omlx_m5_native, module) {
   using omlx::m5::EventKind;
   using omlx::m5::FakeBackendOptions;
   using omlx::m5::LoadOptions;
+  using omlx::m5::PrefillAneMode;
+  using omlx::m5::PrefillAttentionMode;
+  using omlx::m5::PrefillLinearMode;
   using omlx::m5::RequestStats;
   using omlx::m5::SamplingSpec;
   using omlx::m5::SpeculativeBackend;
@@ -43,6 +46,21 @@ NB_MODULE(omlx_m5_native, module) {
       .value("DFLASH", SpeculativeBackend::dflash)
       .value("DFLASH2", SpeculativeBackend::dflash2);
 
+  nb::enum_<PrefillLinearMode>(module, "PrefillLinearMode")
+      .value("BFLOAT16", PrefillLinearMode::BFloat16)
+      .value("W4A8", PrefillLinearMode::W4A8)
+      .value("W4A4", PrefillLinearMode::W4A4);
+
+  nb::enum_<PrefillAttentionMode>(module, "PrefillAttentionMode")
+      .value("EXACT_NAX", PrefillAttentionMode::ExactNax)
+      .value("SAGE2", PrefillAttentionMode::Sage2);
+
+  nb::enum_<PrefillAneMode>(module, "PrefillAneMode")
+      .value("OFF", PrefillAneMode::Off)
+      .value("AUTO", PrefillAneMode::Auto)
+      .value("COMPACT_INT8", PrefillAneMode::CompactInt8)
+      .value("ULTRA_FP16_SWIGLU", PrefillAneMode::UltraFp16SwiGlu);
+
   nb::class_<SpeculativeOptions>(module, "SpeculativeOptions")
       .def(nb::init<>())
       .def_rw("backend", &SpeculativeOptions::backend)
@@ -57,6 +75,13 @@ NB_MODULE(omlx_m5_native, module) {
       .def_rw("speculative", &LoadOptions::speculative)
       .def_rw("kv_dtype", &LoadOptions::kv_dtype)
       .def_rw("prefill_engine", &LoadOptions::prefill_engine)
+      .def_rw("prefill_linear_mode", &LoadOptions::prefill_linear_mode)
+      .def_rw("prefill_attention_mode", &LoadOptions::prefill_attention_mode)
+      .def_rw("prefill_sparse_minference",
+              &LoadOptions::prefill_sparse_minference)
+      .def_rw("prefill_cache_blend", &LoadOptions::prefill_cache_blend)
+      .def_rw("prefill_ane_mode", &LoadOptions::prefill_ane_mode)
+      .def_rw("prefill_ane_offload", &LoadOptions::prefill_ane_offload)
       .def_rw("spec_search", &LoadOptions::spec_search)
       .def_rw("sampling_contract", &LoadOptions::sampling_contract)
       .def_rw("path_overrides", &LoadOptions::path_overrides);
@@ -207,7 +232,45 @@ NB_MODULE(omlx_m5_native, module) {
       .def_ro("contended_prefill_chunks",
               &StatsReport::contended_prefill_chunks)
       .def_ro("packed_batch_calls", &StatsReport::packed_batch_calls)
-      .def_ro("packed_batch_tokens", &StatsReport::packed_batch_tokens);
+      .def_ro("packed_batch_tokens", &StatsReport::packed_batch_tokens)
+      .def_ro("prefill_linear_mode", &StatsReport::prefill_linear_mode)
+      .def_ro("prefill_linear_mode_effective",
+              &StatsReport::prefill_linear_mode_effective)
+      .def_ro("prefill_linear_fallback", &StatsReport::prefill_linear_fallback)
+      .def_ro("prefill_linear_fallback_reason",
+              &StatsReport::prefill_linear_fallback_reason)
+      .def_ro("model_quant_format", &StatsReport::model_quant_format)
+      .def_ro("prefill_attention_mode", &StatsReport::prefill_attention_mode)
+      .def_ro("prefill_sparse_minference",
+              &StatsReport::prefill_sparse_minference)
+      .def_ro("prefill_sparse_minference_effective",
+              &StatsReport::prefill_sparse_minference_effective)
+      .def_ro("prefill_sparse_minference_inactive_reason",
+              &StatsReport::prefill_sparse_minference_inactive_reason)
+      .def_ro("prefill_cache_blend", &StatsReport::prefill_cache_blend)
+      .def_ro("prefill_ane_mode", &StatsReport::prefill_ane_mode)
+      .def_ro("prefill_ane_mode_effective",
+              &StatsReport::prefill_ane_mode_effective)
+      .def_ro("prefill_ane_inactive_reason",
+              &StatsReport::prefill_ane_inactive_reason)
+      .def_ro("prefill_ane_offload", &StatsReport::prefill_ane_offload)
+      .def_ro("prefill_ane_active", &StatsReport::prefill_ane_active)
+      .def_ro("prefill_ane_split_alpha", &StatsReport::prefill_ane_split_alpha)
+      .def_ro("prefill_w4a8_tokens", &StatsReport::prefill_w4a8_tokens)
+      .def_ro("prefill_w4a4_tokens", &StatsReport::prefill_w4a4_tokens)
+      .def_ro("prefill_sage2_tokens", &StatsReport::prefill_sage2_tokens)
+      .def_ro("prefill_minference_blocks_skipped",
+              &StatsReport::prefill_minference_blocks_skipped)
+      .def_ro("prefill_minference_blocks_total",
+              &StatsReport::prefill_minference_blocks_total)
+      .def_ro("prefill_cache_blend_hit_tokens",
+              &StatsReport::prefill_cache_blend_hit_tokens)
+      .def_ro("prefill_cache_blend_recomputed_tokens",
+              &StatsReport::prefill_cache_blend_recomputed_tokens)
+      .def_ro("prefill_ane_offload_tokens",
+              &StatsReport::prefill_ane_offload_tokens)
+      .def_ro("prefill_ane_fallback_tokens",
+              &StatsReport::prefill_ane_fallback_tokens);
 
   nb::class_<FakeBackendOptions>(module, "FakeBackendOptions")
       .def(nb::init<>())

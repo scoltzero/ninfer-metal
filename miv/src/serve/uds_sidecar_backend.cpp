@@ -683,7 +683,11 @@ struct UdsSidecarBackend::Impl {
              prefill_attention_mode_to_string(lo.prefill_attention_mode))},
         {"prefill_sparse_minference", lo.prefill_sparse_minference},
         {"prefill_cache_blend", lo.prefill_cache_blend},
-        {"prefill_ane_offload", lo.prefill_ane_offload},
+        {"prefill_ane_mode",
+         std::string(prefill_ane_mode_to_string(
+             effective_load_prefill_ane_mode(lo)))},
+        {"prefill_ane_offload",
+         effective_load_prefill_ane_mode(lo) != PrefillAneMode::Off},
         {"spec_search", lo.spec_search},
         {"sampling_contract", lo.sampling_contract},
         {"memory_budget_bytes", lo.memory_budget_bytes},
@@ -1192,6 +1196,12 @@ StatsReport UdsSidecarBackend::stats() const {
       static_cast<std::uint32_t>(read_u64_field(res, "lora_adapted_layers"));
   st.prefill_linear_mode =
       res.value("prefill_linear_mode", std::string("bf16"));
+  st.prefill_linear_mode_effective =
+      res.value("prefill_linear_mode_effective", st.prefill_linear_mode);
+  st.prefill_linear_fallback = res.value("prefill_linear_fallback", false);
+  st.prefill_linear_fallback_reason =
+      res.value("prefill_linear_fallback_reason", std::string{});
+  st.model_quant_format = res.value("model_quant_format", std::string{});
   st.prefill_attention_mode =
       res.value("prefill_attention_mode", std::string("exact_nax"));
   st.prefill_sparse_minference =
@@ -1202,9 +1212,17 @@ StatsReport UdsSidecarBackend::stats() const {
       res.value("prefill_sparse_minference_inactive_reason", std::string{});
   st.prefill_cache_blend = res.value("prefill_cache_blend", false);
   st.prefill_ane_offload = res.value("prefill_ane_offload", false);
+  st.prefill_ane_mode = res.value(
+      "prefill_ane_mode",
+      st.prefill_ane_offload ? std::string("auto") : std::string("off"));
+  st.prefill_ane_mode_effective =
+      res.value("prefill_ane_mode_effective", std::string("off"));
+  st.prefill_ane_inactive_reason =
+      res.value("prefill_ane_inactive_reason", std::string{});
   st.prefill_ane_active = res.value("prefill_ane_active", false);
   st.prefill_ane_split_alpha = res.value("prefill_ane_split_alpha", 0.0);
   st.prefill_w4a8_tokens = read_u64_field(res, "prefill_w4a8_tokens");
+  st.prefill_w4a4_tokens = read_u64_field(res, "prefill_w4a4_tokens");
   st.prefill_sage2_tokens = read_u64_field(res, "prefill_sage2_tokens");
   st.prefill_minference_blocks_skipped =
       read_u64_field(res, "prefill_minference_blocks_skipped");

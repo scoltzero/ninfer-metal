@@ -1235,7 +1235,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
     }
 
-    func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportPresetsAndTelemetry() throws {
+    func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportModesA4GatingAndTelemetry() throws {
         let vm = ModelSettingsScreenVM()
         let m5Opt = ExternalEngineOption(
             id: "m5rt",
@@ -1246,55 +1246,100 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             providerId: "io.ninfer.metal",
             optionsSchema: [
                 ["key": AnyCodable("max_concurrency"), "label": AnyCodable("Concurrency"), "type": AnyCodable("int"), "default": AnyCodable(1)],
-                ["key": AnyCodable("prefill_linear_mode"), "label": AnyCodable("W4A8"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("bf16"), AnyCodable("w4a8")]), "default": AnyCodable("bf16")],
+                ["key": AnyCodable("prefill_linear_mode"), "label": AnyCodable("Linear"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("bf16"), AnyCodable("w4a8"), AnyCodable("w4a4")]), "default": AnyCodable("bf16")],
                 ["key": AnyCodable("prefill_attention_mode"), "label": AnyCodable("Sage2"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("exact_nax"), AnyCodable("sage2")]), "default": AnyCodable("exact_nax")],
                 ["key": AnyCodable("prefill_sparse_minference"), "label": AnyCodable("MInference"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
                 ["key": AnyCodable("prefill_cache_blend"), "label": AnyCodable("CacheBlend"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
-                ["key": AnyCodable("prefill_ane_offload"), "label": AnyCodable("Dual-ANE"), "type": AnyCodable("bool"), "default": AnyCodable(false)],
+                ["key": AnyCodable("prefill_ane_mode"), "label": AnyCodable("ANE Mode"), "type": AnyCodable("enum"), "options": AnyCodable([AnyCodable("off"), AnyCodable("auto"), AnyCodable("compact_int8"), AnyCodable("ultra_fp16_swiglu")]), "default": AnyCodable("off")],
             ]
         )
-        var model = makeModel(id: "Qwen3.8-27B-oQ4e-mtp", configModelType: "qwen3_5")
-        model.externalEngines = [m5Opt]
-        model.autoExternalEngine = "m5rt"
-        vm.model = model
-        vm.externalEngine = ""
 
+        // 1) Non-MXFP4 (oQ4e) model: A4 is gated & saved w4a4 auto-falls back to A8 (w4a8)
+        var oqModel = makeModel(id: "Qwen3.8-27B-oQ4e-mtp", configModelType: "qwen3_5")
+        oqModel.externalEngines = [m5Opt]
+        oqModel.autoExternalEngine = "m5rt"
+        oqModel.quantFormat = "oq_affine"
+        oqModel.mxfp4W4A4Supported = false
+        vm.model = oqModel
+        vm.externalEngine = ""
+        vm.externalEngineOptions = ["m5rt": ["prefill_linear_mode": AnyCodable("w4a4")]]
+
+        XCTAssertFalse(vm.isMxfp4ExternalEngineModel)
         XCTAssertEqual(vm.externalEngineGeneralOptions.map(\.key), ["max_concurrency"])
         XCTAssertEqual(vm.externalEnginePrefillOptions.map(\.key), [
             "prefill_linear_mode",
             "prefill_attention_mode",
             "prefill_sparse_minference",
             "prefill_cache_blend",
-            "prefill_ane_offload",
+            "prefill_ane_mode",
         ])
-        XCTAssertEqual(vm.activeMivPrefillPreset, .lossless)
+        XCTAssertEqual(vm.activeMivLinearMode, "w4a8")
+        XCTAssertEqual(vm.activeMivLinearSubTier, .a8)
+        XCTAssertEqual(vm.normalizeMivPrefillOptionsForCurrentModel(), ["prefill_linear_mode"])
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
+        XCTAssertEqual(vm.activeMivPrefillMode, .routeA)
+
+        // Selecting A4 on oQ4e auto-falls back to A8 ("w4a8")
+        let a4KeysOnOq = vm.stageMivLinearSubTier(.a4)
+        XCTAssertEqual(a4KeysOnOq, ["prefill_linear_mode"])
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
+        XCTAssertEqual(vm.activeMivLinearSubTier, .a8)
+
+        // 2) MXFP4 model: A4 enabled, 4-Tier mode preserves A4 and NEVER touches MInference / CacheBlend / ANE
+        var mxfp4Model = makeModel(id: "Qwen3.8-27B-mxfp4", configModelType: "qwen3_8")
+        mxfp4Model.externalEngines = [m5Opt]
+        mxfp4Model.autoExternalEngine = "m5rt"
+        mxfp4Model.quantFormat = "mxfp4"
+        mxfp4Model.mxfp4W4A4Supported = true
+        vm.model = mxfp4Model
+        vm.externalEngineOptions = [:]
+        vm.syncPreferredMivLinearSubTier()
+
+        XCTAssertTrue(vm.isMxfp4ExternalEngineModel)
+        XCTAssertEqual(vm.activeMivPrefillMode, .lossless)
         XCTAssertFalse(vm.isExternalEngineSage2Active)
 
-        // Turning on Sage2 auto-enables MInference and returns both keys for atomic PATCH.
-        let sageOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }))
-        let sageKeys = vm.setExternalEnginePrefillToggle(sageOpt, isOn: true)
-        XCTAssertEqual(sageKeys, ["prefill_attention_mode", "prefill_sparse_minference"])
+        // Enable CacheBlend + ANE=ultra_fp16_swiglu independently
+        let blendOpt = try XCTUnwrap(vm.externalEnginePrefillOption(forKey: "prefill_cache_blend"))
+        XCTAssertEqual(vm.setExternalEnginePrefillToggle(blendOpt, isOn: true), ["prefill_cache_blend"])
+        XCTAssertEqual(vm.stageMivAneMode(.ultraFp16SwiGlu), ["prefill_ane_mode"])
+        XCTAssertEqual(vm.activeMivAneMode, .ultraFp16SwiGlu)
+
+        // Route B (Sage2) does NOT force-enable MInference (strictly independent)
+        XCTAssertEqual(vm.stageMivPrefillMode(.routeB), ["prefill_linear_mode", "prefill_attention_mode"])
+        XCTAssertEqual(vm.activeMivPrefillMode, .routeB)
         XCTAssertTrue(vm.isExternalEngineSage2Active)
-        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
-
-        // MInference remains independently toggleable off afterwards.
-        let minfOpt = try XCTUnwrap(vm.externalEnginePrefillOptions.first(where: { $0.key == "prefill_sparse_minference" }))
-        let minfKeys = vm.setExternalEnginePrefillToggle(minfOpt, isOn: false)
-        XCTAssertEqual(minfKeys, ["prefill_sparse_minference"])
+        let minfOpt = try XCTUnwrap(vm.externalEnginePrefillOption(forKey: "prefill_sparse_minference"))
         XCTAssertFalse(vm.externalEnginePrefillToggleValue(for: minfOpt))
+        XCTAssertTrue(vm.externalEnginePrefillToggleValue(for: blendOpt))
+        XCTAssertEqual(vm.activeMivAneMode, .ultraFp16SwiGlu)
 
-        // GPU Full preset turns on all 4 GPU switches (W4A8 + Sage2 + MInference + CacheBlend) with Dual-ANE off.
-        let staged = vm.stageMivPrefillPreset(.gpuFull)
-        XCTAssertEqual(staged.count, 5)
-        XCTAssertEqual(vm.activeMivPrefillPreset, .gpuFull)
-        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_linear_mode"]?.value as? String, "w4a8")
-        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_attention_mode"]?.value as? String, "sage2")
-        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_sparse_minference"]?.value as? Bool, true)
-        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_cache_blend"]?.value as? Bool, true)
+        // Route A -> A4 -> Route A+B preserves A4 and leaves MInference/CacheBlend/ANE untouched
+        _ = vm.stageMivPrefillMode(.routeA)
+        XCTAssertEqual(vm.activeMivLinearMode, "w4a8")
+        XCTAssertEqual(vm.stageMivLinearSubTier(.a4), ["prefill_linear_mode"])
+        XCTAssertEqual(vm.activeMivLinearMode, "w4a4")
+        _ = vm.stageMivPrefillMode(.routeAB)
+        XCTAssertEqual(vm.activeMivPrefillMode, .routeAB)
+        XCTAssertEqual(vm.activeMivLinearMode, "w4a4")
+        XCTAssertFalse(vm.externalEnginePrefillToggleValue(for: minfOpt))
+        XCTAssertTrue(vm.externalEnginePrefillToggleValue(for: blendOpt))
+        XCTAssertEqual(vm.activeMivAneMode, .ultraFp16SwiGlu)
+
+        // Toggle MInference ON independently
+        XCTAssertEqual(vm.setExternalEnginePrefillToggle(minfOpt, isOn: true), ["prefill_sparse_minference"])
+        XCTAssertTrue(vm.externalEnginePrefillToggleValue(for: minfOpt))
+        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 5)
+
+        // Legacy prefill_ane_offload=true hydrates activeMivAneMode as .auto and syncs on write
+        vm.externalEngineOptions = ["m5rt": ["prefill_ane_offload": AnyCodable(true)]]
+        XCTAssertEqual(vm.activeMivAneMode, .auto)
+        let aneKeys = vm.stageMivAneMode(.off)
+        XCTAssertEqual(aneKeys, ["prefill_ane_mode", "prefill_ane_offload"])
+        XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_ane_mode"]?.value as? String, "off")
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["prefill_ane_offload"]?.value as? Bool, false)
-        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 4)
 
-        // Verify live telemetry decoding on MivEffectiveSettings.
+        // Verify live telemetry decoding on MivEffectiveSettings (including W4A4 fallback & ANE mode)
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let eff = try decoder.decode(
@@ -1308,24 +1353,53 @@ final class ModelSettingsScreenVMTests: XCTestCase {
               "speculative_backend": "mtp",
               "max_draft_tokens": 4,
               "concurrency_source": "default",
-              "prefill_linear_mode": "w4a8",
+              "prefill_linear_mode": "w4a4",
+              "prefill_linear_mode_effective": "w4a8",
+              "prefill_linear_fallback": true,
+              "prefill_linear_fallback_reason": "requires_mxfp4_model",
+              "model_quant_format": "oq_affine",
               "prefill_attention_mode": "sage2",
               "prefill_sparse_minference": true,
               "prefill_sparse_minference_effective": true,
               "prefill_cache_blend": false,
+              "prefill_ane_mode": "ultra_fp16_swiglu",
+              "prefill_ane_mode_effective": "ultra_fp16_swiglu",
               "prefill_ane_offload": true,
               "prefill_ane_active": true,
               "prefill_w4a8_tokens": 8192,
+              "prefill_w4a4_tokens": 0,
               "prefill_sage2_tokens": 8192,
               "prefill_minference_blocks_skipped": 420
             }
             """#.utf8)
         )
-        XCTAssertEqual(eff.prefillLinearMode, "w4a8")
+        XCTAssertEqual(eff.prefillLinearMode, "w4a4")
+        XCTAssertEqual(eff.prefillLinearModeEffective, "w4a8")
+        XCTAssertEqual(eff.prefillLinearFallback, true)
+        XCTAssertEqual(eff.prefillLinearFallbackReason, "requires_mxfp4_model")
+        XCTAssertEqual(eff.modelQuantFormat, "oq_affine")
         XCTAssertEqual(eff.prefillAttentionMode, "sage2")
         XCTAssertEqual(eff.prefillSparseMinferenceEffective, true)
+        XCTAssertEqual(eff.prefillAneMode, "ultra_fp16_swiglu")
+        XCTAssertEqual(eff.prefillAneModeEffective, "ultra_fp16_swiglu")
         XCTAssertEqual(eff.prefillAneActive, true)
+        XCTAssertEqual(eff.prefillW4A8Tokens, 8192)
+        XCTAssertEqual(eff.prefillW4A4Tokens, 0)
         XCTAssertEqual(eff.prefillMinferenceBlocksSkipped, 420)
+
+        // Verify snake_case JSON decoding of quant_format & mxfp4_w4a4_supported on ModelDTO
+        let decodedMxfp4 = try decoder.decode(
+            ModelDTO.self,
+            from: Data(#"{"id":"qwen-mxfp4","loaded":false,"is_loading":false,"estimated_size":0,"quant_format":"mxfp4","mxfp4_w4a4_supported":true}"#.utf8)
+        )
+        XCTAssertEqual(decodedMxfp4.quantFormat, "mxfp4")
+        XCTAssertEqual(decodedMxfp4.mxfp4W4A4Supported, true)
+        let decodedOq = try decoder.decode(
+            ModelDTO.self,
+            from: Data(#"{"id":"qwen-oq4e","loaded":false,"is_loading":false,"estimated_size":0,"quant_format":"oq_affine","mxfp4_w4a4_supported":false}"#.utf8)
+        )
+        XCTAssertEqual(decodedOq.quantFormat, "oq_affine")
+        XCTAssertEqual(decodedOq.mxfp4W4A4Supported, false)
     }
 }
 

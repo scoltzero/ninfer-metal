@@ -835,6 +835,8 @@ struct ServeHttpServer::Impl {
           snap.engine_stats.spec_accepted_tokens;
       agg.engine_stats.prefill_w4a8_tokens +=
           snap.engine_stats.prefill_w4a8_tokens;
+      agg.engine_stats.prefill_w4a4_tokens +=
+          snap.engine_stats.prefill_w4a4_tokens;
       agg.engine_stats.prefill_sage2_tokens +=
           snap.engine_stats.prefill_sage2_tokens;
       agg.engine_stats.prefill_minference_blocks_skipped +=
@@ -946,6 +948,10 @@ struct ServeHttpServer::Impl {
         << "# TYPE ninfer_metal_prefill_w4a8_tokens_total counter\n"
         << "ninfer_metal_prefill_w4a8_tokens_total "
         << agg.engine_stats.prefill_w4a8_tokens << "\n"
+        << "# HELP ninfer_metal_prefill_w4a4_tokens_total Prefill tokens executed with native W4A4.\n"
+        << "# TYPE ninfer_metal_prefill_w4a4_tokens_total counter\n"
+        << "ninfer_metal_prefill_w4a4_tokens_total "
+        << agg.engine_stats.prefill_w4a4_tokens << "\n"
         << "# HELP ninfer_metal_prefill_sage2_tokens_total Prefill tokens executed with Sage2.\n"
         << "# TYPE ninfer_metal_prefill_sage2_tokens_total counter\n"
         << "ninfer_metal_prefill_sage2_tokens_total "

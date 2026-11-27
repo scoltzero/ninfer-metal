@@ -2969,6 +2969,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "source_repo_id": model_info.get("source_repo_id"),
             "model_format": model_info.get("model_format"),
             "weight_format": fmt_info["weight_format"],
+            "quant_format": fmt_info["quant_format"],
+            "mxfp4_w4a4_supported": fmt_info["mxfp4_w4a4_supported"],
             "has_miv_weights": fmt_info["has_miv_weights"],
             "pending_auto_repack": fmt_info["pending_auto_repack"],
             "repack_target_format": fmt_info["repack_target_format"],

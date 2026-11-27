@@ -1271,7 +1271,10 @@ int main(int argc, char **argv) {
             ld.digest, "affine4_g128",
             prefill_linear_mode_to_string(mc.opts.linear_mode),
             prefill_attention_mode_to_string(mc.opts.attention_mode),
-            mc.opts.sparse_minference, mc.opts.ane_offload);
+            mc.opts.sparse_minference,
+            mc.opts.ane_mode != PrefillAneMode::Off
+                ? prefill_ane_mode_to_string(mc.opts.ane_mode)
+                : (mc.opts.ane_offload ? "auto" : "off"));
 
         GpuSamplingOptions samp{};
         samp.absolute_position = prompt_ab.size() - 1U;
@@ -1429,7 +1432,7 @@ int main(int argc, char **argv) {
 
         detail::ChunkBlendCache mw_cache(1ULL << 30);
         const U64 mw_hash = detail::compute_blend_model_exec_hash(
-            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, false);
+            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, "off");
         GpuSamplingOptions mw_samp{};
         mw_samp.absolute_position = p_abc.size() - 1U;
         mw_samp.contract = SamplingContract::PositionCoupledV1;
@@ -1490,7 +1493,7 @@ int main(int argc, char **argv) {
 
         detail::ChunkBlendCache ane_cache(1ULL << 30);
         const U64 all5_hash = detail::compute_blend_model_exec_hash(
-            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, true);
+            ld4k.digest, "affine4_g128", "w4a8", "sage2", false, "auto");
         detail::BlendSegmentConfig tail960_cfg = seg_cfg;
         tail960_cfg.dense_tail_tokens = 960U;
 
@@ -1537,6 +1540,43 @@ int main(int argc, char **argv) {
       }
 
       report["case6_cache_blend"] = case6;
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 7: Safe Auto-Fallback when requesting W4A4 on non-MXFP4 (oQ4e) model
+    // -------------------------------------------------------------------------
+    {
+      auto fb_opts = make_load_options(
+          dense_oq, libs, 1024, PrefillLinearMode::W4A4,
+          PrefillAttentionMode::ExactNax, false, false, false, true);
+      auto eng_fb = Engine::create(fb_opts);
+      const auto prompt_fb = make_tokens(64U, 307U, 240U);
+      const auto toks = run_engine_request(*eng_fb, prompt_fb, 4);
+      const auto st_fb = eng_fb->stats();
+      eng_fb->shutdown();
+
+      require(toks.size() == 4U,
+              "Case 7 W4A4->W4A8 fallback engine did not generate tokens");
+      require(st_fb.prefill_linear_mode == "w4a4",
+              "Case 7 requested prefill_linear_mode must stay w4a4");
+      require(st_fb.prefill_linear_fallback,
+              "Case 7 must report prefill_linear_fallback=true on oQ4e");
+      require(st_fb.prefill_linear_fallback_reason == "requires_mxfp4_model",
+              "Case 7 fallback reason mismatch: " +
+                  st_fb.prefill_linear_fallback_reason);
+      require(st_fb.model_quant_format == "oq_affine",
+              "Case 7 model_quant_format mismatch: " + st_fb.model_quant_format);
+      require(st_fb.prefill_linear_mode_effective == "w4a8" ||
+                  st_fb.prefill_linear_mode_effective == "bf16",
+              "Case 7 effective mode must fall back to w4a8 or bf16, got: " +
+                  st_fb.prefill_linear_mode_effective);
+      report["case7_w4a4_non_mxfp4_fallback"] = {
+          {"requested", st_fb.prefill_linear_mode},
+          {"effective", st_fb.prefill_linear_mode_effective},
+          {"fallback", st_fb.prefill_linear_fallback},
+          {"reason", st_fb.prefill_linear_fallback_reason},
+          {"model_quant_format", st_fb.model_quant_format},
+      };
     }
 
     std::cout << report.dump(2) << '\n';
