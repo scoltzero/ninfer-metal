@@ -223,6 +223,98 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_sparse_minference": True,
         "prefill_cache_blend": True,
         "prefill_ane_offload": True,
+        "prefill_ane_mode": "auto",
+        "prefix_cache_gb": 24.0,
+    },
+    # Phase 3 cells: W4A4 (MXFP4) & Ultra FP16 SwiGLU Dual-ANE
+    "M0_ULTRA_ANE": {
+        "label": "Lossless Base + Ultra FP16 SwiGLU ANE (BF16 + Exact NAX)",
+        "prefill_linear_mode": "bf16",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefix_cache_gb": 0.0,
+    },
+    "M1_ULTRA_ANE": {
+        "label": "Route A (W4A8) + Ultra FP16 SwiGLU ANE",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefix_cache_gb": 0.0,
+    },
+    "M1_A4": {
+        "label": "Route A4 (W4A4 + Exact NAX, ANE=OFF)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": False,
+        "prefill_ane_mode": "off",
+        "prefix_cache_gb": 0.0,
+    },
+    "M1_A4_ANE": {
+        "label": "Route A4 + Ultra FP16 SwiGLU ANE (W4A4 + Exact NAX)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefix_cache_gb": 0.0,
+    },
+    "M3a_A4": {
+        "label": "Route A4+B1 (W4A4 + Dense Sage2, MInf=OFF, ANE=OFF)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": False,
+        "prefill_ane_mode": "off",
+        "prefix_cache_gb": 0.0,
+    },
+    "M3b_A4": {
+        "label": "Route A4+B2 (W4A4 + Sage2 + MInference, ANE=OFF)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": False,
+        "prefill_ane_mode": "off",
+        "prefix_cache_gb": 0.0,
+    },
+    "M3b_ULTRA_ANE": {
+        "label": "Route A+B2 + Ultra FP16 SwiGLU ANE (W4A8 + Sage2 + MInf)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefix_cache_gb": 0.0,
+    },
+    "M3b_A4_ANE": {
+        "label": "Route A4+B2 + Ultra FP16 SwiGLU ANE (W4A4 + Sage2 + MInf)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefix_cache_gb": 0.0,
+    },
+    "M5b_A4": {
+        "label": "All-On Stack A4 (W4A4 + Sage2 + MInf + CacheBlend + Ultra ANE)",
+        "prefill_linear_mode": "w4a4",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": True,
+        "prefill_ane_offload": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
         "prefix_cache_gb": 24.0,
     },
 }
@@ -399,6 +491,7 @@ def query_server_phys_footprint(host: str, port: int) -> Optional[int]:
 
 PREFILL_TELEMETRY_METRICS: Tuple[Tuple[str, str], ...] = (
     ("w4a8_tokens", "ninfer_metal_prefill_w4a8_tokens_total"),
+    ("w4a4_tokens", "ninfer_metal_prefill_w4a4_tokens_total"),
     ("sage2_tokens", "ninfer_metal_prefill_sage2_tokens_total"),
     ("minference_blocks_skipped", "ninfer_metal_prefill_minference_blocks_skipped_total"),
     ("minference_blocks_total", "ninfer_metal_prefill_minference_blocks_total"),
@@ -875,6 +968,7 @@ def detect_supported_prefill_flags(serve_bin: str) -> set:
         "--no-prefill-sparse-minference",
         "--prefill-cache-blend",
         "--no-prefill-cache-blend",
+        "--prefill-ane-mode",
         "--prefill-ane-offload",
         "--no-prefill-ane-offload",
     ):
@@ -966,8 +1060,14 @@ class IsolatedServeProcess:
             cmd.append("--prefill-sparse-minference")
         if self.cell_cfg.get("prefill_cache_blend") and "--prefill-cache-blend" in supported:
             cmd.append("--prefill-cache-blend")
-        if self.cell_cfg.get("prefill_ane_offload") and "--prefill-ane-offload" in supported:
-            cmd.append("--prefill-ane-offload")
+        ane_mode = self.cell_cfg.get("prefill_ane_mode")
+        if ane_mode and "--prefill-ane-mode" in supported:
+            cmd.extend(["--prefill-ane-mode", str(ane_mode)])
+        elif self.cell_cfg.get("prefill_ane_offload"):
+            if "--prefill-ane-mode" in supported:
+                cmd.extend(["--prefill-ane-mode", "auto"])
+            elif "--prefill-ane-offload" in supported:
+                cmd.append("--prefill-ane-offload")
 
         self.cmd = cmd
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1462,7 +1562,9 @@ def run_cpp_ppl_eval(
                 cmd.append("--prefill-sparse-minference")
             if cell_cfg.get("prefill_cache_blend"):
                 cmd.append("--prefill-cache-blend")
-            if cell_cfg.get("prefill_ane_offload"):
+            if cell_cfg.get("prefill_ane_mode"):
+                cmd.extend(["--prefill-ane-mode", str(cell_cfg["prefill_ane_mode"])])
+            elif cell_cfg.get("prefill_ane_offload"):
                 cmd.append("--prefill-ane-offload")
             if logits_dir is not None:
                 logits_dir.mkdir(parents=True, exist_ok=True)
@@ -1742,6 +1844,18 @@ def parse_cli() -> argparse.Namespace:
         help="Model spec as label=path (repeatable)",
     )
     ap.add_argument("--cell", default="M0", choices=sorted(MATRIX_CELLS.keys()))
+    ap.add_argument(
+        "--prefill-linear-mode",
+        default=None,
+        choices=["bf16", "w4a8", "w4a4"],
+        help="Optional override for cell prefill_linear_mode (bf16|w4a8|w4a4)",
+    )
+    ap.add_argument(
+        "--prefill-ane-mode",
+        default=None,
+        choices=["off", "auto", "compact_int8", "ultra_fp16_swiglu"],
+        help="Optional override for cell prefill_ane_mode (off|auto|compact_int8|ultra_fp16_swiglu)",
+    )
     ap.add_argument("--baseline-commit", default="7336688")
     ap.add_argument("--title", default="M5 Ultra 16K-256K Prefill Baseline (7336688)")
     ap.add_argument("--host", default="127.0.0.1")
@@ -1812,6 +1926,18 @@ def parse_model_spec(spec: str, default_artifact: Optional[str] = None) -> Tuple
     return label, rest, default_artifact
 
 
+def _resolve_cell_cfg(args: argparse.Namespace) -> Dict[str, Any]:
+    cell_cfg = _resolve_cell_cfg(args)
+    if args.prefill_linear_mode is not None:
+        cell_cfg["prefill_linear_mode"] = args.prefill_linear_mode
+    if args.prefill_ane_mode is not None:
+        cell_cfg["prefill_ane_mode"] = args.prefill_ane_mode
+        cell_cfg["prefill_ane_offload"] = args.prefill_ane_mode != "off"
+    elif "prefill_ane_mode" not in cell_cfg:
+        cell_cfg["prefill_ane_mode"] = "auto" if cell_cfg.get("prefill_ane_offload") else "off"
+    return cell_cfg
+
+
 def main() -> int:
     args = parse_cli()
     extra_env = parse_env_list(args.env)
@@ -1850,7 +1976,7 @@ def main() -> int:
             raise SystemExit("--action ppl requires --cpp-bench-bin PATH")
         if not args.model:
             raise SystemExit("--model label=path is required for ppl")
-        cell_cfg = dict(MATRIX_CELLS[args.cell])
+        cell_cfg = _resolve_cell_cfg(args)
         ppl_lengths = [int(x.strip()) for x in args.ppl_lengths.split(",") if x.strip()]
         logits_dir = Path(args.logits_dir) if args.logits_dir else None
         ppl_results: List[Dict[str, Any]] = []
@@ -1878,7 +2004,7 @@ def main() -> int:
     if args.action == "bench-rag":
         if not args.model:
             raise SystemExit("--model label=path is required for bench-rag")
-        cell_cfg = dict(MATRIX_CELLS[args.cell])
+        cell_cfg = _resolve_cell_cfg(args)
         doc_counts = (
             [int(x.strip()) for x in args.rag_docs_list.split(",") if x.strip()]
             if args.rag_docs_list
@@ -1924,7 +2050,7 @@ def main() -> int:
     tiers = [int(x.strip()) for x in args.tiers.split(",") if x.strip()]
     depths = [int(x.strip()) for x in args.depths.split(",") if x.strip()]
     ppl_lengths = [int(x.strip()) for x in args.ppl_lengths.split(",") if x.strip()]
-    cell_cfg = dict(MATRIX_CELLS[args.cell])
+    cell_cfg = _resolve_cell_cfg(args)
     if args.prefix_cache_gb is not None:
         cell_cfg["prefix_cache_gb"] = args.prefix_cache_gb
 

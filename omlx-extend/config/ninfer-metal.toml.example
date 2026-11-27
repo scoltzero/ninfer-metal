@@ -61,19 +61,28 @@ rolling_prefix_cache = true
 prefix_cache_gb = 4.0
 
 # Strictly orthogonal prefill execution switches (independent; never mutually exclusive):
-# Prefill dense linear GEMM precision route: "bf16" | "w4a8"
+# Prefill dense linear GEMM precision route:
+#   "bf16" - Exact W4A16 (default)
+#   "w4a8" - Universal A8 INT8 prefill (MXFP4 & oQ4e)
+#   "w4a4" - Native A4 MXFP4 prefill (MXFP4 .miv v2 FWHT-64 only; safely auto-falls back to w4a8 on non-MXFP4)
 prefill_linear_mode = "bf16"
 # Prefill full-attention kernel route: "exact_nax" | "sage2"
 prefill_attention_mode = "exact_nax"
-# Sub-switch under sage2: MInference vertical-slash dynamic sparse attention tiles
+# Independent sub-switch under sage2: off = dense full-receptive-field Sage2, on = dynamic block-sparse Sage2 + MInference
 prefill_sparse_minference = false
 # Tier-2 cross-chunk non-contiguous RAG KV+GDN cache reuse (~15% HKVD selective recomputation)
 prefill_cache_blend = false
-# Dual-ANE output-channel-split co-execution alongside GPU bf16 or w4a8 prefill
+# Dual-ANE collaboration mode:
+#   "off"               - Pure GPU (default)
+#   "auto"              - Hardware/topology crossover policy (auto-bypasses when GPU-only wins; skips MoE)
+#   "compact_int8"      - Balanced compact G=64 asymmetric INT8 MIL offload
+#   "ultra_fp16_swiglu" - Ultra direct FP16 MlpGateUpSwiGlu Dual-ANE co-execution
+prefill_ane_mode = "off"
+# Legacy boolean alias (when prefill_ane_mode is unset: true -> "auto", false -> "off")
 prefill_ane_offload = false
 
 # Legacy prefill execution engine alias: "auto" | "nax" | "nax_ane"
-# ("nax_ane" maps to prefill_ane_offload = true when prefill_ane_offload is unset,
+# ("nax_ane" maps to prefill_ane_mode = "auto" / prefill_ane_offload = true when unset,
 # without modifying any other prefill switch.)
 prefill_engine = "auto"
 

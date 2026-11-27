@@ -92,7 +92,7 @@ U64 compute_blend_model_exec_hash(std::string_view artifact_digest,
                                   std::string_view prefill_linear_mode,
                                   std::string_view prefill_attention_mode,
                                   bool prefill_sparse_minference,
-                                  bool prefill_ane_offload) noexcept {
+                                  std::string_view prefill_ane_mode) noexcept {
   U64 h = 14695981039346656037ULL;
   auto feed = [&](std::string_view s) {
     h = fnv1a_64_blend_bytes(s.data(), s.size(), h);
@@ -105,7 +105,13 @@ U64 compute_blend_model_exec_hash(std::string_view artifact_digest,
   feed(prefill_linear_mode);
   feed(prefill_attention_mode);
   feed(prefill_sparse_minference ? "minf=1" : "minf=0");
-  feed(prefill_ane_offload ? "ane=1" : "ane=0");
+  if (prefill_ane_mode.empty() || prefill_ane_mode == "off") {
+    feed("ane=off");
+  } else {
+    std::string ane_tag("ane=");
+    ane_tag.append(prefill_ane_mode);
+    feed(ane_tag);
+  }
   return h;
 }
 

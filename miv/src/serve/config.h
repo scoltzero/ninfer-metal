@@ -32,6 +32,8 @@ struct ModelServeConfig {
   PrefillAttentionMode prefill_attention_mode = PrefillAttentionMode::ExactNax;
   bool prefill_sparse_minference = false;
   bool prefill_cache_blend = false;
+  PrefillAneMode prefill_ane_mode = PrefillAneMode::Off;
+  bool prefill_ane_mode_explicit = false;
   bool prefill_ane_offload = false;
   bool prefill_ane_offload_explicit = false;
   std::string spec_search = "auto";
@@ -64,6 +66,7 @@ struct SidecarModelOverride {
   std::optional<PrefillAttentionMode> prefill_attention_mode;
   std::optional<bool> prefill_sparse_minference;
   std::optional<bool> prefill_cache_blend;
+  std::optional<PrefillAneMode> prefill_ane_mode;
   std::optional<bool> prefill_ane_offload;
   std::optional<std::string> spec_search;
   std::optional<std::string> sampling_contract;
@@ -128,6 +131,7 @@ struct ServeConfig {
   bool cli_prefill_attention_mode_override = false;
   bool cli_prefill_sparse_minference_override = false;
   bool cli_prefill_cache_blend_override = false;
+  bool cli_prefill_ane_mode_override = false;
   bool cli_prefill_ane_offload_override = false;
 
   // [engine]
@@ -139,6 +143,8 @@ struct ServeConfig {
   PrefillAttentionMode prefill_attention_mode = PrefillAttentionMode::ExactNax;
   bool prefill_sparse_minference = false;
   bool prefill_cache_blend = false;
+  PrefillAneMode prefill_ane_mode = PrefillAneMode::Off;
+  bool prefill_ane_mode_explicit = false;
   bool prefill_ane_offload = false;
   bool prefill_ane_offload_explicit = false;
   std::string spec_search = "auto";

@@ -449,15 +449,26 @@ void apply_sidecar_model_override(ModelServeConfig &m,
       !(respect_cli_overrides && config.cli_prefill_cache_blend_override)) {
     m.prefill_cache_blend = *ov->prefill_cache_blend;
   }
-  if (ov->prefill_ane_offload.has_value() &&
-      !(respect_cli_overrides && config.cli_prefill_ane_offload_override)) {
-    m.prefill_ane_offload = *ov->prefill_ane_offload;
-    m.prefill_ane_offload_explicit = true;
-  } else if (ov->prefill_engine.has_value() &&
-             *ov->prefill_engine == "nax_ane" &&
-             !(respect_cli_overrides &&
-               config.cli_prefill_ane_offload_override)) {
-    m.prefill_ane_offload = true;
+  const bool cli_ane_locked =
+      respect_cli_overrides && (config.cli_prefill_ane_mode_override ||
+                                config.cli_prefill_ane_offload_override);
+  if (!cli_ane_locked) {
+    if (ov->prefill_ane_mode.has_value()) {
+      m.prefill_ane_mode = *ov->prefill_ane_mode;
+      m.prefill_ane_mode_explicit = true;
+      m.prefill_ane_offload = (m.prefill_ane_mode != PrefillAneMode::Off);
+      m.prefill_ane_offload_explicit = true;
+    } else if (ov->prefill_ane_offload.has_value()) {
+      m.prefill_ane_offload = *ov->prefill_ane_offload;
+      m.prefill_ane_offload_explicit = true;
+      m.prefill_ane_mode =
+          m.prefill_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
+      m.prefill_ane_mode_explicit = false;
+    } else if (ov->prefill_engine.has_value() &&
+               *ov->prefill_engine == "nax_ane") {
+      m.prefill_ane_mode = PrefillAneMode::Auto;
+      m.prefill_ane_offload = true;
+    }
   }
   if (ov->spec_search.has_value()) {
     m.spec_search = *ov->spec_search;
@@ -517,6 +528,8 @@ ModelServeConfig default_model_from_serve_config(const ServeConfig &config,
   m.prefill_attention_mode = config.prefill_attention_mode;
   m.prefill_sparse_minference = config.prefill_sparse_minference;
   m.prefill_cache_blend = config.prefill_cache_blend;
+  m.prefill_ane_mode = config.prefill_ane_mode;
+  m.prefill_ane_mode_explicit = config.prefill_ane_mode_explicit;
   m.prefill_ane_offload = config.prefill_ane_offload;
   m.prefill_ane_offload_explicit = config.prefill_ane_offload_explicit;
   m.spec_search = config.spec_search;
@@ -746,6 +759,9 @@ SidecarModelOverride parse_sidecar_model_override(const toml::table &entry,
                                     ov.prefill_sparse_minference);
   read_toml_optional_bool_or_on_off(entry, "prefill_cache_blend",
                                     ov.prefill_cache_blend);
+  if (const auto v = read_toml_optional_string(entry, "prefill_ane_mode")) {
+    ov.prefill_ane_mode = parse_prefill_ane_mode(*v);
+  }
   read_toml_optional_bool_or_on_off(entry, "prefill_ane_offload",
                                     ov.prefill_ane_offload);
   if (const auto v = read_toml_optional_string(entry, "spec_search")) {
@@ -1184,14 +1200,27 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     read_toml_bool_or_on_off(*engine, "prefill_cache_blend",
                              config.prefill_cache_blend);
     {
-      std::optional<bool> ane_opt;
-      read_toml_optional_bool_or_on_off(*engine, "prefill_ane_offload",
-                                        ane_opt);
-      if (ane_opt.has_value()) {
-        config.prefill_ane_offload = *ane_opt;
+      if (const auto ane_mode_str =
+              read_toml_optional_string(*engine, "prefill_ane_mode")) {
+        config.prefill_ane_mode = parse_prefill_ane_mode(*ane_mode_str);
+        config.prefill_ane_mode_explicit = true;
+        config.prefill_ane_offload =
+            (config.prefill_ane_mode != PrefillAneMode::Off);
         config.prefill_ane_offload_explicit = true;
-      } else if (config.prefill_engine == "nax_ane") {
-        config.prefill_ane_offload = true;
+      } else {
+        std::optional<bool> ane_opt;
+        read_toml_optional_bool_or_on_off(*engine, "prefill_ane_offload",
+                                          ane_opt);
+        if (ane_opt.has_value()) {
+          config.prefill_ane_offload = *ane_opt;
+          config.prefill_ane_offload_explicit = true;
+          config.prefill_ane_mode =
+              *ane_opt ? PrefillAneMode::Auto : PrefillAneMode::Off;
+          config.prefill_ane_mode_explicit = false;
+        } else if (config.prefill_engine == "nax_ane") {
+          config.prefill_ane_mode = PrefillAneMode::Auto;
+          config.prefill_ane_offload = true;
+        }
       }
     }
     if (const auto v = (*engine)["spec_search"].value<std::string>()) {
@@ -1302,15 +1331,28 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
     read_toml_bool_or_on_off(*sidecar, "prefill_cache_blend",
                              config.prefill_cache_blend);
     {
-      std::optional<bool> ane_opt;
-      read_toml_optional_bool_or_on_off(*sidecar, "prefill_ane_offload",
-                                        ane_opt);
-      if (ane_opt.has_value()) {
-        config.prefill_ane_offload = *ane_opt;
+      if (const auto ane_mode_str =
+              read_toml_optional_string(*sidecar, "prefill_ane_mode")) {
+        config.prefill_ane_mode = parse_prefill_ane_mode(*ane_mode_str);
+        config.prefill_ane_mode_explicit = true;
+        config.prefill_ane_offload =
+            (config.prefill_ane_mode != PrefillAneMode::Off);
         config.prefill_ane_offload_explicit = true;
-      } else if ((*sidecar)["prefill_engine"].value<std::string>() ==
-                 std::optional<std::string>("nax_ane")) {
-        config.prefill_ane_offload = true;
+      } else {
+        std::optional<bool> ane_opt;
+        read_toml_optional_bool_or_on_off(*sidecar, "prefill_ane_offload",
+                                          ane_opt);
+        if (ane_opt.has_value()) {
+          config.prefill_ane_offload = *ane_opt;
+          config.prefill_ane_offload_explicit = true;
+          config.prefill_ane_mode =
+              *ane_opt ? PrefillAneMode::Auto : PrefillAneMode::Off;
+          config.prefill_ane_mode_explicit = false;
+        } else if ((*sidecar)["prefill_engine"].value<std::string>() ==
+                   std::optional<std::string>("nax_ane")) {
+          config.prefill_ane_mode = PrefillAneMode::Auto;
+          config.prefill_ane_offload = true;
+        }
       }
     }
     if (const auto v = (*sidecar)["spec_search"].value<std::string>()) {
@@ -1441,15 +1483,27 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
       read_toml_bool_or_on_off(*entry, "prefill_cache_blend",
                                m.prefill_cache_blend);
       {
-        std::optional<bool> ane_opt;
-        read_toml_optional_bool_or_on_off(*entry, "prefill_ane_offload",
-                                          ane_opt);
-        if (ane_opt.has_value()) {
-          m.prefill_ane_offload = *ane_opt;
+        if (const auto ane_mode_str =
+                read_toml_optional_string(*entry, "prefill_ane_mode")) {
+          m.prefill_ane_mode = parse_prefill_ane_mode(*ane_mode_str);
+          m.prefill_ane_mode_explicit = true;
+          m.prefill_ane_offload = (m.prefill_ane_mode != PrefillAneMode::Off);
           m.prefill_ane_offload_explicit = true;
-        } else if ((*entry)["prefill_engine"].value<std::string>() ==
-                   std::optional<std::string>("nax_ane")) {
-          m.prefill_ane_offload = true;
+        } else {
+          std::optional<bool> ane_opt;
+          read_toml_optional_bool_or_on_off(*entry, "prefill_ane_offload",
+                                            ane_opt);
+          if (ane_opt.has_value()) {
+            m.prefill_ane_offload = *ane_opt;
+            m.prefill_ane_offload_explicit = true;
+            m.prefill_ane_mode =
+                *ane_opt ? PrefillAneMode::Auto : PrefillAneMode::Off;
+            m.prefill_ane_mode_explicit = false;
+          } else if ((*entry)["prefill_engine"].value<std::string>() ==
+                     std::optional<std::string>("nax_ane")) {
+            m.prefill_ane_mode = PrefillAneMode::Auto;
+            m.prefill_ane_offload = true;
+          }
         }
       }
       if (const auto v = (*entry)["spec_search"].value<std::string>()) {
@@ -1567,6 +1621,7 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     bool prefill_attention_mode = false;
     bool prefill_sparse_minference = false;
     bool prefill_cache_blend = false;
+    bool prefill_ane_mode = false;
     bool prefill_ane_offload = false;
   } cli_overrides;
 
@@ -1597,13 +1652,31 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     cli_overrides.prefill_cache_blend = true;
     config.cli_prefill_cache_blend_override = true;
   }
-  if (const char *env = std::getenv("NINFER_PREFILL_ANE_OFFLOAD");
-      env && *env) {
+  if (const char *env = std::getenv("NINFER_PREFILL_ANE_MODE"); env && *env) {
+    config.prefill_ane_mode = parse_prefill_ane_mode(env);
+    config.prefill_ane_mode_explicit = true;
+    config.prefill_ane_offload =
+        (config.prefill_ane_mode != PrefillAneMode::Off);
+    config.prefill_ane_offload_explicit = true;
+    cli_overrides.prefill_ane_mode = true;
+    cli_overrides.prefill_ane_offload = true;
+    config.cli_prefill_ane_mode_override = true;
+    config.cli_prefill_ane_offload_override = true;
+  } else if (const char *env = std::getenv("NINFER_PREFILL_ANE_OFFLOAD");
+             env && *env) {
     config.prefill_ane_offload = parse_on_off(env, "NINFER_PREFILL_ANE_OFFLOAD");
     config.prefill_ane_offload_explicit = true;
+    config.prefill_ane_mode =
+        config.prefill_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
+    config.prefill_ane_mode_explicit = false;
+    cli_overrides.prefill_ane_mode = true;
     cli_overrides.prefill_ane_offload = true;
+    config.cli_prefill_ane_mode_override = true;
     config.cli_prefill_ane_offload_override = true;
   }
+
+  std::optional<PrefillAneMode> cli_ane_mode_val;
+  std::optional<bool> cli_ane_offload_val;
 
   // Pass 2: apply all CLI flags on top of TOML values.
   for (int i = 1; i < argc; ++i) {
@@ -1781,29 +1854,25 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       config.prefill_cache_blend = false;
       cli_overrides.prefill_cache_blend = true;
       config.cli_prefill_cache_blend_override = true;
+    } else if (flag == "--prefill-ane-mode") {
+      cli_ane_mode_val = parse_prefill_ane_mode(next_val());
     } else if (flag == "--prefill-ane-offload") {
       if (inline_value.has_value()) {
-        config.prefill_ane_offload = parse_on_off(*inline_value, flag);
+        cli_ane_offload_val = parse_on_off(*inline_value, flag);
       } else if (i + 1 < argc) {
         const std::string_view peek(argv[i + 1]);
         if (peek == "on" || peek == "off" || peek == "true" ||
             peek == "false" || peek == "1" || peek == "0") {
-          config.prefill_ane_offload = parse_on_off(peek, flag);
+          cli_ane_offload_val = parse_on_off(peek, flag);
           ++i;
         } else {
-          config.prefill_ane_offload = true;
+          cli_ane_offload_val = true;
         }
       } else {
-        config.prefill_ane_offload = true;
+        cli_ane_offload_val = true;
       }
-      config.prefill_ane_offload_explicit = true;
-      cli_overrides.prefill_ane_offload = true;
-      config.cli_prefill_ane_offload_override = true;
     } else if (flag == "--no-prefill-ane-offload") {
-      config.prefill_ane_offload = false;
-      config.prefill_ane_offload_explicit = true;
-      cli_overrides.prefill_ane_offload = true;
-      config.cli_prefill_ane_offload_override = true;
+      cli_ane_offload_val = false;
     } else if (flag == "--version") {
       config.show_version = true;
     } else if (flag == "--help" || flag == "-h") {
@@ -1811,6 +1880,29 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     } else {
       throw std::invalid_argument("unknown argument: " + std::string(raw));
     }
+  }
+
+  // Resolve CLI ANE overrides deterministically: --prefill-ane-mode > --[no-]prefill-ane-offload
+  if (cli_ane_mode_val.has_value()) {
+    config.prefill_ane_mode = *cli_ane_mode_val;
+    config.prefill_ane_mode_explicit = true;
+    config.prefill_ane_offload =
+        (config.prefill_ane_mode != PrefillAneMode::Off);
+    config.prefill_ane_offload_explicit = true;
+    cli_overrides.prefill_ane_mode = true;
+    cli_overrides.prefill_ane_offload = true;
+    config.cli_prefill_ane_mode_override = true;
+    config.cli_prefill_ane_offload_override = true;
+  } else if (cli_ane_offload_val.has_value()) {
+    config.prefill_ane_offload = *cli_ane_offload_val;
+    config.prefill_ane_offload_explicit = true;
+    config.prefill_ane_mode =
+        *cli_ane_offload_val ? PrefillAneMode::Auto : PrefillAneMode::Off;
+    config.prefill_ane_mode_explicit = false;
+    cli_overrides.prefill_ane_mode = true;
+    cli_overrides.prefill_ane_offload = true;
+    config.cli_prefill_ane_mode_override = true;
+    config.cli_prefill_ane_offload_override = true;
   }
 
   // CLI --providers-dir entries take highest precedence (prepend before TOML).
@@ -1892,7 +1984,9 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       if (cli_overrides.prefill_cache_blend) {
         m.prefill_cache_blend = config.prefill_cache_blend;
       }
-      if (cli_overrides.prefill_ane_offload) {
+      if (cli_overrides.prefill_ane_mode || cli_overrides.prefill_ane_offload) {
+        m.prefill_ane_mode = config.prefill_ane_mode;
+        m.prefill_ane_mode_explicit = config.prefill_ane_mode_explicit;
         m.prefill_ane_offload = config.prefill_ane_offload;
         m.prefill_ane_offload_explicit = true;
       }
@@ -2027,10 +2121,25 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   opts.prefill_attention_mode = resolved.prefill_attention_mode;
   opts.prefill_sparse_minference = resolved.prefill_sparse_minference;
   opts.prefill_cache_blend = resolved.prefill_cache_blend;
-  opts.prefill_ane_offload = resolved.prefill_ane_offload;
-  if (!resolved.prefill_ane_offload_explicit &&
-      resolved.prefill_engine == "nax_ane") {
+  if (resolved.prefill_ane_mode_explicit) {
+    opts.prefill_ane_mode = resolved.prefill_ane_mode;
+    opts.prefill_ane_offload = (opts.prefill_ane_mode != PrefillAneMode::Off);
+  } else if (resolved.prefill_ane_offload_explicit) {
+    opts.prefill_ane_offload = resolved.prefill_ane_offload;
+    opts.prefill_ane_mode =
+        resolved.prefill_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
+  } else if (resolved.prefill_ane_mode != PrefillAneMode::Off) {
+    opts.prefill_ane_mode = resolved.prefill_ane_mode;
     opts.prefill_ane_offload = true;
+  } else if (resolved.prefill_ane_offload) {
+    opts.prefill_ane_mode = PrefillAneMode::Auto;
+    opts.prefill_ane_offload = true;
+  } else if (resolved.prefill_engine == "nax_ane") {
+    opts.prefill_ane_mode = PrefillAneMode::Auto;
+    opts.prefill_ane_offload = true;
+  } else {
+    opts.prefill_ane_mode = PrefillAneMode::Off;
+    opts.prefill_ane_offload = false;
   }
   opts.spec_search = resolved.spec_search;
   opts.sampling_contract = resolved.sampling_contract;
@@ -2186,15 +2295,18 @@ std::string format_help_string() {
       << "  --sampling-contract NAME         Sampling contract "
          "(legacy_rejection_v1|position_coupled_v1)\n"
       << "  --prefill-linear-mode MODE       Prefill linear precision: "
-         "bf16|w4a8 (env: NINFER_PREFILL_LINEAR_MODE)\n"
+         "bf16|w4a8|w4a4 (env: NINFER_PREFILL_LINEAR_MODE)\n"
       << "  --prefill-attention-mode MODE    Prefill attention kernel: "
          "exact_nax|sage2 (env: NINFER_PREFILL_ATTENTION_MODE)\n"
       << "  --[no-]prefill-sparse-minference MInference dynamic sparse tiles "
          "under sage2 (env: NINFER_PREFILL_SPARSE_MINFERENCE)\n"
       << "  --[no-]prefill-cache-blend       Cross-chunk non-contiguous RAG "
          "CacheBlend (env: NINFER_PREFILL_CACHE_BLEND)\n"
-      << "  --[no-]prefill-ane-offload       Dual-ANE output-channel-split "
-         "co-execution (env: NINFER_PREFILL_ANE_OFFLOAD)\n\n"
+      << "  --prefill-ane-mode MODE          Dual-ANE collaboration mode: "
+         "off|auto|compact_int8|ultra_fp16_swiglu (env: "
+         "NINFER_PREFILL_ANE_MODE)\n"
+      << "  --[no-]prefill-ane-offload       Legacy Dual-ANE boolean alias "
+         "(env: NINFER_PREFILL_ANE_OFFLOAD)\n\n"
       << "Info:\n"
       << "  --version                        Print version identity and exit\n"
       << "  --help, -h                       Show this help message and exit\n";

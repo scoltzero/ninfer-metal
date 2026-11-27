@@ -957,6 +957,8 @@ final class ModelSettingsScreenVM {
                     mergedExtOpts["m5rt"] = m5Dict
                 }
                 self.externalEngineOptions = mergedExtOpts
+                self.normalizeMivPrefillOptionsForCurrentModel()
+                self.syncPreferredMivLinearSubTier()
                 self.activeProfileName = s?.activeProfileName
             }
             self.profiles = profiles
@@ -1238,12 +1240,17 @@ final class ModelSettingsScreenVM {
     }
 
     /// Saves multiple external-engine options atomically in one PATCH request
-    /// (used by the miv Prefill Acceleration presets and Sage2 auto-coupled toggles).
+    /// (used by the miv Prefill Acceleration tiers and orthogonal controls).
     func saveExternalEngineOptionsPatch(keys: [String], client: OMLXClient) async {
         let active = effectiveExternalEngine
         guard !active.isEmpty else { return }
+        var effectiveKeys = keys
+        let normalized = normalizeMivPrefillOptionsForCurrentModel()
+        for k in normalized where !effectiveKeys.contains(k) {
+            effectiveKeys.append(k)
+        }
         var updates: [String: AnyCodable] = [:]
-        for key in keys {
+        for key in effectiveKeys {
             if let value = externalEngineOptions[active]?[key] {
                 updates[key] = value
             }
@@ -1606,36 +1613,158 @@ final class ModelSettingsScreenVM {
         "prefill_attention_mode",
         "prefill_sparse_minference",
         "prefill_cache_blend",
+        "prefill_ane_mode",
         "prefill_ane_offload",
     ]
 
-    enum MivPrefillPreset: String, CaseIterable, Identifiable {
+    enum MivPrefillMode: String, CaseIterable, Identifiable {
         case lossless
-        case balanced
-        case gpuFull
-        case ragBlend
+        case routeA
+        case routeB
+        case routeAB
+
+        var id: String { rawValue }
+
+        var linearActive: Bool {
+            self == .routeA || self == .routeAB
+        }
+
+        var attentionMode: String {
+            (self == .routeB || self == .routeAB) ? "sage2" : "exact_nax"
+        }
+
+        var title: String {
+            switch self {
+            case .lossless:
+                return String(localized: "settings.miv.prefill.mode.lossless",
+                              defaultValue: "Lossless Default",
+                              comment: "4-tier prefill mode pill for lossless exact miv prefill")
+            case .routeA:
+                return String(localized: "settings.miv.prefill.mode.route_a",
+                              defaultValue: "Route A (Linear)",
+                              comment: "4-tier prefill mode pill for Route A linear acceleration")
+            case .routeB:
+                return String(localized: "settings.miv.prefill.mode.route_b",
+                              defaultValue: "Route B (Attention)",
+                              comment: "4-tier prefill mode pill for Route B Sage2 attention acceleration")
+            case .routeAB:
+                return String(localized: "settings.miv.prefill.mode.route_ab",
+                              defaultValue: "Route A+B (Full Speed)",
+                              comment: "4-tier prefill mode pill combining Route A linear and Route B attention acceleration")
+            }
+        }
+    }
+
+    enum MivLinearSubTier: String, CaseIterable, Identifiable {
+        case a8 = "w4a8"
+        case a4 = "w4a4"
 
         var id: String { rawValue }
 
         var title: String {
             switch self {
-            case .lossless:
-                return String(localized: "settings.miv.prefill.preset.lossless",
-                              defaultValue: "Lossless Default",
-                              comment: "Preset pill for lossless exact miv prefill")
-            case .balanced:
-                return String(localized: "settings.miv.prefill.preset.balanced",
-                              defaultValue: "W4A8 Balanced",
-                              comment: "Preset pill for W4A8 linear + exact attention prefill")
-            case .gpuFull:
-                return String(localized: "settings.miv.prefill.preset.gpu_full",
-                              defaultValue: "GPU Full",
-                              comment: "Preset pill enabling all GPU prefill accelerations (W4A8 + Sage2 + MInference + CacheBlend, Dual-ANE off)")
-            case .ragBlend:
-                return String(localized: "settings.miv.prefill.preset.rag_blend",
-                              defaultValue: "RAG Reuse",
-                              comment: "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse")
+            case .a8:
+                return String(localized: "settings.miv.prefill.linear.a8",
+                              defaultValue: "A8 (Universal W4A8)",
+                              comment: "Linear prefill sub-tier button title for universal W4A8")
+            case .a4:
+                return String(localized: "settings.miv.prefill.linear.a4",
+                              defaultValue: "A4 (Native W4A4)",
+                              comment: "Linear prefill sub-tier button title for native MXFP4 W4A4")
             }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .a8:
+                return String(localized: "settings.miv.prefill.linear.a8.sub",
+                              defaultValue: "Universal (MXFP4 & oQ4e)",
+                              comment: "Subtitle for universal A8 W4A8 prefill linear sub-tier")
+            case .a4:
+                return String(localized: "settings.miv.prefill.linear.a4.sub",
+                              defaultValue: "MXFP4 models only",
+                              comment: "Subtitle noting A4 W4A4 is supported only on MXFP4 models")
+            }
+        }
+    }
+
+    enum MivAneMode: String, CaseIterable, Identifiable {
+        case off = "off"
+        case auto = "auto"
+        case compactInt8 = "compact_int8"
+        case ultraFp16SwiGlu = "ultra_fp16_swiglu"
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .off:
+                return String(localized: "settings.miv.prefill.ane.off",
+                              defaultValue: "Off (GPU Only)",
+                              comment: "ANE collaboration mode option: disabled / pure GPU")
+            case .auto:
+                return String(localized: "settings.miv.prefill.ane.auto",
+                              defaultValue: "Auto",
+                              comment: "ANE collaboration mode option: automatic topology policy")
+            case .compactInt8:
+                return String(localized: "settings.miv.prefill.ane.compact_int8",
+                              defaultValue: "Compact INT8",
+                              comment: "ANE collaboration mode option: G=64 compact INT8 shift-scale")
+            case .ultraFp16SwiGlu:
+                return String(localized: "settings.miv.prefill.ane.ultra_fp16_swiglu",
+                              defaultValue: "Ultra FP16 SwiGLU",
+                              comment: "ANE collaboration mode option: Ultra direct FP16 SwiGLU Dual-ANE")
+            }
+        }
+    }
+
+    private(set) var preferredMivLinearSubTier: MivLinearSubTier = .a8
+
+    /// True when the active model supports native W4A4 linear prefill (`MXFP4`).
+    var isMxfp4ExternalEngineModel: Bool {
+        guard let model else { return false }
+        if let supported = model.mxfp4W4A4Supported {
+            return supported
+        }
+        if let fmt = model.quantFormat?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !fmt.isEmpty {
+            return fmt == "mxfp4"
+        }
+        if let effFmt = model.mivEffectiveSettings?.modelQuantFormat?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !effFmt.isEmpty {
+            return effFmt == "mxfp4"
+        }
+        return model.id.localizedCaseInsensitiveContains("mxfp4")
+    }
+
+    /// Normalizes any saved `"w4a4"` back to `"w4a8"` when the current model is non-MXFP4.
+    @discardableResult
+    func normalizeMivPrefillOptionsForCurrentModel() -> [String] {
+        guard !isMxfp4ExternalEngineModel else { return [] }
+        preferredMivLinearSubTier = .a8
+        let active = effectiveExternalEngine
+        guard !active.isEmpty else { return [] }
+        var normalized = false
+        for key in optionLookupKeys(for: active) {
+            if let raw = externalEngineOptions[key]?["prefill_linear_mode"]?.value as? String,
+               raw.lowercased() == "w4a4" {
+                externalEngineOptions[key]?["prefill_linear_mode"] = AnyCodable("w4a8")
+                normalized = true
+            }
+        }
+        if normalized {
+            writeExternalEngineOptionValue("w4a8", forKey: "prefill_linear_mode")
+            return ["prefill_linear_mode"]
+        }
+        return []
+    }
+
+    func syncPreferredMivLinearSubTier() {
+        let mode = activeMivLinearMode
+        if mode == "w4a4" && isMxfp4ExternalEngineModel {
+            preferredMivLinearSubTier = .a4
+        } else {
+            preferredMivLinearSubTier = .a8
         }
     }
 
@@ -1688,8 +1817,20 @@ final class ModelSettingsScreenVM {
 
     /// Prefill acceleration switches rendered in the dedicated Acceleration card.
     var externalEnginePrefillOptions: [ExternalEngineSchemaOption] {
-        let byKey = Dictionary(uniqueKeysWithValues: allExternalEngineSchemaOptions().map { ($0.key, $0) })
+        var byKey = Dictionary(uniqueKeysWithValues: allExternalEngineSchemaOptions().map { ($0.key, $0) })
+        if byKey["prefill_ane_mode"] != nil {
+            byKey.removeValue(forKey: "prefill_ane_offload")
+        }
         return Self.externalEnginePrefillOptionKeys.compactMap { byKey[$0] }
+    }
+
+    func externalEnginePrefillOption(forKey key: String) -> ExternalEngineSchemaOption? {
+        externalEnginePrefillOptions.first(where: { $0.key == key })
+    }
+
+    var hasExternalEngineAneOption: Bool {
+        externalEnginePrefillOption(forKey: "prefill_ane_mode") != nil
+            || externalEnginePrefillOption(forKey: "prefill_ane_offload") != nil
     }
 
     var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
@@ -1697,113 +1838,166 @@ final class ModelSettingsScreenVM {
         return allExternalEngineSchemaOptions().filter { !prefillSet.contains($0.key) }
     }
 
+    var activeMivLinearMode: String {
+        let raw: String
+        if let opt = externalEnginePrefillOption(forKey: "prefill_linear_mode") {
+            raw = externalEngineEnumOption(opt).lowercased()
+        } else {
+            raw = "bf16"
+        }
+        if raw == "w4a4" {
+            return isMxfp4ExternalEngineModel ? "w4a4" : "w4a8"
+        }
+        return raw == "w4a8" ? "w4a8" : "bf16"
+    }
+
+    var isExternalEngineLinearAccelActive: Bool {
+        activeMivLinearMode != "bf16"
+    }
+
     var isExternalEngineSage2Active: Bool {
-        guard let opt = externalEnginePrefillOptions.first(where: { $0.key == "prefill_attention_mode" }) else {
+        guard let opt = externalEnginePrefillOption(forKey: "prefill_attention_mode") else {
             return false
         }
         return externalEngineEnumOption(opt) == "sage2"
     }
 
+    var activeMivPrefillMode: MivPrefillMode {
+        let linear = isExternalEngineLinearAccelActive
+        let sage2 = isExternalEngineSage2Active
+        switch (linear, sage2) {
+        case (false, false): return .lossless
+        case (true, false):  return .routeA
+        case (false, true):  return .routeB
+        case (true, true):   return .routeAB
+        }
+    }
+
+    var activeMivLinearSubTier: MivLinearSubTier {
+        let mode = activeMivLinearMode
+        if mode == "w4a4" && isMxfp4ExternalEngineModel { return .a4 }
+        if mode == "w4a8" { return .a8 }
+        return (preferredMivLinearSubTier == .a4 && isMxfp4ExternalEngineModel) ? .a4 : .a8
+    }
+
+    var activeMivAneMode: MivAneMode {
+        let active = effectiveExternalEngine
+        if !active.isEmpty {
+            var resolvedMode: String? = nil
+            var resolvedLegacy: Bool? = nil
+            for key in optionLookupKeys(for: active) {
+                if let raw = externalEngineOptions[key]?["prefill_ane_mode"]?.value as? String,
+                   !raw.isEmpty {
+                    resolvedMode = raw.lowercased()
+                }
+                if let b = externalEngineOptions[key]?["prefill_ane_offload"]?.value as? Bool {
+                    resolvedLegacy = b
+                } else if let i = externalEngineOptions[key]?["prefill_ane_offload"]?.value as? Int {
+                    resolvedLegacy = (i != 0)
+                }
+            }
+            if let resolvedMode, let parsed = MivAneMode(rawValue: resolvedMode) {
+                return parsed
+            }
+            if let resolvedLegacy {
+                return resolvedLegacy ? .auto : .off
+            }
+        }
+        if let opt = externalEnginePrefillOption(forKey: "prefill_ane_mode"),
+           let def = opt.defaultValue?.value as? String,
+           let parsed = MivAneMode(rawValue: def.lowercased()) {
+            return parsed
+        }
+        return .off
+    }
+
     func externalEnginePrefillToggleValue(for opt: ExternalEngineSchemaOption) -> Bool {
         switch opt.key {
         case "prefill_linear_mode":
-            return externalEngineEnumOption(opt) == "w4a8"
+            return isExternalEngineLinearAccelActive
         case "prefill_attention_mode":
-            return externalEngineEnumOption(opt) == "sage2"
+            return isExternalEngineSage2Active
+        case "prefill_ane_mode", "prefill_ane_offload":
+            return activeMivAneMode != .off
         default:
             return externalEngineBoolOption(opt)
         }
     }
 
     /// Updates a miv prefill toggle locally and returns all option keys to persist.
-    /// Turning on Sage2 convenience-enables MInference so long prompts don't stall,
-    /// while leaving MInference freely toggleable afterwards.
+    /// `prefill_sparse_minference` is strictly independent of `prefill_attention_mode`.
     @discardableResult
     func setExternalEnginePrefillToggle(_ opt: ExternalEngineSchemaOption, isOn: Bool) -> [String] {
         switch opt.key {
         case "prefill_linear_mode":
-            writeExternalEngineOptionValue(isOn ? "w4a8" : "bf16", forKey: opt.key)
+            let next = isOn ? activeMivLinearSubTier.rawValue : "bf16"
+            writeExternalEngineOptionValue(next, forKey: opt.key)
             return [opt.key]
         case "prefill_attention_mode":
-            let wasSage2 = externalEngineEnumOption(opt) == "sage2"
             writeExternalEngineOptionValue(isOn ? "sage2" : "exact_nax", forKey: opt.key)
-            if isOn && !wasSage2,
-               externalEnginePrefillOptions.contains(where: { $0.key == "prefill_sparse_minference" }) {
-                writeExternalEngineOptionValue(true, forKey: "prefill_sparse_minference")
-                return ["prefill_attention_mode", "prefill_sparse_minference"]
-            }
             return [opt.key]
+        case "prefill_ane_mode", "prefill_ane_offload":
+            return stageMivAneMode(isOn ? .auto : .off)
         default:
             writeExternalEngineOptionValue(isOn, forKey: opt.key)
             return [opt.key]
         }
     }
 
-    var activeMivPrefillPreset: MivPrefillPreset? {
-        guard !externalEnginePrefillOptions.isEmpty else { return nil }
-        let byKey = Dictionary(uniqueKeysWithValues: externalEnginePrefillOptions.map { ($0.key, $0) })
-        let w4a8 = byKey["prefill_linear_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
-        let sage2 = byKey["prefill_attention_mode"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
-        let minf = byKey["prefill_sparse_minference"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
-        let blend = byKey["prefill_cache_blend"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
-        let ane = byKey["prefill_ane_offload"].map { externalEnginePrefillToggleValue(for: $0) } ?? false
-        if !w4a8 && !sage2 && !blend && !ane { return .lossless }
-        if w4a8 && !sage2 && !blend && !ane { return .balanced }
-        if w4a8 && sage2 && minf && blend && !ane { return .gpuFull }
-        if w4a8 && !sage2 && blend && !ane { return .ragBlend }
-        return nil
+    /// Applies one of the 4 orthogonal Prefill Modes without touching MInference, CacheBlend, or ANE mode.
+    @discardableResult
+    func stageMivPrefillMode(_ mode: MivPrefillMode) -> [String] {
+        normalizeMivPrefillOptionsForCurrentModel()
+        let nextLinear = mode.linearActive ? activeMivLinearSubTier.rawValue : "bf16"
+        let nextAttn = mode.attentionMode
+        writeExternalEngineOptionValue(nextLinear, forKey: "prefill_linear_mode")
+        writeExternalEngineOptionValue(nextAttn, forKey: "prefill_attention_mode")
+        return ["prefill_linear_mode", "prefill_attention_mode"]
     }
 
+    func applyMivPrefillMode(_ mode: MivPrefillMode, client: OMLXClient) async {
+        let keys = stageMivPrefillMode(mode)
+        await saveExternalEngineOptionsPatch(keys: keys, client: client)
+    }
+
+    /// Selects the A8/A4 linear precision sub-tier. Automatically falls back to A8 on non-MXFP4 models.
     @discardableResult
-    func stageMivPrefillPreset(_ preset: MivPrefillPreset) -> [String] {
-        let available = Set(externalEnginePrefillOptions.map(\.key))
-        let target: [String: any Sendable]
-        switch preset {
-        case .lossless:
-            target = [
-                "prefill_linear_mode": "bf16",
-                "prefill_attention_mode": "exact_nax",
-                "prefill_sparse_minference": false,
-                "prefill_cache_blend": false,
-                "prefill_ane_offload": false,
-            ]
-        case .balanced:
-            target = [
-                "prefill_linear_mode": "w4a8",
-                "prefill_attention_mode": "exact_nax",
-                "prefill_sparse_minference": false,
-                "prefill_cache_blend": false,
-                "prefill_ane_offload": false,
-            ]
-        case .gpuFull:
-            target = [
-                "prefill_linear_mode": "w4a8",
-                "prefill_attention_mode": "sage2",
-                "prefill_sparse_minference": true,
-                "prefill_cache_blend": true,
-                "prefill_ane_offload": false,
-            ]
-        case .ragBlend:
-            target = [
-                "prefill_linear_mode": "w4a8",
-                "prefill_attention_mode": "exact_nax",
-                "prefill_sparse_minference": false,
-                "prefill_cache_blend": true,
-                "prefill_ane_offload": false,
-            ]
+    func stageMivLinearSubTier(_ tier: MivLinearSubTier) -> [String] {
+        let resolved: MivLinearSubTier = (tier == .a4 && !isMxfp4ExternalEngineModel) ? .a8 : tier
+        preferredMivLinearSubTier = resolved
+        if !isExternalEngineLinearAccelActive {
+            return normalizeMivPrefillOptionsForCurrentModel()
         }
-        var changed: [String] = []
-        for key in Self.externalEnginePrefillOptionKeys where available.contains(key) {
-            if let val = target[key] {
-                writeExternalEngineOptionValue(val, forKey: key)
-                changed.append(key)
+        writeExternalEngineOptionValue(resolved.rawValue, forKey: "prefill_linear_mode")
+        return ["prefill_linear_mode"]
+    }
+
+    func applyMivLinearSubTier(_ tier: MivLinearSubTier, client: OMLXClient) async {
+        let keys = stageMivLinearSubTier(tier)
+        guard !keys.isEmpty else { return }
+        await saveExternalEngineOptionsPatch(keys: keys, client: client)
+    }
+
+    /// Sets the standalone ANE Collaboration Mode and syncs any legacy `prefill_ane_offload` key.
+    @discardableResult
+    func stageMivAneMode(_ mode: MivAneMode) -> [String] {
+        writeExternalEngineOptionValue(mode.rawValue, forKey: "prefill_ane_mode")
+        let active = effectiveExternalEngine
+        var keys = ["prefill_ane_mode"]
+        if !active.isEmpty {
+            let hasLegacy = optionLookupKeys(for: active).contains { key in
+                externalEngineOptions[key]?["prefill_ane_offload"] != nil
+            }
+            if hasLegacy {
+                writeExternalEngineOptionValue(mode != .off, forKey: "prefill_ane_offload")
+                keys.append("prefill_ane_offload")
             }
         }
-        return changed
+        return keys
     }
 
-    func applyMivPrefillPreset(_ preset: MivPrefillPreset, client: OMLXClient) async {
-        let keys = stageMivPrefillPreset(preset)
+    func applyMivAneMode(_ mode: MivAneMode, client: OMLXClient) async {
+        let keys = stageMivAneMode(mode)
         await saveExternalEngineOptionsPatch(keys: keys, client: client)
     }
 
@@ -1811,24 +2005,24 @@ final class ModelSettingsScreenVM {
         switch opt.key {
         case "prefill_linear_mode":
             return String(localized: "settings.miv.prefill.opt.linear",
-                          defaultValue: "W4A8 Linear",
-                          comment: "Short switch title for W4A8 prefill linear acceleration")
+                          defaultValue: "Linear Precision (A8 / A4)",
+                          comment: "Short label for prefill linear acceleration sub-tier")
         case "prefill_attention_mode":
             return String(localized: "settings.miv.prefill.opt.sage2",
                           defaultValue: "Sage2 Attention",
                           comment: "Short switch title for SageAttention2 low-bit prefill attention")
         case "prefill_sparse_minference":
             return String(localized: "settings.miv.prefill.opt.minference",
-                          defaultValue: "MInference Sparse",
+                          defaultValue: "MInference Dynamic Sparse",
                           comment: "Short switch title for MInference dynamic block sparsity under Sage2")
         case "prefill_cache_blend":
             return String(localized: "settings.miv.prefill.opt.cache_blend",
-                          defaultValue: "CacheBlend Reuse",
+                          defaultValue: "CacheBlend Cross-Chunk Reuse",
                           comment: "Short switch title for cross-chunk KV cache blend reuse")
-        case "prefill_ane_offload":
-            return String(localized: "settings.miv.prefill.opt.ane",
-                          defaultValue: "Dual-ANE Offload",
-                          comment: "Short switch title for GPU + Dual-ANE hybrid prefill offload")
+        case "prefill_ane_mode", "prefill_ane_offload":
+            return String(localized: "settings.miv.prefill.opt.ane_mode",
+                          defaultValue: "ANE Collaboration Mode",
+                          comment: "Row label for the 4-way ANE collaboration mode selector")
         case "max_concurrency":
             return String(localized: "settings.advanced.external_engine.opt.max_concurrency",
                           defaultValue: "Concurrency (B/C)",
@@ -1861,36 +2055,41 @@ final class ModelSettingsScreenVM {
     func externalEnginePrefillCautionHint(_ opt: ExternalEngineSchemaOption) -> String {
         switch opt.key {
         case "prefill_linear_mode":
+            if !isMxfp4ExternalEngineModel {
+                return String(localized: "settings.miv.prefill.hint.linear_non_mxfp4",
+                              defaultValue: "Non-MXFP4 model: A8 (Universal W4A8) is active; A4 is MXFP4-only and disabled automatically.",
+                              comment: "Hint under A8/A4 sub-tier when current model is not MXFP4")
+            }
             return String(localized: "settings.miv.prefill.hint.linear",
-                          defaultValue: "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift.",
-                          comment: "Subtle trade-off note under the W4A8 Linear prefill switch")
+                          defaultValue: "A8 runs universal W4A8; A4 enables native MXFP4 W4A4 prefill matmuls (decode stays W4A16).",
+                          comment: "Subtle trade-off note under the A8/A4 prefill linear sub-tier")
         case "prefill_attention_mode":
             return String(localized: "settings.miv.prefill.hint.sage2",
-                          defaultValue: "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups.",
+                          defaultValue: "Low-bit INT8 QK + FP16 PV attention; pairs independently with MInference dynamic sparsity below.",
                           comment: "Subtle trade-off note under the Sage2 Attention prefill switch")
         case "prefill_sparse_minference":
             if !isExternalEngineSage2Active {
                 return String(localized: "settings.miv.prefill.hint.minference_disabled",
-                              defaultValue: "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown.",
+                              defaultValue: "Select Route B or Route A+B above to configure dense Sage2 vs dynamic block-sparse Sage2 + MInference.",
                               comment: "Subtle note under MInference when Sage2 is currently off")
             }
             return String(localized: "settings.miv.prefill.hint.minference",
-                          defaultValue: "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens).",
-                          comment: "Subtle trade-off note under the MInference Sparse prefill switch")
+                          defaultValue: "Off = dense full-receptive-field Sage2; On = dynamic block-sparse Sage2 + MInference.",
+                          comment: "Subtle trade-off note under the MInference Dynamic Sparse prefill switch")
         case "prefill_cache_blend":
             return String(localized: "settings.miv.prefill.hint.cache_blend",
                           defaultValue: "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup.",
                           comment: "Subtle trade-off note under the CacheBlend Reuse prefill switch")
-        case "prefill_ane_offload":
+        case "prefill_ane_mode", "prefill_ane_offload":
             let isMoE = (model?.configModelType ?? "").lowercased().contains("moe")
             if isMoE {
                 return String(localized: "settings.miv.prefill.hint.ane_moe",
-                              defaultValue: "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2).",
-                              comment: "Subtle note under Dual-ANE Offload for MoE models")
+                              defaultValue: "Dense MLP only — automatically skipped on MoE models (stacks orthogonally with Route A/B & CacheBlend).",
+                              comment: "Subtle note under ANE Collaboration Mode for MoE models")
             }
-            return String(localized: "settings.miv.prefill.hint.ane",
-                          defaultValue: "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE.",
-                          comment: "Subtle trade-off note under the Dual-ANE Offload prefill switch")
+            return String(localized: "settings.miv.prefill.hint.ane_mode",
+                          defaultValue: "Orthogonal GPU + Dual-ANE collaboration (Auto policy, Compact INT8 G=64, or Ultra FP16 SwiGLU).",
+                          comment: "Subtle trade-off note under the ANE Collaboration Mode selector")
         default:
             return opt.description ?? ""
         }
@@ -2327,10 +2526,25 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "INT8 Prefill",
                                     comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
             }
-            if usesMiv {
-                for opt in externalEnginePrefillOptions where externalEnginePrefillToggleValue(for: opt) {
-                    if opt.key == "prefill_sparse_minference" && !isExternalEngineSage2Active { continue }
-                    items.append(externalEngineOptionDisplayLabel(opt))
+            if usesMiv && !externalEnginePrefillOptions.isEmpty {
+                if isExternalEngineLinearAccelActive {
+                    items.append(activeMivLinearMode == "w4a4" ? "W4A4" : "W4A8")
+                }
+                if isExternalEngineSage2Active {
+                    if let opt = externalEnginePrefillOption(forKey: "prefill_attention_mode") {
+                        items.append(externalEngineOptionDisplayLabel(opt))
+                    }
+                    if let minf = externalEnginePrefillOption(forKey: "prefill_sparse_minference"),
+                       externalEnginePrefillToggleValue(for: minf) {
+                        items.append(externalEngineOptionDisplayLabel(minf))
+                    }
+                }
+                if let blend = externalEnginePrefillOption(forKey: "prefill_cache_blend"),
+                   externalEnginePrefillToggleValue(for: blend) {
+                    items.append(externalEngineOptionDisplayLabel(blend))
+                }
+                if hasExternalEngineAneOption && activeMivAneMode != .off {
+                    items.append("ANE: \(activeMivAneMode.title)")
                 }
             }
         case .memory:

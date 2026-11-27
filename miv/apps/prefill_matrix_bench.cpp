@@ -327,11 +327,13 @@ struct CliOptions {
   std::uint32_t max_new_tokens = 0;
   std::size_t top_k_report = 16;
 
-  // Orthogonal Wave 2/3 prefill switches (propagated via env + future API hooks).
+  // Orthogonal Wave 2/3 prefill switches (propagated via env + API hooks).
   std::string prefill_linear_mode = "bf16";
   std::string prefill_attention_mode = "exact_nax";
   bool prefill_sparse_minference = false;
   bool prefill_cache_blend = false;
+  std::string prefill_ane_mode = "off";
+  bool prefill_ane_mode_explicit = false;
   bool prefill_ane_offload = false;
 
   // Optional CacheBlend priming controls for Wave 3 benchmarks.
@@ -371,10 +373,11 @@ Common options:
   --ref PATH --cand PATH           Binary float32 logit files for compare-logits mode
 
 Orthogonal prefill switches (for Wave 2/3 runtime builds):
-  --prefill-linear-mode bf16|w4a8
+  --prefill-linear-mode bf16|w4a8|w4a4
   --prefill-attention-mode exact_nax|sage2
   --prefill-sparse-minference / --no-prefill-sparse-minference
   --prefill-cache-blend / --no-prefill-cache-blend
+  --prefill-ane-mode off|auto|compact_int8|ultra_fp16_swiglu
   --prefill-ane-offload / --no-prefill-ane-offload
   --blend-prime-tokens-file PATH   Optional priming prompt tokens JSON for CacheBlend warm pass
   --blend-prime-text-file PATH     Optional priming prompt UTF-8 text for CacheBlend warm pass
@@ -482,10 +485,20 @@ CliOptions parse_args(int argc, char **argv) {
       o.prefill_cache_blend = true;
     } else if (key == "--no-prefill-cache-blend") {
       o.prefill_cache_blend = false;
+    } else if (key == "--prefill-ane-mode") {
+      o.prefill_ane_mode = prefill_ane_mode_to_string(parse_prefill_ane_mode(value()));
+      o.prefill_ane_mode_explicit = true;
+      o.prefill_ane_offload = (o.prefill_ane_mode != "off");
     } else if (key == "--prefill-ane-offload") {
-      o.prefill_ane_offload = true;
+      if (!o.prefill_ane_mode_explicit) {
+        o.prefill_ane_offload = true;
+        o.prefill_ane_mode = "auto";
+      }
     } else if (key == "--no-prefill-ane-offload") {
-      o.prefill_ane_offload = false;
+      if (!o.prefill_ane_mode_explicit) {
+        o.prefill_ane_offload = false;
+        o.prefill_ane_mode = "off";
+      }
     } else if (key == "--blend-prime-tokens-file") {
       o.blend_prime_tokens_file = serve::expand_user_path(value());
     } else if (key == "--blend-prime-text-file") {
@@ -516,6 +529,9 @@ void export_prefill_switch_env(const CliOptions &o) {
   }
   if (o.prefill_cache_blend) {
     ::setenv("NINFER_PREFILL_CACHE_BLEND", "1", 1);
+  }
+  if (o.prefill_ane_mode != "off") {
+    ::setenv("NINFER_PREFILL_ANE_MODE", o.prefill_ane_mode.c_str(), 1);
   }
   if (o.prefill_ane_offload) {
     ::setenv("NINFER_PREFILL_ANE_OFFLOAD", "1", 1);
@@ -658,12 +674,14 @@ std::unique_ptr<LoadedModel> load_forward_model(const CliOptions &o,
 
   const auto artifact_digest = execution_artifact_digest(artifact);
   loaded->artifact_digest = artifact_digest;
+  const auto parsed_ane_mode = parse_prefill_ane_mode(o.prefill_ane_mode);
   QwenPrefillOptions pf_opts{
       .linear_mode = parse_prefill_linear_mode(o.prefill_linear_mode),
       .attention_mode = parse_prefill_attention_mode(o.prefill_attention_mode),
       .sparse_minference = o.prefill_sparse_minference,
       .cache_blend = o.prefill_cache_blend,
-      .ane_offload = o.prefill_ane_offload,
+      .ane_offload = (parsed_ane_mode != PrefillAneMode::Off),
+      .ane_mode = parsed_ane_mode,
       .artifact_digest = artifact_digest,
   };
   loaded->forward = std::make_unique<QwenForward>(
@@ -857,17 +875,21 @@ int run_ppl(const CliOptions &o) {
            {"prefill_attention_mode", o.prefill_attention_mode},
            {"prefill_sparse_minference", o.prefill_sparse_minference},
            {"prefill_cache_blend", o.prefill_cache_blend},
+           {"prefill_ane_mode", o.prefill_ane_mode},
            {"prefill_ane_offload", o.prefill_ane_offload},
        }},
       {"prefill_telemetry",
        {
            {"prefill_w4a8_tokens", pf_tel.prefill_w4a8_tokens},
+           {"prefill_w4a4_tokens", pf_tel.prefill_w4a4_tokens},
            {"prefill_sage2_tokens", pf_tel.prefill_sage2_tokens},
            {"prefill_minference_blocks_skipped",
             pf_tel.prefill_minference_blocks_skipped},
            {"prefill_minference_blocks_total",
             pf_tel.prefill_minference_blocks_total},
            {"prefill_ane_active", pf_tel.prefill_ane_active},
+           {"prefill_ane_mode_effective", pf_tel.prefill_ane_mode_effective},
+           {"prefill_ane_inactive_reason", pf_tel.prefill_ane_inactive_reason},
            {"prefill_ane_split_alpha", pf_tel.prefill_ane_split_alpha},
            {"prefill_ane_offload_tokens", pf_tel.prefill_ane_offload_tokens},
            {"prefill_ane_fallback_tokens", pf_tel.prefill_ane_fallback_tokens},
@@ -989,7 +1011,7 @@ int run_prefill_logits(const CliOptions &o) {
     const std::uint64_t exec_hash = detail::compute_blend_model_exec_hash(
         loaded->artifact_digest, o.kv_dtype, o.prefill_linear_mode,
         o.prefill_attention_mode, o.prefill_sparse_minference,
-        o.prefill_ane_offload);
+        o.prefill_ane_mode);
     detail::BlendSegmentConfig seg_cfg;
     if (o.blend_delim_token.has_value()) {
       seg_cfg.prefix_delimiters.push_back({*o.blend_delim_token});
@@ -1107,17 +1129,21 @@ int run_prefill_logits(const CliOptions &o) {
            {"prefill_attention_mode", o.prefill_attention_mode},
            {"prefill_sparse_minference", o.prefill_sparse_minference},
            {"prefill_cache_blend", o.prefill_cache_blend},
+           {"prefill_ane_mode", o.prefill_ane_mode},
            {"prefill_ane_offload", o.prefill_ane_offload},
        }},
       {"prefill_telemetry",
        {
            {"prefill_w4a8_tokens", pf_tel.prefill_w4a8_tokens},
+           {"prefill_w4a4_tokens", pf_tel.prefill_w4a4_tokens},
            {"prefill_sage2_tokens", pf_tel.prefill_sage2_tokens},
            {"prefill_minference_blocks_skipped",
             pf_tel.prefill_minference_blocks_skipped},
            {"prefill_minference_blocks_total",
             pf_tel.prefill_minference_blocks_total},
            {"prefill_ane_active", pf_tel.prefill_ane_active},
+           {"prefill_ane_mode_effective", pf_tel.prefill_ane_mode_effective},
+           {"prefill_ane_inactive_reason", pf_tel.prefill_ane_inactive_reason},
            {"prefill_ane_split_alpha", pf_tel.prefill_ane_split_alpha},
            {"prefill_ane_offload_tokens", pf_tel.prefill_ane_offload_tokens},
            {"prefill_ane_fallback_tokens", pf_tel.prefill_ane_fallback_tokens},
