@@ -493,16 +493,22 @@ public:
     const bool enable_w4a8_ws =
         (prefill_options_.linear_mode == PrefillLinearMode::W4A8);
     const bool enable_minf_ws =
-        (prefill_options_.attention_mode == PrefillAttentionMode::Sage2 &&
+        (shared_primary_ == nullptr &&
+         prefill_options_.attention_mode == PrefillAttentionMode::Sage2 &&
          prefill_options_.sparse_minference && c.full_attention_layers() > 0 &&
          c.head_dim == 256);
+    const bool enable_sage2_kv_ws =
+        (shared_primary_ == nullptr &&
+         prefill_options_.attention_mode == PrefillAttentionMode::Sage2 &&
+         c.full_attention_layers() > 0 && c.head_dim == 256);
     allocation_plan = plan_qwen_forward_memory(
         c, max_context, U32(feature_layers.size()), inspect_routes, speculative,
         enable_attention_split,
         sampling_contract == SamplingContract::PositionCoupledV1,
         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1,
         inspect_tensors_workspace, 0U, workspace_rows_, affine4_kv, 0U,
-        flash_nax_prefill_, enable_w4a8_ws, enable_minf_ws);
+        flash_nax_prefill_, enable_w4a8_ws, enable_minf_ws,
+        enable_sage2_kv_ws);
     feature_ring_rows_ = allocation_plan.feature_ring_rows;
 
     if (allocation_plan.largest_buffer_bytes >
@@ -571,6 +577,11 @@ public:
     }
     if (enable_minf_ws) {
       minference_scratch = allocate("minference_scratch");
+    }
+    if (enable_sage2_kv_ws) {
+      sage2_kv_ws_ = allocate_private("sage2_kv_ws");
+      sage2_kv_ws_layout_ =
+          plan_sage2_kv_workspace(U32(c.num_key_value_heads), max_context);
     }
     zero = allocate("zero");
     const_cast<MetalBuffer *>(zero.buffer)->zero();
@@ -1015,6 +1026,7 @@ public:
     sage2_enabled_ =
         (prefill_options_.attention_mode == PrefillAttentionMode::Sage2) &&
         c.full_attention_layers() > 0 && affine4_planar_ok &&
+        sage2_kv_ws_.buffer != nullptr &&
         sage2_runtime_eligible(context, libraries, U32(c.num_attention_heads),
                                U32(c.num_key_value_heads), U32(c.head_dim));
     minference_enabled_ =
@@ -1024,6 +1036,16 @@ public:
                                     U32(c.num_attention_heads),
                                     U32(c.num_key_value_heads),
                                     U32(c.head_dim));
+    sage2_min_end_kv_ = kDefaultSage2MinEndKv;
+    if (const char *env_s2 = std::getenv("OMLX_M5_SAGE2_MIN_KV_TOKENS")) {
+      const auto parsed = std::strtoul(env_s2, nullptr, 10);
+      sage2_min_end_kv_ = U32(std::min<unsigned long>(parsed, 1UL << 24));
+    }
+    minf_min_mean_kv_ = kDefaultMInferenceMinMeanKv;
+    if (const char *env_mf = std::getenv("OMLX_M5_MINFERENCE_MIN_MEAN_KV")) {
+      const auto parsed = std::strtoul(env_mf, nullptr, 10);
+      minf_min_mean_kv_ = U32(std::min<unsigned long>(parsed, 1UL << 24));
+    }
 
     if (attention_positions.buffer == nullptr && c.full_attention_layers() > 0 &&
         (sage2_enabled_ || prefill_options_.cache_blend)) {
@@ -1460,47 +1482,83 @@ public:
         }
       }
     }
-    if ((minference_enabled_ ||
-         (flash_nax_prefill_ && split_attention_enabled &&
-          config.head_dim == 256)) &&
-        max_context >= kMInferenceMinContextTokens && !inspect_tensors_workspace) {
-      std::vector<U32> lc_envs{max_context};
-      if (max_context > kMInferenceMinContextTokens) {
-        lc_envs.push_back(kMInferenceMinContextTokens);
-      }
-      std::ranges::sort(lc_envs);
-      lc_envs.erase(std::unique(lc_envs.begin(), lc_envs.end()), lc_envs.end());
-      std::vector<U32> lc_caps;
+    if (!inspect_tensors_workspace) {
       const U32 max_cap = std::min(max_context, workspace_rows_);
-      for (U32 cap : {64U, 256U, 1024U, max_cap}) {
-        if (cap >= kFlashNaxPrefillMinTokens && cap <= max_cap) {
-          lc_caps.push_back(cap);
-        }
-      }
-      std::ranges::sort(lc_caps);
-      lc_caps.erase(std::unique(lc_caps.begin(), lc_caps.end()), lc_caps.end());
-      for (const U32 env : lc_envs) {
-        for (const U32 cap : lc_caps) {
-          if (!minference_enabled_ &&
-              !gqa_flash_prefill_tail_needs_split_kv(
-                  cap, U32(config.num_attention_heads),
-                  U32(config.num_key_value_heads), env,
-                  silicon_tuning.gpu_cores)) {
-            continue;
-          }
-          const LongCtxProfileKey fk{cap, env, false, false};
-          auto prof = compile(cap, false, false, env, false);
+      auto precompile_lc = [&](U32 cap, U32 env, ChunkAttentionRoute route,
+                               bool include_pipe_slot1) {
+        const LongCtxProfileKey fk{cap, env, route, false, false, 0U};
+        if (!long_ctx_profiles_.contains(fk)) {
+          auto prof = compile(cap, false, false, env, false, {}, {}, {}, {},
+                              false, {}, route);
           ensure_profile_icb(context, prof);
           long_ctx_profiles_.emplace(fk, std::move(prof));
-          if (!shared_primary_ && !inspect_routes_enabled &&
-              prefill_pipe_[0].token_ids.buffer != nullptr && cap >= 64U) {
-            const LongCtxProfileKey tk{cap, env, true, true};
-            auto tprof = compile(cap, false, false, env, false, {},
-                                 prefill_pipe_[0].attn_pos, {}, ".pf_pipe0",
-                                 /*trunk_only=*/true,
-                                 prefill_pipe_[0].token_ids);
-            ensure_profile_icb(context, tprof);
-            long_ctx_profiles_.emplace(tk, std::move(tprof));
+        }
+        if (!shared_primary_ && !inspect_routes_enabled &&
+            prefill_pipe_[0].token_ids.buffer != nullptr && cap >= 64U) {
+          const U32 max_slot =
+              (include_pipe_slot1 &&
+               prefill_pipe_[1].token_ids.buffer != nullptr)
+                  ? 2U
+                  : 1U;
+          for (U32 slot_i = 0U; slot_i < max_slot; ++slot_i) {
+            const LongCtxProfileKey tk{cap, env, route, true, true,
+                                       std::uint8_t(slot_i)};
+            if (!long_ctx_profiles_.contains(tk)) {
+              auto tprof = compile(
+                  cap, false, false, env, false, {},
+                  prefill_pipe_[slot_i].attn_pos, {},
+                  ".pf_pipe" + std::to_string(slot_i), /*trunk_only=*/true,
+                  prefill_pipe_[slot_i].token_ids, route);
+              ensure_profile_icb(context, tprof);
+              long_ctx_profiles_.emplace(tk, std::move(tprof));
+            }
+          }
+        }
+      };
+
+      // WP4: Precompile tight Sage2Dense prefix envelopes (2K, 4K) with both
+      // double-buffered async pipe slots when max_context > 4K so prepare_k
+      // launches <= 64/128 blocks instead of max_context/32.
+      if (sage2_enabled_ && max_context > 4096U &&
+          max_cap >= kFlashNaxPrefillMinTokens) {
+        for (const U32 env : {2048U, 4096U}) {
+          precompile_lc(max_cap, env, ChunkAttentionRoute::Sage2Dense,
+                        /*include_pipe_slot1=*/true);
+        }
+      }
+
+      if ((minference_enabled_ ||
+           (flash_nax_prefill_ && split_attention_enabled &&
+            config.head_dim == 256)) &&
+          max_context >= kMInferenceMinContextTokens) {
+        std::vector<U32> lc_envs{max_context};
+        if (max_context > kMInferenceMinContextTokens) {
+          lc_envs.push_back(kMInferenceMinContextTokens);
+        }
+        std::ranges::sort(lc_envs);
+        lc_envs.erase(std::unique(lc_envs.begin(), lc_envs.end()),
+                      lc_envs.end());
+        std::vector<U32> lc_caps;
+        for (U32 cap : {64U, 256U, 1024U, max_cap}) {
+          if (cap >= kFlashNaxPrefillMinTokens && cap <= max_cap) {
+            lc_caps.push_back(cap);
+          }
+        }
+        std::ranges::sort(lc_caps);
+        lc_caps.erase(std::unique(lc_caps.begin(), lc_caps.end()),
+                      lc_caps.end());
+        for (const U32 env : lc_envs) {
+          for (const U32 cap : lc_caps) {
+            if (minference_enabled_) {
+              precompile_lc(cap, env, ChunkAttentionRoute::Sage2MInference,
+                            /*include_pipe_slot1=*/false);
+            } else if (gqa_flash_prefill_tail_needs_split_kv(
+                           cap, U32(config.num_attention_heads),
+                           U32(config.num_key_value_heads), env,
+                           silicon_tuning.gpu_cores)) {
+              precompile_lc(cap, env, ChunkAttentionRoute::ExactNax,
+                            /*include_pipe_slot1=*/false);
+            }
           }
         }
       }
@@ -3463,13 +3521,20 @@ public:
     return true;
   }
 
+  enum class ChunkAttentionRoute : std::uint8_t {
+    ExactNax = 0,
+    Sage2Dense = 1,
+    Sage2MInference = 2,
+  };
+
   void emit_attention_state_step(
       Encoder &e, const Block &block, const Block &state_block,
       KvPagePool &slot_pool, U32 slot_max_context, KvStorageFormat slot_kv_fmt,
       Ref q_ref, Ref k_ref, Ref v_ref, Ref mix_ref, Ref attn_pos_ref, U32 t,
       bool split, U32 context_envelope, bool dynamic_tokens,
       std::optional<U32> pos_placeholder = std::nullopt,
-      std::vector<std::pair<U64, U32>> *pos_patches = nullptr) {
+      std::vector<std::pair<U64, U32>> *pos_patches = nullptr,
+      std::optional<ChunkAttentionRoute> attn_route_override = std::nullopt) {
     const auto &c = config;
     const bool exact_attention =
         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1;
@@ -3625,6 +3690,17 @@ public:
         pos_placeholder.has_value() ? std::optional<U32>{}
                                     : std::optional<U32>{4U};
 
+    const ChunkAttentionRoute default_attn_route =
+        (sage2_enabled_ && t >= kFlashNaxPrefillMinTokens && c.head_dim == 256 &&
+         attn_pos_ref.buffer != nullptr && sage2_kv_ws_.buffer != nullptr)
+            ? ((minference_enabled_ &&
+                context_envelope >= kMInferenceMinContextTokens)
+                   ? ChunkAttentionRoute::Sage2MInference
+                   : ChunkAttentionRoute::Sage2Dense)
+            : ChunkAttentionRoute::ExactNax;
+    const ChunkAttentionRoute eff_attn_route =
+        attn_route_override.value_or(default_attn_route);
+
     if (slot_kv_fmt == KvStorageFormat::Affine4Group128) {
       if (affine4_nax_ok) {
         if (!fuse_qk_kv_append_affine4_t1) {
@@ -3633,15 +3709,20 @@ public:
               table_ref, params, tok_word_attn, pos_word_attn, pos_patches);
         }
         if (!split && !pos_placeholder.has_value() && dynamic_tokens &&
-            sage2_enabled_ && t >= kFlashNaxPrefillMinTokens &&
-            c.head_dim == 256 && attn_pos_ref.buffer != nullptr) {
+            eff_attn_route != ChunkAttentionRoute::ExactNax &&
+            sage2_enabled_ && sage2_kv_ws_.buffer != nullptr &&
+            t >= kFlashNaxPrefillMinTokens && c.head_dim == 256 &&
+            attn_pos_ref.buffer != nullptr) {
           const bool use_minf =
+              (eff_attn_route == ChunkAttentionRoute::Sage2MInference) &&
               minference_enabled_ &&
-              context_envelope >= kMInferenceMinContextTokens;
+              context_envelope >= kMInferenceMinContextTokens &&
+              minference_scratch.buffer != nullptr;
           emit_paged_flash_prefill_sage2(
               e, c, t, context_envelope, /*is_affine4=*/true, use_minf, q_ref,
               gate_ref, state_block.state0, state_block.state1, mix_ref,
-              table_ref, attn_pos_ref, params,
+              table_ref, attn_pos_ref, params, sage2_kv_ws_,
+              sage2_kv_ws_layout_,
               use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
           e.profile.used_sage2 = true;
           if (use_minf) {
@@ -3734,15 +3815,18 @@ public:
     }
 
     if (!pos_placeholder.has_value() && dynamic_tokens && !split &&
-        sage2_enabled_ && t >= kFlashNaxPrefillMinTokens && c.head_dim == 256 &&
-        attn_pos_ref.buffer != nullptr) {
+        eff_attn_route != ChunkAttentionRoute::ExactNax && sage2_enabled_ &&
+        sage2_kv_ws_.buffer != nullptr && t >= kFlashNaxPrefillMinTokens &&
+        c.head_dim == 256 && attn_pos_ref.buffer != nullptr) {
       const bool use_minf =
+          (eff_attn_route == ChunkAttentionRoute::Sage2MInference) &&
           minference_enabled_ &&
-          context_envelope >= kMInferenceMinContextTokens;
+          context_envelope >= kMInferenceMinContextTokens &&
+          minference_scratch.buffer != nullptr;
       emit_paged_flash_prefill_sage2(
           e, c, t, context_envelope, /*is_affine4=*/false, use_minf, q_ref,
           gate_ref, state_block.state0, state_block.state1, mix_ref, table_ref,
-          attn_pos_ref, params,
+          attn_pos_ref, params, sage2_kv_ws_, sage2_kv_ws_layout_,
           use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
       e.profile.used_sage2 = true;
       if (use_minf) {
@@ -3976,7 +4060,9 @@ public:
                  Ref custom_attn_pos = {},
                  std::optional<U32> *io_sq_slot = nullptr,
                  std::optional<U32> out_sq_slot = std::nullopt,
-                 bool input_is_a8 = false) {
+                 bool input_is_a8 = false,
+                 std::optional<ChunkAttentionRoute> attn_route_override =
+                     std::nullopt) {
     const U32 t = e.profile.capacity;
     Ref q_ref = query, k_ref = key, v_ref = value;
     const std::array<MaterializedWeightView, 3> parts{
@@ -4174,7 +4260,8 @@ public:
         e, block, block, *page_pool, max_context, kv_format_, q_ref, k_ref,
         v_ref, mixer,
         custom_attn_pos.buffer ? custom_attn_pos : attention_positions, t,
-        split, context_envelope, true);
+        split, context_envelope, true, std::nullopt, nullptr,
+        attn_route_override);
     if (input_is_a8 &&
         try_linear_w4a8_base(e, block.get("attention_o"), mixer, delta, h, q)) {
       emit_bypass_for_weight(e, block.get("attention_o"), mixer, delta, h);
@@ -5632,7 +5719,9 @@ public:
                   U32 context_envelope = 0, bool defer_sample = false,
                   Ref custom_sampled = {}, Ref custom_attn_pos = {},
                   Ref feed_next_token = {}, std::string key_tag = {},
-                  bool trunk_only = false, Ref custom_token_ids = {}) {
+                  bool trunk_only = false, Ref custom_token_ids = {},
+                  std::optional<ChunkAttentionRoute> attn_route_override =
+                      std::nullopt) {
     Encoder e(
         context, libraries, t,
         (verify ? "qwen.verify" : "qwen.forward") +
@@ -5653,6 +5742,9 @@ public:
                                      ? ".nosplit.l" +
                                            std::to_string(context_envelope)
                                      : "")) +
+            (attn_route_override.has_value()
+                 ? (".ar" + std::to_string(U32(*attn_route_override)))
+                 : std::string{}) +
             key_tag + plan_key_suffix());
     e.profile.context_envelope = context_envelope;
     e.profile.sampling_contract_id =
@@ -5793,7 +5885,7 @@ public:
                   layer_fuse ? &pending_sq_slot : nullptr,
                   layer_fuse ? std::optional<U32>{2U * layer_index}
                              : std::optional<U32>{},
-                  layer_w4a8);
+                  layer_w4a8, attn_route_override);
       else
         gdn(e, block, verify, in_f16, layer_fuse ? &pending_sq_slot : nullptr,
             layer_fuse ? std::optional<U32>{2U * layer_index}
@@ -8347,9 +8439,18 @@ public:
   struct LongCtxProfileKey {
     U32 capacity = 0;
     U32 context_envelope = 0;
+    ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
     bool trunk_only = false;
     bool uses_pipe_slot0 = false;
+    std::uint8_t pipe_slot = 0;
     auto operator<=>(const LongCtxProfileKey &) const = default;
+  };
+
+  struct AneChunkPlanKey {
+    U32 context_envelope = 0;
+    ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
+    bool trunk_only = false;
+    auto operator<=>(const AneChunkPlanKey &) const = default;
   };
 
   struct AneLayerSubPlan {
@@ -8374,6 +8475,7 @@ public:
   struct AneChunkPlan {
     U32 chunk_t = 0;
     U32 context_envelope = 0;
+    ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
     bool trunk_only = false;
     bool used_w4a8 = false;
     bool used_sage2 = false;
@@ -8389,16 +8491,47 @@ public:
     return std::vector<std::byte>(raw.begin(), raw.end());
   }
 
+  ChunkAttentionRoute select_chunk_attention_route(U32 count,
+                                                   U32 start_pos) const noexcept {
+    if (!sage2_enabled_ || count < kFlashNaxPrefillMinTokens ||
+        config.head_dim != 256) {
+      return ChunkAttentionRoute::ExactNax;
+    }
+    const U32 end_pos = start_pos + count;
+    if (end_pos < sage2_min_end_kv_) {
+      return ChunkAttentionRoute::ExactNax;
+    }
+    // Tiny tail over deep KV cache: use Split-KV ExactNax to saturate GPU cores.
+    if (count < 64U && end_pos >= 4096U && flash_nax_prefill_ &&
+        split_attention_enabled && !strict_two_pass_attn_ &&
+        gqa_flash_prefill_tail_needs_split_kv(
+            count, U32(config.num_attention_heads),
+            U32(config.num_key_value_heads), end_pos,
+            silicon_tuning.gpu_cores)) {
+      return ChunkAttentionRoute::ExactNax;
+    }
+    const U32 mean_causal_kv = start_pos + (count >> 1U);
+    if (minference_enabled_ && end_pos >= kMInferenceMinContextTokens &&
+        mean_causal_kv >= minf_min_mean_kv_) {
+      return ChunkAttentionRoute::Sage2MInference;
+    }
+    return ChunkAttentionRoute::Sage2Dense;
+  }
+
   bool needs_long_ctx_prefill_profile(U32 count, U32 start_pos) const noexcept {
     if (inspect_tensors_workspace || count < kFlashNaxPrefillMinTokens) {
       return false;
     }
     const U32 end_pos = start_pos + count;
-    if (minference_enabled_ && end_pos >= kMInferenceMinContextTokens) {
+    const auto route = select_chunk_attention_route(count, start_pos);
+    if (route == ChunkAttentionRoute::Sage2MInference) {
       return true;
     }
-    if (!sage2_enabled_ && flash_nax_prefill_ && split_attention_enabled &&
-        config.head_dim == 256 && end_pos >= 4096U &&
+    if (route == ChunkAttentionRoute::Sage2Dense && max_context > 4096U) {
+      return true;
+    }
+    if (route == ChunkAttentionRoute::ExactNax && flash_nax_prefill_ &&
+        split_attention_enabled && config.head_dim == 256 && end_pos >= 4096U &&
         gqa_flash_prefill_tail_needs_split_kv(
             count, U32(config.num_attention_heads),
             U32(config.num_key_value_heads), end_pos, silicon_tuning.gpu_cores)) {
@@ -8408,7 +8541,8 @@ public:
   }
 
   U32 select_long_ctx_envelope(U32 end_pos) const noexcept {
-    for (U32 env : {4096U, 8192U, 16384U, 32768U, 65536U, 131072U, 262144U}) {
+    for (U32 env :
+         {2048U, 4096U, 8192U, 16384U, 32768U, 65536U, 131072U, 262144U}) {
       if (env >= max_context) {
         return max_context;
       }
@@ -8421,22 +8555,28 @@ public:
 
   Profile *select_long_ctx_prefill_profile(U32 count, U32 start_pos,
                                            bool trunk_only,
-                                           bool use_pipe_slot0) {
+                                           bool use_pipe_slot0,
+                                           U32 pipe_slot = 0U) {
     if (!needs_long_ctx_prefill_profile(count, start_pos)) {
       return nullptr;
     }
     const U32 cap = select_forward_bucket_capacity(count, max_context);
     const U32 end_pos = start_pos + count;
     const U32 env = select_long_ctx_envelope(end_pos);
-    const LongCtxProfileKey exact_key{cap, env, trunk_only, use_pipe_slot0};
+    const auto route = select_chunk_attention_route(count, start_pos);
+    const std::uint8_t slot_id =
+        use_pipe_slot0 ? std::uint8_t(pipe_slot & 1U) : std::uint8_t(0U);
+    const LongCtxProfileKey exact_key{cap, env, route, trunk_only,
+                                      use_pipe_slot0, slot_id};
     if (auto it = long_ctx_profiles_.find(exact_key);
         it != long_ctx_profiles_.end()) {
       return &it->second;
     }
-    // Check if an existing precompiled profile covers (cap, env) when warmup is sealed.
+    // Check if an existing precompiled profile covers (cap, env, route) when warmup is sealed.
     Profile *best = nullptr;
     for (auto &[k, prof] : long_ctx_profiles_) {
-      if (k.trunk_only == trunk_only && k.uses_pipe_slot0 == use_pipe_slot0 &&
+      if (k.attn_route == route && k.trunk_only == trunk_only &&
+          k.uses_pipe_slot0 == use_pipe_slot0 && k.pipe_slot == slot_id &&
           k.capacity >= count && k.context_envelope >= end_pos) {
         if (!best || k.capacity < best->capacity ||
             (k.capacity == best->capacity &&
@@ -8449,12 +8589,13 @@ public:
       return best;
     }
     const Ref tok_ref =
-        use_pipe_slot0 ? prefill_pipe_[0].token_ids : Ref{};
+        use_pipe_slot0 ? prefill_pipe_[slot_id].token_ids : Ref{};
     const Ref pos_ref =
-        use_pipe_slot0 ? prefill_pipe_[0].attn_pos : Ref{};
-    const std::string tag = use_pipe_slot0 ? ".pf_pipe0" : "";
+        use_pipe_slot0 ? prefill_pipe_[slot_id].attn_pos : Ref{};
+    const std::string tag =
+        use_pipe_slot0 ? (".pf_pipe" + std::to_string(slot_id)) : "";
     auto prof = compile(cap, false, false, env, false, {}, pos_ref, {}, tag,
-                        trunk_only, tok_ref);
+                        trunk_only, tok_ref, route);
     ensure_profile_icb(context, prof);
     auto [it, _] = long_ctx_profiles_.emplace(exact_key, std::move(prof));
     return &it->second;
@@ -8546,8 +8687,9 @@ public:
   }
 
   AneChunkPlan &get_or_build_ane_chunk_plan(U32 context_envelope,
+                                            ChunkAttentionRoute attn_route,
                                             bool trunk_only) {
-    const auto plan_key = std::make_pair(context_envelope, trunk_only);
+    const AneChunkPlanKey plan_key{context_envelope, attn_route, trunk_only};
     if (auto it = ane_layer_plans_.find(plan_key);
         it != ane_layer_plans_.end()) {
       return it->second;
@@ -8555,13 +8697,15 @@ public:
     const U32 chunk_t = ane_chunk_tokens_;
     const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
     const std::string pkey_sfx = ".ane.c" + std::to_string(chunk_t) + ".e" +
-                                 std::to_string(context_envelope) +
+                                 std::to_string(context_envelope) + ".ar" +
+                                 std::to_string(U32(attn_route)) +
                                  (trunk_only ? ".tr" : ".fl") +
                                  plan_key_suffix();
 
     AneChunkPlan plan;
     plan.chunk_t = chunk_t;
     plan.context_envelope = context_envelope;
+    plan.attn_route = attn_route;
     plan.trunk_only = trunk_only;
     plan.used_w4a8 = use_w4a8;
 
@@ -8632,7 +8776,7 @@ public:
           emit_attention_state_step(
               e, block, block, *page_pool, max_context, kv_format_, query, key,
               value, mixer, attention_positions, chunk_t, false,
-              context_envelope, true);
+              context_envelope, true, std::nullopt, nullptr, attn_route);
           plan.used_sage2 |= e.profile.used_sage2;
           plan.used_minference |= e.profile.used_minference;
           lp.attn_pre_o = e.finish();
@@ -8929,11 +9073,13 @@ public:
     const U32 count = U32(tokens.size());
     const U32 start_pos = next_position;
     const U32 end_pos = start_pos + count;
+    const auto route = select_chunk_attention_route(count, start_pos);
     const U32 env =
-        (minference_enabled_ && end_pos >= kMInferenceMinContextTokens)
+        (route == ChunkAttentionRoute::Sage2MInference ||
+         (route == ChunkAttentionRoute::Sage2Dense && max_context > 4096U))
             ? select_long_ctx_envelope(end_pos)
             : 0U;
-    auto &plan = get_or_build_ane_chunk_plan(env, trunk_only);
+    auto &plan = get_or_build_ane_chunk_plan(env, route, trunk_only);
 
     std::fill_n(token_staging.begin(), count, 0U);
     std::copy(tokens.begin(), tokens.end(), token_staging.begin());
@@ -9191,14 +9337,19 @@ public:
                          kv,
                          q * 2,
                          U32(c.head_dim * 2)});
-    if (sage2_enabled_ && m_rows >= kFlashNaxPrefillMinTokens) {
+    const auto route =
+        select_chunk_attention_route(m_rows, start_pos_for_params);
+    if (route != ChunkAttentionRoute::ExactNax && sage2_enabled_ &&
+        sage2_kv_ws_.buffer != nullptr && m_rows >= kFlashNaxPrefillMinTokens) {
       const bool use_minf =
+          (route == ChunkAttentionRoute::Sage2MInference) &&
           minference_enabled_ &&
-          context_envelope >= kMInferenceMinContextTokens;
+          context_envelope >= kMInferenceMinContextTokens &&
+          minference_scratch.buffer != nullptr;
       emit_paged_flash_prefill_sage2(
           e, c, m_rows, context_envelope, /*is_affine4=*/true, use_minf, query,
           gate_ref, block.state0, block.state1, mixer, table_ref, attn_pos_ref,
-          params,
+          params, sage2_kv_ws_, sage2_kv_ws_layout_,
           use_minf ? std::optional<Ref>{minference_scratch} : std::nullopt);
       e.profile.used_sage2 = true;
       if (use_minf) {
@@ -9330,8 +9481,9 @@ public:
     execute_cow_copies(page_copies);
 
     const U32 end_pos = start_pos + lm;
+    const auto cold_route = select_chunk_attention_route(lm, start_pos);
     const U32 ctx_env =
-        (minference_enabled_ && end_pos >= kMInferenceMinContextTokens)
+        (cold_route != ChunkAttentionRoute::ExactNax)
             ? select_long_ctx_envelope(end_pos)
             : end_pos;
     const bool use_w4a8 = use_w4a8_for_t(lm, false);
@@ -9438,7 +9590,7 @@ public:
         emit_attention_state_step(
             e, block, block, *page_pool, max_context, kv_format_, query, key,
             value, mixer, attention_positions, lm, /*split=*/false, ctx_env,
-            /*dynamic_tokens=*/true);
+            /*dynamic_tokens=*/true, std::nullopt, nullptr, cold_route);
 
         if (li == probe_idx) {
           detail::BlendInt8QuantParams qm{.tokens = lm, .width = q};
@@ -9791,9 +9943,7 @@ public:
       const U32 win_end = win_prefix + win_len;
       const U32 win_rel_base = win_prefix - prefix_tokens;
       const U32 ctx_env =
-          (minference_enabled_ && win_end >= kMInferenceMinContextTokens)
-              ? select_long_ctx_envelope(win_end)
-              : win_end;
+          sage2_enabled_ ? select_long_ctx_envelope(win_end) : win_end;
 
       const auto page_copies = page_pool->begin_append(win_len);
       struct PageGuard {
@@ -11313,16 +11463,22 @@ public:
   bool w4a8_down_proj_ = false;
   Ref a8_qa, a8_sa, a8_ra;
   U32 a8_workspace_mp_ = 0U;
+  static constexpr U32 kDefaultSage2MinEndKv = 0U;
+  static constexpr U32 kDefaultMInferenceMinMeanKv = 4096U;
   bool sage2_enabled_ = false;
   bool minference_enabled_ = false;
+  U32 sage2_min_end_kv_ = kDefaultSage2MinEndKv;
+  U32 minf_min_mean_kv_ = kDefaultMInferenceMinMeanKv;
   Ref minference_scratch;
+  Ref sage2_kv_ws_;
+  Sage2KvWorkspaceLayout sage2_kv_ws_layout_{};
   std::unique_ptr<ane::AneDualOffloadEngine> ane_engine_;
   U32 ane_chunk_tokens_ = 0U;
   bool ane_active_ = false;
   double ane_split_alpha_ = 0.0;
   bool cache_blend_kernels_ready_ = false;
   std::map<LongCtxProfileKey, Profile> long_ctx_profiles_;
-  std::map<std::pair<U32, bool>, AneChunkPlan> ane_layer_plans_;
+  std::map<AneChunkPlanKey, AneChunkPlan> ane_layer_plans_;
   QwenPrefillTelemetry prefill_telemetry_{};
   std::atomic<U64> blend_plan_seq_{1ULL};
   std::shared_ptr<const QwenMergedLoraOverrides> merged_lora_;
@@ -11758,9 +11914,34 @@ bool QwenForward::can_pipeline_prefill(std::size_t count) const noexcept {
     return false;
   if ((p.next_position % 64U) != 0U)
     return false;
-  if (p.can_run_ane_chunk(U32(count), false, false, false) ||
-      p.needs_long_ctx_prefill_profile(U32(count), p.next_position))
+  if (p.can_run_ane_chunk(U32(count), false, false, false))
     return false;
+  const auto route =
+      p.select_chunk_attention_route(U32(count), p.next_position);
+  // WP4: Unlock async double-buffered prefill on Dense Sage2 prefix chunks;
+  // only synchronous MInference (CPU active_counts readback) and ExactNax
+  // long-ctx split tails stay off the async pipe.
+  if (route == QwenForward::Impl::ChunkAttentionRoute::Sage2MInference)
+    return false;
+  if (p.needs_long_ctx_prefill_profile(U32(count), p.next_position)) {
+    if (route != QwenForward::Impl::ChunkAttentionRoute::Sage2Dense)
+      return false;
+    if (p.context.warmup_sealed()) {
+      const std::uint8_t slot_id = std::uint8_t(p.prefill_pipe_cursor_ & 1U);
+      const U32 end_pos = p.next_position + U32(count);
+      bool found_icb = false;
+      for (const auto &[k, prof] : p.long_ctx_profiles_) {
+        if (k.attn_route == route && k.trunk_only && k.uses_pipe_slot0 &&
+            k.pipe_slot == slot_id && k.capacity >= count &&
+            k.context_envelope >= end_pos && prof.icb.has_value()) {
+          found_icb = true;
+          break;
+        }
+      }
+      if (!found_icb)
+        return false;
+    }
+  }
   if (p.prefill_pipe_[0].profiles.empty() ||
       p.prefill_pipe_[1].profiles.empty() ||
       !p.prefill_pipe_[0].profiles.front().icb.has_value() ||
@@ -11781,13 +11962,23 @@ QwenForward::enqueue_prefill_step(std::span<const U32> tokens) {
 
   const U32 slot_i = p.prefill_pipe_cursor_ & 1U;
   auto &pp = p.prefill_pipe_[slot_i];
-  auto found = std::find_if(pp.profiles.begin(), pp.profiles.end(),
-                            [&](const Profile &prof) {
-                              return tokens.size() <= prof.capacity;
-                            });
-  if (found == pp.profiles.end() || !found->icb.has_value())
+  Profile *selected_ptr = nullptr;
+  if (p.needs_long_ctx_prefill_profile(U32(tokens.size()), p.next_position)) {
+    selected_ptr = p.select_long_ctx_prefill_profile(
+        U32(tokens.size()), p.next_position, /*trunk_only=*/true,
+        /*use_pipe_slot0=*/true, slot_i);
+  } else {
+    auto found = std::find_if(pp.profiles.begin(), pp.profiles.end(),
+                              [&](const Profile &prof) {
+                                return tokens.size() <= prof.capacity;
+                              });
+    if (found != pp.profiles.end()) {
+      selected_ptr = &(*found);
+    }
+  }
+  if (selected_ptr == nullptr || !selected_ptr->icb.has_value())
     throw std::out_of_range("Qwen async prefill profile capacity unavailable");
-  auto &profile = *found;
+  auto &profile = *selected_ptr;
 
   const U32 start_pos = p.next_position;
   const U32 count = U32(tokens.size());

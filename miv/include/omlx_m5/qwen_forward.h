@@ -73,6 +73,7 @@ struct QwenForwardMemoryPlan {
   std::uint64_t workspace_bytes = 0;
   std::uint64_t state_bytes = 0;
   std::uint64_t largest_buffer_bytes = 0;
+  std::uint64_t sage2_kv_workspace_bytes = 0;
   std::uint32_t feature_ring_rows = 0;
   std::uint32_t workspace_rows = 1024;
   [[nodiscard]] std::uint64_t buffer_bytes() const;
@@ -98,7 +99,8 @@ plan_qwen_forward_memory(const QwenModelConfig &, std::uint32_t max_context,
                          std::uint32_t kv_pool_pages = 0,
                          bool flash_nax_prefill = false,
                          bool enable_w4a8_workspace = false,
-                         bool enable_minference_workspace = false);
+                         bool enable_minference_workspace = false,
+                         bool enable_sage2_kv_workspace = false);
 
 struct QwenLoadBudget {
   std::uint64_t required_bytes = 0;

@@ -13,6 +13,7 @@
 #include "omlx_m5/metal.h"
 #include "omlx_m5/model_config.h"
 #include "omlx_m5/quantization.h"
+#include "omlx_m5/qwen_forward.h"
 
 #include <algorithm>
 #include <array>
@@ -162,14 +163,38 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
       {.key = "m2.minf",
        .path = libs / "omlx_m5_attention_minference.metallib"});
 
-  // 1A. Verify SRAM <= 28.5 KiB (29,184 B) across all Sage2 & MInference kernels.
+  // 1A. Verify WP2.2 SRAM caps:
+  //     - ALL attention_sage2.metal kernels <= 15.5 KiB (15,872 B)
+  //     - ALL attention_minference.metal kernels <= 16.0 KiB (16,384 B)
   // Note: MTL_SHADER_VALIDATION=1 instruments TG memory (~2x static TG bytes).
   const char *sv_env = std::getenv("MTL_SHADER_VALIDATION");
   const bool sv_on = sv_env != nullptr && std::string_view(sv_env) != "0" &&
                      !std::string_view(sv_env).empty();
-  const U64 sram_cap = sv_on ? (29184ULL * 2ULL + 1024ULL) : 29184ULL;
+  const U64 sage2_sram_cap = sv_on ? 32768ULL : 15872ULL;
+  const U64 minf_sram_cap = sv_on ? 32768ULL : 16384ULL;
   Json sram = Json::object();
-  for (const U32 wm : {4u, 6u, 8u}) {
+  Json max_tptg = Json::object();
+  for (const char *fn : {
+           "omlx_m5_sage2_compute_valid_kv",
+           "omlx_m5_sage2_prepare_k_affine4_g128_hd256",
+           "omlx_m5_sage2_prepare_k_bf16_hd256",
+       }) {
+    const auto pi = ctx.warmup_pipeline(
+        {.key = std::string("m2.s2.") + fn,
+         .library_key = "m2.sage2",
+         .function_name = fn,
+         .variant = "v1"});
+    require(pi.static_threadgroup_memory_bytes <= sage2_sram_cap,
+            std::string(fn) + " exceeded 15.5 KiB SRAM cap: " +
+                std::to_string(pi.static_threadgroup_memory_bytes));
+    require(pi.max_threads_per_threadgroup >= 256ULL,
+            std::string(fn) + " max_threads_per_threadgroup < 256: " +
+                std::to_string(pi.max_threads_per_threadgroup));
+    sram[fn] = pi.static_threadgroup_memory_bytes;
+    max_tptg[fn] = pi.max_threads_per_threadgroup;
+  }
+  for (const U32 wm : {2u}) {
+    const U64 need_tptg = U64(wm) * 128ULL;
     for (const bool is_aff4 : {true, false}) {
       for (const Sage2PvMode pv : {Sage2PvMode::Mxfp8, Sage2PvMode::Fp16}) {
         for (const bool sp : {false, true}) {
@@ -179,19 +204,23 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
                .library_key = "m2.sage2",
                .function_name = fn,
                .variant = "v1"});
-          require(pi.static_threadgroup_memory_bytes <= sram_cap,
-                  std::string(fn) + " exceeded 28.5 KiB SRAM cap: " +
+          require(pi.static_threadgroup_memory_bytes <= sage2_sram_cap,
+                  std::string(fn) + " exceeded 15.5 KiB SRAM cap: " +
                       std::to_string(pi.static_threadgroup_memory_bytes));
+          require(pi.max_threads_per_threadgroup >= need_tptg,
+                  std::string(fn) + " max_threads_per_threadgroup < " +
+                      std::to_string(need_tptg) + ": " +
+                      std::to_string(pi.max_threads_per_threadgroup));
           sram[fn] = pi.static_threadgroup_memory_bytes;
+          max_tptg[fn] = pi.max_threads_per_threadgroup;
         }
       }
     }
   }
   for (const char *fn : {
-           "omlx_m5_minference_probe_stats_affine4_g128_hd256",
-           "omlx_m5_minference_probe_stats_bf16_hd256",
-           "omlx_m5_minference_probe_score_affine4_g128_hd256",
-           "omlx_m5_minference_probe_score_bf16_hd256",
+           "omlx_m5_minference_probe_stats_i8",
+           "omlx_m5_minference_probe_reduce_and_clear",
+           "omlx_m5_minference_probe_accum_i8",
            "omlx_m5_minference_select_topk",
            "omlx_m5_minference_build_indices",
        }) {
@@ -200,15 +229,19 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
          .library_key = "m2.minf",
          .function_name = fn,
          .variant = "v1"});
-    require(pi.static_threadgroup_memory_bytes <= sram_cap,
-            std::string(fn) + " exceeded 28.5 KiB SRAM cap: " +
+    require(pi.static_threadgroup_memory_bytes <= minf_sram_cap,
+            std::string(fn) + " exceeded 16.0 KiB SRAM cap: " +
                 std::to_string(pi.static_threadgroup_memory_bytes));
+    require(pi.max_threads_per_threadgroup >= 256ULL,
+            std::string(fn) + " max_threads_per_threadgroup < 256: " +
+                std::to_string(pi.max_threads_per_threadgroup));
     if (std::string_view(fn) == "omlx_m5_minference_build_indices" && !sv_on) {
       require(pi.static_threadgroup_memory_bytes <= 2048ULL,
               "minference_build_indices exceeded 2 KiB SRAM cap: " +
                   std::to_string(pi.static_threadgroup_memory_bytes));
     }
     sram[fn] = pi.static_threadgroup_memory_bytes;
+    max_tptg[fn] = pi.max_threads_per_threadgroup;
   }
 
   // 1B. INT8 16x32x128 Identity & Exact Matrix Multiply Probe
@@ -343,12 +376,56 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
           "MXFP8 16x128x32 probe mismatch: cos_sim=" + std::to_string(mxfp8_cos) +
               " q_max_abs=" + std::to_string(q_max_abs));
 
+  // 1D. Mixed INT8 x FP32 -> FP32 16x16x128 Delta NAX Probe
+  std::vector<float> mu_mat(16 * 128);
+  for (int b = 0; b < 16; ++b)
+    for (int d = 0; d < 128; ++d)
+      mu_mat[b * 128 + d] =
+          float(((b * 37 + d * 13 + 11) % 201) - 100) * 0.08f;
+  const auto mub = ctx.upload(std::as_bytes(std::span(mu_mat)));
+  auto db_out = ctx.make_buffer(16 * 16 * sizeof(float));
+  auto fb_out = ctx.make_buffer(4 * sizeof(U32));
+  Encoder e_del(ctx, libs, 16u, "m2.probe.delta");
+  auto &d_del = e_del.emit("attention_sage2", "omlx_m5_sage2_probe_delta_16x16x128",
+                           {.width = 32u}, {.width = 32u},
+                           {{&qb, 0, qb.size()},
+                            {&mub, 0, mub.size()},
+                            {&db_out, 0, db_out.size()},
+                            {&fb_out, 0, fb_out.size()}});
+  e_del.dynamic(d_del, 4, words({0u}));
+  auto p_del = e_del.finish();
+  exec_profile(ctx, p_del);
+
+  const auto d_gpu = read_f32(db_out, 16 * 16);
+  const auto d_flags = read_u32(fb_out, 4);
+  double delta_max_abs = 0.0;
+  for (int r = 0; r < 16; ++r) {
+    for (int b = 0; b < 16; ++b) {
+      double ref = 0.0;
+      for (int d = 0; d < 128; ++d) {
+        ref += double(q_i8[r * 128 + d]) * double(mu_mat[b * 128 + d]);
+      }
+      require(std::isfinite(d_gpu[r * 16 + b]), "Delta probe non-finite");
+      delta_max_abs = std::max(delta_max_abs, std::abs(double(d_gpu[r * 16 + b]) - ref));
+    }
+  }
+  require(delta_max_abs <= 1e-2,
+          "INT8xFP32 16x16x128 Delta probe mismatch: max_abs=" +
+              std::to_string(delta_max_abs));
+
   return {{"int8_16x32x128_exact", true},
           {"int8_coords_bijective", true},
+          {"delta_16x16x128_max_abs", delta_max_abs},
+          {"delta_ct_q_matches_mu", d_flags[0] != 0u},
+          {"delta_ct_q_cap", d_flags[1]},
+          {"delta_ct_qm_cap", d_flags[2]},
+          {"delta_ct_df_cap", d_flags[3]},
           {"mxfp8_16x128x32_cos_sim", mxfp8_cos},
           {"mxfp8_16x128x32_exact_q_max_abs", q_max_abs},
-          {"all_sram_le_28_5kib", true},
-          {"sram_bytes", sram}};
+          {"all_sage2_sram_le_15_5kib", true},
+          {"all_minf_sram_le_16_0kib", true},
+          {"sram_bytes", sram},
+          {"max_threads_per_threadgroup", max_tptg}};
 }
 
 // ============================================================================
@@ -356,14 +433,14 @@ Json test_hardware_probes_and_sram(const MetalContext &ctx,
 // ============================================================================
 Json test_mu_k_sink_nan_trap(const MetalContext &ctx,
                              const std::filesystem::path &libs, U32 qh, U32 kvh,
-                             bool is_affine4) {
+                             bool is_affine4, U32 history = 101u) {
   constexpr U32 hd = 256u;
   constexpr U32 page_tokens = 64u;
-  // History = 101, Tokens = 64 -> total_kv = 165 = 5*32 + 5 (final block valid_k = 5!)
-  constexpr U32 history = 101u;
+  // Default history=101, tokens=64 -> total_kv=165 (5*32+5, valid_k=5).
+  // Also tested with history=549 -> total_kv=613 (19*32+5, crossing 16-block Delta boundary!).
   constexpr U32 tokens = 64u;
-  constexpr U32 total_kv = history + tokens; // 165 -> 3 pages (192 slots, 27 NaN tail!)
-  constexpr U32 pages = (total_kv + page_tokens - 1u) / page_tokens;
+  const U32 total_kv = history + tokens;
+  const U32 pages = (total_kv + page_tokens - 1u) / page_tokens;
 
   const auto cfg = make_cfg(qh, kvh, hd);
   const U32 q_stride = qh * hd * 2u;
@@ -401,11 +478,12 @@ Json test_mu_k_sink_nan_trap(const MetalContext &ctx,
   for (U32 pos = 0; pos < total_kv; ++pos) {
     const U32 tile = pos / 32u;
     float tile_bias = 0.0f;
-    if (tile == 0u) tile_bias = +8.0f;
-    else if (tile == 1u) tile_bias = -8.0f;
-    else if (tile == 2u) tile_bias = +6.0f;
-    else if (tile == 3u) tile_bias = -6.0f;
-    else if (tile == 4u) tile_bias = +4.0f;
+    const U32 tmod = tile % 6u;
+    if (tmod == 0u) tile_bias = +8.0f;
+    else if (tmod == 1u) tile_bias = -8.0f;
+    else if (tmod == 2u) tile_bias = +6.0f;
+    else if (tmod == 3u) tile_bias = -6.0f;
+    else if (tmod == 4u) tile_bias = +4.0f;
     else tile_bias = -4.0f;
 
     for (U32 h = 0; h < kvh; ++h) {
@@ -572,19 +650,25 @@ Json test_mu_k_sink_nan_trap(const MetalContext &ctx,
     }
   }
 
+  const auto kv_ws_lo = plan_sage2_kv_workspace(kvh, total_kv);
+  auto kv_ws = ctx.make_private_buffer(kv_ws_lo.total_bytes);
+
   Json modes = Json::object();
   for (const char *mode_str : {"fp16", "mxfp8"}) {
     ScopedEnv env_pv("OMLX_M5_SAGE2_PV_MODE", mode_str);
     auto out_s2 = ctx.make_buffer(out_elems * 2ULL);
     Encoder enc_s2(ctx, libs, tokens, std::string("m2.trap.sage2.") + mode_str);
-    // Also verify short-context MInference bypass (total_kv = 165 < 4096)!
+    // Also verify short-context MInference bypass (total_kv < 4096):
+    // exactly 3 dispatches (compute_valid_kv + prepare_k + sage2_attn, 0 MInf)!
     emit_paged_flash_prefill_sage2(
         enc_s2, cfg, tokens, total_kv, is_affine4, /*sparse_minference=*/true,
         ref_of(qb), sub(ref_of(qb), hd * 2u), ref_of(*kb_storage),
-        ref_of(*vb_storage), ref_of(out_s2), ref_of(ptb), ref_of(posb), params);
+        ref_of(*vb_storage), ref_of(out_s2), ref_of(ptb), ref_of(posb), params,
+        ref_of(kv_ws), kv_ws_lo);
     auto prof_s2 = enc_s2.finish();
-    require(prof_s2.plan.dispatch_count() == 1u,
-            "Short-context (<4096) MInference bypass failed!");
+    require(prof_s2.plan.dispatch_count() == 3u,
+            "Short-context (<4096) MInference bypass failed: dispatches=" +
+                std::to_string(prof_s2.plan.dispatch_count()));
     require(prof_s2.attention_kernel.find(mode_str) != std::string::npos,
             "OMLX_M5_SAGE2_PV_MODE=" + std::string(mode_str) +
                 " did not select matching kernel: " + prof_s2.attention_kernel);
@@ -805,11 +889,13 @@ Json test_minference_needle_slash(const MetalContext &ctx,
   exec_profile(ctx, prof_d);
   const auto dense_bits = read_u16(out_dense, out_elems);
 
-  // 2. Sage2 + MInference sparse path (allocate <= 2.26 MiB scratch!)
+  // 2. Sage2 + MInference sparse path (allocate <= 2.26 MiB scratch + sage2_kv_ws!)
   const auto lo = plan_minference_scratch(tokens, qh, kvh, total_kv);
   require(lo.total_bytes <= 2370000ull,
           "MInference scratch exceeded 2.26 MiB budget: " +
               std::to_string(lo.total_bytes));
+  const auto kv_ws_lo = plan_sage2_kv_workspace(kvh, total_kv);
+  auto kv_ws = ctx.make_private_buffer(kv_ws_lo.total_bytes);
   auto scratch = ctx.make_buffer(lo.total_bytes);
   auto out_sp = ctx.make_buffer(out_elems * 2ULL);
 
@@ -818,7 +904,7 @@ Json test_minference_needle_slash(const MetalContext &ctx,
       enc_sp, cfg, tokens, total_kv, is_affine4, /*sparse_minference=*/true,
       ref_of(qb), sub(ref_of(qb), hd * 2u), ref_of(*kb_storage),
       ref_of(*vb_storage), ref_of(out_sp), ref_of(ptb), ref_of(posb), params,
-      ref_of(scratch), Sage2PvMode::Fp16);
+      ref_of(kv_ws), kv_ws_lo, ref_of(scratch), Sage2PvMode::Fp16);
   auto prof_sp = enc_sp.finish();
   exec_profile(ctx, prof_sp);
 
@@ -925,7 +1011,7 @@ Json test_minference_needle_slash(const MetalContext &ctx,
       enc_sp_mx, cfg, tokens, total_kv, is_affine4, /*sparse_minference=*/true,
       ref_of(qb), sub(ref_of(qb), hd * 2u), ref_of(*kb_storage),
       ref_of(*vb_storage), ref_of(out_sp_mx), ref_of(ptb), ref_of(posb), params,
-      ref_of(scratch), Sage2PvMode::Mxfp8);
+      ref_of(kv_ws), kv_ws_lo, ref_of(scratch), Sage2PvMode::Mxfp8);
   auto prof_sp_mx = enc_sp_mx.finish();
   exec_profile(ctx, prof_sp_mx);
   const auto sp_mx_bits = read_u16(out_sp_mx, out_elems);
@@ -1042,6 +1128,8 @@ Json test_minference_reusable_profile_patch(const MetalContext &ctx,
 
   const auto lo = plan_minference_scratch(capacity, qh, kvh, total_kv);
   auto scratch = ctx.make_buffer(lo.total_bytes);
+  const auto kv_ws_lo = plan_sage2_kv_workspace(kvh, total_kv);
+  auto kv_ws = ctx.make_private_buffer(kv_ws_lo.total_bytes);
 
   // Compile ONE reusable Profile at capacity=256!
   const auto cap_params = words({qh, kvh, hd, capacity, history,
@@ -1053,7 +1141,7 @@ Json test_minference_reusable_profile_patch(const MetalContext &ctx,
       enc_sp, cfg, capacity, total_kv, /*is_affine4=*/true,
       /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
       ref_of(kb), ref_of(vb), ref_of(out_sp), ref_of(ptb), ref_of(posb),
-      cap_params, ref_of(scratch), Sage2PvMode::Fp16);
+      cap_params, ref_of(kv_ws), kv_ws_lo, ref_of(scratch), Sage2PvMode::Fp16);
   auto prof_sp = enc_sp.finish();
 
   // Verify BOTH MInference (mp_bytes) AND Sage2 (sp_bytes) registered patches!
@@ -1216,13 +1304,14 @@ Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
   const U32 q_stride = qh * hd * 2u;
   const U32 kv_width = kvh * hd;
 
-  // q_blk 0 spans pos=100..107 (tok 0..7) AND pos=32693..32700 (tok 8..15)!
-  // q_blk 1 spans pos=32701..32716 (tok 16..31).
+  // q_blk 0 (bm_tok=5 on wm2, 8 on wm3) spans pos=100..101 (tok 0..1) AND
+  // pos=32698..32700 (tok 2..4)!
   std::vector<U32> positions(tokens);
-  for (U32 t = 0; t < 8u; ++t) positions[t] = 100u + t;
-  for (U32 t = 8u; t < 16u; ++t) positions[t] = 32693u + (t - 8u);
-  for (U32 t = 16u; t < 32u; ++t) positions[t] = 32701u + (t - 16u);
-  require(positions[0] == 100u && positions[15] == kSelfFarPos,
+  positions[0] = 100u;
+  positions[1] = 101u;
+  for (U32 t = 2u; t < 16u; ++t) positions[t] = 32698u + (t - 2u);
+  for (U32 t = 16u; t < 32u; ++t) positions[t] = 32712u + (t - 16u);
+  require(positions[0] == 100u && positions[4] == kSelfFarPos,
           "Wide-span CacheBlend positions setup error");
 
   std::vector<U32> page_table(pages);
@@ -1261,9 +1350,9 @@ Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
   for (U32 pos = 0; pos < total_kv; ++pos) {
     const bool is_needle = (pos == kNeedlePos);
     const bool is_slash_far =
-        (pos + kSlashLagFar >= 32693u && pos + kSlashLagFar <= 32716u);
-    const bool is_self_far = (pos >= 32693u && pos <= 32716u);
-    const bool is_self_near = (pos >= 100u && pos <= 107u);
+        (pos + kSlashLagFar >= 32698u && pos + kSlashLagFar <= 32727u);
+    const bool is_self_far = (pos >= 32698u && pos <= 32727u);
+    const bool is_self_near = (pos >= 100u && pos <= 101u);
     for (U32 h = 0; h < kvh; ++h) {
       const U64 base = (U64(pos) * kvh + h) * hd;
       for (U32 d = 0; d < hd; ++d) {
@@ -1345,13 +1434,15 @@ Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
 
   const auto lo = plan_minference_scratch(tokens, qh, kvh, total_kv);
   auto scratch = ctx.make_buffer(lo.total_bytes);
+  const auto kv_ws_lo = plan_sage2_kv_workspace(kvh, total_kv);
+  auto kv_ws = ctx.make_private_buffer(kv_ws_lo.total_bytes);
   auto out_fp16 = ctx.make_buffer(out_elems * 2ULL);
   Encoder enc_fp16(ctx, libs, tokens, "m2.minf.wide.fp16");
   emit_paged_flash_prefill_sage2(
       enc_fp16, cfg, tokens, total_kv, /*is_affine4=*/true,
       /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
       ref_of(kb), ref_of(vb), ref_of(out_fp16), ref_of(ptb), ref_of(posb),
-      params, ref_of(scratch), Sage2PvMode::Fp16);
+      params, ref_of(kv_ws), kv_ws_lo, ref_of(scratch), Sage2PvMode::Fp16);
   auto prof_fp16 = enc_fp16.finish();
   exec_profile(ctx, prof_fp16);
 
@@ -1404,7 +1495,7 @@ Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
       enc_mx, cfg, tokens, total_kv, /*is_affine4=*/true,
       /*sparse_minference=*/true, ref_of(qb), sub(ref_of(qb), hd * 2u),
       ref_of(kb), ref_of(vb), ref_of(out_mx), ref_of(ptb), ref_of(posb),
-      params, ref_of(scratch), Sage2PvMode::Mxfp8);
+      params, ref_of(kv_ws), kv_ws_lo, ref_of(scratch), Sage2PvMode::Mxfp8);
   auto prof_mx = enc_mx.finish();
   exec_profile(ctx, prof_mx);
   const auto m_mx = compare_bf16_vs_bf16(read_u16(out_mx, out_elems), dense_bits);
@@ -1423,6 +1514,57 @@ Json test_minference_wide_span_cacheblend(const MetalContext &ctx,
           {"mxfp8pv_cos_sim", m_mx.cos_sim}};
 }
 
+Json test_wp2_memory_plan_accounting() {
+  QwenModelConfig cfg = make_cfg(24u, 4u, 256u);
+  cfg.hidden_size = 5120;
+  cfg.intermediate_size = 17408;
+  cfg.num_hidden_layers = 64;
+  cfg.vocab_size = 248320;
+  cfg.linear_num_key_heads = 16;
+  cfg.linear_num_value_heads = 48;
+  cfg.linear_key_head_dim = 128;
+  cfg.linear_value_head_dim = 128;
+  cfg.linear_conv_kernel_dim = 4;
+  cfg.layer_types.assign(64u, LayerType::linear_attention);
+  for (std::size_t i = 3u; i < 64u; i += 4u) {
+    cfg.layer_types[i] = LayerType::full_attention;
+  }
+
+  constexpr U32 kMaxCtx = 131072u;
+  const auto plan_off = plan_qwen_forward_memory(
+      cfg, kMaxCtx, 0u, false, false, false, false, false, false, 0u, 2048u,
+      true, 0u, true, true, true, false);
+  const auto plan_on = plan_qwen_forward_memory(
+      cfg, kMaxCtx, 0u, false, false, false, false, false, false, 0u, 2048u,
+      true, 0u, true, true, true, true);
+  const auto kv_lo = plan_sage2_kv_workspace(4u, kMaxCtx);
+
+  require(plan_off.sage2_kv_workspace_bytes == 0ULL,
+          "Secondary/non-Sage2 plan must allocate 0 B for sage2_kv_workspace");
+  require(plan_on.sage2_kv_workspace_bytes == kv_lo.total_bytes &&
+              plan_on.sage2_kv_workspace_bytes > 0ULL,
+          "Primary Sage2 plan sage2_kv_workspace_bytes mismatch");
+  require(plan_on.buffer_bytes() ==
+              plan_off.buffer_bytes() + kv_lo.total_bytes &&
+          plan_on.workspace_bytes ==
+              plan_off.workspace_bytes + kv_lo.total_bytes,
+          "buffer_bytes/workspace_bytes must include sage2_kv_workspace_bytes exactly once");
+  require((kv_lo.k_int8_off & 255ULL) == 0ULL &&
+              (kv_lo.mu_k_off & 255ULL) == 0ULL &&
+              (kv_lo.s_k_off & 255ULL) == 0ULL &&
+              (kv_lo.valid_kv_off & 255ULL) == 0ULL,
+          "Sage2KvWorkspaceLayout sub-buffers must be 256-byte aligned");
+  require((kv_lo.pad_kv_blocks % 16ULL) == 0ULL &&
+              kv_lo.pad_kv_blocks >= kv_lo.max_kv_blocks,
+          "Sage2KvWorkspaceLayout pad_kv_blocks must be 16-block aligned");
+  return {{"max_context", kMaxCtx},
+          {"k_int8_bytes", kv_lo.k_int8_bytes},
+          {"mu_k_bytes", kv_lo.mu_k_bytes},
+          {"s_k_bytes", kv_lo.s_k_bytes},
+          {"total_workspace_bytes", kv_lo.total_bytes},
+          {"secondary_slot_bytes", plan_off.sage2_kv_workspace_bytes}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1437,12 +1579,14 @@ int main(int argc, char **argv) {
     Json report;
     report["device"] = ctx.capabilities().device_name;
     report["hardware_probes"] = test_hardware_probes_and_sram(ctx, libs);
+    report["wp2_memory_accounting"] = test_wp2_memory_plan_accounting();
 
     Json trap_cases = Json::array();
-    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 24u, 4u, false));
-    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 24u, 4u, true));
-    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 16u, 2u, false));
-    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 16u, 2u, true));
+    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 24u, 4u, false, 101u));
+    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 24u, 4u, true, 101u));
+    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 24u, 4u, true, 549u));
+    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 16u, 2u, false, 101u));
+    trap_cases.push_back(test_mu_k_sink_nan_trap(ctx, libs, 16u, 2u, true, 101u));
     report["mu_k_sink_nan_trap"] = trap_cases;
 
     Json minf_cases = Json::array();
