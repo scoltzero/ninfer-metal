@@ -151,7 +151,36 @@ M5RT_DEFAULT_CONVERTER: dict[str, Any] = {
     "output_filename": "model.miv",
     "artifact_extension": ".miv",
     "default_args": ["--nax-pretile"],
-    "supported_quant_modes": ["affine", "mxfp4", "mxfp4-pack-quantized"],
+    "supported_quant_modes": [
+        "affine",
+        "mxfp4",
+        "mxfp4-pack-quantized",
+        "bf16",
+        "fp16",
+        "mixed",
+    ],
+}
+M5RT_DEFAULT_ARCHITECTURE_CAPABILITIES: dict[str, Any] = {
+    "topologies": ["gdn_hybrid_gqa", "pure_gqa_swiglu", "dflash2_draft"],
+    "model_type_whitelist_enforced": False,
+    "attn_output_gate": [True, False],
+    "qk_norm": [True, False],
+    "head_dims": [64, 128, 256],
+    "moe": {
+        "min_experts": 2,
+        "max_experts": 256,
+        "min_top_k": 1,
+        "max_top_k": 8,
+        "shared_expert": "optional",
+    },
+    "quantization": {
+        "affine_bits": [3, 4, 5, 6, 8],
+        "affine_group_sizes": [64, 128],
+        "mxfp4_group_sizes": [32],
+        "direct_dtypes": ["bf16", "f16"],
+        "per_tensor_mixed_precision": True,
+        "strip_non_text_vlm": True,
+    },
 }
 M5RT_DEFAULT_CAPABILITIES: tuple[str, ...] = (
     "ar",
@@ -1777,6 +1806,7 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
         "options_schema": [dict(s) for s in M5RT_DEFAULT_OPTIONS_SCHEMA],
         "artifact_extensions": list(M5RT_ARTIFACT_EXTENSIONS),
         "converter": dict(M5RT_DEFAULT_CONVERTER),
+        "architecture_capabilities": dict(M5RT_DEFAULT_ARCHITECTURE_CAPABILITIES),
     }
     for root in _provider_root_dirs():
         if not root.is_dir():
@@ -1788,6 +1818,11 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
             vals = installed.get(key)
             if isinstance(vals, list) and vals:
                 manifest[key] = vals
+        if isinstance(installed.get("architecture_capabilities"), dict):
+            merged_arch_caps = dict(M5RT_DEFAULT_ARCHITECTURE_CAPABILITIES)
+            merged_arch_caps.update(installed["architecture_capabilities"])
+            merged_arch_caps["model_type_whitelist_enforced"] = False
+            manifest["architecture_capabilities"] = merged_arch_caps
         for union_key, default_vals in (
             ("capabilities", M5RT_DEFAULT_CAPABILITIES),
             ("supported_standard_settings", M5RT_SUPPORTED_STANDARD_SETTINGS),
@@ -1943,6 +1978,117 @@ def _extract_model_type_tokens(
     return tokens
 
 
+def _has_miv_container_magic(path: Path | None) -> bool:
+    """Fast 8-byte check whether `path` begins with `MIV00001` or `OMLXM5A1`."""
+    if path is None:
+        return False
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(8)
+        return len(magic) == 8 and magic in _MIV_VALID_MAGICS
+    except OSError:
+        return False
+
+
+def _foreign_spi_claims_model_artifact(model_types: set[str], ext: str) -> bool:
+    """Return True when an installed Path B SPI provider explicitly claims `(model_types, ext)`."""
+    if not model_types:
+        return False
+    norm_ext = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+    for base in _provider_search_bases():
+        if not base.is_dir():
+            continue
+        try:
+            children = sorted(base.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in children:
+            if not entry.is_dir() or entry.name in M5RT_BUILTIN_PROVIDER_IDS:
+                continue
+            for cand_root in (entry / "current", entry):
+                if not cand_root.is_dir():
+                    continue
+                parsed = _read_provider_manifest(cand_root)
+                if parsed is None:
+                    continue
+                pid = str(parsed.get("provider_id") or entry.name).strip()
+                if not pid or pid in M5RT_BUILTIN_PROVIDER_IDS:
+                    break
+                p_exts = _normalize_extensions(parsed.get("artifact_extensions"))
+                p_types = {
+                    str(m).strip().lower()
+                    for m in (parsed.get("supported_model_types") or ())
+                    if isinstance(m, str) and m.strip()
+                }
+                if norm_ext in p_exts and (model_types & p_types):
+                    return True
+                break
+    return False
+
+
+def _config_structural_blocker(config: dict[str, Any] | None) -> str:
+    """Fast config-only check for incompatible architectures on adapted/candidate directories."""
+    if not isinstance(config, dict):
+        return ""
+    text_cfg = _text_config(config)
+    for mla_key in (
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    ):
+        if text_cfg.get(mla_key) is not None or config.get(mla_key) is not None:
+            return (
+                f"MLA (Multi-head Latent Attention) architecture is not supported by "
+                f"{M5RT_ENGINE_LABEL} (found config key {mla_key!r})"
+            )
+    for ssm_key in ("mamba_d_state", "ssm_state_size", "mamba_d_conv"):
+        val = text_cfg.get(ssm_key) if text_cfg.get(ssm_key) is not None else config.get(ssm_key)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return (
+                f"Mamba/SSM architecture is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found config key {ssm_key!r}={val})"
+            )
+    raw_ltypes = text_cfg.get("layer_types")
+    if isinstance(raw_ltypes, list):
+        for idx, lt in enumerate(raw_ltypes):
+            lt_s = str(lt or "").strip()
+            if lt_s not in ("full_attention", "linear_attention"):
+                if "mamba" in lt_s.lower() or "ssm" in lt_s.lower():
+                    return (
+                        f"Mamba/SSM layer_type {lt_s!r} at layer {idx} is not supported "
+                        f"by {M5RT_ENGINE_LABEL}"
+                    )
+                return (
+                    f"Unsupported layer_type {lt_s!r} at layer {idx} "
+                    "(supported: 'full_attention', 'linear_attention')"
+                )
+    hidden_act = text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
+    if isinstance(hidden_act, str) and hidden_act.strip():
+        if hidden_act.strip().lower() not in ("silu", "swiglu"):
+            return (
+                f"Unsupported hidden_act={hidden_act!r} "
+                f"({M5RT_ENGINE_LABEL} requires 'silu' / SwiGLU)"
+            )
+    raw_experts = (
+        text_cfg.get("num_experts")
+        if text_cfg.get("num_experts") is not None
+        else (
+            text_cfg.get("n_routed_experts")
+            if text_cfg.get("n_routed_experts") is not None
+            else text_cfg.get("num_local_experts")
+        )
+    )
+    if isinstance(raw_experts, int) and not isinstance(raw_experts, bool) and raw_experts != 0:
+        if raw_experts < 2 or raw_experts > 256:
+            return (
+                f"MoE num_experts={raw_experts} is outside {M5RT_ENGINE_LABEL} "
+                "supported range [2, 256]"
+            )
+    return ""
+
+
 def _probe_provider_adapted(
     model_dir: str | Path,
     manifest: dict[str, Any],
@@ -1952,9 +2098,10 @@ def _probe_provider_adapted(
 
     Checks in order with zero subprocess spawn and zero full-file hashing:
       (a) explicit `provider_id` / `engine_id` in `model_pack.json` / `omlxm5-manifest.json`,
-      (b) `topology_id` or `config.json` `model_type` against `manifest["supported_topologies"]`
-          and `manifest["supported_model_types"]`, and
-      (c) artifact files matching `manifest.get("artifact_extensions", [".omlxm5"])`.
+      (b) structural capability check for built-in `m5rt` (decoupled from `model_type` string
+          whitelist!), or `supported_topologies` / `supported_model_types` for third-party
+          Path B providers unless `architecture_capabilities.model_type_whitelist_enforced` is False,
+      (c) artifact files matching `manifest.get("artifact_extensions", [".miv", ".omlxm5"])`.
     """
     mdir = Path(model_dir).expanduser()
     provider_id = str(manifest.get("provider_id") or "").strip()
@@ -1965,6 +2112,11 @@ def _probe_provider_adapted(
         if isinstance(x, str) and x.strip()
     ]
     is_builtin = (engine_id == M5RT_ENGINE_ID) or (provider_id in M5RT_BUILTIN_PROVIDER_IDS)
+    arch_caps = manifest.get("architecture_capabilities")
+    whitelist_enforced = (not is_builtin) and not (
+        isinstance(arch_caps, dict)
+        and arch_caps.get("model_type_whitelist_enforced") is False
+    )
     identity_tokens = {tok.lower() for tok in (provider_id, engine_id, *legacy_ids) if tok}
     if is_builtin:
         identity_tokens.update(k.lower() for k in M5RT_OPTION_KEYS)
@@ -1975,6 +2127,8 @@ def _probe_provider_adapted(
         for t in (manifest.get("supported_topologies") or ())
         if isinstance(t, str) and t.strip()
     }
+    if is_builtin:
+        supported_topologies.update({"gdn_hybrid_gqa", "pure_gqa_swiglu"})
     supported_model_types = {
         str(m).strip().lower()
         for m in (manifest.get("supported_model_types") or ())
@@ -2041,8 +2195,14 @@ def _probe_provider_adapted(
         if pack_provider is not None or pack_engine is not None:
             explicit_provider_match = True
 
-    # (b) Topology / config.json model_type compatibility check
+    # (b) Topology / structural compatibility check
     config = _read_json(mdir / "config.json") if (mdir / "config.json").is_file() else None
+    if is_builtin and not explicit_provider_match and _is_dflash_family_architecture(config)[0]:
+        return ProbeResult(
+            adapted=False,
+            reason="DFlash draft helper model is not a standalone engine target",
+        )
+
     raw_topology = (
         (pack_meta.get("topology_id") or pack_meta.get("topology"))
         if pack_meta is not None
@@ -2065,18 +2225,31 @@ def _probe_provider_adapted(
                 )
             topology_matched = True
 
-    model_type_matched = False
-    if model_types and supported_model_types:
-        if model_types & supported_model_types:
-            model_type_matched = True
-        elif not topology_matched and not explicit_provider_match:
+    model_type_matched = bool(model_types and supported_model_types and (model_types & supported_model_types))
+    if whitelist_enforced and model_types and supported_model_types:
+        if not model_type_matched and not topology_matched and not explicit_provider_match:
             return ProbeResult(
                 adapted=False,
                 reason=f"model_type {sorted(model_types)} not supported by '{provider_id or engine_id}'",
             )
 
-    def _can_claim_extension(ext: str) -> bool:
-        if is_builtin or explicit_provider_match or topology_matched or model_type_matched:
+    if is_builtin and not explicit_provider_match:
+        cfg_blocker = _config_structural_blocker(config)
+        if cfg_blocker:
+            return ProbeResult(adapted=False, reason=cfg_blocker)
+
+    def _can_claim_artifact(cand_path: Path | None, ext: str) -> bool:
+        if explicit_provider_match or topology_matched or model_type_matched:
+            return True
+        if is_builtin:
+            if (
+                ext == ".omlxm5"
+                and _foreign_spi_claims_model_artifact(model_types, ext)
+                and not _has_miv_container_magic(cand_path)
+            ):
+                return False
+            return True
+        if not whitelist_enforced:
             return True
         # Non-builtin Path B providers without an explicit provider/topology/model_type
         # match may only auto-claim custom non-.miv/.omlxm5 artifact extensions.
@@ -2120,7 +2293,7 @@ def _probe_provider_adapted(
                 draft_path = dcand.resolve()
 
         matched_ext = art_path.suffix.lower() if art_path is not None else extensions[0]
-        if _can_claim_extension(matched_ext) and (
+        if _can_claim_artifact(art_path, matched_ext) and (
             art_path is not None or explicit_provider_match or is_builtin
         ):
             return ProbeResult(
@@ -2132,20 +2305,19 @@ def _probe_provider_adapted(
             )
 
     for ext in extensions:
-        if not _can_claim_extension(ext):
-            continue
         direct = mdir / f"model{ext}"
-        if direct.is_file():
+        if direct.is_file() and _can_claim_artifact(direct, ext):
             return ProbeResult(
                 adapted=True,
                 artifact_path=direct.resolve(),
                 reason=f"model{ext}",
                 explicit_provider_match=explicit_provider_match,
             )
-        if mdir.name == "source" and (mdir.parent / f"model{ext}").is_file():
+        parent_art = mdir.parent / f"model{ext}" if mdir.name == "source" else None
+        if parent_art is not None and parent_art.is_file() and _can_claim_artifact(parent_art, ext):
             return ProbeResult(
                 adapted=True,
-                artifact_path=(mdir.parent / f"model{ext}").resolve(),
+                artifact_path=parent_art.resolve(),
                 reason=f"fixture parent model{ext}",
                 explicit_provider_match=explicit_provider_match,
             )
@@ -2155,7 +2327,7 @@ def _probe_provider_adapted(
                 for p in sorted(mdir.glob(f"*{ext}"))
                 if p.is_file() and not p.name.startswith(".")
             ]
-            if len(custom_matches) == 1:
+            if len(custom_matches) == 1 and _can_claim_artifact(custom_matches[0], ext):
                 return ProbeResult(
                     adapted=True,
                     artifact_path=custom_matches[0].resolve(),
@@ -2450,28 +2622,14 @@ def _dflash2_draft_matches_target(
     if not isinstance(draft_cfg, dict) or not isinstance(target_cfg, dict):
         return False
     archs = draft_cfg.get("architectures") or ()
+    if isinstance(archs, str):
+        archs = (archs,)
     if not isinstance(archs, (list, tuple)) or "DFlash2DraftModel" not in archs:
         return False
-    text_cfg = _text_config(target_cfg)
-    t_hidden = text_cfg.get("hidden_size")
-    t_vocab = text_cfg.get("vocab_size")
-    t_layers = text_cfg.get("num_hidden_layers")
-    if t_hidden is None or t_vocab is None:
-        return False
-    if draft_cfg.get("hidden_size") != t_hidden or draft_cfg.get("vocab_size") != t_vocab:
-        return False
-    d_target_layers = draft_cfg.get("num_target_layers")
-    if isinstance(t_layers, int) and t_layers > 0:
-        if isinstance(d_target_layers, int) and d_target_layers != t_layers:
-            return False
-        extra = draft_cfg.get("dflash_config")
-        if isinstance(extra, dict):
-            tids = extra.get("target_layer_ids")
-            if isinstance(tids, list) and any(
-                not isinstance(tid, int) or tid < 0 or tid >= t_layers for tid in tids
-            ):
-                return False
-    return True
+    ok, _ = _is_supported_dflash2_draft_config(
+        draft_cfg, is_builtin=True, target_config=target_cfg
+    )
+    return ok
 
 
 def _requested_speculative_backend(
@@ -2558,6 +2716,7 @@ def _resolve_draft_target(
     if spec_backend == "dflash2" or draft_dir_raw:
         discovered_dirs.extend(Path(c).expanduser() for c in draft_candidates)
 
+    target_cfg = _read_json(model_dir / "config.json")
     resolved_dir: Path | None = None
     for cdir in explicit_dirs:
         if (cdir / "config.json").is_file():
@@ -2565,7 +2724,6 @@ def _resolve_draft_target(
             break
 
     if resolved_dir is None and discovered_dirs:
-        target_cfg = _read_json(model_dir / "config.json")
         fallback_dir: Path | None = None
         for cdir in discovered_dirs:
             cfg_file = cdir / "config.json"
@@ -2582,6 +2740,18 @@ def _resolve_draft_target(
                 break
         if resolved_dir is None and spec_backend == "dflash2":
             resolved_dir = fallback_dir
+
+    if is_builtin and resolved_dir is not None and target_cfg is not None:
+        draft_cfg = _read_json(resolved_dir / "config.json")
+        if _is_dflash_family_architecture(draft_cfg)[0]:
+            ok_pair, pair_reason = _is_supported_dflash2_draft_config(
+                draft_cfg, manifest, is_builtin=True, target_config=target_cfg
+            )
+            if not ok_pair:
+                if spec_backend == "dflash2":
+                    return None, None, pair_reason
+                resolved_dir = None
+                draft_art = None
 
     if draft_art is None and resolved_dir is not None:
         draft_art = _find_draft_artifact_in_dir(
@@ -2788,6 +2958,7 @@ def resolve_m5rt_target(
                 binary=binary,
                 manifest=manifest,
                 is_builtin=True,
+                target_model_dir=model_dir,
             )
             if can_draft_conv:
                 auto_convert_draft_output = _converter_output_path(
@@ -2804,8 +2975,9 @@ def resolve_m5rt_target(
     artifact_path, art_reason = _resolve_target_artifact(model_dir, model_settings, model_id=model_id)
     auto_convert_output: Path | None = None
     if artifact_path is None:
+        conv_reason = ""
         if allow_auto_convert:
-            can_conv, _ = can_convert_provider_model(
+            can_conv, conv_reason = can_convert_provider_model(
                 model_dir,
                 binary=binary,
                 manifest=manifest,
@@ -2815,6 +2987,13 @@ def resolve_m5rt_target(
             if can_conv:
                 auto_convert_output = _converter_output_path(model_dir, manifest, is_builtin=True)
         if auto_convert_output is None:
+            if (
+                allow_auto_convert
+                and conv_reason
+                and _has_valid_safetensors_header(model_dir)
+                and art_reason.startswith("No ")
+            ):
+                return None, conv_reason
             return None, art_reason
 
     return (
@@ -2994,6 +3173,28 @@ def inspect_safetensors_has_mtp_weights(model_dir: Path | None) -> bool | None:
     return any(k.startswith("mtp.") or ".mtp." in k for k in tensor_keys)
 
 
+def _effective_head_dim(text_cfg: dict[str, Any] | None) -> int | None:
+    """Resolve explicit or implicit `head_dim = hidden_size // num_attention_heads`."""
+    if not isinstance(text_cfg, dict):
+        return None
+    raw_hd = text_cfg.get("head_dim")
+    if isinstance(raw_hd, int) and not isinstance(raw_hd, bool) and raw_hd > 0:
+        return raw_hd
+    raw_h = text_cfg.get("hidden_size")
+    raw_q = text_cfg.get("num_attention_heads")
+    if (
+        isinstance(raw_h, int)
+        and not isinstance(raw_h, bool)
+        and raw_h > 0
+        and isinstance(raw_q, int)
+        and not isinstance(raw_q, bool)
+        and raw_q > 0
+        and raw_h % raw_q == 0
+    ):
+        return raw_h // raw_q
+    return None
+
+
 def _resolve_effective_kv_dtype(
     opts: dict[str, Any],
     model_settings: object | None,
@@ -3002,6 +3203,9 @@ def _resolve_effective_kv_dtype(
     shared_toml: dict[str, Any] | None = None,
     model_toml: dict[str, Any] | None = None,
     explicit_opts: dict[str, Any] | None = None,
+    head_dim: int | None = None,
+    is_builtin: bool = False,
+    fake: bool = False,
 ) -> str:
     allowed = allowed_kv_dtypes if allowed_kv_dtypes else VALID_KV_DTYPES
 
@@ -3056,11 +3260,21 @@ def _resolve_effective_kv_dtype(
     if model_toml is not None and model_toml.get("kv_dtype") is not None:
         return _validate_kv(model_toml["kv_dtype"])
 
-    # Tier 3: [engine] in shared ninfer-metal.toml
+    # Tier 3: [engine] in shared ninfer-metal.toml (affine4_g128 NAX KV requires head_dim == 256)
     if shared_toml is not None and shared_toml.get("kv_dtype") is not None:
-        return _validate_kv(shared_toml["kv_dtype"])
+        resolved_shared = _validate_kv(shared_toml["kv_dtype"])
+        if (
+            is_builtin
+            and resolved_shared == "affine4_g128"
+            and head_dim is not None
+            and head_dim != 256
+        ):
+            return "bf16"
+        return resolved_shared
 
-    # Tier 4: hardcoded fallback
+    # Tier 4: structural fallback based on head_dim == 256 for built-in miv
+    if is_builtin and not fake and head_dim == 256 and "affine4_g128" in allowed:
+        return "affine4_g128"
     return "bf16"
 
 
@@ -3220,7 +3434,7 @@ def _kv_bytes_per_token(text_cfg: dict[str, Any], kv_dtype: str) -> int:
         interval = max(1, int(text_cfg.get("full_attention_interval") or 1))
         full_layers = num_layers // interval
     kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
-    head_dim = int(text_cfg.get("head_dim") or 128)
+    head_dim = _effective_head_dim(text_cfg) or 128
     values = full_layers * 2 * kv_heads * head_dim
     if values <= 0:
         return 0
@@ -3324,10 +3538,14 @@ def _estimate_shared_kv_pool_bytes(
     model_type: str | None = None,
 ) -> int:
     """Estimate shared `KvPagePool` base allocation matching `native_backend.cpp`."""
+    del model_type
+    inferred_hd = _effective_head_dim(text_cfg)
+    head_dim = inferred_hd if inferred_hd is not None else 128
     eff_kv_dtype = str(kv_dtype or "").strip().lower()
     if eff_kv_dtype in ("", "auto"):
-        mt = str(model_type or text_cfg.get("model_type") or "").strip().lower()
-        eff_kv_dtype = "affine4_g128" if mt in M5RT_SUPPORTED_MODEL_TYPES else "bf16"
+        # affine4_g128 NAX KV cache requires head_dim == 256; use structural head_dim
+        # rather than model_type string whitelisting.
+        eff_kv_dtype = "affine4_g128" if head_dim == 256 else "bf16"
     layer_types = text_cfg.get("layer_types") or []
     full_layers = sum(1 for k in layer_types if k == "full_attention")
     if not full_layers:
@@ -3335,7 +3553,6 @@ def _estimate_shared_kv_pool_bytes(
         interval = max(1, int(text_cfg.get("full_attention_interval") or 1))
         full_layers = num_layers // interval
     kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
-    head_dim = int(text_cfg.get("head_dim") or 128)
     if full_layers <= 0 or kv_heads <= 0 or head_dim <= 0 or max_context <= 0:
         return 0
     page_tokens = 64
@@ -3672,6 +3889,7 @@ def build_m5rt_options(
         concurrency_source = "global"
     else:
         concurrency_source = "default"
+    is_miv = eff_engine_id == M5RT_ENGINE_ID and eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
     allowed_kv = (
         None
         if eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
@@ -3684,6 +3902,9 @@ def build_m5rt_options(
         shared_toml=shared_toml,
         model_toml=model_toml,
         explicit_opts=explicit_opts,
+        head_dim=_effective_head_dim(text_cfg),
+        is_builtin=is_miv,
+        fake=bool(target.fake),
     )
     spec_backend, draft_tokens = _resolve_effective_speculative(
         opts,
@@ -3716,7 +3937,6 @@ def build_m5rt_options(
         if isinstance(raw_overrides, dict)
         else {}
     )
-    is_miv = eff_engine_id == M5RT_ENGINE_ID and eff_provider_id in M5RT_BUILTIN_PROVIDER_IDS
     if is_miv:
         if spec_backend == "none":
             overrides["enable_mtp"] = "off"
@@ -4298,17 +4518,9 @@ def external_engine_mtp_compatibility(
     raw_model_type = cfg.get("model_type") or raw_info_type or ""
 
     if external_engine == M5RT_ENGINE_ID:
-        manifest = _builtin_m5rt_manifest()
-        supported_types = tuple(
-            str(m).strip().lower()
-            for m in (manifest.get("supported_model_types") or M5RT_SUPPORTED_MODEL_TYPES)
-            if isinstance(m, str) and m.strip()
-        )
-        if not model_types or not (model_types & set(supported_types)):
-            return False, (
-                f"model_type={raw_model_type!r} is not supported by {M5RT_ENGINE_LABEL} MTP "
-                f"(supported: {', '.join(supported_types)})"
-            )
+        cfg_blocker = _config_structural_blocker(cfg)
+        if cfg_blocker:
+            return False, cfg_blocker
 
         opts = _merged_m5rt_options(mdir, model_settings)
         raw_mtp_art = (
@@ -4405,6 +4617,11 @@ def external_engine_dflash_compatibility(
     raw_model_type = raw_info_type or (cfg.get("model_type") if isinstance(cfg, dict) else "") or ""
 
     if external_engine == M5RT_ENGINE_ID:
+        cfg_blocker = _config_structural_blocker(cfg)
+        if cfg_blocker:
+            return False, cfg_blocker
+        if cfg is not None:
+            return True, ""
         manifest = _builtin_m5rt_manifest()
         supported_types = tuple(
             str(m).strip().lower()
@@ -4414,7 +4631,7 @@ def external_engine_dflash_compatibility(
         if model_types & set(supported_types):
             return True, ""
         return False, (
-            f"DFlash on {M5RT_ENGINE_LABEL} supports {', '.join(supported_types)} "
+            f"DFlash on {M5RT_ENGINE_LABEL} requires a valid language model config "
             f"(model_type='{raw_model_type}', engine='{engine_type}')"
         )
 
@@ -7079,6 +7296,264 @@ def _converter_output_path(
     return model_dir / Path(out_name).name
 
 
+_NON_TEXT_TENSOR_PREFIXES: tuple[str, ...] = (
+    "visual.",
+    "model.visual.",
+    "vision_tower.",
+    "model.vision_tower.",
+    "vision_model.",
+    "model.vision_model.",
+    "multi_modal_projector.",
+    "model.multi_modal_projector.",
+    "mm_projector.",
+    "model.mm_projector.",
+    "aligner.",
+    "model.aligner.",
+    "audio_tower.",
+    "model.audio_tower.",
+    "talker.",
+    "model.talker.",
+)
+_NON_TEXT_TENSOR_MARKERS: tuple[str, ...] = (
+    ".visual.",
+    ".vision_tower.",
+    ".vision_model.",
+    ".multi_modal_projector.",
+    ".mm_projector.",
+    ".aligner.",
+    ".audio_tower.",
+    ".talker.",
+)
+
+
+def _classify_source_tensor_domain(name: str) -> str:
+    """Classify tensor name into `'skip_non_text'`, `'companion_mtp'`, or `'text'`."""
+    if name.startswith(_NON_TEXT_TENSOR_PREFIXES) or any(
+        m in name for m in _NON_TEXT_TENSOR_MARKERS
+    ):
+        return "skip_non_text"
+    if name.startswith("mtp.") or ".mtp." in name:
+        return "companion_mtp"
+    return "text"
+
+
+def _read_safetensors_headers_fast(
+    model_dir: Path,
+) -> tuple[dict[str, tuple[str, tuple[int, ...]]], str | None, str]:
+    """Read ONLY 8-byte header length + JSON header of `.safetensors` files (zero weight bytes)."""
+    shard_paths: list[Path] = []
+    idx_path = model_dir / "model.safetensors.index.json"
+    if idx_path.is_file():
+        idx_doc = _read_json(idx_path)
+        if not isinstance(idx_doc, dict) or not isinstance(idx_doc.get("weight_map"), dict):
+            return {}, "invalid_safetensors_index", "model.safetensors.index.json is invalid"
+        seen_shards: set[str] = set()
+        for shard_rel in idx_doc["weight_map"].values():
+            if not isinstance(shard_rel, str) or not shard_rel.strip():
+                continue
+            sname = shard_rel.strip()
+            if Path(sname).name != sname:
+                return {}, "invalid_safetensors_index", f"unsafe shard path in index: {sname!r}"
+            if sname not in seen_shards:
+                seen_shards.add(sname)
+                shard_paths.append(model_dir / sname)
+        shard_paths.sort(key=lambda p: p.name)
+    elif (model_dir / "model.safetensors").is_file():
+        shard_paths.append(model_dir / "model.safetensors")
+    else:
+        try:
+            for entry in sorted(model_dir.iterdir(), key=lambda p: p.name):
+                if not entry.is_file() or entry.name.startswith("."):
+                    continue
+                suf = entry.suffix.lower()
+                if suf == ".safetensors":
+                    shard_paths.append(entry)
+                elif suf == ".gguf" and not shard_paths:
+                    return (
+                        {},
+                        "unsupported_gguf",
+                        f"GGUF checkpoint '{entry.name}' is not supported by {M5RT_ENGINE_LABEL}",
+                    )
+        except OSError as exc:
+            return {}, "io_error", f"failed scanning model directory: {exc}"
+
+    if not shard_paths:
+        return {}, "missing_safetensors", "no valid .safetensors weights found in model directory"
+
+    tensors: dict[str, tuple[str, tuple[int, ...]]] = {}
+    valid_shards = 0
+    for spath in shard_paths:
+        try:
+            st = spath.stat()
+            if st.st_size < 10:
+                continue
+            with spath.open("rb") as fh:
+                raw_len = fh.read(8)
+                if len(raw_len) != 8:
+                    continue
+                (hdr_len,) = struct.unpack("<Q", raw_len)
+                if hdr_len < 2 or hdr_len > min(64 * 1024 * 1024, st.st_size - 8):
+                    continue
+                raw_hdr = fh.read(hdr_len)
+            if len(raw_hdr) != hdr_len:
+                continue
+            parsed = json.loads(raw_hdr.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            if idx_path.is_file():
+                return (
+                    {},
+                    "missing_safetensors_shard",
+                    f"missing or unreadable safetensors shard '{spath.name}'",
+                )
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        valid_shards += 1
+        for tname, rec in parsed.items():
+            if tname == "__metadata__" or not isinstance(rec, dict):
+                continue
+            dtype = str(rec.get("dtype") or "")
+            raw_shape = rec.get("shape")
+            if not dtype or not isinstance(raw_shape, list):
+                return (
+                    {},
+                    "invalid_safetensors_header",
+                    f"malformed safetensors record for tensor {tname!r} in '{spath.name}'",
+                )
+            try:
+                shape = tuple(int(dim) for dim in raw_shape)
+            except (TypeError, ValueError):
+                return (
+                    {},
+                    "invalid_safetensors_header",
+                    f"invalid shape in safetensors header for tensor {tname!r}",
+                )
+            tensors[tname] = (dtype, shape)
+
+    if valid_shards == 0:
+        return {}, "missing_safetensors", "no valid .safetensors weights found in model directory"
+    return tensors, None, ""
+
+
+def _extract_quant_dicts(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    text_cfg = _text_config(cfg)
+    raw_q = (
+        cfg.get("quantization")
+        or cfg.get("quantization_config")
+        or text_cfg.get("quantization")
+        or text_cfg.get("quantization_config")
+        or {}
+    )
+    raw_qcfg = cfg.get("quantization_config") or text_cfg.get("quantization_config") or {}
+    return (
+        raw_q if isinstance(raw_q, dict) else {},
+        raw_qcfg if isinstance(raw_qcfg, dict) else {},
+    )
+
+
+def _module_quant_spec(cfg: dict[str, Any], module_name: str) -> dict[str, Any]:
+    quant, _ = _extract_quant_dicts(cfg)
+    spec: dict[str, Any] = {
+        "bits": quant.get("bits"),
+        "group_size": quant.get("group_size"),
+        "mode": str(quant.get("mode") or "").strip().lower(),
+    }
+    candidates = [module_name]
+    if module_name.startswith("language_model."):
+        candidates.append(module_name[len("language_model.") :])
+    for cand in list(candidates):
+        if cand.startswith("model."):
+            candidates.append(cand[len("model.") :])
+    if module_name.endswith(".lm_head"):
+        candidates.append("lm_head")
+    for key in candidates:
+        override = quant.get(key)
+        if isinstance(override, dict):
+            if "bits" in override:
+                spec["bits"] = override["bits"]
+            if "group_size" in override:
+                spec["group_size"] = override["group_size"]
+            if "mode" in override and isinstance(override["mode"], str):
+                spec["mode"] = override["mode"].strip().lower()
+            break
+    return spec
+
+
+def _infer_expected_module_in_features(
+    module_name: str,
+    text_cfg: dict[str, Any],
+    *,
+    head_dim: int | None,
+    shared_inter_override: int | None = None,
+) -> int | None:
+    hidden = text_cfg.get("hidden_size")
+    hidden_i = hidden if isinstance(hidden, int) and not isinstance(hidden, bool) and hidden > 0 else None
+    inter = text_cfg.get("intermediate_size")
+    inter_i = inter if isinstance(inter, int) and not isinstance(inter, bool) and inter > 0 else None
+    moe_inter = text_cfg.get("moe_intermediate_size")
+    moe_inter_i = (
+        moe_inter
+        if isinstance(moe_inter, int) and not isinstance(moe_inter, bool) and moe_inter > 0
+        else inter_i
+    )
+    q_heads = text_cfg.get("num_attention_heads")
+    q_heads_i = (
+        q_heads if isinstance(q_heads, int) and not isinstance(q_heads, bool) and q_heads > 0 else None
+    )
+    probe = module_name if module_name.startswith(".") else f".{module_name}"
+    if probe.endswith(".embed_tokens") or probe.endswith(".lm_head"):
+        return hidden_i
+    if ".self_attn." in probe:
+        if probe.endswith((".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")):
+            return hidden_i
+        if probe.endswith(".self_attn.o_proj") and q_heads_i is not None and head_dim is not None:
+            return q_heads_i * head_dim
+    if ".linear_attn." in probe:
+        if probe.endswith(
+            (
+                ".linear_attn.in_proj_qkv",
+                ".linear_attn.in_proj_z",
+                ".linear_attn.in_proj_a",
+                ".linear_attn.in_proj_b",
+            )
+        ):
+            return hidden_i
+        if probe.endswith(".linear_attn.out_proj"):
+            v_heads = text_cfg.get("linear_num_value_heads")
+            v_dim = text_cfg.get("linear_value_head_dim")
+            if (
+                isinstance(v_heads, int)
+                and not isinstance(v_heads, bool)
+                and v_heads > 0
+                and isinstance(v_dim, int)
+                and not isinstance(v_dim, bool)
+                and v_dim > 0
+            ):
+                return v_heads * v_dim
+    if ".mlp." in probe:
+        if ".shared_expert." in probe or ".shared_experts." in probe:
+            if probe.endswith((".gate_proj", ".up_proj")):
+                return hidden_i
+            if probe.endswith(".down_proj"):
+                raw_sh = text_cfg.get("shared_expert_intermediate_size")
+                if isinstance(raw_sh, int) and not isinstance(raw_sh, bool) and raw_sh > 0:
+                    return raw_sh
+                return shared_inter_override
+        elif ".switch_mlp." in probe or ".experts." in probe:
+            if probe.endswith((".gate_proj", ".up_proj")):
+                return hidden_i
+            if probe.endswith(".down_proj"):
+                return moe_inter_i
+        else:
+            if probe.endswith((".mlp.gate", ".mlp.shared_expert_gate", ".mlp.gate_proj", ".mlp.up_proj")):
+                return hidden_i
+            if probe.endswith(".mlp.down_proj"):
+                return inter_i
+    if ".mtp." in probe and probe.endswith(".mtp.fc") and hidden_i is not None:
+        return 2 * hidden_i
+    return None
+
+
 def _config_matches_converter_quant(
     cfg: dict[str, Any],
     converter_spec: dict[str, Any],
@@ -7093,24 +7568,30 @@ def _config_matches_converter_quant(
     if not allowed_modes:
         return True, ""
 
-    text_cfg = _text_config(cfg)
-    quant = (
-        cfg.get("quantization")
-        or cfg.get("quantization_config")
-        or text_cfg.get("quantization")
-        or text_cfg.get("quantization_config")
-        or {}
-    )
-    qcfg = cfg.get("quantization_config") or text_cfg.get("quantization_config") or {}
-    if not isinstance(quant, dict):
-        quant = {}
-    if not isinstance(qcfg, dict):
-        qcfg = {}
-
+    quant, qcfg = _extract_quant_dicts(cfg)
+    qmethod = str(
+        qcfg.get("quant_method") or quant.get("quant_method") or ""
+    ).strip().lower()
     mode = str(quant.get("mode") or "").strip().lower()
     fmt = str(qcfg.get("format") or quant.get("format") or "").strip().lower()
 
-    if mode == "affine" and "affine" in allowed_modes:
+    for bad_m, label in (
+        ("awq", "AWQ"),
+        ("gptq", "GPTQ"),
+        ("fp8", "FP8"),
+        ("fbgemm_fp8", "FP8"),
+        ("bitsandbytes", "bitsandbytes"),
+        ("bnb", "bitsandbytes"),
+        ("gguf", "GGUF"),
+    ):
+        if qmethod == bad_m or mode == bad_m or fmt == bad_m:
+            return False, f"{label} quantization is not supported by {M5RT_ENGINE_LABEL}"
+
+    has_affine_fields = (
+        mode == "affine"
+        or (not mode and not fmt and (quant.get("bits") is not None or quant.get("group_size") is not None))
+    )
+    if has_affine_fields and "affine" in allowed_modes:
         if is_builtin:
             bits = quant.get("bits")
             gs = quant.get("group_size")
@@ -7120,21 +7601,1512 @@ def _config_matches_converter_quant(
                     f"affine quantization bits={bits!r}, group_size={gs!r} is not supported "
                     "(expected bits in {3,4,5,6,8} and group_size in {64,128})",
                 )
+            for k, v in quant.items():
+                if not isinstance(v, dict):
+                    continue
+                ov_mode = str(v.get("mode") or mode or "affine").strip().lower()
+                if ov_mode == "mxfp4":
+                    if v.get("group_size", 32) != 32:
+                        return False, f"MXFP4 override on {k!r} requires group_size=32"
+                    continue
+                ov_bits = v.get("bits", bits)
+                ov_gs = v.get("group_size", gs)
+                if ov_bits not in (3, 4, 5, 6, 8) or ov_gs not in (64, 128):
+                    return (
+                        False,
+                        f"affine quantization override on {k!r} (bits={ov_bits!r}, "
+                        f"group_size={ov_gs!r}) is not supported (expected bits in "
+                        "{3,4,5,6,8} and group_size in {64,128})",
+                    )
         return True, ""
 
     if mode == "mxfp4" and "mxfp4" in allowed_modes:
+        if is_builtin and quant.get("group_size") not in (None, 32):
+            return (
+                False,
+                f"MXFP4 quantization group_size={quant.get('group_size')!r} is not supported "
+                "(expected group_size=32)",
+            )
         return True, ""
 
     if fmt == "mxfp4-pack-quantized" and "mxfp4-pack-quantized" in allowed_modes:
         return True, ""
 
-    if not mode and not fmt and ({"bf16", "fp16", "unquantized"} & allowed_modes):
-        return True, ""
+    if not mode and not fmt and quant.get("bits") is None and quant.get("group_size") is None:
+        if {"bf16", "fp16", "mixed", "unquantized"} & allowed_modes:
+            return True, ""
 
     return (
         False,
         f"checkpoint quantization is not in {sorted(allowed_modes)} "
         f"(mode={mode or 'none'!r}, format={fmt or 'none'!r})",
+    )
+
+
+def inspect_m5rt_source_fast(
+    model_dir: str | Path,
+    *,
+    target_model_dir: str | Path | None = None,
+    target_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Built-in `< 5 ms` O(1) zero-weight-read Two-Layer Structural & Per-Tensor Probe.
+
+    Reads ONLY `config.json`, optional `model.safetensors.index.json`, and the 8-byte
+    header size + JSON header of `.safetensors` shards (never loading weight payload bytes).
+    """
+    t0 = time.perf_counter()
+    mdir = Path(model_dir).expanduser()
+
+    def _finish(
+        eligible: bool,
+        *,
+        blocker_code: str | None = None,
+        reason: str = "",
+        is_dflash2_draft: bool = False,
+        model_type: str = "",
+        text_model_type: str = "",
+        model_type_hint_matched: bool = False,
+        topology: str | None = None,
+        head_dim: int | None = None,
+        has_attn_output_gate: bool | None = None,
+        has_qk_norm: bool | None = None,
+        linear_attention_layers: int = 0,
+        full_attention_layers: int = 0,
+        num_experts: int = 0,
+        num_experts_per_tok: int = 0,
+        has_shared_expert: bool = False,
+        tie_word_embeddings: bool = False,
+        quant_modes: list[str] | None = None,
+        skipped_non_text_tensors: list[str] | None = None,
+        companion_mtp_tensors: list[str] | None = None,
+        repack_counts: dict[str, int] | None = None,
+        first_blocker: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        modes = sorted(set(quant_modes or ()))
+        return {
+            "eligible": eligible,
+            "blocker_code": blocker_code,
+            "reason": reason,
+            "is_dflash2_draft": is_dflash2_draft,
+            "model_type": model_type,
+            "text_model_type": text_model_type,
+            "model_type_hint_matched": model_type_hint_matched,
+            "topology": topology,
+            "head_dim": head_dim,
+            "kv_dtype_default": "affine4_g128" if head_dim == 256 else "bf16",
+            "has_attn_output_gate": has_attn_output_gate,
+            "has_qk_norm": has_qk_norm,
+            "linear_attention_layers": linear_attention_layers,
+            "full_attention_layers": full_attention_layers,
+            "num_experts": num_experts,
+            "num_experts_per_tok": num_experts_per_tok,
+            "has_shared_expert": has_shared_expert,
+            "tie_word_embeddings": tie_word_embeddings,
+            "quant_modes": modes,
+            "is_mixed_precision": len(modes) > 1,
+            "skipped_non_text_tensors": skipped_non_text_tensors or [],
+            "companion_mtp_tensors": companion_mtp_tensors or [],
+            "repack_counts": repack_counts
+            or {
+                "nax_pretile": 0,
+                "rowsplit_or_direct": 0,
+                "companion_mtp": 0,
+                "skip_non_text": 0,
+                "incompatible_blocker": 0 if eligible else 1,
+            },
+            "first_blocker": first_blocker,
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 4),
+        }
+
+    if not mdir.is_dir():
+        return _finish(
+            False,
+            blocker_code="missing_model_dir",
+            reason=f"model directory not found: {mdir}",
+        )
+
+    cfg_path = mdir / "config.json"
+    if not cfg_path.is_file():
+        return _finish(False, blocker_code="missing_config", reason="config.json not found")
+    cfg = _read_json(cfg_path)
+    if cfg is None:
+        return _finish(
+            False,
+            blocker_code="invalid_config",
+            reason="config.json is not a valid JSON object",
+        )
+
+    text_cfg = _text_config(cfg)
+    raw_mt = str(cfg.get("model_type") or "").strip()
+    raw_text_mt = str(text_cfg.get("model_type") or raw_mt).strip()
+    mt_tokens = _extract_model_type_tokens(cfg)
+    hint_matched = bool(mt_tokens & {m.lower() for m in M5RT_SUPPORTED_MODEL_TYPES})
+    tie_embed_raw = (
+        text_cfg.get("tie_word_embeddings")
+        if text_cfg.get("tie_word_embeddings") is not None
+        else cfg.get("tie_word_embeddings", False)
+    )
+    tie_word_embeddings = bool(tie_embed_raw)
+
+    # DFlash2 Draft Mode
+    is_draft_arch, _ = _is_dflash_family_architecture(cfg)
+    if is_draft_arch:
+        eff_target_cfg = target_config
+        if eff_target_cfg is None and target_model_dir is not None:
+            eff_target_cfg = _read_json(Path(target_model_dir).expanduser() / "config.json")
+        ok_df, df_reason = _is_supported_dflash2_draft_config(
+            cfg, is_builtin=True, target_config=eff_target_cfg
+        )
+        if not ok_df:
+            return _finish(
+                False,
+                blocker_code="unsupported_dflash2_draft",
+                reason=df_reason,
+                is_dflash2_draft=True,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+            )
+        tensors, st_code, st_err = _read_safetensors_headers_fast(mdir)
+        if st_code is not None:
+            return _finish(
+                False,
+                blocker_code=st_code,
+                reason=st_err,
+                is_dflash2_draft=True,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+            )
+        repack_counts = {
+            "nax_pretile": 0,
+            "rowsplit_or_direct": 0,
+            "companion_mtp": 0,
+            "skip_non_text": 0,
+            "incompatible_blocker": 0,
+        }
+        for tname in sorted(tensors):
+            tdtype, tshape = tensors[tname]
+            if tdtype != "BF16":
+                reason = (
+                    f"DFlash2 draft requires all-BF16 tensors; found {tname!r} "
+                    f"with dtype={tdtype!r}, shape={list(tshape)}"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="unsupported_dflash2_dtype",
+                    reason=reason,
+                    is_dflash2_draft=True,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+                )
+            repack_counts["rowsplit_or_direct"] += 1
+        return _finish(
+            True,
+            is_dflash2_draft=True,
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            topology="dflash2_draft",
+            head_dim=_effective_head_dim(cfg),
+            quant_modes=["bf16"],
+            repack_counts=repack_counts,
+        )
+
+    tensors, st_code, st_err = _read_safetensors_headers_fast(mdir)
+
+    skipped_non_text: list[str] = []
+    companion_mtp: list[str] = []
+    text_tensors: dict[str, tuple[str, tuple[int, ...]]] = {}
+    active_tensors: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for tname in sorted(tensors):
+        domain = _classify_source_tensor_domain(tname)
+        if domain == "skip_non_text":
+            skipped_non_text.append(tname)
+        elif domain == "companion_mtp":
+            companion_mtp.append(tname)
+            active_tensors[tname] = tensors[tname]
+        else:
+            text_tensors[tname] = tensors[tname]
+            active_tensors[tname] = tensors[tname]
+
+    base_counts = {
+        "nax_pretile": 0,
+        "rowsplit_or_direct": 0,
+        "companion_mtp": 0,
+        "skip_non_text": len(skipped_non_text),
+        "incompatible_blocker": 0,
+    }
+
+    # Layer 1A: Immediate topology blockers (MLA, Mamba/SSM, unsupported layer_types/activations, linear .bias)
+    for tname, (_tdtype, tshape) in text_tensors.items():
+        if any(
+            mla_tok in tname
+            for mla_tok in ("kv_a_proj_with_mqa", "kv_b_proj", "q_a_proj", "q_b_proj")
+        ):
+            reason = (
+                f"MLA (Multi-head Latent Attention) topology is not supported by "
+                f"{M5RT_ENGINE_LABEL} (found tensor {tname!r} with shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_mla",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+    for mla_key in (
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    ):
+        if text_cfg.get(mla_key) is not None or cfg.get(mla_key) is not None:
+            reason = (
+                f"MLA (Multi-head Latent Attention) architecture is not supported by "
+                f"{M5RT_ENGINE_LABEL} (found config key {mla_key!r})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_mla",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+
+    for tname, (_tdtype, tshape) in text_tensors.items():
+        if ".mamba." in tname or ".ssm." in tname:
+            reason = (
+                f"Mamba/SSM state-space topology is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found tensor {tname!r} with shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_mamba",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+
+    raw_layer_types = text_cfg.get("layer_types")
+    if isinstance(raw_layer_types, list):
+        for idx, lt in enumerate(raw_layer_types):
+            lt_s = str(lt or "").strip()
+            if lt_s not in ("full_attention", "linear_attention"):
+                code = (
+                    "unsupported_mamba"
+                    if ("mamba" in lt_s.lower() or "ssm" in lt_s.lower())
+                    else "unsupported_layer_type"
+                )
+                label = "Mamba/SSM" if code == "unsupported_mamba" else "Unsupported"
+                reason = (
+                    f"{label} layer_type {lt_s!r} at layer {idx} is not supported by "
+                    f"{M5RT_ENGINE_LABEL} (supported: 'full_attention', 'linear_attention')"
+                )
+                base_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code=code,
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=base_counts,
+                )
+
+    for ssm_key in ("mamba_d_state", "ssm_state_size", "mamba_d_conv"):
+        val = text_cfg.get(ssm_key) if text_cfg.get(ssm_key) is not None else cfg.get(ssm_key)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            reason = (
+                f"Mamba/SSM architecture is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found config key {ssm_key!r}={val})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_mamba",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+
+    hidden_act = text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
+    if isinstance(hidden_act, str) and hidden_act.strip():
+        if hidden_act.strip().lower() not in ("silu", "swiglu"):
+            reason = (
+                f"Unsupported hidden_act={hidden_act!r} "
+                f"({M5RT_ENGINE_LABEL} requires 'silu' / SwiGLU)"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_activation",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+
+    for tname, (_tdtype, tshape) in active_tensors.items():
+        if tname.endswith(".bias") and not tname.endswith(".dt_bias"):
+            reason = (
+                f"Additive linear bias tensor {tname!r} (shape={list(tshape)}) is not "
+                f"supported by {M5RT_ENGINE_LABEL}"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_linear_bias",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+
+    # Layer 2A: Immediate per-tensor & config quantization method blockers (AWQ, GPTQ, FP8, BnB)
+    for tname, (tdtype, tshape) in active_tensors.items():
+        if tname.endswith((".qweight", ".qzeros")):
+            reason = (
+                f"AWQ quantization is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found tensor {tname!r} with shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_quant_awq",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if tname.endswith(".g_idx"):
+            reason = (
+                f"GPTQ quantization is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found tensor {tname!r} with shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_quant_gptq",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if tname.endswith(".weight_scale_inv") or tdtype in ("F8_E4M3", "F8_E5M2"):
+            reason = (
+                f"FP8 quantization is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found tensor {tname!r} with dtype={tdtype!r}, shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_quant_fp8",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if tname.endswith((".absmax", ".quant_state", ".SCB")):
+            reason = (
+                f"bitsandbytes quantization is not supported by {M5RT_ENGINE_LABEL} "
+                f"(found tensor {tname!r} with shape={list(tshape)})"
+            )
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_quant_bnb",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+
+    quant_dict, qcfg_dict = _extract_quant_dicts(cfg)
+    qmethod_raw = str(
+        qcfg_dict.get("quant_method")
+        or quant_dict.get("quant_method")
+        or quant_dict.get("mode")
+        or qcfg_dict.get("format")
+        or ""
+    ).strip().lower()
+    for bad_m, b_code, b_label in (
+        ("awq", "unsupported_quant_awq", "AWQ"),
+        ("gptq", "unsupported_quant_gptq", "GPTQ"),
+        ("fp8", "unsupported_quant_fp8", "FP8"),
+        ("fbgemm_fp8", "unsupported_quant_fp8", "FP8"),
+        ("bitsandbytes", "unsupported_quant_bnb", "bitsandbytes"),
+        ("bnb", "unsupported_quant_bnb", "bitsandbytes"),
+        ("gguf", "unsupported_gguf", "GGUF"),
+    ):
+        if qmethod_raw == bad_m:
+            first_t = next(iter(active_tensors.items()), None)
+            fb = (
+                {
+                    "tensor": first_t[0],
+                    "shape": list(first_t[1][1]),
+                    "reason": f"{b_label} quantization is not supported",
+                }
+                if first_t is not None
+                else None
+            )
+            detail = (
+                f" (first tensor {first_t[0]!r} shape={list(first_t[1][1])})"
+                if first_t is not None
+                else ""
+            )
+            reason = f"{b_label} quantization is not supported by {M5RT_ENGINE_LABEL}{detail}"
+            base_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code=b_code,
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+                first_blocker=fb,
+            )
+
+    if st_code is not None:
+        return _finish(
+            False,
+            blocker_code=st_code,
+            reason=st_err,
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+        )
+
+    # Synthetic empty `{}` safetensors header support for minimal mock tests
+    if not tensors:
+        q_ok, q_reason = _config_matches_converter_quant(
+            cfg, M5RT_DEFAULT_CONVERTER, is_builtin=True
+        )
+        if not q_ok:
+            return _finish(
+                False,
+                blocker_code="unsupported_quant_config",
+                reason=q_reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+            )
+        has_explicit_quant = bool(
+            quant_dict.get("mode")
+            or quant_dict.get("bits") is not None
+            or qcfg_dict.get("format")
+        )
+        if hint_matched and has_explicit_quant:
+            # Validate any geometry fields present on mock config
+            raw_h = text_cfg.get("hidden_size")
+            if isinstance(raw_h, int) and not isinstance(raw_h, bool):
+                if raw_h < 64 or raw_h % 64 != 0:
+                    return _finish(
+                        False,
+                        blocker_code="invalid_hidden_size",
+                        reason=f"hidden_size={raw_h} must be >= 64 and divisible by 64",
+                        model_type=raw_mt,
+                        text_model_type=raw_text_mt,
+                        model_type_hint_matched=hint_matched,
+                    )
+            return _finish(
+                True,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                topology="gdn_hybrid_gqa",
+                head_dim=_effective_head_dim(text_cfg),
+                tie_word_embeddings=tie_word_embeddings,
+                quant_modes=[str(quant_dict.get("mode") or qcfg_dict.get("format") or "affine")],
+            )
+        return _finish(
+            False,
+            blocker_code="incomplete_checkpoint_metadata",
+            reason="checkpoint has empty .safetensors header and incomplete structural config",
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+        )
+
+    # Layer 1B: Full Structural Geometry Validation (matching C++ QwenForward::supports_config)
+    def _pos_int(obj: dict[str, Any], key: str) -> int | None:
+        v = obj.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+        return None
+
+    hidden_size = _pos_int(text_cfg, "hidden_size")
+    if hidden_size is None or hidden_size < 64 or hidden_size % 64 != 0:
+        return _finish(
+            False,
+            blocker_code="invalid_hidden_size",
+            reason=(
+                f"Unsupported hidden_size={text_cfg.get('hidden_size')!r} "
+                "(must be >= 64 and divisible by 64)"
+            ),
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    num_hidden_layers = _pos_int(text_cfg, "num_hidden_layers")
+    if num_hidden_layers is None:
+        return _finish(
+            False,
+            blocker_code="invalid_num_hidden_layers",
+            reason=f"Unsupported num_hidden_layers={text_cfg.get('num_hidden_layers')!r} (must be >= 1)",
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    vocab_size = _pos_int(text_cfg, "vocab_size") or _pos_int(cfg, "vocab_size")
+    if vocab_size is None:
+        return _finish(
+            False,
+            blocker_code="invalid_vocab_size",
+            reason=f"Unsupported vocab_size={text_cfg.get('vocab_size')!r} (must be > 0)",
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    raw_experts = (
+        text_cfg.get("num_experts")
+        if text_cfg.get("num_experts") is not None
+        else (
+            text_cfg.get("n_routed_experts")
+            if text_cfg.get("n_routed_experts") is not None
+            else text_cfg.get("num_local_experts", 0)
+        )
+    )
+    if isinstance(raw_experts, bool) or not isinstance(raw_experts, int) or raw_experts < 0:
+        return _finish(
+            False,
+            blocker_code="invalid_moe_geometry",
+            reason=f"Invalid MoE num_experts={raw_experts!r}",
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+    num_experts = raw_experts
+
+    inter_size = _pos_int(text_cfg, "intermediate_size")
+    moe_inter_size = _pos_int(text_cfg, "moe_intermediate_size")
+    eff_inter = (moe_inter_size or inter_size) if num_experts > 0 else (inter_size or moe_inter_size)
+    if eff_inter is None or eff_inter < 64 or eff_inter % 64 != 0:
+        return _finish(
+            False,
+            blocker_code="invalid_intermediate_size",
+            reason=(
+                f"Unsupported intermediate_size={eff_inter!r} "
+                "(must be >= 64 and divisible by 64)"
+            ),
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    num_q_heads = _pos_int(text_cfg, "num_attention_heads")
+    num_kv_heads = _pos_int(text_cfg, "num_key_value_heads")
+    if num_q_heads is None or num_kv_heads is None or num_q_heads % num_kv_heads != 0:
+        return _finish(
+            False,
+            blocker_code="invalid_attention_heads",
+            reason=(
+                f"Invalid GQA head geometry: num_attention_heads={text_cfg.get('num_attention_heads')!r}, "
+                f"num_key_value_heads={text_cfg.get('num_key_value_heads')!r}"
+            ),
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    if text_cfg.get("head_dim") is not None:
+        raw_hd = text_cfg.get("head_dim")
+        if isinstance(raw_hd, bool) or not isinstance(raw_hd, int):
+            head_dim = None
+        else:
+            head_dim = raw_hd
+    elif hidden_size % num_q_heads == 0:
+        head_dim = hidden_size // num_q_heads
+    else:
+        head_dim = None
+    if head_dim not in (64, 128, 256):
+        return _finish(
+            False,
+            blocker_code="invalid_head_dim",
+            reason=f"Unsupported head_dim={head_dim!r} (expected one of 64, 128, 256)",
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    # RoPE validation (supports rope_parameters object and top-level rope_theta / partial_rotary_factor)
+    rope_obj = text_cfg.get("rope_parameters")
+    if not isinstance(rope_obj, dict):
+        rope_obj = cfg.get("rope_parameters") if isinstance(cfg.get("rope_parameters"), dict) else {}
+    raw_theta = (
+        rope_obj.get("rope_theta")
+        if rope_obj.get("rope_theta") is not None
+        else (
+            text_cfg.get("rope_theta")
+            if text_cfg.get("rope_theta") is not None
+            else cfg.get("rope_theta", 10000.0)
+        )
+    )
+    raw_prf = (
+        rope_obj.get("partial_rotary_factor")
+        if rope_obj.get("partial_rotary_factor") is not None
+        else (
+            text_cfg.get("partial_rotary_factor")
+            if text_cfg.get("partial_rotary_factor") is not None
+            else cfg.get("partial_rotary_factor", 1.0)
+        )
+    )
+    try:
+        rope_theta = float(raw_theta)
+        partial_rotary = float(raw_prf)
+    except (TypeError, ValueError):
+        rope_theta = -1.0
+        partial_rotary = -1.0
+    rotary_dim = int(round(head_dim * partial_rotary)) if partial_rotary > 0 else 0
+    if (
+        not math.isfinite(rope_theta)
+        or rope_theta <= 0.0
+        or not math.isfinite(partial_rotary)
+        or not (0.0 < partial_rotary <= 1.0)
+        or rotary_dim < 2
+        or rotary_dim % 2 != 0
+    ):
+        return _finish(
+            False,
+            blocker_code="invalid_rope",
+            reason=(
+                f"Invalid RoPE configuration (rope_theta={raw_theta!r}, "
+                f"partial_rotary_factor={raw_prf!r})"
+            ),
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            head_dim=head_dim,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=base_counts,
+        )
+
+    # Layer types resolution (supports explicit layer_types or implicit 0-GDN pure GQA / tensor-inferred GDN)
+    if isinstance(raw_layer_types, list):
+        if len(raw_layer_types) != num_hidden_layers:
+            return _finish(
+                False,
+                blocker_code="invalid_layer_types_length",
+                reason=(
+                    f"layer_types length ({len(raw_layer_types)}) does not match "
+                    f"num_hidden_layers ({num_hidden_layers})"
+                ),
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+        layer_types = [str(x) for x in raw_layer_types]
+    else:
+        has_any_gdn_tensor = any(".linear_attn." in ("." + n) for n in text_tensors)
+        if has_any_gdn_tensor:
+            layer_types = [
+                (
+                    "linear_attention"
+                    if any(f".layers.{idx}.linear_attn." in ("." + n) for n in text_tensors)
+                    else "full_attention"
+                )
+                for idx in range(num_hidden_layers)
+            ]
+        else:
+            layer_types = ["full_attention"] * num_hidden_layers
+
+    linear_layers = sum(1 for lt in layer_types if lt == "linear_attention")
+    full_layers = sum(1 for lt in layer_types if lt == "full_attention")
+
+    # GDN geometry validation (ONLY required when linear_attention_layers > 0!)
+    if linear_layers > 0:
+        lin_kh = _pos_int(text_cfg, "linear_num_key_heads")
+        lin_vh = _pos_int(text_cfg, "linear_num_value_heads")
+        lin_kd = _pos_int(text_cfg, "linear_key_head_dim")
+        lin_vd = _pos_int(text_cfg, "linear_value_head_dim")
+        lin_conv = _pos_int(text_cfg, "linear_conv_kernel_dim")
+        if (
+            lin_kh is None
+            or lin_vh is None
+            or lin_vh % lin_kh != 0
+            or lin_kd is None
+            or lin_vd is None
+            or lin_conv is None
+            or lin_conv < 2
+        ):
+            return _finish(
+                False,
+                blocker_code="invalid_gdn_geometry",
+                reason=(
+                    "Invalid GDN linear_attention head geometry in config.json "
+                    f"(linear_num_key_heads={lin_kh!r}, linear_num_value_heads={lin_vh!r}, "
+                    f"linear_key_head_dim={lin_kd!r}, linear_value_head_dim={lin_vd!r}, "
+                    f"linear_conv_kernel_dim={lin_conv!r})"
+                ),
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                linear_attention_layers=linear_layers,
+                full_attention_layers=full_layers,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+
+    # MoE geometry validation
+    num_experts_per_tok = 0
+    has_shared_expert = False
+    inferred_shared_inter: int | None = None
+    if num_experts != 0:
+        if not (2 <= num_experts <= 256):
+            return _finish(
+                False,
+                blocker_code="invalid_moe_geometry",
+                reason=(
+                    f"MoE num_experts={num_experts} is outside {M5RT_ENGINE_LABEL} "
+                    "supported range [2, 256]"
+                ),
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                linear_attention_layers=linear_layers,
+                full_attention_layers=full_layers,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+        raw_topk = (
+            text_cfg.get("num_experts_per_tok")
+            if text_cfg.get("num_experts_per_tok") is not None
+            else text_cfg.get("num_experts_per_token", 0)
+        )
+        if (
+            isinstance(raw_topk, bool)
+            or not isinstance(raw_topk, int)
+            or not (1 <= raw_topk <= 8)
+            or raw_topk > num_experts
+        ):
+            return _finish(
+                False,
+                blocker_code="invalid_moe_geometry",
+                reason=(
+                    f"MoE num_experts_per_tok={raw_topk!r} is outside {M5RT_ENGINE_LABEL} "
+                    f"supported range [1, min(8, num_experts={num_experts})]"
+                ),
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                linear_attention_layers=linear_layers,
+                full_attention_layers=full_layers,
+                num_experts=num_experts,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+        num_experts_per_tok = raw_topk
+
+        raw_shared_inter = text_cfg.get("shared_expert_intermediate_size", 0) or 0
+        if isinstance(raw_shared_inter, bool) or not isinstance(raw_shared_inter, int) or raw_shared_inter < 0:
+            return _finish(
+                False,
+                blocker_code="invalid_moe_geometry",
+                reason=f"Invalid shared_expert_intermediate_size={raw_shared_inter!r}",
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+        if raw_shared_inter > 0 and (raw_shared_inter < 64 or raw_shared_inter % 64 != 0):
+            return _finish(
+                False,
+                blocker_code="invalid_moe_geometry",
+                reason=(
+                    f"shared_expert_intermediate_size={raw_shared_inter} must be 0 "
+                    "or a multiple of 64"
+                ),
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=base_counts,
+            )
+        for tname, (_td, tsh) in text_tensors.items():
+            if (
+                (".shared_expert.gate_proj." in ("." + tname) or ".shared_experts.gate_proj." in ("." + tname))
+                and len(tsh) >= 2
+            ):
+                inferred_shared_inter = tsh[0]
+                break
+        if inferred_shared_inter is not None:
+            if inferred_shared_inter < 64 or inferred_shared_inter % 64 != 0:
+                return _finish(
+                    False,
+                    blocker_code="invalid_moe_geometry",
+                    reason=(
+                        f"shared_expert gate_proj output dim={inferred_shared_inter} "
+                        "must be >= 64 and divisible by 64"
+                    ),
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=base_counts,
+                )
+            has_shared_expert = True
+        else:
+            has_shared_expert = raw_shared_inter > 0
+
+    # Layer 2B: Per-Tensor Quantization & Repack Classification
+    consumed_tensors: set[str] = set()
+    quant_modes: list[str] = []
+    repack_counts = dict(base_counts)
+
+    def _record_module_category(module_name: str, shape: tuple[int, ...], fmt_kind: str, logical_k: int, gs: int) -> None:
+        if module_name.startswith("mtp.") or ".mtp." in module_name:
+            repack_counts["companion_mtp"] += 1
+            return
+        probe = module_name if module_name.startswith(".") else f".{module_name}"
+        is_embed = probe.endswith(".embed_tokens")
+        is_router = probe.endswith((".mlp.gate", ".mlp.shared_expert_gate"))
+        if len(shape) == 2 and not is_embed and not is_router and logical_k >= 512:
+            if fmt_kind == "mxfp4" and logical_k % 128 == 0:
+                repack_counts["nax_pretile"] += 1
+                return
+            if fmt_kind == "affine" and logical_k % gs == 0:
+                repack_counts["nax_pretile"] += 1
+                return
+        elif len(shape) == 3 and logical_k >= 128:
+            if fmt_kind == "mxfp4" and logical_k % 128 == 0:
+                repack_counts["nax_pretile"] += 1
+                return
+            if fmt_kind == "affine" and logical_k % gs == 0:
+                repack_counts["nax_pretile"] += 1
+                return
+        repack_counts["rowsplit_or_direct"] += 1
+
+    # 1) Compressed MXFP4 modules (*.weight_packed + *.weight_scale)
+    for tname in list(active_tensors):
+        if not tname.endswith(".weight_packed"):
+            continue
+        mod = tname[: -len(".weight_packed")]
+        sc_name = mod + ".weight_scale"
+        sh_name = mod + ".weight_shape"
+        p_dtype, p_shape = active_tensors[tname]
+        if sc_name not in active_tensors:
+            reason = f"Compressed MXFP4 tensor {tname!r} is missing companion {sc_name!r}"
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="invalid_mxfp4_module",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(p_shape), "reason": reason},
+            )
+        s_dtype, s_shape = active_tensors[sc_name]
+        logical_k = p_shape[-1] * 2 if len(p_shape) >= 2 else 0
+        if (
+            p_dtype not in ("U8", "I8")
+            or s_dtype not in ("U8", "F8_E8M0")
+            or len(p_shape) < 2
+            or logical_k <= 0
+            or logical_k % 32 != 0
+            or s_shape != (*p_shape[:-1], logical_k // 32)
+        ):
+            reason = (
+                f"Invalid compressed MXFP4 layout on {tname!r} "
+                f"(dtype={p_dtype}, shape={list(p_shape)}, scale_shape={list(s_shape)})"
+            )
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="invalid_mxfp4_module",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(p_shape), "reason": reason},
+            )
+        consumed_tensors.update((tname, sc_name))
+        if sh_name in active_tensors:
+            consumed_tensors.add(sh_name)
+        quant_modes.append("mxfp4-pack-quantized")
+        _record_module_category(mod, (*p_shape[:-1], logical_k), "mxfp4", logical_k, 32)
+
+    # 2) MLX quantized modules (*.weight + *.scales [+ *.biases])
+    for tname in list(active_tensors):
+        if tname in consumed_tensors or not tname.endswith(".weight"):
+            continue
+        mod = tname[: -len(".weight")]
+        sc_name = mod + ".scales"
+        bi_name = mod + ".biases"
+        if sc_name not in active_tensors:
+            continue
+        w_dtype, w_shape = active_tensors[tname]
+        s_dtype, s_shape = active_tensors[sc_name]
+        expected_k = _infer_expected_module_in_features(
+            mod, text_cfg, head_dim=head_dim, shared_inter_override=inferred_shared_inter
+        )
+        if bi_name in active_tensors:
+            # Affine quantized module
+            b_dtype, b_shape = active_tensors[bi_name]
+            if (
+                w_dtype != "U32"
+                or s_dtype not in ("BF16", "F16")
+                or b_dtype not in ("BF16", "F16")
+                or len(w_shape) < 2
+                or len(s_shape) != len(w_shape)
+                or s_shape != b_shape
+                or w_shape[:-1] != s_shape[:-1]
+                or s_shape[-1] <= 0
+            ):
+                reason = (
+                    f"Invalid affine quantization tensors on '{mod}' "
+                    f"(weight={w_dtype}{list(w_shape)}, scales={s_dtype}{list(s_shape)}, "
+                    f"biases={b_dtype}{list(b_shape)})"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="invalid_affine_tensors",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": tname, "shape": list(w_shape), "reason": reason},
+                )
+            groups = s_shape[-1]
+            total_row_bits = w_shape[-1] * 32
+            spec = _module_quant_spec(cfg, mod)
+            spec_bits = spec.get("bits")
+            spec_gs = spec.get("group_size")
+            bits: int | None = None
+            gs: int | None = None
+            logical_k = 0
+            if (
+                expected_k is not None
+                and expected_k > 0
+                and expected_k % groups == 0
+                and total_row_bits % expected_k == 0
+            ):
+                gs = expected_k // groups
+                bits = total_row_bits // expected_k
+                logical_k = expected_k
+            elif (
+                isinstance(spec_bits, int)
+                and not isinstance(spec_bits, bool)
+                and spec_bits > 0
+                and isinstance(spec_gs, int)
+                and not isinstance(spec_gs, bool)
+                and spec_gs > 0
+                and groups * spec_gs * spec_bits == total_row_bits
+            ):
+                bits = spec_bits
+                gs = spec_gs
+                logical_k = groups * spec_gs
+            elif (
+                isinstance(spec_bits, int)
+                and not isinstance(spec_bits, bool)
+                and spec_bits > 0
+                and total_row_bits % spec_bits == 0
+                and (total_row_bits // spec_bits) % groups == 0
+            ):
+                bits = spec_bits
+                logical_k = total_row_bits // spec_bits
+                gs = logical_k // groups
+            elif (
+                isinstance(spec_gs, int)
+                and not isinstance(spec_gs, bool)
+                and spec_gs > 0
+                and total_row_bits % (groups * spec_gs) == 0
+            ):
+                gs = spec_gs
+                logical_k = groups * spec_gs
+                bits = total_row_bits // logical_k
+            else:
+                for cand_gs in (64, 128, 32, 16, 256):
+                    cand_k = groups * cand_gs
+                    if cand_k > 0 and total_row_bits % cand_k == 0:
+                        cand_b = total_row_bits // cand_k
+                        if cand_b in (2, 3, 4, 5, 6, 8):
+                            gs = cand_gs
+                            bits = cand_b
+                            logical_k = cand_k
+                            break
+
+            if bits is None or bits not in (3, 4, 5, 6, 8):
+                reason = (
+                    f"Unsupported affine quantization bits={bits!r} on tensor {tname!r} "
+                    f"shape={list(w_shape)} (supported bits: 3, 4, 5, 6, 8)"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="unsupported_affine_bits",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": tname, "shape": list(w_shape), "reason": reason},
+                )
+            if gs is None or gs not in (64, 128):
+                reason = (
+                    f"Unsupported affine quantization group_size={gs!r} on tensor {tname!r} "
+                    f"shape={list(w_shape)} (supported group_size: 64, 128)"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="unsupported_affine_group_size",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": tname, "shape": list(w_shape), "reason": reason},
+                )
+            consumed_tensors.update((tname, sc_name, bi_name))
+            quant_modes.append(f"affine_q{bits}_g{gs}")
+            _record_module_category(mod, (*s_shape[:-1], logical_k), "affine", logical_k, gs)
+        else:
+            # MXFP4 (U32 weight + U8/F8_E8M0 scales) or unsupported scale-only format
+            if w_dtype == "U32" and s_dtype in ("U8", "F8_E8M0") and len(w_shape) >= 2 and len(s_shape) == len(w_shape) and w_shape[:-1] == s_shape[:-1] and s_shape[-1] > 0:
+                groups = s_shape[-1]
+                gs = (expected_k // groups) if (expected_k and expected_k % groups == 0) else 32
+                logical_k = groups * gs
+                if gs != 32 or w_shape[-1] * 8 != logical_k:
+                    reason = (
+                        f"Unsupported MXFP4 geometry (group_size={gs}) on tensor {tname!r} "
+                        f"shape={list(w_shape)} (expected group_size=32)"
+                    )
+                    repack_counts["incompatible_blocker"] = 1
+                    return _finish(
+                        False,
+                        blocker_code="unsupported_mxfp4_geometry",
+                        reason=reason,
+                        model_type=raw_mt,
+                        text_model_type=raw_text_mt,
+                        model_type_hint_matched=hint_matched,
+                        head_dim=head_dim,
+                        skipped_non_text_tensors=skipped_non_text,
+                        companion_mtp_tensors=companion_mtp,
+                        repack_counts=repack_counts,
+                        first_blocker={"tensor": tname, "shape": list(w_shape), "reason": reason},
+                    )
+                consumed_tensors.update((tname, sc_name))
+                quant_modes.append("mxfp4")
+                _record_module_category(mod, (*s_shape[:-1], logical_k), "mxfp4", logical_k, 32)
+            else:
+                reason = (
+                    f"Unsupported scale-only quantization on tensor {tname!r} "
+                    f"(weight={w_dtype}{list(w_shape)}, scales={s_dtype}{list(s_shape)} without .biases)"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="unsupported_quant_format",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": tname, "shape": list(w_shape), "reason": reason},
+                )
+
+    # 3) Direct unquantized tensors (norms, GDN scalars, BF16/FP16 embeddings/lm_head/layers)
+    for tname, (tdtype, tshape) in active_tensors.items():
+        if tname in consumed_tensors:
+            continue
+        probe_t = "." + tname.lstrip(".")
+        if tname.endswith((".scales", ".biases", ".weight_scale")):
+            reason = f"Orphaned quantization metadata tensor {tname!r} shape={list(tshape)}"
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="orphaned_quant_metadata",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if len(tshape) == 3 and (".switch_mlp." in probe_t or ".experts." in probe_t):
+            reason = (
+                f"Unquantized 3D MoE expert tensor {tname!r} (dtype={tdtype}, shape={list(tshape)}) "
+                f"is not supported by {M5RT_ENGINE_LABEL} (MoE experts must be affine or MXFP4 quantized)"
+            )
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_unquantized_moe_experts",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if ".mlp.experts." in probe_t and any(
+            f".mlp.experts.{d}." in probe_t for d in ("0", "1")
+        ):
+            reason = (
+                f"Unfused per-expert 2D MoE tensor {tname!r} shape={list(tshape)} is not supported "
+                f"by {M5RT_ENGINE_LABEL} (expected 3D [E, N, K] switch_mlp/experts tensors)"
+            )
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_unfused_moe_experts",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        is_scalar_or_conv = tname.endswith((".A_log", ".dt_bias", ".conv1d.weight")) or (
+            len(tshape) == 1 and tname.endswith("norm.weight")
+        )
+        allowed_dtypes = ("BF16", "F16", "F32") if is_scalar_or_conv else ("BF16", "F16")
+        if tdtype not in allowed_dtypes:
+            reason = (
+                f"Unsupported tensor dtype={tdtype!r} on {tname!r} shape={list(tshape)} "
+                f"(expected {allowed_dtypes})"
+            )
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="unsupported_tensor_dtype",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+                first_blocker={"tensor": tname, "shape": list(tshape), "reason": reason},
+            )
+        if not is_scalar_or_conv and len(tshape) == 2 and not probe_t.endswith(
+            (".mlp.gate.weight", ".mlp.shared_expert_gate.weight")
+        ):
+            quant_modes.append("bf16" if tdtype == "BF16" else "fp16")
+        if tname.startswith("mtp.") or ".mtp." in tname:
+            repack_counts["companion_mtp"] += 1
+        else:
+            repack_counts["rowsplit_or_direct"] += 1
+
+    # Layer 1C: Attention Output Gate (`has_attn_output_gate`) & QK-Norm (`has_qk_norm`) Auto-Detection
+    has_attn_output_gate: bool | None = None
+    has_qk_norm: bool | None = None
+    if full_layers > 0:
+        q_ungated = num_q_heads * head_dim
+        q_gated = 2 * q_ungated
+        gate_flags: list[bool] = []
+        qknorm_flags: list[bool] = []
+        for l_idx, lt in enumerate(layer_types):
+            if lt != "full_attention":
+                continue
+            q_marker = f".layers.{l_idx}.self_attn.q_proj."
+            q_entry: tuple[str, tuple[int, ...]] | None = None
+            for cand_suffix in ("weight", "weight_packed"):
+                target_s = q_marker + cand_suffix
+                for tname, (_td, tsh) in text_tensors.items():
+                    if ("." + tname).endswith(target_s):
+                        q_entry = (tname, tsh)
+                        break
+                if q_entry is not None:
+                    break
+            if q_entry is None:
+                reason = f"Missing self_attn.q_proj tensor for full_attention layer {l_idx}"
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="missing_layer_tensor",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                )
+            q_tname, q_shape = q_entry
+            n_q = q_shape[0] if q_shape else 0
+            if n_q == q_gated:
+                gate_flags.append(True)
+            elif n_q == q_ungated:
+                gate_flags.append(False)
+            else:
+                reason = (
+                    f"Unsupported self_attn.q_proj output dim {n_q} on {q_tname!r} "
+                    f"shape={list(q_shape)} (expected {q_ungated} for ungated GQA or "
+                    f"{q_gated} for gated GQA)"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="invalid_q_proj_shape",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                    first_blocker={"tensor": q_tname, "shape": list(q_shape), "reason": reason},
+                )
+
+            qn_suffix = f".layers.{l_idx}.self_attn.q_norm.weight"
+            kn_suffix = f".layers.{l_idx}.self_attn.k_norm.weight"
+            has_qn = any(("." + n).endswith(qn_suffix) for n in text_tensors)
+            has_kn = any(("." + n).endswith(kn_suffix) for n in text_tensors)
+            if has_qn != has_kn:
+                reason = (
+                    f"Inconsistent QK-norm tensors at layer {l_idx} "
+                    f"(q_norm={has_qn}, k_norm={has_kn})"
+                )
+                repack_counts["incompatible_blocker"] = 1
+                return _finish(
+                    False,
+                    blocker_code="inconsistent_qk_norm",
+                    reason=reason,
+                    model_type=raw_mt,
+                    text_model_type=raw_text_mt,
+                    model_type_hint_matched=hint_matched,
+                    head_dim=head_dim,
+                    skipped_non_text_tensors=skipped_non_text,
+                    companion_mtp_tensors=companion_mtp,
+                    repack_counts=repack_counts,
+                )
+            qknorm_flags.append(has_qn)
+
+        if len(set(gate_flags)) > 1:
+            reason = "Inconsistent self_attn.q_proj output gate across full-attention layers"
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="inconsistent_attn_output_gate",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+            )
+        if len(set(qknorm_flags)) > 1:
+            reason = "Inconsistent QK-norm presence across full-attention layers"
+            repack_counts["incompatible_blocker"] = 1
+            return _finish(
+                False,
+                blocker_code="inconsistent_qk_norm",
+                reason=reason,
+                model_type=raw_mt,
+                text_model_type=raw_text_mt,
+                model_type_hint_matched=hint_matched,
+                head_dim=head_dim,
+                skipped_non_text_tensors=skipped_non_text,
+                companion_mtp_tensors=companion_mtp,
+                repack_counts=repack_counts,
+            )
+        has_attn_output_gate = gate_flags[0]
+        has_qk_norm = qknorm_flags[0]
+
+    # Verify required global text backbone tensors
+    has_embed = any(
+        n.endswith(("embed_tokens.weight", "embed_tokens.weight_packed"))
+        for n in text_tensors
+    )
+    has_final_norm = any(
+        n == "norm.weight"
+        or n.endswith("model.norm.weight")
+        or (n.endswith(".norm.weight") and ".layers." not in ("." + n))
+        for n in text_tensors
+    )
+    has_lm_head = tie_word_embeddings or any(
+        n.endswith(("lm_head.weight", "lm_head.weight_packed")) for n in text_tensors
+    )
+    if not has_embed or not has_final_norm or not has_lm_head:
+        missing_parts = []
+        if not has_embed:
+            missing_parts.append("embed_tokens")
+        if not has_final_norm:
+            missing_parts.append("model.norm.weight")
+        if not has_lm_head:
+            missing_parts.append("lm_head.weight")
+        reason = (
+            f"Checkpoint is missing required text backbone tensor(s): "
+            f"{', '.join(missing_parts)}"
+        )
+        repack_counts["incompatible_blocker"] = 1
+        return _finish(
+            False,
+            blocker_code="missing_backbone_tensors",
+            reason=reason,
+            model_type=raw_mt,
+            text_model_type=raw_text_mt,
+            model_type_hint_matched=hint_matched,
+            head_dim=head_dim,
+            skipped_non_text_tensors=skipped_non_text,
+            companion_mtp_tensors=companion_mtp,
+            repack_counts=repack_counts,
+        )
+
+    topology = "gdn_hybrid_gqa" if linear_layers > 0 else "pure_gqa_swiglu"
+    return _finish(
+        True,
+        model_type=raw_mt,
+        text_model_type=raw_text_mt,
+        model_type_hint_matched=hint_matched,
+        topology=topology,
+        head_dim=head_dim,
+        has_attn_output_gate=has_attn_output_gate,
+        has_qk_norm=has_qk_norm,
+        linear_attention_layers=linear_layers,
+        full_attention_layers=full_layers,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        has_shared_expert=has_shared_expert,
+        tie_word_embeddings=tie_word_embeddings,
+        quant_modes=quant_modes or ["bf16"],
+        skipped_non_text_tensors=skipped_non_text,
+        companion_mtp_tensors=companion_mtp,
+        repack_counts=repack_counts,
     )
 
 
@@ -7282,27 +9254,40 @@ def can_auto_convert_provider_fast(
     if mdir_err or (is_builtin and mdir_resolved is None):
         return False
 
+    if not os.access(model_dir, os.W_OK):
+        return False
+
+    if is_builtin:
+        probe = inspect_m5rt_source_fast(model_dir)
+        if probe["is_dflash2_draft"]:
+            return False
+        return bool(probe["eligible"])
+
     cfg = _read_json(model_dir / "config.json")
     if cfg is None:
         return False
 
+    arch_caps = manifest.get("architecture_capabilities")
+    whitelist_enforced = not (
+        isinstance(arch_caps, dict)
+        and arch_caps.get("model_type_whitelist_enforced") is False
+    )
     supported_types = {
         str(m).strip().lower()
         for m in (manifest.get("supported_model_types") or ())
         if isinstance(m, str) and m.strip()
     }
     model_types = _extract_model_type_tokens(cfg)
-    if supported_types and (not model_types or not (model_types & supported_types)):
+    if whitelist_enforced and supported_types and (
+        not model_types or not (model_types & supported_types)
+    ):
         return False
 
-    quant_ok, _ = _config_matches_converter_quant(cfg, spec, is_builtin=is_builtin)
+    quant_ok, _ = _config_matches_converter_quant(cfg, spec, is_builtin=False)
     if not quant_ok:
         return False
 
-    if not _has_valid_safetensors_header(model_dir):
-        return False
-
-    return os.access(model_dir, os.W_OK)
+    return _has_valid_safetensors_header(model_dir)
 
 
 def can_auto_convert_m5rt_fast(
@@ -7347,8 +9332,9 @@ def _is_supported_dflash2_draft_config(
     manifest: dict[str, Any] | None = None,
     *,
     is_builtin: bool = True,
+    target_config: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Verify whether `cfg` is a whitelisted DFlash2 draft checkpoint for this provider."""
+    """Verify structural DFlash2 draft compatibility (and optional target model pairing)."""
     if not isinstance(cfg, dict):
         return False, "config.json is not a valid JSON object"
 
@@ -7381,12 +9367,6 @@ def _is_supported_dflash2_draft_config(
     if not is_builtin:
         return True, ""
 
-    raw_mt = str(cfg.get("model_type") or "").strip().lower()
-    if raw_mt not in M5RT_SUPPORTED_DFLASH2_MODEL_TYPES:
-        return (
-            False,
-            f"DFlash2 draft model_type={raw_mt!r} is not in {list(M5RT_SUPPORTED_DFLASH2_MODEL_TYPES)}",
-        )
     if cfg.get("is_causal", True) is not False:
         return False, "DFlash2 draft config must set is_causal=false"
 
@@ -7403,50 +9383,104 @@ def _is_supported_dflash2_draft_config(
     sel_topk = extra.get("selector_top_k")
     target_lids = extra.get("target_layer_ids")
     if (
-        not isinstance(layer_count, int)
+        isinstance(layer_count, bool)
+        or not isinstance(layer_count, int)
         or layer_count < 1
         or layer_count > 5
         or not isinstance(layer_types, list)
         or len(layer_types) != layer_count
         or any(lt != "sliding_attention" for lt in layer_types)
+        or isinstance(conv_kernel, bool)
         or conv_kernel != 2
+        or isinstance(conv_group, bool)
         or not isinstance(conv_group, int)
         or conv_group <= 0
+        or isinstance(sel_rank, bool)
         or not isinstance(sel_rank, int)
         or sel_rank <= 0
+        or isinstance(sel_topk, bool)
         or not isinstance(sel_topk, int)
         or sel_topk <= 0
+        or isinstance(block_size, bool)
         or not isinstance(block_size, int)
         or block_size < 2
         or block_size > 16
         or not isinstance(target_lids, list)
         or not target_lids
+        or any(isinstance(tid, bool) or not isinstance(tid, int) or tid < 0 for tid in target_lids)
     ):
         return False, "DFlash2 draft config geometry does not match miv DFlash2 contract"
 
+    hidden_size = cfg.get("hidden_size")
+    if (
+        isinstance(hidden_size, bool)
+        or not isinstance(hidden_size, int)
+        or hidden_size < 64
+        or hidden_size % 64 != 0
+    ):
+        return (
+            False,
+            f"DFlash2 draft hidden_size={hidden_size!r} must be >= 64 and divisible by 64",
+        )
+
+    vocab_size = cfg.get("vocab_size")
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        return False, f"DFlash2 draft vocab_size={vocab_size!r} must be a positive integer"
+
     quant = cfg.get("quantization") or cfg.get("quantization_config") or {}
-    if isinstance(quant, dict) and (quant.get("mode") or quant.get("format")):
+    if isinstance(quant, dict) and (
+        quant.get("mode") or quant.get("format") or quant.get("quant_method") or quant.get("bits")
+    ):
         return False, "DFlash2 draft conversion requires an unquantized BF16 checkpoint"
     raw_dtype = str(cfg.get("dtype") or cfg.get("torch_dtype") or "bfloat16").strip().lower()
     if raw_dtype not in ("bfloat16", "bf16"):
         return False, f"DFlash2 draft dtype={raw_dtype!r} is not supported (expected 'bfloat16')"
 
-    vocab_size = cfg.get("vocab_size")
-    hidden_size = cfg.get("hidden_size")
-    num_target_layers = cfg.get("num_target_layers")
-    if isinstance(vocab_size, int) and vocab_size >= 65536:
-        if vocab_size != 248320:
+    if isinstance(target_config, dict):
+        t_text = _text_config(target_config)
+        t_vocab = (
+            t_text.get("vocab_size")
+            if t_text.get("vocab_size") is not None
+            else target_config.get("vocab_size")
+        )
+        t_hidden = (
+            t_text.get("hidden_size")
+            if t_text.get("hidden_size") is not None
+            else target_config.get("hidden_size")
+        )
+        t_layers = (
+            t_text.get("num_hidden_layers")
+            if t_text.get("num_hidden_layers") is not None
+            else target_config.get("num_hidden_layers")
+        )
+        if isinstance(t_vocab, int) and not isinstance(t_vocab, bool) and vocab_size != t_vocab:
             return (
                 False,
-                f"DFlash2 draft vocab_size={vocab_size} does not match supported Qwen3.5/3.6/3.8 models (248320)",
+                f"DFlash2 draft vocab_size={vocab_size} does not match target vocab_size={t_vocab}",
             )
-        if isinstance(hidden_size, int) and isinstance(num_target_layers, int):
-            if (hidden_size, num_target_layers) not in M5RT_SUPPORTED_DFLASH2_TARGET_GEOMETRIES:
+        if isinstance(t_hidden, int) and not isinstance(t_hidden, bool) and hidden_size != t_hidden:
+            return (
+                False,
+                f"DFlash2 draft hidden_size={hidden_size} does not match target hidden_size={t_hidden}",
+            )
+        if isinstance(t_layers, int) and not isinstance(t_layers, bool) and t_layers > 0:
+            num_target_layers = cfg.get("num_target_layers")
+            if (
+                isinstance(num_target_layers, int)
+                and not isinstance(num_target_layers, bool)
+                and num_target_layers != t_layers
+            ):
                 return (
                     False,
-                    f"DFlash2 draft target geometry (hidden_size={hidden_size}, "
-                    f"num_target_layers={num_target_layers}) is not in supported Qwen3.5/3.6/3.8 "
-                    f"families {sorted(M5RT_SUPPORTED_DFLASH2_TARGET_GEOMETRIES)}",
+                    f"DFlash2 draft num_target_layers={num_target_layers} does not match "
+                    f"target num_hidden_layers={t_layers}",
+                )
+            max_tid = max(target_lids)
+            if max_tid >= t_layers:
+                return (
+                    False,
+                    f"DFlash2 draft max(target_layer_ids)={max_tid} must be < "
+                    f"target num_hidden_layers={t_layers}",
                 )
 
     return True, ""
@@ -7455,17 +9489,18 @@ def _is_supported_dflash2_draft_config(
 def _can_convert_dflash2_draft_fast(
     model_dir: Path,
     configured_binary: str | None = None,
+    *,
+    target_config: dict[str, Any] | None = None,
 ) -> bool:
-    """Fast O(1) zero-subprocess check whether `model_dir` is a convertible Qwen DFlash2 draft."""
+    """Fast O(1) zero-subprocess check whether `model_dir` is a convertible DFlash2 draft."""
     if not model_dir.is_dir():
         return False
     manifest = _builtin_m5rt_manifest()
     extensions = _normalize_extensions(manifest.get("artifact_extensions"))
     if _find_draft_artifact_in_dir(model_dir, extensions, is_builtin=True) is not None:
         return False
-    cfg = _read_json(model_dir / "config.json")
-    ok_df, _ = _is_supported_dflash2_draft_config(cfg, manifest, is_builtin=True)
-    if not ok_df:
+    probe = inspect_m5rt_source_fast(model_dir, target_config=target_config)
+    if not probe["is_dflash2_draft"] or not probe["eligible"]:
         return False
     bin_path, inst_manifest = _find_m5rt_binary_path_fast(configured_binary)
     if bin_path is None:
@@ -7473,8 +9508,6 @@ def _can_convert_dflash2_draft_fast(
     if isinstance(inst_manifest, dict) and inst_manifest.get("_provider_dir"):
         manifest["_provider_dir"] = inst_manifest["_provider_dir"]
     if find_provider_converter_tool_fast(bin_path, manifest, is_builtin=True) is None:
-        return False
-    if not _has_valid_safetensors_header(model_dir):
         return False
     return os.access(model_dir, os.W_OK)
 
@@ -7488,6 +9521,8 @@ def can_convert_provider_model(
     manifest: dict[str, Any] | None = None,
     model_settings: object | None = None,
     is_builtin: bool = True,
+    target_model_dir: str | Path | None = None,
+    target_config: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Return `(True, '')` when `model_path` has `.safetensors` convertible for this provider."""
     if not model_path:
@@ -7515,35 +9550,49 @@ def can_convert_provider_model(
 
     extensions = _normalize_extensions(eff_manifest.get("artifact_extensions"))
     is_draft_arch, _ = _is_dflash_family_architecture(cfg)
-    if is_draft_arch:
-        if _find_draft_artifact_in_dir(model_dir, extensions, is_builtin=False) is not None:
-            return False, "model already has repacked microkernel weights"
-        draft_ok, draft_reason = _is_supported_dflash2_draft_config(
-            cfg, eff_manifest, is_builtin=is_builtin
+    if is_draft_arch and _find_draft_artifact_in_dir(model_dir, extensions, is_builtin=False) is not None:
+        return False, "model already has repacked microkernel weights"
+
+    if is_builtin:
+        probe = inspect_m5rt_source_fast(
+            model_dir,
+            target_model_dir=target_model_dir,
+            target_config=target_config,
         )
-        if not draft_ok:
-            return False, draft_reason
+        if not probe["eligible"]:
+            return False, str(probe["reason"])
     else:
-        supported_types = {
-            str(m).strip().lower()
-            for m in (
-                eff_manifest.get("supported_model_types")
-                or (M5RT_SUPPORTED_MODEL_TYPES if is_builtin else ())
+        if is_draft_arch:
+            draft_ok, draft_reason = _is_supported_dflash2_draft_config(
+                cfg, eff_manifest, is_builtin=False, target_config=target_config
             )
-            if isinstance(m, str) and m.strip()
-        }
-        model_types = _extract_model_type_tokens(cfg)
-        if supported_types and (not model_types or not (model_types & supported_types)):
-            return False, f"model_type is not in {sorted(supported_types)}"
+            if not draft_ok:
+                return False, draft_reason
+        else:
+            arch_caps = eff_manifest.get("architecture_capabilities")
+            whitelist_enforced = not (
+                isinstance(arch_caps, dict)
+                and arch_caps.get("model_type_whitelist_enforced") is False
+            )
+            supported_types = {
+                str(m).strip().lower()
+                for m in (eff_manifest.get("supported_model_types") or ())
+                if isinstance(m, str) and m.strip()
+            }
+            model_types = _extract_model_type_tokens(cfg)
+            if whitelist_enforced and supported_types and (
+                not model_types or not (model_types & supported_types)
+            ):
+                return False, f"model_type is not in {sorted(supported_types)}"
 
-        quant_ok, quant_reason = _config_matches_converter_quant(
-            cfg, spec, is_builtin=is_builtin
-        )
-        if not quant_ok:
-            return False, quant_reason
+            quant_ok, quant_reason = _config_matches_converter_quant(
+                cfg, spec, is_builtin=False
+            )
+            if not quant_ok:
+                return False, quant_reason
 
-    if not _has_valid_safetensors_header(model_dir):
-        return False, "no valid .safetensors weights found in model directory"
+        if not _has_valid_safetensors_header(model_dir):
+            return False, "no valid .safetensors weights found in model directory"
 
     if not os.access(model_dir, os.W_OK):
         return False, f"model directory is not writable: {model_dir}"
@@ -7594,6 +9643,8 @@ def convert_provider_model(
     model_settings: object | None = None,
     nax_pretile: bool | None = None,
     is_builtin: bool = True,
+    target_model_dir: str | Path | None = None,
+    target_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically repack `.safetensors` weights in `model_path` alongside original weights."""
     model_dir = Path(model_path).expanduser().resolve()
@@ -7639,6 +9690,8 @@ def convert_provider_model(
             manifest=eff_manifest,
             model_settings=model_settings,
             is_builtin=is_builtin,
+            target_model_dir=target_model_dir,
+            target_config=target_config,
         )
         if not ok:
             raise ValueError(f"Cannot convert model to {out_path.suffix}: {reason}")
@@ -7738,14 +9791,19 @@ def can_convert_to_miv(
     model_path: str | Path,
     configured_binary: str | None = None,
     model_settings: object | None = None,
+    *,
+    target_model_dir: str | Path | None = None,
+    target_config: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Return `(True, '')` when `model_path` has Qwen `.safetensors` convertible to `.miv`."""
+    """Return `(True, '')` when `model_path` has `.safetensors` convertible to `.miv`."""
     return can_convert_provider_model(
         model_path,
         configured_binary=configured_binary,
         manifest=_builtin_m5rt_manifest(),
         model_settings=model_settings,
         is_builtin=True,
+        target_model_dir=target_model_dir,
+        target_config=target_config,
     )
 
 
@@ -7756,6 +9814,8 @@ def convert_model_to_miv(
     configured_binary: str | None = None,
     model_settings: object | None = None,
     nax_pretile: bool = True,
+    target_model_dir: str | Path | None = None,
+    target_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert `.safetensors` weights in `model_path` to `model.miv` atomically alongside `.safetensors`."""
     return convert_provider_model(
@@ -7766,6 +9826,8 @@ def convert_model_to_miv(
         model_settings=model_settings,
         nax_pretile=nax_pretile,
         is_builtin=True,
+        target_model_dir=target_model_dir,
+        target_config=target_config,
     )
 
 
