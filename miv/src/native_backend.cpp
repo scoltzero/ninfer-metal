@@ -4206,26 +4206,14 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
   backend_stats_.prefill_linear_fallback_reason =
       ar_program_->prefill_linear_fallback_reason;
   backend_stats_.model_quant_format = ar_program_->model_quant_format;
-  const auto init_prefill_tel = ar_program_->program->prefill_telemetry();
   backend_stats_.prefill_ane_active =
       ar_program_->program->ane_offload_active();
   backend_stats_.prefill_ane_split_alpha =
       ar_program_->program->ane_split_alpha();
-  if (!init_prefill_tel.prefill_ane_mode_effective.empty() &&
-      init_prefill_tel.prefill_ane_mode_effective != "off") {
-    backend_stats_.prefill_ane_mode_effective =
-        init_prefill_tel.prefill_ane_mode_effective;
-  } else if (backend_stats_.prefill_ane_active) {
-    const auto req_ane = effective_load_prefill_ane_mode(options_);
-    backend_stats_.prefill_ane_mode_effective =
-        (req_ane == PrefillAneMode::UltraFp16SwiGlu)
-            ? std::string("ultra_fp16_swiglu")
-            : std::string("compact_int8");
-  } else {
-    backend_stats_.prefill_ane_mode_effective = "off";
-  }
+  backend_stats_.prefill_ane_mode_effective =
+      prefill_ane_mode_to_string(ar_program_->program->ane_mode_effective());
   backend_stats_.prefill_ane_inactive_reason =
-      init_prefill_tel.prefill_ane_inactive_reason;
+      std::string(ar_program_->program->ane_inactive_reason());
   if (!backend_stats_.prefill_ane_active &&
       backend_stats_.prefill_ane_inactive_reason.empty() &&
       effective_load_prefill_ane_mode(options_) != PrefillAneMode::Off &&

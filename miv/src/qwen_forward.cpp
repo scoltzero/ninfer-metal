@@ -2853,9 +2853,12 @@ public:
   }
 
   bool can_gpu_suffix_linear(const MaterializedWeightView &w, U32 n, U32 k,
-                             bool use_w4a8) const {
+                             bool use_w4a8, bool use_w4a4 = false) const {
     if (is_overridden(w) || has_bypass_lora(w)) {
       return false;
+    }
+    if (use_w4a4 && can_w4a4_weight(w, n, k)) {
+      return true;
     }
     if (use_w4a8 && can_w4a8_weight(w, n, k)) {
       return true;
@@ -2878,7 +2881,12 @@ public:
   bool emit_gpu_suffix_linear(Encoder &e, const MaterializedWeightView &w,
                               Ref x, Ref y, U32 n, U32 k, bool use_w4a8,
                               U32 row_offset, U32 out_stride, U32 slice_n,
-                              std::optional<U32> explicit_t = {}) {
+                              std::optional<U32> explicit_t = {},
+                              bool use_w4a4 = false) {
+    if (use_w4a4 && try_linear_w4a4_base(e, w, x, y, n, k, explicit_t,
+                                         row_offset, out_stride, slice_n)) {
+      return true;
+    }
     if (use_w4a8 && try_linear_w4a8_base(e, w, x, y, n, k, explicit_t,
                                          row_offset, out_stride, slice_n)) {
       return true;
@@ -2912,10 +2920,20 @@ public:
 
   bool can_gpu_suffix_swiglu(const MaterializedWeightView &gate_w,
                              const MaterializedWeightView &up_w, U32 n, U32 k,
-                             bool use_w4a8) const {
+                             bool use_w4a8, bool use_w4a4 = false) const {
     if (is_overridden(gate_w) || is_overridden(up_w) ||
         has_bypass_lora(gate_w) || has_bypass_lora(up_w)) {
       return false;
+    }
+    if (use_w4a4 && can_w4a4_weight(gate_w, n, k) &&
+        can_w4a4_weight(up_w, n, k)) {
+      if (mxfp4_nax_active() && (k % 128U) == 0U) {
+        const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+        const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+        if (gw && uw && gw->bn == 16U && uw->bn == 16U) {
+          return true;
+        }
+      }
     }
     if (use_w4a8 && can_w4a8_weight(gate_w, n, k) &&
         can_w4a8_weight(up_w, n, k)) {
@@ -2963,6 +2981,22 @@ public:
     return false;
   }
 
+  bool can_gpu_suffix_swiglu_fwht64_a4(const MaterializedWeightView &gate_w,
+                                       const MaterializedWeightView &up_w,
+                                       const MaterializedWeightView &down_w,
+                                       U32 n, U32 k, bool use_w4a4) const {
+    if (!use_w4a4 || !w4a4_nax_enabled_ || !down_w.has_fwht64() ||
+        gate_w.has_fwht64() || up_w.has_fwht64() || (n % 128U) != 0U ||
+        (k % 128U) != 0U || w4a4_codes.buffer == nullptr ||
+        w4a4_mid_codes.buffer == nullptr || w4a4_mid_scales.buffer == nullptr ||
+        has_bypass_lora(down_w) || inspect_tensors_workspace ||
+        !can_w4a4_weight(down_w, h, n)) {
+      return false;
+    }
+    return can_gpu_suffix_swiglu(gate_w, up_w, n, k, /*use_w4a8=*/false,
+                                 /*use_w4a4=*/true);
+  }
+
   bool can_gpu_suffix_swiglu_fwht64_a8(const MaterializedWeightView &gate_w,
                                        const MaterializedWeightView &up_w,
                                        const MaterializedWeightView &down_w,
@@ -2982,7 +3016,13 @@ public:
                               const MaterializedWeightView &up_w, Ref x, Ref y,
                               U32 n, U32 k, bool use_w4a8, U32 row_offset,
                               U32 out_stride, U32 slice_n,
-                              std::optional<U32> explicit_t = {}) {
+                              std::optional<U32> explicit_t = {},
+                              bool use_w4a4 = false) {
+    if (use_w4a4 &&
+        try_linear_w4a4_swiglu(e, gate_w, up_w, x, y, n, k, explicit_t,
+                               row_offset, out_stride, slice_n)) {
+      return true;
+    }
     if (use_w4a8 &&
         try_linear_w4a8_swiglu(e, gate_w, up_w, x, y, n, k, explicit_t,
                                row_offset, out_stride, slice_n)) {
@@ -9443,6 +9483,7 @@ public:
     ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
     bool trunk_only = false;
     bool used_w4a8 = false;
+    bool used_w4a4 = false;
     bool used_sage2 = false;
     bool used_minference = false;
     std::optional<Profile> embed_norm0;
@@ -9454,7 +9495,7 @@ public:
     std::optional<Profile> pre_mlp;    // attn/gdn (full concat + GDN Stage-3) + post_norm
     std::optional<U32> mlp_gu_op_id;   // MlpGateUpSwiGlu ANE op_id
     ane::AneUnpackTarget unpack_target{};
-    std::optional<Profile> mlp_gu_gpu; // GPU suffix [N_ane, f) in BF16 or W4A8 Mode B
+    std::optional<Profile> mlp_gu_gpu; // GPU suffix [N_ane, f) in BF16, W4A8 Mode B, or W4A4 Mode B
     std::optional<Profile> post_mlp;   // mlp_down + add + next input_norm (or final add)
   };
 
@@ -9464,6 +9505,7 @@ public:
     ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
     bool trunk_only = false;
     bool used_w4a8 = false;
+    bool used_w4a4 = false;
     bool used_sage2 = false;
     bool used_minference = false;
     std::optional<Profile> embed_norm0;
@@ -9709,8 +9751,9 @@ public:
     const auto &uw = blk0.get("mlp_up");
     const auto &dw = blk0.get("mlp_down");
     const U32 chunk_t = base_cfg.chunk_tokens;
-    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
-    if (!can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8)) {
+    const bool use_w4a4 = use_w4a4_for_t(chunk_t, false);
+    const bool use_w4a8 = !use_w4a4 && use_w4a8_for_t(chunk_t, false);
+    if (!can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8, use_w4a4)) {
       out_reason = "gpu_suffix_unsupported";
       return false;
     }
@@ -9804,13 +9847,16 @@ public:
     constexpr U32 kBurst = 4U;
     constexpr U32 kWarmups = 2U;
     constexpr U32 kSamples = 5U;
+    const bool mode_b_a4 =
+        can_gpu_suffix_swiglu_fwht64_a4(gw, uw, dw, f, h, use_w4a4);
     const bool mode_b_a8 =
-        can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h, use_w4a8);
+        !mode_b_a4 && can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h, use_w4a8);
+    const bool down_w4a4 = use_w4a4 && (dw.has_fwht64() || w4a4_down_proj_);
     const bool down_w4a8 = use_w4a8 && (dw.has_fwht64() || w4a8_down_proj_);
     const bool affine_xs_eligible =
-        (!use_w4a8 && affine_nax_active() && affine_nax_xs.buffer != nullptr &&
-         (h % 64U) == 0U);
-    const bool mlp_f16 = !use_w4a8 && block_mlp_input_nax(blk0, chunk_t);
+        (!use_w4a4 && !use_w4a8 && affine_nax_active() &&
+         affine_nax_xs.buffer != nullptr && (h % 64U) == 0U);
+    const bool mlp_f16 = !use_w4a4 && !use_w4a8 && block_mlp_input_nax(blk0, chunk_t);
 
     auto median_of = [](std::vector<double> vals) -> double {
       if (vals.empty()) {
@@ -9828,7 +9874,13 @@ public:
                     plan_key_suffix());
       e.begin_stage("cal_gpu_solo");
       for (U32 bi = 0U; bi < kBurst; ++bi) {
-        if (use_w4a8) {
+        if (use_w4a4) {
+          emit_add_rmsnorm_a4_bm16_bk128(
+              e, hidden, delta, direct(blk0.get("post_attention_norm"), h),
+              norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/false);
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (use_w4a8) {
           emit_add_rmsnorm_a8_g64(
               e, hidden, delta, direct(blk0.get("post_attention_norm"), h),
               norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -9849,7 +9901,7 @@ public:
           add_normalize(e, blk0.get("post_attention_norm"), hidden, delta, norm);
         }
         mlp(e, blk0, 0U, mlp_f16, {}, nullptr, std::nullopt, false, use_w4a8,
-            false);
+            false, use_w4a4);
       }
       Profile solo_prof = e.finish();
       ensure_profile_icb(context, solo_prof);
@@ -9896,7 +9948,12 @@ public:
                 "qwen.ane.cal.post_norm.c" + std::to_string(chunk_t) +
                     plan_key_suffix());
       e.begin_stage("cal_post_norm");
-      if (use_w4a8) {
+      if (use_w4a4) {
+        emit_add_rmsnorm_a4_bm16_bk128(
+            e, hidden, delta, direct(blk0.get("post_attention_norm"), h), norm,
+            w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+            normalization_weight_offset, /*write_bf16=*/true);
+      } else if (use_w4a8) {
         emit_add_rmsnorm_a8_g64(
             e, hidden, delta, direct(blk0.get("post_attention_norm"), h), norm,
             a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -9915,14 +9972,20 @@ public:
     Profile p_mlp_down = [&] {
       Encoder e(context, libraries, chunk_t,
                 "qwen.ane.cal.mlp_dn.c" + std::to_string(chunk_t) +
-                    (mode_b_a8 ? ".mb" : ".ma") + plan_key_suffix());
+                    (mode_b_a4 ? ".mb4" : (mode_b_a8 ? ".mb8" : ".ma")) +
+                    plan_key_suffix());
       e.begin_stage("cal_mlp_dn");
-      if (mode_b_a8) {
+      if (mode_b_a4) {
+        e.set_a4_quant(make_a4_key_for(e, product, f, w4a4_mid_codes,
+                                       w4a4_mid_scales, std::nullopt,
+                                       /*fwht64=*/true));
+      } else if (mode_b_a8) {
         e.set_a8_quant(make_a8_key_for(e, product, f, a8_mid_qa, a8_mid_sa,
                                        a8_mid_ra, std::nullopt,
                                        /*fwht64=*/true));
       }
-      if (down_w4a8 && try_linear_w4a8_base(e, dw, product, delta, h, f)) {
+      if (down_w4a4 && try_linear_w4a4_base(e, dw, product, delta, h, f)) {
+      } else if (down_w4a8 && try_linear_w4a8_base(e, dw, product, delta, h, f)) {
       } else {
         linear(e, dw, product, delta, h, f);
       }
@@ -9963,29 +10026,46 @@ public:
         Encoder e(context, libraries, chunk_t,
                   "qwen.ane.cal.mlp_gu.c" + std::to_string(chunk_t) + ".off" +
                       std::to_string(op0->split.gpu_row_offset) +
-                      (mode_b_a8 ? ".mb" : ".ma") + plan_key_suffix());
+                      (mode_b_a4 ? ".mb4" : (mode_b_a8 ? ".mb8" : ".ma")) +
+                      plan_key_suffix());
         e.begin_stage("cal_mlp_gu");
-        if (use_w4a8) {
+        if (use_w4a4) {
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (use_w4a8) {
           e.set_a8_quant(make_a8_key(e, norm, h));
         } else if (affine_xs_eligible) {
           e.set_group_sum(Encoder::GroupSumKey{
               affine_nax_xs.buffer, affine_nax_xs.offset, norm.buffer,
               norm.offset, h, 64U, chunk_t, true, 2U});
         }
-        if (mode_b_a8) {
+        if (mode_b_a4) {
+          (void)try_linear_w4a4_swiglu_fwht64_a4(
+              e, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
+              std::nullopt, op0->split.gpu_row_offset, f, op0->split.gpu_rows);
+        } else if (mode_b_a8) {
           (void)try_linear_w4a8_swiglu_fwht64_a8(
               e, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
               std::nullopt, op0->split.gpu_row_offset, f, op0->split.gpu_rows);
         } else {
           (void)emit_gpu_suffix_swiglu(
               e, gw, uw, norm, product, f, h, use_w4a8,
-              op0->split.gpu_row_offset, f, op0->split.gpu_rows);
+              op0->split.gpu_row_offset, f, op0->split.gpu_rows, std::nullopt,
+              use_w4a4);
         }
         return e.finish();
       }();
 
       ane::AneUnpackTarget unpack_target{};
-      if (mode_b_a8) {
+      if (mode_b_a4) {
+        unpack_target.mode = ane::AneUnpackMode::Fwht64A4;
+        unpack_target.primary_buf = w4a4_mid_codes.buffer->native_mtl_buffer();
+        unpack_target.primary_offset = w4a4_mid_codes.offset;
+        unpack_target.aux0_buf = w4a4_mid_scales.buffer->native_mtl_buffer();
+        unpack_target.aux0_offset = w4a4_mid_scales.offset;
+        unpack_target.out_stride = f;
+        unpack_target.dst_col_offset = 0U;
+        unpack_target.mp = w4a4_nax_mp(chunk_t);
+      } else if (mode_b_a8) {
         unpack_target.mode = ane::AneUnpackMode::Fwht64A8;
         unpack_target.primary_buf = a8_mid_qa.buffer->native_mtl_buffer();
         unpack_target.primary_offset = a8_mid_qa.offset;
@@ -10073,7 +10153,7 @@ public:
               std::string(ane::to_string(base_cfg.linear_route)).c_str(),
               chunk_t, cand_alpha, op0->split.ane_total_rows, f,
               canary->stats().shared_input_surface_active ? 1 : 0,
-              mode_b_a8 ? 1 : 0, gpu_solo_ms, med_ms,
+              (mode_b_a4 || mode_b_a8) ? 1 : 0, gpu_solo_ms, med_ms,
               gpu_solo_ms > 0.0 ? (med_ms / gpu_solo_ms) : 0.0,
               gu_ms, dn_ms, ane_ms);
         }
@@ -10121,10 +10201,11 @@ public:
       return it->second;
     }
     const U32 chunk_t = ane_chunk_tokens_;
-    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
+    const bool use_w4a4 = use_w4a4_for_t(chunk_t, false);
+    const bool use_w4a8 = !use_w4a4 && use_w4a8_for_t(chunk_t, false);
     const bool affine_xs_eligible =
-        (!use_w4a8 && affine_nax_active() && affine_nax_xs.buffer != nullptr &&
-         (h % 64U) == 0U);
+        (!use_w4a4 && !use_w4a8 && affine_nax_active() &&
+         affine_nax_xs.buffer != nullptr && (h % 64U) == 0U);
     const std::string pkey_sfx = ".ane_ultra.c" + std::to_string(chunk_t) +
                                  ".e" + std::to_string(context_envelope) +
                                  ".ar" + std::to_string(U32(attn_route)) +
@@ -10133,6 +10214,23 @@ public:
     auto block_input_needs_bf16 = [&](const Block &blk) -> bool {
       if (inspect_tensors_workspace)
         return true;
+      if (use_w4a4) {
+        if (blk.type == LayerType::full_attention) {
+          return w4a4_keep_qk_a8_ ||
+                 block_has_any_bypass(
+                     blk, {"attention_q", "attention_k", "attention_v"}) ||
+                 !can_w4a4_weight(blk.get("attention_q"), 2 * q, h) ||
+                 !can_w4a4_weight(blk.get("attention_k"), kv, h) ||
+                 !can_w4a4_weight(blk.get("attention_v"), kv, h);
+        }
+        const U32 hv = U32(config.linear_num_value_heads);
+        return block_has_any_bypass(
+                   blk, {"gdn_qkv", "gdn_z", "gdn_a", "gdn_b"}) ||
+               !can_w4a4_weight(blk.get("gdn_qkv"), conv, h) ||
+               !can_w4a4_weight(blk.get("gdn_z"), gv, h) ||
+               !can_w4a4_weight(blk.get("gdn_a"), hv, h) ||
+               !can_w4a4_weight(blk.get("gdn_b"), hv, h);
+      }
       if (blk.type == LayerType::full_attention) {
         return block_has_any_bypass(
                    blk, {"attention_q", "attention_k", "attention_v"}) ||
@@ -10154,14 +10252,21 @@ public:
     plan.attn_route = attn_route;
     plan.trunk_only = false;
     plan.used_w4a8 = use_w4a8;
+    plan.used_w4a4 = use_w4a4;
 
     // 1. Embedding + Layer-0 input RMSNorm.
     {
       Encoder e(context, libraries, chunk_t, "qwen.ultra.emb0" + pkey_sfx);
       e.begin_stage("embedding");
       embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
-      const bool in0_f16 = !use_w4a8 && block_input_nax(blocks[0], chunk_t);
-      if (use_w4a8) {
+      const bool in0_f16 =
+          !use_w4a4 && !use_w4a8 && block_input_nax(blocks[0], chunk_t);
+      if (use_w4a4) {
+        emit_rmsnorm_a4_bm16_bk128(
+            e, hidden, direct(blocks[0].get("input_norm"), h), norm, w4a4_codes,
+            w4a4_scales, h, float(config.rms_norm_eps),
+            normalization_weight_offset, block_input_needs_bf16(blocks[0]));
+      } else if (use_w4a8) {
         emit_rmsnorm_a8_g64(e, hidden, direct(blocks[0].get("input_norm"), h),
                             norm, a8_qa, a8_sa, a8_ra, h,
                             float(config.rms_norm_eps),
@@ -10185,8 +10290,10 @@ public:
       const auto &block = blocks[li];
       auto &lp = plan.layers[li];
       const std::string ltag = ".L" + std::to_string(li) + pkey_sfx;
-      const bool in_f16 = !use_w4a8 && block_input_nax(block, chunk_t);
-      const bool in_affine_xs = (!use_w4a8 && !in_f16 && affine_xs_eligible);
+      const bool in_f16 =
+          !use_w4a4 && !use_w4a8 && block_input_nax(block, chunk_t);
+      const bool in_affine_xs =
+          (!use_w4a4 && !use_w4a8 && !in_f16 && affine_xs_eligible);
 
       // 2. Unbroken per-layer pre-MLP GPU trunk:
       //    Full-Attn (QKV concat + Sage2/MInf/Exact + o_proj) OR
@@ -10195,7 +10302,9 @@ public:
       {
         Encoder e(context, libraries, chunk_t, "qwen.ultra.pre_mlp" + ltag);
         e.begin_stage("pre_mlp");
-        if (use_w4a8) {
+        if (use_w4a4) {
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (use_w4a8) {
           e.set_a8_quant(make_a8_key(e, norm, h));
         } else if (in_affine_xs) {
           e.set_group_sum(Encoder::GroupSumKey{
@@ -10204,15 +10313,20 @@ public:
         }
         if (block.type == LayerType::full_attention) {
           attention(e, block, /*split=*/false, context_envelope, in_f16, {},
-                    nullptr, std::nullopt, use_w4a8, attn_route);
+                    nullptr, std::nullopt, use_w4a8, attn_route, use_w4a4);
         } else {
           gdn(e, block, /*verify=*/false, in_f16, nullptr, std::nullopt,
-              use_w4a8);
+              use_w4a8, use_w4a4);
         }
         plan.used_sage2 |= e.profile.used_sage2;
         plan.used_minference |= e.profile.used_minference;
 
-        if (use_w4a8) {
+        if (use_w4a4) {
+          emit_add_rmsnorm_a4_bm16_bk128(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+        } else if (use_w4a8) {
           emit_add_rmsnorm_a8_g64(
               e, hidden, delta, direct(block.get("post_attention_norm"), h),
               norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10230,7 +10344,7 @@ public:
       }
 
       // 3. CB_B1: MLP Gate+Up+SwiGLU GPU suffix [N_ane, f) overlapping Dual-ANE [0, N_ane),
-      //    with Mode B (also_write_bf16=false) FWHT-64 + A8 splice when down_proj uses FWHT-64!
+      //    with Mode B (also_write_bf16=false) FWHT-64 + A4/A8 splice when down_proj uses FWHT-64!
       const auto &gw = block.get("mlp_gate");
       const auto &uw = block.get("mlp_up");
       const auto &dw = block.get("mlp_down");
@@ -10238,13 +10352,17 @@ public:
           ane_engine_->find_op(li, ane::AneProjectionRole::MlpGateUpSwiGlu);
       const bool offload_gu =
           (op != nullptr && op->split.enabled() &&
-           can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8));
+           can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8, use_w4a4));
+      const bool down_w4a4 = use_w4a4 && (dw.has_fwht64() || w4a4_down_proj_);
       const bool down_w4a8 = use_w4a8 && (dw.has_fwht64() || w4a8_down_proj_);
+      bool used_mode_b_a4 = false;
       bool used_mode_b_a8 = false;
       {
         Encoder e(context, libraries, chunk_t, "qwen.ultra.mlp_gu" + ltag);
         e.begin_stage("mlp_gu");
-        if (use_w4a8) {
+        if (use_w4a4) {
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (use_w4a8) {
           e.set_a8_quant(make_a8_key(e, norm, h));
         } else if (affine_xs_eligible) {
           e.set_group_sum(Encoder::GroupSumKey{
@@ -10253,11 +10371,28 @@ public:
         }
         if (offload_gu) {
           lp.mlp_gu_op_id = op->op_id;
-          if (can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h, use_w4a8) &&
-              try_linear_w4a8_swiglu_fwht64_a8(
+          if (can_gpu_suffix_swiglu_fwht64_a4(gw, uw, dw, f, h, use_w4a4) &&
+              try_linear_w4a4_swiglu_fwht64_a4(
                   e, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
                   std::nullopt, op->split.gpu_row_offset, f,
                   op->split.gpu_rows)) {
+            used_mode_b_a4 = true;
+            lp.unpack_target.mode = ane::AneUnpackMode::Fwht64A4;
+            lp.unpack_target.primary_buf =
+                w4a4_mid_codes.buffer->native_mtl_buffer();
+            lp.unpack_target.primary_offset = w4a4_mid_codes.offset;
+            lp.unpack_target.aux0_buf =
+                w4a4_mid_scales.buffer->native_mtl_buffer();
+            lp.unpack_target.aux0_offset = w4a4_mid_scales.offset;
+            lp.unpack_target.out_stride = f;
+            lp.unpack_target.dst_col_offset = 0U;
+            lp.unpack_target.mp = w4a4_nax_mp(chunk_t);
+          } else if (can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h,
+                                                     use_w4a8) &&
+                     try_linear_w4a8_swiglu_fwht64_a8(
+                         e, gw, uw, norm, product, f, h,
+                         /*also_write_bf16=*/false, std::nullopt,
+                         op->split.gpu_row_offset, f, op->split.gpu_rows)) {
             used_mode_b_a8 = true;
             lp.unpack_target.mode = ane::AneUnpackMode::Fwht64A8;
             lp.unpack_target.primary_buf =
@@ -10273,7 +10408,8 @@ public:
           } else {
             (void)emit_gpu_suffix_swiglu(e, gw, uw, norm, product, f, h,
                                          use_w4a8, op->split.gpu_row_offset, f,
-                                         op->split.gpu_rows);
+                                         op->split.gpu_rows, std::nullopt,
+                                         use_w4a4);
             lp.unpack_target.mode = ane::AneUnpackMode::BF16;
             lp.unpack_target.primary_buf = product.buffer->native_mtl_buffer();
             lp.unpack_target.primary_offset = product.offset;
@@ -10281,6 +10417,13 @@ public:
             lp.unpack_target.dst_col_offset = 0U;
             lp.unpack_target.mp = chunk_t;
           }
+        } else if (down_w4a4 && dw.has_fwht64() && can_w4a4_weight(dw, h, f) &&
+                   try_linear_w4a4_swiglu_fwht64_a4(
+                       e, gw, uw, norm, product, f, h,
+                       /*also_write_bf16=*/false)) {
+          used_mode_b_a4 = true;
+        } else if (use_w4a4 &&
+                   try_linear_w4a4_swiglu(e, gw, uw, norm, product, f, h)) {
         } else if (down_w4a8 && dw.has_fwht64() && can_w4a8_weight(dw, h, f) &&
                    try_linear_w4a8_swiglu_fwht64_a8(
                        e, gw, uw, norm, product, f, h,
@@ -10297,23 +10440,35 @@ public:
       }
 
       // 4. Post-MLP GPU work fused into the unpack CB:
-      //    mlp_down (consuming Mode B a8_mid directly!) + residual add + next layer input_norm.
+      //    mlp_down (consuming Mode B w4a4_mid or a8_mid directly!) + residual add + next layer input_norm.
       {
         Encoder e(context, libraries, chunk_t, "qwen.ultra.post_mlp" + ltag);
         e.begin_stage("post_mlp");
-        if (used_mode_b_a8) {
+        if (used_mode_b_a4) {
+          e.set_a4_quant(make_a4_key_for(e, product, f, w4a4_mid_codes,
+                                         w4a4_mid_scales, std::nullopt,
+                                         /*fwht64=*/true));
+        } else if (used_mode_b_a8) {
           e.set_a8_quant(make_a8_key_for(e, product, f, a8_mid_qa, a8_mid_sa,
                                          a8_mid_ra, std::nullopt,
                                          /*fwht64=*/true));
         }
-        if (down_w4a8 && try_linear_w4a8_base(e, dw, product, delta, h, f)) {
+        if (down_w4a4 && try_linear_w4a4_base(e, dw, product, delta, h, f)) {
+        } else if (down_w4a8 &&
+                   try_linear_w4a8_base(e, dw, product, delta, h, f)) {
         } else {
           linear(e, dw, product, delta, h, f);
         }
         if (li + 1U < blocks.size()) {
           const auto &next_blk = blocks[li + 1U];
-          const bool next_in_f16 = !use_w4a8 && block_input_nax(next_blk, chunk_t);
-          if (use_w4a8) {
+          const bool next_in_f16 =
+              !use_w4a4 && !use_w4a8 && block_input_nax(next_blk, chunk_t);
+          if (use_w4a4) {
+            emit_add_rmsnorm_a4_bm16_bk128(
+                e, hidden, delta, direct(next_blk.get("input_norm"), h), norm,
+                w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                normalization_weight_offset, block_input_needs_bf16(next_blk));
+          } else if (use_w4a8) {
             emit_add_rmsnorm_a8_g64(
                 e, hidden, delta, direct(next_blk.get("input_norm"), h), norm,
                 a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10587,7 +10742,8 @@ public:
     record_prefill_telemetry(count, start_pos, plan.used_w4a8, plan.used_sage2,
                              plan.used_minference, plan.chunk_t,
                              plan.context_envelope, /*used_ane=*/true,
-                             &result.prefill_delta);
+                             &result.prefill_delta, std::nullopt,
+                             plan.used_w4a4);
     return result;
   }
 
@@ -10600,7 +10756,8 @@ public:
       return it->second;
     }
     const U32 chunk_t = ane_chunk_tokens_;
-    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
+    const bool use_w4a4 = use_w4a4_for_t(chunk_t, false);
+    const bool use_w4a8 = !use_w4a4 && use_w4a8_for_t(chunk_t, false);
     const std::string pkey_sfx = ".ane.c" + std::to_string(chunk_t) + ".e" +
                                  std::to_string(context_envelope) + ".ar" +
                                  std::to_string(U32(attn_route)) +
@@ -10613,13 +10770,19 @@ public:
     plan.attn_route = attn_route;
     plan.trunk_only = trunk_only;
     plan.used_w4a8 = use_w4a8;
+    plan.used_w4a4 = use_w4a4;
 
     // 1. Embedding + Layer-0 input RMSNorm (always write BF16 norm for ANE!).
     {
       Encoder e(context, libraries, chunk_t, "qwen.ane.emb0" + pkey_sfx);
       e.begin_stage("embedding");
       embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
-      if (use_w4a8) {
+      if (use_w4a4) {
+        emit_rmsnorm_a4_bm16_bk128(
+            e, hidden, direct(blocks[0].get("input_norm"), h), norm, w4a4_codes,
+            w4a4_scales, h, float(config.rms_norm_eps),
+            normalization_weight_offset, /*write_bf16=*/true);
+      } else if (use_w4a8) {
         emit_rmsnorm_a8_g64(e, hidden, direct(blocks[0].get("input_norm"), h),
                             norm, a8_qa, a8_sa, a8_ra, h,
                             float(config.rms_norm_eps),
@@ -10644,38 +10807,54 @@ public:
         {
           Encoder e(context, libraries, chunk_t, "qwen.ane.attn_pre" + ltag);
           e.begin_stage("attn_pre");
-          if (use_w4a8) {
+          const std::array<MaterializedWeightView, 3> parts{
+              block.get("attention_q"), block.get("attention_k"),
+              block.get("attention_v")};
+          const std::array<U32, 3> part_ns{2 * q, kv, kv};
+          if (use_w4a4) {
+            e.set_a4_quant(make_a4_key(e, norm, h));
+            if (!w4a4_keep_qk_a8_ &&
+                try_concat_w4a4_nax(e, block.concat_qkv_id, parts, part_ns, h,
+                                    norm, concat_out)) {
+              emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+            } else {
+              if (w4a4_keep_qk_a8_) {
+                if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h) &&
+                    !try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+                  linear_base(e, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h) &&
+                    !try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+                  linear_base(e, parts[1], norm, key, kv, h);
+              } else {
+                if (!try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+                  linear_base(e, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+                  linear_base(e, parts[1], norm, key, kv, h);
+              }
+              if (!try_linear_w4a4_base(e, parts[2], norm, value, kv, h))
+                linear_base(e, parts[2], norm, value, kv, h);
+            }
+          } else if (use_w4a8) {
             e.set_a8_quant(make_a8_key(e, norm, h));
-            const std::array<MaterializedWeightView, 3> parts{
-                block.get("attention_q"), block.get("attention_k"),
-                block.get("attention_v")};
-            const std::array<U32, 3> part_ns{2 * q, kv, kv};
             if (try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
                                     norm, concat_out)) {
               emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
             } else {
-              if (!try_linear_w4a8_base(e, block.get("attention_q"), norm,
-                                        query, 2 * q, h))
-                linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
-              if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key,
-                                        kv, h))
-                linear_base(e, block.get("attention_k"), norm, key, kv, h);
-              if (!try_linear_w4a8_base(e, block.get("attention_v"), norm,
-                                        value, kv, h))
-                linear_base(e, block.get("attention_v"), norm, value, kv, h);
+              if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
+                linear_base(e, parts[0], norm, query, 2 * q, h);
+              if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
+                linear_base(e, parts[1], norm, key, kv, h);
+              if (!try_linear_w4a8_base(e, parts[2], norm, value, kv, h))
+                linear_base(e, parts[2], norm, value, kv, h);
             }
           } else {
-            const std::array<MaterializedWeightView, 3> parts{
-                block.get("attention_q"), block.get("attention_k"),
-                block.get("attention_v")};
-            const std::array<U32, 3> part_ns{2 * q, kv, kv};
             if (try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h, false,
                                norm, concat_out)) {
               emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
             } else {
-              linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
-              linear_base(e, block.get("attention_k"), norm, key, kv, h);
-              linear_base(e, block.get("attention_v"), norm, value, kv, h);
+              linear_base(e, parts[0], norm, query, 2 * q, h);
+              linear_base(e, parts[1], norm, key, kv, h);
+              linear_base(e, parts[2], norm, value, kv, h);
             }
           }
           emit_attention_state_step(
@@ -10693,14 +10872,17 @@ public:
               ane_engine_->find_op(li, ane::AneProjectionRole::AttnOProj);
           const bool offload_o =
               (op != nullptr && op->split.enabled() &&
-               can_gpu_suffix_linear(o_w, h, q, use_w4a8));
+               can_gpu_suffix_linear(o_w, h, q, use_w4a8, use_w4a4));
           Encoder e(context, libraries, chunk_t, "qwen.ane.attn_o" + ltag);
           e.begin_stage("attn_o");
           if (offload_o) {
             lp.attn_o_op_id = op->op_id;
             (void)emit_gpu_suffix_linear(e, o_w, mixer, delta, h, q, use_w4a8,
                                          op->split.gpu_row_offset, h,
-                                         op->split.gpu_rows);
+                                         op->split.gpu_rows, std::nullopt,
+                                         use_w4a4);
+          } else if (use_w4a4 &&
+                     try_linear_w4a4_base(e, o_w, mixer, delta, h, q)) {
           } else if (use_w4a8 &&
                      try_linear_w4a8_base(e, o_w, mixer, delta, h, q)) {
           } else {
@@ -10713,34 +10895,45 @@ public:
         {
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_qkvab" + ltag);
           e.begin_stage("gdn_qkvab");
-          if (use_w4a8) {
+          const std::array<MaterializedWeightView, 2> ab_parts{
+              block.get("gdn_a"), block.get("gdn_b")};
+          const std::array<U32, 2> ab_ns{hv, hv};
+          if (use_w4a4) {
+            e.set_a4_quant(make_a4_key(e, norm, h));
+            if (!try_linear_w4a4_base(e, block.get("gdn_qkv"), norm, qkv, conv,
+                                      h))
+              linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+            if (try_concat_w4a4_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out)) {
+              emit_split2(e, concat_out, a, b, hv, hv);
+            } else {
+              if (!try_linear_w4a4_base(e, ab_parts[0], norm, a, hv, h))
+                linear_base(e, ab_parts[0], norm, a, hv, h);
+              if (!try_linear_w4a4_base(e, ab_parts[1], norm, b, hv, h))
+                linear_base(e, ab_parts[1], norm, b, hv, h);
+            }
+          } else if (use_w4a8) {
             e.set_a8_quant(make_a8_key(e, norm, h));
             if (!try_linear_w4a8_base(e, block.get("gdn_qkv"), norm, qkv, conv,
                                       h))
               linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
-            const std::array<MaterializedWeightView, 2> ab_parts{
-                block.get("gdn_a"), block.get("gdn_b")};
-            const std::array<U32, 2> ab_ns{hv, hv};
             if (try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
                                     h, norm, concat_out)) {
               emit_split2(e, concat_out, a, b, hv, hv);
             } else {
-              if (!try_linear_w4a8_base(e, block.get("gdn_a"), norm, a, hv, h))
-                linear_base(e, block.get("gdn_a"), norm, a, hv, h);
-              if (!try_linear_w4a8_base(e, block.get("gdn_b"), norm, b, hv, h))
-                linear_base(e, block.get("gdn_b"), norm, b, hv, h);
+              if (!try_linear_w4a8_base(e, ab_parts[0], norm, a, hv, h))
+                linear_base(e, ab_parts[0], norm, a, hv, h);
+              if (!try_linear_w4a8_base(e, ab_parts[1], norm, b, hv, h))
+                linear_base(e, ab_parts[1], norm, b, hv, h);
             }
           } else {
             linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
-            const std::array<MaterializedWeightView, 2> ab_parts{
-                block.get("gdn_a"), block.get("gdn_b")};
-            const std::array<U32, 2> ab_ns{hv, hv};
             if (try_concat_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
                                false, norm, concat_out)) {
               emit_split2(e, concat_out, a, b, hv, hv);
             } else {
-              linear_base(e, block.get("gdn_a"), norm, a, hv, h);
-              linear_base(e, block.get("gdn_b"), norm, b, hv, h);
+              linear_base(e, ab_parts[0], norm, a, hv, h);
+              linear_base(e, ab_parts[1], norm, b, hv, h);
             }
           }
           lp.gdn_qkv_ab = e.finish();
@@ -10752,17 +10945,22 @@ public:
               ane_engine_->find_op(li, ane::AneProjectionRole::GdnInProjZ);
           const bool offload_z =
               (op != nullptr && op->split.enabled() &&
-               can_gpu_suffix_linear(z_w, gv, h, use_w4a8));
+               can_gpu_suffix_linear(z_w, gv, h, use_w4a8, use_w4a4));
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_z" + ltag);
           e.begin_stage("gdn_z");
-          if (use_w4a8) {
+          if (use_w4a4) {
+            e.set_a4_quant(make_a4_key(e, norm, h));
+          } else if (use_w4a8) {
             e.set_a8_quant(make_a8_key(e, norm, h));
           }
           if (offload_z) {
             lp.gdn_z_op_id = op->op_id;
             (void)emit_gpu_suffix_linear(e, z_w, norm, z, gv, h, use_w4a8,
                                          op->split.gpu_row_offset, gv,
-                                         op->split.gpu_rows);
+                                         op->split.gpu_rows, std::nullopt,
+                                         use_w4a4);
+          } else if (use_w4a4 &&
+                     try_linear_w4a4_base(e, z_w, norm, z, gv, h)) {
           } else if (use_w4a8 &&
                      try_linear_w4a8_base(e, z_w, norm, z, gv, h)) {
           } else {
@@ -10770,11 +10968,16 @@ public:
           }
           lp.gdn_z_gpu = e.finish();
         }
-        // GDN Conv1D + Recurrence + NormGate (writes BF16 mixer + A8 if W4A8).
+        // GDN Conv1D + Recurrence + NormGate (writes BF16 mixer + A4/A8 if enabled).
+        const bool stage3_req_a4 =
+            use_w4a4 && gdn_chunk_nax_enabled_ &&
+            chunk_t >= gdn_chunk_nax_min_tokens() &&
+            can_w4a4_weight(block.get("gdn_out"), h, gv);
         const bool stage3_req_a8 =
-            use_w4a8 && gdn_chunk_nax_enabled_ &&
+            !stage3_req_a4 && use_w4a8 && gdn_chunk_nax_enabled_ &&
             chunk_t >= gdn_chunk_nax_min_tokens() &&
             can_w4a8_weight(block.get("gdn_out"), h, gv);
+        bool stage3_wrote_a4 = false;
         bool stage3_wrote_a8 = false;
         {
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_rec" + ltag);
@@ -10785,7 +10988,8 @@ public:
               /*allow_f16_out=*/false, 0U, std::nullopt, nullptr,
               /*out_w4a8=*/stage3_req_a8,
               /*out_w4a8_write_bf16=*/true, /*emit_gdn_out_linear=*/false,
-              &stage3_wrote_a8);
+              &stage3_wrote_a8, /*out_w4a4=*/stage3_req_a4,
+              /*out_w4a4_write_bf16=*/true, &stage3_wrote_a4);
           lp.gdn_rec = e.finish();
         }
         // GDN out_proj: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h).
@@ -10795,17 +10999,22 @@ public:
               ane_engine_->find_op(li, ane::AneProjectionRole::GdnOutProj);
           const bool offload_out =
               (op != nullptr && op->split.enabled() &&
-               can_gpu_suffix_linear(out_w, h, gv, use_w4a8));
+               can_gpu_suffix_linear(out_w, h, gv, use_w4a8, use_w4a4));
           Encoder e(context, libraries, chunk_t, "qwen.ane.gdn_out" + ltag);
           e.begin_stage("gdn_out");
-          if (stage3_wrote_a8) {
+          if (stage3_wrote_a4) {
+            e.set_a4_quant(make_a4_key(e, mixer, gv));
+          } else if (stage3_wrote_a8) {
             e.set_a8_quant(make_a8_key(e, mixer, gv));
           }
           if (offload_out) {
             lp.gdn_out_op_id = op->op_id;
             (void)emit_gpu_suffix_linear(e, out_w, mixer, delta, h, gv, use_w4a8,
                                          op->split.gpu_row_offset, h,
-                                         op->split.gpu_rows);
+                                         op->split.gpu_rows, std::nullopt,
+                                         use_w4a4);
+          } else if (use_w4a4 &&
+                     try_linear_w4a4_base(e, out_w, mixer, delta, h, gv)) {
           } else if (use_w4a8 &&
                      try_linear_w4a8_base(e, out_w, mixer, delta, h, gv)) {
           } else {
@@ -10819,7 +11028,12 @@ public:
       {
         Encoder e(context, libraries, chunk_t, "qwen.ane.post_norm" + ltag);
         e.begin_stage("post_norm");
-        if (use_w4a8) {
+        if (use_w4a4) {
+          emit_add_rmsnorm_a4_bm16_bk128(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+        } else if (use_w4a8) {
           emit_add_rmsnorm_a8_g64(
               e, hidden, delta, direct(block.get("post_attention_norm"), h),
               norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10839,17 +11053,22 @@ public:
             ane_engine_->find_op(li, ane::AneProjectionRole::MlpGateUpSwiGlu);
         const bool offload_gu =
             (op != nullptr && op->split.enabled() &&
-             can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8));
+             can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8, use_w4a4));
         Encoder e(context, libraries, chunk_t, "qwen.ane.mlp_gu" + ltag);
         e.begin_stage("mlp_gu");
-        if (use_w4a8) {
+        if (use_w4a4) {
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (use_w4a8) {
           e.set_a8_quant(make_a8_key(e, norm, h));
         }
         if (offload_gu) {
           lp.mlp_gu_op_id = op->op_id;
           (void)emit_gpu_suffix_swiglu(e, gw, uw, norm, product, f, h, use_w4a8,
                                        op->split.gpu_row_offset, f,
-                                       op->split.gpu_rows);
+                                       op->split.gpu_rows, std::nullopt,
+                                       use_w4a4);
+        } else if (use_w4a4 &&
+                   try_linear_w4a4_swiglu(e, gw, uw, norm, product, f, h)) {
         } else if (use_w4a8 &&
                    try_linear_w4a8_swiglu(e, gw, uw, norm, product, f, h)) {
         } else if (!try_linear_swiglu(e, gw, uw, norm, product, f, h)) {
@@ -10860,22 +11079,26 @@ public:
         lp.mlp_gu_gpu = e.finish();
       }
 
-      // Dense MLP Down: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h) (W4A16 default).
+      // Dense MLP Down: Dual-ANE [0..N_ane) || GPU suffix [N_ane..h).
       {
         const auto &dw = block.get("mlp_down");
+        const bool down_w4a4 = use_w4a4 && (dw.has_fwht64() || w4a4_down_proj_);
         const bool down_w4a8 = use_w4a8 && (dw.has_fwht64() || w4a8_down_proj_);
         const auto *op =
             ane_engine_->find_op(li, ane::AneProjectionRole::MlpDown);
         const bool offload_dn =
             (op != nullptr && op->split.enabled() &&
-             can_gpu_suffix_linear(dw, h, f, down_w4a8));
+             can_gpu_suffix_linear(dw, h, f, down_w4a8, down_w4a4));
         Encoder e(context, libraries, chunk_t, "qwen.ane.mlp_dn" + ltag);
         e.begin_stage("mlp_dn");
         if (offload_dn) {
           lp.mlp_down_op_id = op->op_id;
           (void)emit_gpu_suffix_linear(e, dw, product, delta, h, f, down_w4a8,
                                        op->split.gpu_row_offset, h,
-                                       op->split.gpu_rows);
+                                       op->split.gpu_rows, std::nullopt,
+                                       down_w4a4);
+        } else if (down_w4a4 &&
+                   try_linear_w4a4_base(e, dw, product, delta, h, f)) {
         } else if (down_w4a8 &&
                    try_linear_w4a8_base(e, dw, product, delta, h, f)) {
         } else {
@@ -10889,7 +11112,13 @@ public:
         Encoder e(context, libraries, chunk_t, "qwen.ane.next_norm" + ltag);
         e.begin_stage("next_norm");
         if (li + 1U < blocks.size()) {
-          if (use_w4a8) {
+          if (use_w4a4) {
+            emit_add_rmsnorm_a4_bm16_bk128(
+                e, hidden, delta,
+                direct(blocks[li + 1U].get("input_norm"), h), norm, w4a4_codes,
+                w4a4_scales, h, float(config.rms_norm_eps),
+                normalization_weight_offset, /*write_bf16=*/true);
+          } else if (use_w4a8) {
             emit_add_rmsnorm_a8_g64(
                 e, hidden, delta,
                 direct(blocks[li + 1U].get("input_norm"), h), norm, a8_qa, a8_sa,
@@ -11148,7 +11377,8 @@ public:
     record_prefill_telemetry(count, start_pos, plan.used_w4a8, plan.used_sage2,
                              plan.used_minference, plan.chunk_t,
                              plan.context_envelope, /*used_ane=*/true,
-                             &result.prefill_delta);
+                             &result.prefill_delta, std::nullopt,
+                             plan.used_w4a4);
     return result;
   }
 
@@ -12568,7 +12798,10 @@ public:
           !inspect_routes_enabled && !inspect_tensors_workspace &&
           bypass_lora_ == nullptr && feature_layers.empty();
 
-      bool stage2_used_w4a8 = use_w4a8_active;
+      const bool use_w4a4_stage2 = use_w4a4_for_t(m_active, false);
+      const bool use_w4a8_stage2 = !use_w4a4_stage2 && use_w4a8_active;
+      bool stage2_used_w4a4 = use_w4a4_stage2;
+      bool stage2_used_w4a8 = use_w4a8_stage2;
       bool stage2_used_sage2 = false;
       bool stage2_used_minf = false;
       U32 stage2_minf_env = 0U;
@@ -12591,6 +12824,8 @@ public:
         auto submit_stage2_prof = [&](Profile &&pr) {
           stage2_profiles.push_back(std::move(pr));
           auto &stored = stage2_profiles.back();
+          if (stored.used_w4a4)
+            stage2_used_w4a4 = true;
           if (stored.used_w4a8)
             stage2_used_w4a8 = true;
           if (stored.used_sage2)
@@ -12611,19 +12846,25 @@ public:
             [&](U32 li, ane::AneProjectionRole role,
                 const MaterializedWeightView &w, Ref src, Ref dst, U32 n_out,
                 U32 k_in, bool op_w4a8, bool carried_a8,
-                const std::string &tag) {
+                const std::string &tag, bool op_w4a4 = false,
+                bool carried_a4 = false) {
               const auto *op = ane_engine_->find_op(li, role);
               const bool offload =
                   (op != nullptr && op->split.enabled() &&
-                   can_gpu_suffix_linear(w, n_out, k_in, op_w4a8));
+                   can_gpu_suffix_linear(w, n_out, k_in, op_w4a8, op_w4a4));
               if (!offload) {
                 Encoder e(context, libraries, m_active, base_tag + tag);
                 e.begin_stage("blend_ane_fb");
-                if (op_w4a8 && carried_a8) {
+                if (op_w4a4 && carried_a4) {
+                  e.set_a4_quant(make_a4_key(e, src, k_in));
+                } else if (op_w4a8 && carried_a8) {
                   e.set_a8_quant(make_a8_key(e, src, k_in));
                 }
-                if (!(op_w4a8 &&
-                      try_linear_w4a8_base(e, w, src, dst, n_out, k_in))) {
+                if (op_w4a4 &&
+                    try_linear_w4a4_base(e, w, src, dst, n_out, k_in)) {
+                } else if (op_w4a8 &&
+                           try_linear_w4a8_base(e, w, src, dst, n_out, k_in)) {
+                } else {
                   linear(e, w, src, dst, n_out, k_in);
                 }
                 submit_stage2_prof(e.finish());
@@ -12640,15 +12881,21 @@ public:
                 Encoder e(context, libraries, ane_blk_t,
                           base_tag + tag + ".b" + std::to_string(bi));
                 e.begin_stage("blend_ane_gpu_sfx");
-                if (op_w4a8 && carried_a8 && row0 == 0U &&
-                    w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
+                if (op_w4a4 && carried_a4 && row0 == 0U &&
+                    w4a4_nax_mp(m_active) == w4a4_nax_mp(ane_blk_t)) {
+                  e.set_a4_quant(make_a4_key(e, src_s, k_in));
+                } else if (op_w4a8 && carried_a8 && row0 == 0U &&
+                           w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
                   e.set_a8_quant(make_a8_key(e, src_s, k_in));
                 }
                 (void)emit_gpu_suffix_linear(
                     e, w, src_s, dst_s, n_out, k_in, op_w4a8,
-                    op->split.gpu_row_offset, n_out, op->split.gpu_rows);
+                    op->split.gpu_row_offset, n_out, op->split.gpu_rows,
+                    std::nullopt, op_w4a4);
                 stage2_profiles.push_back(e.finish());
                 auto &stored = stage2_profiles.back();
+                if (stored.used_w4a4)
+                  stage2_used_w4a4 = true;
                 if (stored.used_w4a8)
                   stage2_used_w4a8 = true;
                 stored.parameters.write("step", stored.parameter_data);
@@ -12673,13 +12920,19 @@ public:
                                 dst.offset +
                                     mul(ane_rows_total, mul(n_out, 2ULL)),
                                 mul(tail_rows, mul(n_out, 2ULL))};
+                const bool tail_w4a4 =
+                    op_w4a4 && use_w4a4_for_t(tail_rows, false);
                 const bool tail_w4a8 =
-                    op_w4a8 && use_w4a8_for_t(tail_rows, false);
+                    !tail_w4a4 && op_w4a8 && use_w4a8_for_t(tail_rows, false);
                 Encoder e(context, libraries, tail_rows,
                           base_tag + tag + ".tail");
                 e.begin_stage("blend_ane_tail");
-                if (!(tail_w4a8 &&
-                      try_linear_w4a8_base(e, w, src_t, dst_t, n_out, k_in))) {
+                if (tail_w4a4 &&
+                    try_linear_w4a4_base(e, w, src_t, dst_t, n_out, k_in)) {
+                } else if (tail_w4a8 &&
+                           try_linear_w4a8_base(e, w, src_t, dst_t, n_out,
+                                                k_in)) {
+                } else {
                   linear(e, w, src_t, dst_t, n_out, k_in);
                 }
                 submit_stage2_prof(e.finish());
@@ -12690,26 +12943,32 @@ public:
             [&](U32 li, const MaterializedWeightView &gw,
                 const MaterializedWeightView &uw, Ref src, Ref dst, U32 n_out,
                 U32 k_in, bool op_w4a8, bool carried_a8,
-                const std::string &tag) {
+                const std::string &tag, bool op_w4a4 = false,
+                bool carried_a4 = false) {
               const auto *op = ane_engine_->find_op(
                   li, ane::AneProjectionRole::MlpGateUpSwiGlu);
               const bool offload =
                   (op != nullptr && op->split.enabled() &&
-                   can_gpu_suffix_swiglu(gw, uw, n_out, k_in, op_w4a8));
+                   can_gpu_suffix_swiglu(gw, uw, n_out, k_in, op_w4a8,
+                                         op_w4a4));
               if (!offload) {
                 Encoder e(context, libraries, m_active, base_tag + tag);
                 e.begin_stage("blend_ane_gu_fb");
-                if (op_w4a8 && carried_a8) {
+                if (op_w4a4 && carried_a4) {
+                  e.set_a4_quant(make_a4_key(e, src, k_in));
+                } else if (op_w4a8 && carried_a8) {
                   e.set_a8_quant(make_a8_key(e, src, k_in));
                 }
-                if (!(op_w4a8 &&
-                      try_linear_w4a8_swiglu(e, gw, uw, src, dst, n_out,
-                                             k_in))) {
-                  if (!try_linear_swiglu(e, gw, uw, src, dst, n_out, k_in)) {
-                    linear_base(e, gw, src, gate, n_out, k_in);
-                    linear_base(e, uw, src, up, n_out, k_in);
-                    swiglu(e, m_active, n_out);
-                  }
+                if (op_w4a4 &&
+                    try_linear_w4a4_swiglu(e, gw, uw, src, dst, n_out, k_in)) {
+                } else if (op_w4a8 &&
+                           try_linear_w4a8_swiglu(e, gw, uw, src, dst, n_out,
+                                                  k_in)) {
+                } else if (!try_linear_swiglu(e, gw, uw, src, dst, n_out,
+                                              k_in)) {
+                  linear_base(e, gw, src, gate, n_out, k_in);
+                  linear_base(e, uw, src, up, n_out, k_in);
+                  swiglu(e, m_active, n_out);
                 }
                 submit_stage2_prof(e.finish());
                 return;
@@ -12725,15 +12984,21 @@ public:
                 Encoder e(context, libraries, ane_blk_t,
                           base_tag + tag + ".b" + std::to_string(bi));
                 e.begin_stage("blend_ane_gu_sfx");
-                if (op_w4a8 && carried_a8 && row0 == 0U &&
-                    w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
+                if (op_w4a4 && carried_a4 && row0 == 0U &&
+                    w4a4_nax_mp(m_active) == w4a4_nax_mp(ane_blk_t)) {
+                  e.set_a4_quant(make_a4_key(e, src_s, k_in));
+                } else if (op_w4a8 && carried_a8 && row0 == 0U &&
+                           w4a8_nax_mp(m_active) == w4a8_nax_mp(ane_blk_t)) {
                   e.set_a8_quant(make_a8_key(e, src_s, k_in));
                 }
                 (void)emit_gpu_suffix_swiglu(
                     e, gw, uw, src_s, dst_s, n_out, k_in, op_w4a8,
-                    op->split.gpu_row_offset, n_out, op->split.gpu_rows);
+                    op->split.gpu_row_offset, n_out, op->split.gpu_rows,
+                    std::nullopt, op_w4a4);
                 stage2_profiles.push_back(e.finish());
                 auto &stored = stage2_profiles.back();
+                if (stored.used_w4a4)
+                  stage2_used_w4a4 = true;
                 if (stored.used_w4a8)
                   stage2_used_w4a8 = true;
                 stored.parameters.write("step", stored.parameter_data);
@@ -12758,23 +13023,27 @@ public:
                                 dst.offset +
                                     mul(ane_rows_total, mul(n_out, 2ULL)),
                                 mul(tail_rows, mul(n_out, 2ULL))};
+                const bool tail_w4a4 =
+                    op_w4a4 && use_w4a4_for_t(tail_rows, false);
                 const bool tail_w4a8 =
-                    op_w4a8 && use_w4a8_for_t(tail_rows, false);
+                    !tail_w4a4 && op_w4a8 && use_w4a8_for_t(tail_rows, false);
                 Encoder e(context, libraries, tail_rows,
                           base_tag + tag + ".tail");
                 e.begin_stage("blend_ane_gu_tail");
-                if (!(tail_w4a8 &&
-                      try_linear_w4a8_swiglu(e, gw, uw, src_t, dst_t, n_out,
-                                             k_in))) {
-                  if (!try_linear_swiglu(e, gw, uw, src_t, dst_t, n_out,
-                                         k_in)) {
-                    linear_base(e, gw, src_t, gate, n_out, k_in);
-                    linear_base(e, uw, src_t, up, n_out, k_in);
-                    auto &sw = e.emit("mlp_layer", "omlx_m5_mlp_swiglu",
-                                      {.width = U64(tail_rows) * n_out},
-                                      {.width = 256}, {gate, up, dst_t});
-                    e.dynamic(sw, 3, words({tail_rows, n_out}));
-                  }
+                if (tail_w4a4 &&
+                    try_linear_w4a4_swiglu(e, gw, uw, src_t, dst_t, n_out,
+                                           k_in)) {
+                } else if (tail_w4a8 &&
+                           try_linear_w4a8_swiglu(e, gw, uw, src_t, dst_t,
+                                                  n_out, k_in)) {
+                } else if (!try_linear_swiglu(e, gw, uw, src_t, dst_t, n_out,
+                                              k_in)) {
+                  linear_base(e, gw, src_t, gate, n_out, k_in);
+                  linear_base(e, uw, src_t, up, n_out, k_in);
+                  auto &sw = e.emit("mlp_layer", "omlx_m5_mlp_swiglu",
+                                    {.width = U64(tail_rows) * n_out},
+                                    {.width = 256}, {gate, up, dst_t});
+                  e.dynamic(sw, 3, words({tail_rows, n_out}));
                 }
                 submit_stage2_prof(e.finish());
               }
@@ -12786,7 +13055,12 @@ public:
             Encoder e(context, libraries, m_active,
                       base_tag + ltag + ".post_norm");
             e.begin_stage("post_norm");
-            if (use_w4a8_active) {
+            if (use_w4a4_stage2) {
+              emit_add_rmsnorm_a4_bm16_bk128(
+                  e, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                  norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                  normalization_weight_offset, /*write_bf16=*/true);
+            } else if (use_w4a8_stage2) {
               emit_add_rmsnorm_a8_g64(
                   e, hidden, delta, direct(blk.get("post_attention_norm"), h),
                   norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -12804,11 +13078,65 @@ public:
               li, ane::AneProjectionRole::MlpGateUpSwiGlu);
           const auto *op_dn =
               ane_engine_->find_op(li, ane::AneProjectionRole::MlpDown);
-          const bool stage2_mode_b_a8 =
+          const bool stage2_mode_b_a4 =
               (n_ane_blks == 1U && tail_rows == 0U && op_gu != nullptr &&
                op_gu->split.enabled() && op_dn == nullptr &&
+               can_gpu_suffix_swiglu_fwht64_a4(gw, uw, dw, f, h,
+                                               use_w4a4_stage2));
+          const bool stage2_mode_b_a8 =
+              (!stage2_mode_b_a4 && n_ane_blks == 1U && tail_rows == 0U &&
+               op_gu != nullptr && op_gu->split.enabled() && op_dn == nullptr &&
                can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h,
-                                               use_w4a8_active));
+                                               use_w4a8_stage2));
+          if (stage2_mode_b_a4) {
+            // Mode B W4A4 splice for CacheBlend Stage 2: GPU suffix [N_ane, f)
+            // + fused ANE unpack [0, N_ane) directly into w4a4_mid_{codes,scales}.
+            Encoder e_gu(context, libraries, ane_blk_t,
+                         base_tag + ltag + ".mlp_gu.mb4");
+            e_gu.begin_stage("blend_ane_gu_sfx_mb4");
+            e_gu.set_a4_quant(make_a4_key(e_gu, norm, h));
+            (void)try_linear_w4a4_swiglu_fwht64_a4(
+                e_gu, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
+                std::nullopt, op_gu->split.gpu_row_offset, f,
+                op_gu->split.gpu_rows);
+            stage2_profiles.push_back(e_gu.finish());
+            auto &stored_gu = stage2_profiles.back();
+            if (stored_gu.used_w4a4)
+              stage2_used_w4a4 = true;
+            stored_gu.parameters.write("step", stored_gu.parameter_data);
+
+            ane::AneUnpackTarget mb_target{};
+            mb_target.mode = ane::AneUnpackMode::Fwht64A4;
+            mb_target.primary_buf = w4a4_mid_codes.buffer->native_mtl_buffer();
+            mb_target.primary_offset = w4a4_mid_codes.offset;
+            mb_target.aux0_buf = w4a4_mid_scales.buffer->native_mtl_buffer();
+            mb_target.aux0_offset = w4a4_mid_scales.offset;
+            mb_target.out_stride = f;
+            mb_target.dst_col_offset = 0U;
+            mb_target.mp = w4a4_nax_mp(ane_blk_t);
+            ane_engine_->enqueue_op_ex(
+                op_gu->op_id, norm.buffer->native_mtl_buffer(), norm.offset, h,
+                mb_target, [&](void *mtl_cb) {
+                  const std::array calls{MetalCommandInvocation{
+                      .plan = &stored_gu.plan,
+                      .bindings = stored_gu.bindings,
+                      .parameters = &stored_gu.parameters}};
+                  context.encode_into_command_buffer(mtl_cb, calls);
+                });
+
+            Encoder e_dn(context, libraries, ane_blk_t,
+                         base_tag + ltag + ".mlp_dn.mb4");
+            e_dn.begin_stage("blend_ane_dn_mb4");
+            e_dn.set_a4_quant(make_a4_key_for(e_dn, product, f, w4a4_mid_codes,
+                                              w4a4_mid_scales, std::nullopt,
+                                              /*fwht64=*/true));
+            if (!try_linear_w4a4_base(e_dn, dw, product, delta, h, f)) {
+              linear(e_dn, dw, product, delta, h, f);
+            }
+            add(e_dn);
+            submit_stage2_prof(e_dn.finish());
+            return;
+          }
           if (stage2_mode_b_a8) {
             // Mode B W4A8 splice for CacheBlend Stage 2: GPU suffix [N_ane, f)
             // + fused ANE unpack [0, N_ane) directly into a8_mid_{qa,sa,ra}.
@@ -12861,12 +13189,14 @@ public:
             return;
           }
           run_stage2_ane_swiglu(li, gw, uw, norm, product, f, h,
-                                use_w4a8_active, use_w4a8_active,
-                                ltag + ".mlp_gu");
+                                use_w4a8_stage2, use_w4a8_stage2,
+                                ltag + ".mlp_gu", use_w4a4_stage2,
+                                use_w4a4_stage2);
           run_stage2_ane_linear(
               li, ane::AneProjectionRole::MlpDown, dw, product, delta, h, f,
-              use_w4a8_active && (dw.has_fwht64() || w4a8_down_proj_), false,
-              ltag + ".mlp_dn");
+              use_w4a8_stage2 && (dw.has_fwht64() || w4a8_down_proj_), false,
+              ltag + ".mlp_dn",
+              use_w4a4_stage2 && (dw.has_fwht64() || w4a4_down_proj_), false);
           {
             Encoder e(context, libraries, m_active, base_tag + ltag + ".add");
             e.begin_stage("add");
@@ -12905,7 +13235,8 @@ public:
           const auto &pblk = blocks[probe_idx];
           run_stage2_ane_linear(probe_idx, ane::AneProjectionRole::AttnOProj,
                                 pblk.get("attention_o"), mixer, delta, h, q,
-                                use_w4a8_active, false, ".probe.o");
+                                use_w4a8_stage2, false, ".probe.o",
+                                use_w4a4_stage2, false);
           run_stage2_ane_mlp_and_add(probe_idx, pblk);
         }
 
@@ -12919,7 +13250,13 @@ public:
               Encoder e(context, libraries, m_active,
                         base_tag + ltag + ".attn_pre");
               e.begin_stage("blend_deep_attn");
-              if (use_w4a8_active) {
+              if (use_w4a4_stage2) {
+                emit_rmsnorm_a4_bm16_bk128(
+                    e, hidden, direct(blk.get("input_norm"), h), norm,
+                    w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                    normalization_weight_offset, /*write_bf16=*/true);
+                e.set_a4_quant(make_a4_key(e, norm, h));
+              } else if (use_w4a8_stage2) {
                 emit_rmsnorm_a8_g64(e, hidden, direct(blk.get("input_norm"), h),
                                     norm, a8_qa, a8_sa, a8_ra, h,
                                     float(config.rms_norm_eps),
@@ -12932,11 +13269,32 @@ public:
                   blk.get("attention_q"), blk.get("attention_k"),
                   blk.get("attention_v")};
               const std::array<U32, 3> part_ns{2 * q, kv, kv};
-              if (use_w4a8_active &&
-                  try_concat_w4a8_nax(e, blk.concat_qkv_id, parts, part_ns, h,
+              if (use_w4a4_stage2 && !w4a4_keep_qk_a8_ &&
+                  try_concat_w4a4_nax(e, blk.concat_qkv_id, parts, part_ns, h,
                                       norm, concat_out)) {
                 emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
-              } else if (use_w4a8_active) {
+              } else if (use_w4a4_stage2) {
+                if (w4a4_keep_qk_a8_) {
+                  if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q,
+                                            h) &&
+                      !try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+                    linear_base(e, parts[0], norm, query, 2 * q, h);
+                  if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h) &&
+                      !try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+                    linear_base(e, parts[1], norm, key, kv, h);
+                } else {
+                  if (!try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+                    linear_base(e, parts[0], norm, query, 2 * q, h);
+                  if (!try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+                    linear_base(e, parts[1], norm, key, kv, h);
+                }
+                if (!try_linear_w4a4_base(e, parts[2], norm, value, kv, h))
+                  linear_base(e, parts[2], norm, value, kv, h);
+              } else if (use_w4a8_stage2 &&
+                         try_concat_w4a8_nax(e, blk.concat_qkv_id, parts,
+                                             part_ns, h, norm, concat_out)) {
+                emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+              } else if (use_w4a8_stage2) {
                 if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
                   linear_base(e, parts[0], norm, query, 2 * q, h);
                 if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
@@ -12983,14 +13341,21 @@ public:
             }
             run_stage2_ane_linear(li, ane::AneProjectionRole::AttnOProj,
                                   blk.get("attention_o"), mixer, delta, h, q,
-                                  use_w4a8_active, false, ltag + ".o");
+                                  use_w4a8_stage2, false, ltag + ".o",
+                                  use_w4a4_stage2, false);
           } else {
             // GDN input_norm + in_proj_qkv/a/b strictly 100% GPU (NEVER ANE!).
             {
               Encoder e(context, libraries, m_active,
                         base_tag + ltag + ".gdn_qkvab");
               e.begin_stage("blend_deep_gdn_qkvab");
-              if (use_w4a8_active) {
+              if (use_w4a4_stage2) {
+                emit_rmsnorm_a4_bm16_bk128(
+                    e, hidden, direct(blk.get("input_norm"), h), norm,
+                    w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                    normalization_weight_offset, /*write_bf16=*/true);
+                e.set_a4_quant(make_a4_key(e, norm, h));
+              } else if (use_w4a8_stage2) {
                 emit_rmsnorm_a8_g64(e, hidden, direct(blk.get("input_norm"), h),
                                     norm, a8_qa, a8_sa, a8_ra, h,
                                     float(config.rms_norm_eps),
@@ -13003,34 +13368,50 @@ public:
               const std::array<MaterializedWeightView, 2> ab_parts{
                   blk.get("gdn_a"), blk.get("gdn_b")};
               const std::array<U32, 2> ab_ns{hv, hv};
-              if (!(use_w4a8_active &&
-                    try_linear_w4a8_base(e, blk.get("gdn_qkv"), norm, qkv, conv,
-                                         h))) {
-                linear_base(e, blk.get("gdn_qkv"), norm, qkv, conv, h);
-              }
-              if (use_w4a8_active &&
-                  try_concat_w4a8_nax(e, blk.concat_gdn_ab_id, ab_parts, ab_ns,
-                                      h, norm, concat_out)) {
-                emit_split2(e, concat_out, a, b, hv, hv);
-              } else if (use_w4a8_active) {
-                if (!try_linear_w4a8_base(e, ab_parts[0], norm, a, hv, h))
-                  linear_base(e, ab_parts[0], norm, a, hv, h);
-                if (!try_linear_w4a8_base(e, ab_parts[1], norm, b, hv, h))
-                  linear_base(e, ab_parts[1], norm, b, hv, h);
-              } else if (try_concat_nax(e, blk.concat_gdn_ab_id, ab_parts,
-                                        ab_ns, h, false, norm, concat_out)) {
-                emit_split2(e, concat_out, a, b, hv, hv);
+              if (use_w4a4_stage2) {
+                if (!try_linear_w4a4_base(e, blk.get("gdn_qkv"), norm, qkv,
+                                          conv, h))
+                  linear_base(e, blk.get("gdn_qkv"), norm, qkv, conv, h);
+                if (try_concat_w4a4_nax(e, blk.concat_gdn_ab_id, ab_parts,
+                                        ab_ns, h, norm, concat_out)) {
+                  emit_split2(e, concat_out, a, b, hv, hv);
+                } else {
+                  if (!try_linear_w4a4_base(e, ab_parts[0], norm, a, hv, h))
+                    linear_base(e, ab_parts[0], norm, a, hv, h);
+                  if (!try_linear_w4a4_base(e, ab_parts[1], norm, b, hv, h))
+                    linear_base(e, ab_parts[1], norm, b, hv, h);
+                }
+              } else if (use_w4a8_stage2) {
+                if (!try_linear_w4a8_base(e, blk.get("gdn_qkv"), norm, qkv,
+                                          conv, h))
+                  linear_base(e, blk.get("gdn_qkv"), norm, qkv, conv, h);
+                if (try_concat_w4a8_nax(e, blk.concat_gdn_ab_id, ab_parts,
+                                        ab_ns, h, norm, concat_out)) {
+                  emit_split2(e, concat_out, a, b, hv, hv);
+                } else {
+                  if (!try_linear_w4a8_base(e, ab_parts[0], norm, a, hv, h))
+                    linear_base(e, ab_parts[0], norm, a, hv, h);
+                  if (!try_linear_w4a8_base(e, ab_parts[1], norm, b, hv, h))
+                    linear_base(e, ab_parts[1], norm, b, hv, h);
+                }
               } else {
-                linear_base(e, ab_parts[0], norm, a, hv, h);
-                linear_base(e, ab_parts[1], norm, b, hv, h);
+                linear_base(e, blk.get("gdn_qkv"), norm, qkv, conv, h);
+                if (try_concat_nax(e, blk.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                   false, norm, concat_out)) {
+                  emit_split2(e, concat_out, a, b, hv, hv);
+                } else {
+                  linear_base(e, ab_parts[0], norm, a, hv, h);
+                  linear_base(e, ab_parts[1], norm, b, hv, h);
+                }
               }
               submit_stage2_prof(e.finish());
             }
             // GDN in_proj_z on Dual-ANE || GPU suffix!
             run_stage2_ane_linear(li, ane::AneProjectionRole::GdnInProjZ,
                                   blk.get("gdn_z"), norm, z, gv, h,
-                                  use_w4a8_active, use_w4a8_active,
-                                  ltag + ".gdn_z");
+                                  use_w4a8_stage2, use_w4a8_stage2,
+                                  ltag + ".gdn_z", use_w4a4_stage2,
+                                  use_w4a4_stage2);
             // GDN recurrence slices + state jump on GPU.
             {
               Encoder e(context, libraries, m_active,
@@ -13064,7 +13445,8 @@ public:
             // GDN out_proj on Dual-ANE || GPU suffix!
             run_stage2_ane_linear(li, ane::AneProjectionRole::GdnOutProj,
                                   blk.get("gdn_out"), mixer, delta, h, gv,
-                                  use_w4a8_active, false, ltag + ".gdn_out");
+                                  use_w4a8_stage2, false, ltag + ".gdn_out",
+                                  use_w4a4_stage2, false);
             ++gdn_idx;
           }
           run_stage2_ane_mlp_and_add(li, blk);
@@ -13430,7 +13812,8 @@ public:
       has_last_logits = is_final_window;
 
       const bool any_w4a4 =
-          prof1.used_w4a4 || (!stage2_ane && use_w4a4_for_t(m_active, false));
+          prof1.used_w4a4 || stage2_used_w4a4 ||
+          (!stage2_ane && use_w4a4_for_t(m_active, false));
       const bool any_w4a8 = prof1.used_w4a8 || stage2_used_w4a8;
       const bool any_sage2 = prof1.used_sage2 || stage2_used_sage2;
       const bool any_minf = stage2_used_minf || prof1.used_minference;

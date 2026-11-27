@@ -171,6 +171,7 @@ struct BuiltObject {
   std::vector<BuiltPlane> planes;
   std::string binding_use;
   std::string activation_policy;
+  std::string input_transform = "none";
 };
 
 class SyntheticArtifactBuilder {
@@ -202,7 +203,8 @@ public:
   }
 
   U32 add_linear_2d(std::string name, U32 n, U32 k, WeightEnc enc, U32 seed,
-                    std::string use = "linear", float amp = 0.04F) {
+                    std::string use = "linear", float amp = 0.04F,
+                    bool fwht64 = false) {
     if (enc == WeightEnc::DirectBf16) {
       return add_bf16(std::move(name), {n, k}, seed, 0.0F, amp, std::move(use));
     }
@@ -214,6 +216,7 @@ public:
         .shape = {n, k},
         .padded_k = padded_k,
         .binding_use = std::move(use),
+        .input_transform = fwht64 ? "fwht64" : "none",
     };
 
     if (enc == WeightEnc::Mxfp4Tiled) {
@@ -379,7 +382,8 @@ public:
 
   std::vector<std::byte> serialize(std::string_view source_profile,
                                    std::string_view source_repo,
-                                   std::string_view source_rev = "rev1") const {
+                                   std::string_view source_rev = "rev1",
+                                   bool v2_fwht64 = false) const {
     std::vector<std::byte> payload;
     const auto align_payload = [&](std::size_t align) {
       while ((payload.size() % align) != 0U) {
@@ -427,6 +431,9 @@ public:
       if (obj.padded_k.has_value()) {
         jo["padded_k"] = *obj.padded_k;
       }
+      if (obj.input_transform != "none") {
+        jo["input_transform"] = obj.input_transform;
+      }
       j_objects.push_back(std::move(jo));
 
       if (!obj.format.starts_with("direct_") && !obj.binding_use.empty() &&
@@ -448,16 +455,18 @@ public:
       }
     }
 
+    const U32 ver = v2_fwht64 ? 2U : 1U;
+    const U32 flags = v2_fwht64 ? kArtifactFlagFwht64 : 0U;
     Json manifest = {
         {"bindings", std::move(j_bindings)},
-        {"container_version", 1},
+        {"container_version", ver},
         {"model",
          {{"source_profile", source_profile},
           {"source_repo", source_repo},
           {"source_revision", source_rev}}},
         {"objects", std::move(j_objects)},
         {"payload_bytes", payload.size()},
-        {"schema", std::string(kArtifactSchemaV1)},
+        {"schema", std::string(v2_fwht64 ? kArtifactSchemaV2 : kArtifactSchemaV1)},
         {"views", Json::array()},
     };
     const std::string manifest_str = manifest.dump();
@@ -471,7 +480,7 @@ public:
     for (char c : kArtifactMagic) {
       file.push_back(static_cast<std::byte>(c));
     }
-    append_u32(file, 1U);
+    append_u32(file, ver);
     append_u32(file, 64U);
     append_u64(file, 64ULL);
     append_u64(file, manifest_bytes.size());
@@ -482,7 +491,7 @@ public:
     const U32 hdr_crc =
         artifact_crc32(std::span<const std::byte>(file.data(), 56U));
     append_u32(file, hdr_crc);
-    append_u32(file, 0U);
+    append_u32(file, flags);
     file.insert(file.end(), manifest_bytes.begin(), manifest_bytes.end());
     file.resize(static_cast<std::size_t>(payload_offset), std::byte{0});
     file.insert(file.end(), payload.begin(), payload.end());
@@ -504,7 +513,8 @@ struct BuiltModel {
 // (W4A8 + out64 SwiGLU + dv64 GDN + Sage2/MInference + Dual-ANE + GDN-CacheBlend)
 // satisfy every shape/alignment gate live.
 BuiltModel build_dense_hybrid_model(const std::filesystem::path &dir,
-                                    bool use_mxfp4) {
+                                    bool use_mxfp4,
+                                    bool v2_fwht64 = false) {
   std::filesystem::create_directories(dir);
   constexpr U32 kLayers = 8U;
   constexpr U32 h = 1024U;
@@ -580,7 +590,8 @@ BuiltModel build_dense_hybrid_model(const std::filesystem::path &dir,
       b.add_linear_2d(p + ".self_attn.v_proj.weight", kv, h, main_enc, s + 4U);
       b.add_bf16(p + ".self_attn.q_norm.weight", {hd}, s + 5U, 0.0F, 0.03F);
       b.add_bf16(p + ".self_attn.k_norm.weight", {hd}, s + 6U, 0.0F, 0.03F);
-      b.add_linear_2d(p + ".self_attn.o_proj.weight", h, q, main_enc, s + 7U);
+      b.add_linear_2d(p + ".self_attn.o_proj.weight", h, q, main_enc, s + 7U,
+                      "linear", 0.04F, v2_fwht64);
     } else {
       b.add_linear_2d(p + ".linear_attn.in_proj_qkv.weight", conv, h, main_enc,
                       s + 12U);
@@ -603,15 +614,18 @@ BuiltModel build_dense_hybrid_model(const std::filesystem::path &dir,
                0.03F);
     b.add_linear_2d(p + ".mlp.gate_proj.weight", f, h, main_enc, s + 31U);
     b.add_linear_2d(p + ".mlp.up_proj.weight", f, h, main_enc, s + 32U);
-    b.add_linear_2d(p + ".mlp.down_proj.weight", h, f, main_enc, s + 33U);
+    b.add_linear_2d(p + ".mlp.down_proj.weight", h, f, main_enc, s + 33U,
+                    "linear", 0.04F, v2_fwht64);
   }
 
   const auto artifact_path = dir / "model.miv";
   write_binary_file(
       artifact_path,
-      b.serialize(use_mxfp4 ? "mxfp4_v1" : "oq4e_v1",
-                  use_mxfp4 ? "test/qwen38-dense-mxfp4"
-                            : "test/qwen38-dense-oq4"));
+      b.serialize(use_mxfp4 ? (v2_fwht64 ? "mxfp4_v2" : "mxfp4_v1") : "oq4e_v1",
+                  use_mxfp4 ? (v2_fwht64 ? "test/qwen38-dense-mxfp4-v2"
+                                         : "test/qwen38-dense-mxfp4")
+                            : "test/qwen38-dense-oq4",
+                  "rev1", v2_fwht64));
   return {
       .model_dir = dir,
       .artifact_path = artifact_path,
@@ -1576,6 +1590,130 @@ int main(int argc, char **argv) {
           {"fallback", st_fb.prefill_linear_fallback},
           {"reason", st_fb.prefill_linear_fallback_reason},
           {"model_quant_format", st_fb.model_quant_format},
+      };
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 8: WP 3A + WP 3C W4A4 + ultra_fp16_swiglu Mode B Splice E2E
+    //         (GPU [N_ane, F) Mode B fwht64_a4 || ANE [0, N_ane) unpack_fwht64_a4
+    //          -> mlp_down W4A4) on MXFP4 .miv v2 FWHT-64 dense hybrid model!
+    // -------------------------------------------------------------------------
+    {
+      const auto dense_mx_v2 =
+          build_dense_hybrid_model(tmp_root / "dense_mx_v2", true, true);
+      constexpr U32 kCtx = 2048U;
+      const auto chunk1024 = make_tokens(1024U, 401U);
+      const auto tail64 = make_tokens(64U, 409U);
+      const bool hw_ane = ane::is_ane_available();
+
+      // Force ultra_fp16_swiglu active at alpha=0.25 (256 ANE rows % 128 == 0,
+      // 768 GPU suffix rows % 128 == 0) with T_chunk=1024 on synthetic F=1024 model.
+      ScopedEnv force_ane("OMLX_M5_ANE_FORCE_ACTIVE", "1");
+      ScopedEnv ane_alpha("OMLX_M5_ANE_ALPHA", "0.25");
+      ScopedEnv ane_chunk("OMLX_M5_ANE_CHUNK_TOKENS", "1024");
+
+      auto ld = LoadedDirect::open(dense_mx_v2, kCtx);
+      auto fwd_w4a4_gpu = make_forward(
+          ld, dense_mx_v2, libs, kCtx,
+          QwenPrefillOptions{.linear_mode = PrefillLinearMode::W4A4,
+                             .ane_mode = PrefillAneMode::Off});
+      auto fwd_w4a4_ultra = make_forward(
+          ld, dense_mx_v2, libs, kCtx,
+          QwenPrefillOptions{.linear_mode = PrefillLinearMode::W4A4,
+                             .ane_offload = true,
+                             .ane_mode = PrefillAneMode::UltraFp16SwiGlu,
+                             .ane_chunk_tokens = 1024U});
+
+      const auto ref_w4a4_logits =
+          run_chunk_then_probe_logits(*fwd_w4a4_gpu, chunk1024, tail64);
+      const auto splice_logits =
+          run_chunk_then_probe_logits(*fwd_w4a4_ultra, chunk1024, tail64);
+      const double cos_splice =
+          cosine_similarity(ref_w4a4_logits, splice_logits);
+      // Verify W4A8 Mode B splice on the exact same .miv v2 model (expect >= 0.995)
+      // alongside W4A4 Mode B splice (where 25% of MLP rows run FP16 on ANE vs FP4 on GPU).
+      auto fwd_w4a8_gpu = make_forward(
+          ld, dense_mx_v2, libs, kCtx,
+          QwenPrefillOptions{.linear_mode = PrefillLinearMode::W4A8,
+                             .ane_mode = PrefillAneMode::Off});
+      auto fwd_w4a8_ultra = make_forward(
+          ld, dense_mx_v2, libs, kCtx,
+          QwenPrefillOptions{.linear_mode = PrefillLinearMode::W4A8,
+                             .ane_offload = true,
+                             .ane_mode = PrefillAneMode::UltraFp16SwiGlu,
+                             .ane_chunk_tokens = 1024U});
+      const auto ref_w4a8_logits =
+          run_chunk_then_probe_logits(*fwd_w4a8_gpu, chunk1024, tail64);
+      const auto splice_w4a8_logits =
+          run_chunk_then_probe_logits(*fwd_w4a8_ultra, chunk1024, tail64);
+      const double cos_w4a8_splice =
+          cosine_similarity(ref_w4a8_logits, splice_w4a8_logits);
+      require(cos_w4a8_splice >= 0.995,
+              "Case 8 W4A8 + ultra_fp16_swiglu Mode B splice cosine too low: " +
+                  std::to_string(cos_w4a8_splice));
+      require(cos_splice >= 0.92,
+              "Case 8 W4A4 + ultra_fp16_swiglu Mode B splice cosine too low: " +
+                  std::to_string(cos_splice));
+
+      const auto t_gpu = fwd_w4a4_gpu->prefill_telemetry();
+      const auto t_ultra = fwd_w4a4_ultra->prefill_telemetry();
+      require(t_gpu.prefill_w4a4_tokens >= 1024ULL,
+              "Case 8 W4A4 GPU-only did not increment prefill_w4a4_tokens");
+      require(t_ultra.prefill_w4a4_tokens >= 1024ULL,
+              "Case 8 W4A4 + ultra_fp16_swiglu did not increment prefill_w4a4_tokens");
+      if (hw_ane) {
+        require(fwd_w4a4_ultra->ane_offload_active() &&
+                    fwd_w4a4_ultra->ane_mode_effective() ==
+                        PrefillAneMode::UltraFp16SwiGlu,
+                "Case 8 W4A4 + ultra_fp16_swiglu was not active on ANE host (reason=" +
+                    std::string(fwd_w4a4_ultra->ane_inactive_reason()) + ")");
+        require(t_ultra.prefill_ane_offload_tokens >= 1024ULL,
+                "Case 8 W4A4 + ultra_fp16_swiglu did not offload T=1024 chunk");
+      }
+
+      // End-to-end Engine::create with W4A4 + ultra_fp16_swiglu telemetry check.
+      auto eng_opts = make_load_options(
+          dense_mx_v2, libs, 2048, PrefillLinearMode::W4A4,
+          PrefillAttentionMode::ExactNax, false, false, true, true);
+      eng_opts.prefill_ane_mode = PrefillAneMode::UltraFp16SwiGlu;
+      auto eng = Engine::create(eng_opts);
+      std::vector<U32> prompt1088 = chunk1024;
+      prompt1088.insert(prompt1088.end(), tail64.begin(), tail64.end());
+      const auto gen_toks = run_engine_request(*eng, prompt1088, 4);
+      const auto st = eng->stats();
+      eng->shutdown();
+
+      require(gen_toks.size() == 4U,
+              "Case 8 Engine W4A4+ultra_fp16_swiglu did not generate 4 tokens");
+      require(st.prefill_linear_mode == "w4a4" &&
+                  st.prefill_linear_mode_effective == "w4a4" &&
+                  !st.prefill_linear_fallback &&
+                  st.model_quant_format == "mxfp4" &&
+                  st.prefill_w4a4_tokens >= 1088ULL,
+              "Case 8 Engine W4A4 telemetry mismatch (eff=" +
+                  st.prefill_linear_mode_effective +
+                  ", fb=" + st.prefill_linear_fallback_reason +
+                  ", w4a4_tok=" + std::to_string(st.prefill_w4a4_tokens) + ")");
+      if (hw_ane) {
+        require(st.prefill_ane_active &&
+                    st.prefill_ane_mode_effective == "ultra_fp16_swiglu" &&
+                    st.prefill_ane_offload_tokens >= 1024ULL &&
+                    st.prefill_ane_fallback_tokens >= 64ULL,
+                "Case 8 Engine ultra_fp16_swiglu ANE telemetry mismatch (mode=" +
+                    st.prefill_ane_mode_effective +
+                    ", reason=" + st.prefill_ane_inactive_reason +
+                    ", offload=" + std::to_string(st.prefill_ane_offload_tokens) +
+                    ", fb=" + std::to_string(st.prefill_ane_fallback_tokens) + ")");
+      }
+      report["case8_w4a4_ultra_fp16_swiglu_mode_b"] = {
+          {"cos_sim_vs_w4a4_gpu", cos_splice},
+          {"cos_sim_w4a8_mode_b", cos_w4a8_splice},
+          {"hw_ane_available", hw_ane},
+          {"ane_mode_effective", st.prefill_ane_mode_effective},
+          {"ane_split_alpha", st.prefill_ane_split_alpha},
+          {"prefill_w4a4_tokens", st.prefill_w4a4_tokens},
+          {"prefill_ane_offload_tokens", st.prefill_ane_offload_tokens},
+          {"prefill_ane_fallback_tokens", st.prefill_ane_fallback_tokens},
       };
     }
 
