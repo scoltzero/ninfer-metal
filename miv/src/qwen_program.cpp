@@ -304,7 +304,8 @@ build_qwen_program_dispatch_table(const ArtifactModel &artifact,
     for (const auto &profile : profiles.profiles()) {
       KernelKey key;
       const auto binding = bindings.find(object.id);
-      if (binding == bindings.end()) {
+      if (binding == bindings.end() || object.format == "direct_bf16_v1" ||
+          object.format == "direct_f16_v1") {
         if (object.shape.size() != 2 || (object.format != "direct_bf16_v1" &&
                                          object.format != "direct_f16_v1")) {
           throw std::invalid_argument(

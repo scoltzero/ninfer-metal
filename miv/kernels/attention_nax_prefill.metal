@@ -577,21 +577,23 @@ inline void paged_flash_prefill_nax_impl(
 
 #define BF16_STORE_O(OREG, OFF_C)                                              \
   do {                                                                         \
-    BF8 Gfrag;                                                                 \
-    if (lim_rows_q < 16) {                                                     \
-      Frag16x16::load_rows_clean_bf4(Gfrag, G_ptr, p.gate_token_stride,        \
-                                     lim_rows_q, OFF_C, sc);                   \
-    } else {                                                                   \
-      Frag16x16::load_bf4(Gfrag, G_ptr, p.gate_token_stride, OFF_C, sc);       \
+    float4 o0 = float4(OREG[0], OREG[1], OREG[2], OREG[3]) * rcp0;             \
+    float4 o1 = float4(OREG[4], OREG[5], OREG[6], OREG[7]) * rcp1;             \
+    if (p.gate_head_stride != 0u) {                                            \
+      BF8 Gfrag;                                                               \
+      if (lim_rows_q < 16) {                                                   \
+        Frag16x16::load_rows_clean_bf4(Gfrag, G_ptr, p.gate_token_stride,      \
+                                       lim_rows_q, OFF_C, sc);                 \
+      } else {                                                                 \
+        Frag16x16::load_bf4(Gfrag, G_ptr, p.gate_token_stride, OFF_C, sc);     \
+      }                                                                        \
+      const float4 g0 = float4(float(Gfrag[0]), float(Gfrag[1]),               \
+                               float(Gfrag[2]), float(Gfrag[3]));              \
+      const float4 g1 = float4(float(Gfrag[4]), float(Gfrag[5]),               \
+                               float(Gfrag[6]), float(Gfrag[7]));              \
+      o0 /= (float4(1.0f) + exp(-g0));                                         \
+      o1 /= (float4(1.0f) + exp(-g1));                                         \
     }                                                                          \
-    const float4 g0 = float4(float(Gfrag[0]), float(Gfrag[1]), float(Gfrag[2]),\
-                             float(Gfrag[3]));                                 \
-    const float4 g1 = float4(float(Gfrag[4]), float(Gfrag[5]), float(Gfrag[6]),\
-                             float(Gfrag[7]));                                 \
-    const float4 o0 = (float4(OREG[0], OREG[1], OREG[2], OREG[3]) * rcp0) /    \
-                      (float4(1.0f) + exp(-g0));                               \
-    const float4 o1 = (float4(OREG[4], OREG[5], OREG[6], OREG[7]) * rcp1) /    \
-                      (float4(1.0f) + exp(-g1));                               \
     OREG = F8(o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w);                 \
     if (lim_rows_q < 16) {                                                     \
       Frag16x16::store_rows_bf4(OREG, O_ptr, out_stride, lim_rows_q, OFF_C,    \
@@ -1215,27 +1217,31 @@ static inline void flash_bk16_wn_bf16_core(
   #define BF16_BK16_STORE_O(OREG, OFF_C)                                       \
     do {                                                                       \
       if (ep_qv0) {                                                            \
-        ushort4 gu0 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu0 = gqa_clean_bf4_u16(gu0);                                        \
+        float4 o0_f =                                                          \
+            float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu0 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu0 = gqa_clean_bf4_u16(gu0);                                      \
+          }                                                                    \
+          const float4 g0_f = float4(as_type<bfloat4>(gu0));                   \
+          o0_f /= (float4(1.0f) + exp(-g0_f));                                 \
         }                                                                      \
-        const float4 g0_f = float4(as_type<bfloat4>(gu0));                     \
-        const float4 o0_f =                                                    \
-            (float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0) /      \
-            (float4(1.0f) + exp(-g0_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row0 + (OFF_C)) = bfloat4(o0_f); \
       }                                                                        \
       if (ep_qv1) {                                                            \
-        ushort4 gu1 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu1 = gqa_clean_bf4_u16(gu1);                                        \
+        float4 o1_f =                                                          \
+            float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu1 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu1 = gqa_clean_bf4_u16(gu1);                                      \
+          }                                                                    \
+          const float4 g1_f = float4(as_type<bfloat4>(gu1));                   \
+          o1_f /= (float4(1.0f) + exp(-g1_f));                                 \
         }                                                                      \
-        const float4 g1_f = float4(as_type<bfloat4>(gu1));                     \
-        const float4 o1_f =                                                    \
-            (float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1) /      \
-            (float4(1.0f) + exp(-g1_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row1 + (OFF_C)) = bfloat4(o1_f); \
       }                                                                        \
     } while (false)
@@ -1833,27 +1839,31 @@ static inline void flash_bk32_wn4_bf16_hd256_core(
   #define BF16_BK32_STORE_O(OREG, OFF_C)                                       \
     do {                                                                       \
       if (ep_qv0) {                                                            \
-        ushort4 gu0 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu0 = gqa_clean_bf4_u16(gu0);                                        \
+        float4 o0_f =                                                          \
+            float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu0 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu0 = gqa_clean_bf4_u16(gu0);                                      \
+          }                                                                    \
+          const float4 g0_f = float4(as_type<bfloat4>(gu0));                   \
+          o0_f /= (float4(1.0f) + exp(-g0_f));                                 \
         }                                                                      \
-        const float4 g0_f = float4(as_type<bfloat4>(gu0));                     \
-        const float4 o0_f =                                                    \
-            (float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0) /      \
-            (float4(1.0f) + exp(-g0_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row0 + (OFF_C)) = bfloat4(o0_f); \
       }                                                                        \
       if (ep_qv1) {                                                            \
-        ushort4 gu1 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu1 = gqa_clean_bf4_u16(gu1);                                        \
+        float4 o1_f =                                                          \
+            float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu1 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu1 = gqa_clean_bf4_u16(gu1);                                      \
+          }                                                                    \
+          const float4 g1_f = float4(as_type<bfloat4>(gu1));                   \
+          o1_f /= (float4(1.0f) + exp(-g1_f));                                 \
         }                                                                      \
-        const float4 g1_f = float4(as_type<bfloat4>(gu1));                     \
-        const float4 o1_f =                                                    \
-            (float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1) /      \
-            (float4(1.0f) + exp(-g1_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row1 + (OFF_C)) = bfloat4(o1_f); \
       }                                                                        \
     } while (false)
@@ -2489,10 +2499,13 @@ kernel void omlx_m5_paged_attention_bf16_split_merge_half_4sg_hd256(
   FLASH_NAX_UNROLL
   for (uint k = 0u; k < 2u; ++k) {
     const uint d = tid + k * 128u;
-    const float val = (tg_o[0u * 256u + d] + tg_o[1u * 256u + d]) +
-                      (tg_o[2u * 256u + d] + tg_o[3u * 256u + d]);
-    const float g_val = float(gate_row[d]);
-    out_row[d] = bfloat(val / (1.0f + exp(-g_val)));
+    float val = (tg_o[0u * 256u + d] + tg_o[1u * 256u + d]) +
+                (tg_o[2u * 256u + d] + tg_o[3u * 256u + d]);
+    if (params.gate_head_stride != 0u) {
+      const float g_val = float(gate_row[d]);
+      val /= (1.0f + exp(-g_val));
+    }
+    out_row[d] = bfloat(val);
   }
 }
 

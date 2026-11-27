@@ -211,8 +211,11 @@ kernel void omlx_m5_paged_attention_split_merge(
                     partial_output[(begin + split) * params.head_dim + feature],
                     total);
     }
-    const float gated = total / denominator / (1.0f + exp(-float(g[feature])));
-    output[ulong(logical_head) * params.head_dim + feature] = bfloat(gated);
+    const float norm_o = (denominator > 0.0f) ? (total / denominator) : 0.0f;
+    const float out_val = (params.gate_head_stride != 0u)
+                              ? (norm_o / (1.0f + exp(-float(g[feature]))))
+                              : norm_o;
+    output[ulong(logical_head) * params.head_dim + feature] = bfloat(out_val);
   }
 }
 
@@ -263,6 +266,10 @@ omlx_m5_attention_apply_gate_fp32(device const float *ungated [[buffer(0)]],
   const uint token = logical_head / params.query_heads;
   const uint query_head = logical_head - token * params.query_heads;
   const uint feature = i % params.head_dim;
+  if (params.gate_head_stride == 0u) {
+    output[i] = bfloat(ungated[i]);
+    return;
+  }
   const ulong gate_index = ulong(token) * params.gate_token_stride +
                            ulong(query_head) * params.gate_head_stride +
                            feature;

@@ -654,6 +654,11 @@ def main() -> int:
             "capabilities", "kv_formats", "supported_standard_settings", "options_schema",
             "speculative_limits", "load_defaults",
         )},
+        **(
+            {"architecture_capabilities": contract["architecture_capabilities"]}
+            if "architecture_capabilities" in contract
+            else {}
+        ),
         "built_at_utc": built_at_utc,
         "git_commit": git_commit,
     }

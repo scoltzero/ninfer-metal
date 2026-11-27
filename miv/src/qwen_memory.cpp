@@ -55,29 +55,36 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
                          bool enable_w4a8_workspace,
                          bool enable_minference_workspace,
                          bool enable_sage2_kv_workspace) {
+  const bool has_gdn = c.linear_attention_layers() > 0;
   const U32 max_ws_rows = c.num_experts > 1 ? 4096U : 2048U;
   if (max_context == 0 || workspace_rows == 0 || workspace_rows > max_ws_rows ||
       c.num_hidden_layers <= 0 ||
       c.layer_types.size() != std::size_t(c.num_hidden_layers) ||
-      feature_count > U32(c.num_hidden_layers) || c.linear_conv_kernel_dim <= 1)
+      feature_count > U32(c.num_hidden_layers) ||
+      (has_gdn && c.linear_conv_kernel_dim <= 1))
     throw std::invalid_argument(
         "Qwen memory context/layer geometry is invalid");
   const U64 h = positive(c.hidden_size), f = positive(c.intermediate_size);
   const U64 v = positive(c.vocab_size);
   const U64 q = multiply(positive(c.num_attention_heads), positive(c.head_dim));
+  const U64 q_out = c.has_attn_output_gate ? multiply(q, 2) : q;
   const U64 kv =
       multiply(positive(c.num_key_value_heads), positive(c.head_dim));
-  const U64 gk = multiply(positive(c.linear_num_key_heads),
-                          positive(c.linear_key_head_dim));
-  const U64 gv = multiply(positive(c.linear_num_value_heads),
-                          positive(c.linear_value_head_dim));
-  const U64 conv = add(multiply(gk, 2), gv);
+  const U64 gk = has_gdn ? multiply(positive(c.linear_num_key_heads),
+                                    positive(c.linear_key_head_dim))
+                         : 0ULL;
+  const U64 gv = has_gdn ? multiply(positive(c.linear_num_value_heads),
+                                    positive(c.linear_value_head_dim))
+                         : 0ULL;
+  const U64 conv = has_gdn ? add(multiply(gk, 2), gv) : 0ULL;
   const U64 shared_f =
-      c.num_experts ? positive(c.shared_expert_intermediate_size) : 0;
+      (c.num_experts > 0 && c.shared_expert_intermediate_size > 0)
+          ? positive(c.shared_expert_intermediate_size)
+          : 0ULL;
   const U64 assignments = c.num_experts ? positive(c.num_experts_per_token) : 1;
   const U64 feature_width = feature_count ? multiply(h, feature_count) : 0;
   const U64 width =
-      std::max({h, f, q * 2, kv, conv, gv, shared_f, feature_width});
+      std::max({h, f, q_out, kv, conv, gv, shared_f, feature_width});
   const U32 ring_rows = (speculative && feature_count)
                             ? resolve_feature_ring_rows(max_context,
                                                         feature_ring_rows)
@@ -110,15 +117,17 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
   tensor("token_ids", 1, workspace_rows, 4);
   tensor("hidden", h);
   tensor("norm", h);
-  tensor("query", q * 2);
+  tensor("query", q_out);
   tensor("key", kv);
   tensor("value", kv);
-  tensor("qkv", conv);
-  tensor("z", gv);
-  tensor("a", positive(c.linear_num_value_heads));
-  tensor("b", positive(c.linear_num_value_heads));
-  tensor("convolved", conv);
-  tensor("recurrent", gv);
+  if (has_gdn) {
+    tensor("qkv", conv);
+    tensor("z", gv);
+    tensor("a", positive(c.linear_num_value_heads));
+    tensor("b", positive(c.linear_num_value_heads));
+    tensor("convolved", conv);
+    tensor("recurrent", gv);
+  }
   tensor("mixer", std::max(q, gv));
   if (split_attention) {
     const bool strict_two_pass_attn = []() {
@@ -140,8 +149,23 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     append("attention_split_max", multiply(records, 4));
     if (!bf16_two_pass) {
       append("attention_split_sum", multiply(records, 4));
-      append("attention_split_output",
-             multiply(multiply(records, positive(c.head_dim)), 4));
+      U64 split_out_bytes =
+          multiply(multiply(records, positive(c.head_dim)), 4);
+      if (affine4_kv && c.head_dim == 256 && c.num_key_value_heads > 0) {
+        const auto align256 = [](U64 x) { return (x + 255ULL) & ~255ULL; };
+        const U64 qh = positive(c.num_attention_heads);
+        const U64 kvh = positive(c.num_key_value_heads);
+        const U64 repeat = std::max<U64>(1ULL, qh / kvh);
+        const U64 n_rblks = (8ULL * repeat + 15ULL) / 16ULL;
+        const U64 r_stride = n_rblks * 16ULL;
+        const U64 partial_half = multiply(multiply(records, 256ULL), 2ULL);
+        const U64 q_half = multiply(kvh, multiply(2ULL * r_stride, 256ULL));
+        const U64 q_sum = multiply(kvh, multiply(2ULL * r_stride, 4ULL));
+        const U64 a4_need =
+            add(align256(add(align256(partial_half), q_half)), q_sum);
+        split_out_bytes = std::max(split_out_bytes, a4_need);
+      }
+      append("attention_split_output", split_out_bytes);
     }
   }
   if ((exact_attention || affine4_kv || flash_nax_prefill) &&
@@ -158,8 +182,11 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     tensor("route_scores", assignments);
     tensor("expert_output", h, U64(workspace_rows) * assignments);
     tensor("routed", h);
-    tensor("shared", h);
-    tensor("shared_gate", 1);
+    if (shared_f > 0) {
+      tensor("shared", h);
+      if (c.has_shared_expert_gate)
+        tensor("shared_gate", 1);
+    }
   }
   const U64 max_logits_rows =
       inspect_tensors ? U64(workspace_rows) : std::min<U64>(workspace_rows, 8ULL);

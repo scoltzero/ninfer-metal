@@ -353,22 +353,30 @@ kernel void omlx_m5_attention_qk_norm_rope_exact(
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32) {
-    const float value = float(row[column]);
-    square_sum = fma(value, value, square_sum);
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32) {
+      const float value = float(row[column]);
+      square_sum = fma(value, value, square_sum);
+    }
+    inverse_rms =
+        rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   }
-  const float inverse_rms =
-      rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   const uint half_rotary = params.rotary_dim / 2;
   const float position = float(positions[token]);
   for (uint pair = lane; pair < half_rotary; pair += 32) {
     const uint first_index = pair;
     const uint second_index = pair + half_rotary;
-    const float first = float(row[first_index]) * inverse_rms *
-                        (float(norm[first_index]) + params.weight_offset);
-    const float second = float(row[second_index]) * inverse_rms *
-                         (float(norm[second_index]) + params.weight_offset);
+    const float first =
+        has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                       (float(norm[first_index]) + params.weight_offset))
+                    : float(row[first_index]);
+    const float second =
+        has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                       (float(norm[second_index]) + params.weight_offset))
+                    : float(row[second_index]);
     const float exponent = float(2 * pair) / float(params.rotary_dim);
     const float angle = position / pow(params.theta, exponent);
     const float cosine = cos(angle);
@@ -376,10 +384,12 @@ kernel void omlx_m5_attention_qk_norm_rope_exact(
     row[first_index] = bfloat(fma(-second, sine, first * cosine));
     row[second_index] = bfloat(fma(first, sine, second * cosine));
   }
-  for (uint column = params.rotary_dim + lane; column < params.head_dim;
-       column += 32) {
-    row[column] = bfloat(float(row[column]) * inverse_rms *
-                         (float(norm[column]) + params.weight_offset));
+  if (has_qk_norm) {
+    for (uint column = params.rotary_dim + lane; column < params.head_dim;
+         column += 32) {
+      row[column] = bfloat(float(row[column]) * inverse_rms *
+                           (float(norm[column]) + params.weight_offset));
+    }
   }
 }
 
@@ -413,13 +423,17 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_exact(
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32) {
-    const float val = float(row[column]);
-    square_sum = fma(val, val, square_sum);
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32) {
+      const float val = float(row[column]);
+      square_sum = fma(val, val, square_sum);
+    }
+    inverse_rms =
+        rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   }
-  const float inverse_rms =
-      rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   const uint half_rotary = params.rotary_dim / 2;
   const uint logical_pos = positions[token];
   const float position = float(logical_pos);
@@ -427,10 +441,14 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_exact(
     for (uint pair = lane; pair < half_rotary; pair += 32) {
       const uint first_index = pair;
       const uint second_index = pair + half_rotary;
-      const float first = float(row[first_index]) * inverse_rms *
-                          (float(norm[first_index]) + params.weight_offset);
-      const float second = float(row[second_index]) * inverse_rms *
-                           (float(norm[second_index]) + params.weight_offset);
+      const float first =
+          has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                         (float(norm[first_index]) + params.weight_offset))
+                      : float(row[first_index]);
+      const float second =
+          has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                         (float(norm[second_index]) + params.weight_offset))
+                      : float(row[second_index]);
       const float exponent = float(2 * pair) / float(params.rotary_dim);
       const float angle = position / pow(params.theta, exponent);
       const float cosine = cos(angle);
@@ -438,10 +456,12 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_exact(
       row[first_index] = bfloat(fma(-second, sine, first * cosine));
       row[second_index] = bfloat(fma(first, sine, second * cosine));
     }
-    for (uint column = params.rotary_dim + lane; column < params.head_dim;
-         column += 32) {
-      row[column] = bfloat(float(row[column]) * inverse_rms *
-                           (float(norm[column]) + params.weight_offset));
+    if (has_qk_norm) {
+      for (uint column = params.rotary_dim + lane; column < params.head_dim;
+           column += 32) {
+        row[column] = bfloat(float(row[column]) * inverse_rms *
+                             (float(norm[column]) + params.weight_offset));
+      }
     }
   } else {
     const uint page = logical_pos >> 6u;
@@ -456,10 +476,14 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_exact(
     for (uint pair = lane; pair < half_rotary; pair += 32) {
       const uint first_index = pair;
       const uint second_index = pair + half_rotary;
-      const float first = float(row[first_index]) * inverse_rms *
-                          (float(norm[first_index]) + params.weight_offset);
-      const float second = float(row[second_index]) * inverse_rms *
-                           (float(norm[second_index]) + params.weight_offset);
+      const float first =
+          has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                         (float(norm[first_index]) + params.weight_offset))
+                      : float(row[first_index]);
+      const float second =
+          has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                         (float(norm[second_index]) + params.weight_offset))
+                      : float(row[second_index]);
       const float exponent = float(2 * pair) / float(params.rotary_dim);
       const float angle = position / pow(params.theta, exponent);
       const float cosine = cos(angle);
@@ -475,8 +499,10 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_exact(
     }
     for (uint column = params.rotary_dim + lane; column < params.head_dim;
          column += 32) {
-      const bfloat kv_normed = bfloat(float(row[column]) * inverse_rms *
-                                      (float(norm[column]) + params.weight_offset));
+      const bfloat kv_normed =
+          has_qk_norm ? bfloat(float(row[column]) * inverse_rms *
+                               (float(norm[column]) + params.weight_offset))
+                      : row[column];
       row[column] = kv_normed;
       ck_head[column] = kv_normed;
       cv_head[column] = v_head[column];
@@ -668,15 +694,19 @@ kernel void omlx_m5_paged_causal_attention_exact(
     }
 
     if (active) {
-      device const bfloat *gate_row =
-          gate + ulong(token) * params.gate_token_stride +
-          ulong(query_head) * params.gate_head_stride;
-      device const bfloat4 *gv =
-          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-      const float4 g0 = float4(gv[0]);
-      const float4 g1 = float4(gv[1]);
-      const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-      const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+      const float4 norm0 = acc0 / denominator;
+      const float4 norm1 = acc1 / denominator;
+      float4 o0 = norm0;
+      float4 o1 = norm1;
+      if (params.gate_head_stride != 0u) {
+        device const bfloat *gate_row =
+            gate + ulong(token) * params.gate_token_stride +
+            ulong(query_head) * params.gate_head_stride;
+        device const bfloat4 *gv =
+            reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+        o0 /= (1.0f + exp(-float4(gv[0])));
+        o1 /= (1.0f + exp(-float4(gv[1])));
+      }
       device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
           output + (ulong(token) * params.query_heads + query_head) * 256u +
           lane * 8u);
@@ -799,12 +829,14 @@ kernel void omlx_m5_paged_causal_attention_exact(
                             acc1);
       }
     }
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
-    const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-    const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+    float4 o0 = acc0 / denominator;
+    float4 o1 = acc1 / denominator;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      o0 /= (1.0f + exp(-float4(gv[0])));
+      o1 /= (1.0f + exp(-float4(gv[1])));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + (ulong(token) * params.query_heads + query_head) * 256u +
         lane * 8u);
@@ -866,12 +898,14 @@ kernel void omlx_m5_paged_causal_attention_exact(
   for (uint index = 0; index < values_per_lane; ++index) {
     const uint feature = lane + index * 32;
     if (feature < params.head_dim) {
-      const float gate_value = float(gate_row[feature]);
-      const float gated =
-          (accumulators[index] / denominator) / (1.0f + exp(-gate_value));
+      const float norm_o = accumulators[index] / denominator;
+      const float out_val =
+          (params.gate_head_stride != 0u)
+              ? (norm_o / (1.0f + exp(-float(gate_row[feature]))))
+              : norm_o;
       output[(ulong(token) * params.query_heads + query_head) *
                  params.head_dim +
-             feature] = bfloat(gated);
+             feature] = bfloat(out_val);
     }
   }
 }
@@ -1014,15 +1048,19 @@ kernel void omlx_m5_paged_attention_exact_merge(
     }
 
     if (active) {
-      device const bfloat *gate_row =
-          gate + ulong(token) * params.gate_token_stride +
-          ulong(query_head) * params.gate_head_stride;
-      device const bfloat4 *gv =
-          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-      const float4 g0 = float4(gv[0]);
-      const float4 g1 = float4(gv[1]);
-      const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-      const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+      const float4 norm0 = acc0 / denominator;
+      const float4 norm1 = acc1 / denominator;
+      float4 o0 = norm0;
+      float4 o1 = norm1;
+      if (params.gate_head_stride != 0u) {
+        device const bfloat *gate_row =
+            gate + ulong(token) * params.gate_token_stride +
+            ulong(query_head) * params.gate_head_stride;
+        device const bfloat4 *gv =
+            reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+        o0 /= (1.0f + exp(-float4(gv[0])));
+        o1 /= (1.0f + exp(-float4(gv[1])));
+      }
       device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
           output + (ulong(token) * params.query_heads + query_head) * 256u +
           lane * 8u);
@@ -1113,12 +1151,16 @@ kernel void omlx_m5_paged_attention_exact_merge(
                             acc1);
       }
     }
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
-    const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-    const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+    float4 o0 = acc0 / denominator;
+    float4 o1 = acc1 / denominator;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      const float4 g0 = float4(gv[0]);
+      const float4 g1 = float4(gv[1]);
+      o0 /= (1.0f + exp(-g0));
+      o1 /= (1.0f + exp(-g1));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + (ulong(token) * params.query_heads + query_head) * 256u +
         lane * 8u);
@@ -1161,12 +1203,14 @@ kernel void omlx_m5_paged_attention_exact_merge(
   for (uint index = 0; index < values_per_lane; ++index) {
     const uint feature = lane + index * 32;
     if (feature < params.head_dim) {
-      const float gate_value = float(gate_row[feature]);
-      const float gated =
-          (accumulators[index] / denominator) / (1.0f + exp(-gate_value));
+      float out_val = accumulators[index] / denominator;
+      if (params.gate_head_stride != 0u) {
+        const float gate_value = float(gate_row[feature]);
+        out_val /= (1.0f + exp(-gate_value));
+      }
       output[(ulong(token) * params.query_heads + query_head) *
                  params.head_dim +
-             feature] = bfloat(gated);
+             feature] = bfloat(out_val);
     }
   }
 }
@@ -1628,14 +1672,16 @@ kernel void omlx_m5_paged_attention_exact_1pass_merge(
         acc_run1 = fma(acc_run1, float4(w_old), po4[1] * float4(w_new));
       }
     }
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
     const float4 norm0 = (l_run > 0.0f) ? (acc_run0 / l_run) : float4(0.0f);
     const float4 norm1 = (l_run > 0.0f) ? (acc_run1 / l_run) : float4(0.0f);
-    const float4 o0 = norm0 / (1.0f + exp(-g0));
-    const float4 o1 = norm1 / (1.0f + exp(-g1));
+    float4 o0 = norm0;
+    float4 o1 = norm1;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      o0 /= (1.0f + exp(-float4(gv[0])));
+      o1 /= (1.0f + exp(-float4(gv[1])));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + ulong(logical_head) * 256ul + lane * 8u);
     ov[0] = bfloat4(o0);
@@ -1673,8 +1719,11 @@ kernel void omlx_m5_paged_attention_exact_1pass_merge(
     const uint d = lane + idx * 32u;
     if (d < params.head_dim) {
       const float norm_o = (l_run > 0.0f) ? (acc_run[idx] / l_run) : 0.0f;
-      const float g_val = float(gate_row[d]);
-      out_row[d] = bfloat(norm_o / (1.0f + exp(-g_val)));
+      const float out_val =
+          (params.gate_head_stride != 0u)
+              ? (norm_o / (1.0f + exp(-float(gate_row[d]))))
+              : norm_o;
+      out_row[d] = bfloat(out_val);
     }
   }
 }
@@ -1826,17 +1875,19 @@ kernel void omlx_m5_paged_causal_attention_exact_1pass(
     }
 
     if (active) {
-      device const bfloat *gate_row =
-          gate + ulong(token) * params.gate_token_stride +
-          ulong(query_head) * params.gate_head_stride;
-      device const bfloat4 *gv =
-          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-      const float4 g0 = float4(gv[0]);
-      const float4 g1 = float4(gv[1]);
       const float4 norm0 = (l_run > 0.0f) ? (acc_run0 / l_run) : float4(0.0f);
       const float4 norm1 = (l_run > 0.0f) ? (acc_run1 / l_run) : float4(0.0f);
-      const float4 o0 = norm0 / (1.0f + exp(-g0));
-      const float4 o1 = norm1 / (1.0f + exp(-g1));
+      float4 o0 = norm0;
+      float4 o1 = norm1;
+      if (params.gate_head_stride != 0u) {
+        device const bfloat *gate_row =
+            gate + ulong(token) * params.gate_token_stride +
+            ulong(query_head) * params.gate_head_stride;
+        device const bfloat4 *gv =
+            reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+        o0 /= (1.0f + exp(-float4(gv[0])));
+        o1 /= (1.0f + exp(-float4(gv[1])));
+      }
       device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
           output + (ulong(token) * params.query_heads + query_head) * 256ul +
           lane * 8u);
@@ -1930,14 +1981,16 @@ kernel void omlx_m5_paged_causal_attention_exact_1pass(
       }
     }
 
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
     const float4 norm0 = (l_run > 0.0f) ? (acc_run0 / l_run) : float4(0.0f);
     const float4 norm1 = (l_run > 0.0f) ? (acc_run1 / l_run) : float4(0.0f);
-    const float4 o0 = norm0 / (1.0f + exp(-g0));
-    const float4 o1 = norm1 / (1.0f + exp(-g1));
+    float4 o0 = norm0;
+    float4 o1 = norm1;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      o0 /= (1.0f + exp(-float4(gv[0])));
+      o1 /= (1.0f + exp(-float4(gv[1])));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + ulong(logical_head) * 256ul + lane * 8u);
     ov[0] = bfloat4(o0);
@@ -2022,9 +2075,12 @@ kernel void omlx_m5_paged_causal_attention_exact_1pass(
     const uint feature = lane + idx * 32u;
     if (feature < params.head_dim) {
       const float norm_o = (l_run > 0.0f) ? (acc_run[idx] / l_run) : 0.0f;
-      const float gate_value = float(gate_row[feature]);
+      const float out_val =
+          (params.gate_head_stride != 0u)
+              ? (norm_o / (1.0f + exp(-float(gate_row[feature]))))
+              : norm_o;
       output[ulong(logical_head) * params.head_dim + feature] =
-          bfloat(norm_o / (1.0f + exp(-gate_value)));
+          bfloat(out_val);
     }
   }
 }
@@ -2132,42 +2188,19 @@ inline void exact_v_accum_gen8(float prob, device const bfloat *v_row,
 inline void exact_store_gated_gen8(float4 a_lo, float4 a_hi, float denom,
                                    device const bfloat *gate_row,
                                    device bfloat *out_row, uint lane,
-                                   uint head_dim) {
-  const float inv_d = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+                                   uint head_dim, bool has_gate) {
   const bool valid = (denom > 0.0f);
-  if (lane + 0u < head_dim) {
-    const float o = valid ? (a_lo.x / denom) : 0.0f;
-    out_row[lane + 0u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 0u]))));
+  const float vals[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                         a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+#pragma clang loop unroll(full)
+  for (uint idx = 0u; idx < 8u; ++idx) {
+    const uint d = lane + idx * 32u;
+    if (d < head_dim) {
+      const float o = valid ? (vals[idx] / denom) : 0.0f;
+      out_row[d] = bfloat(has_gate ? (o / (1.0f + exp(-float(gate_row[d]))))
+                                   : o);
+    }
   }
-  if (lane + 32u < head_dim) {
-    const float o = valid ? (a_lo.y / denom) : 0.0f;
-    out_row[lane + 32u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 32u]))));
-  }
-  if (lane + 64u < head_dim) {
-    const float o = valid ? (a_lo.z / denom) : 0.0f;
-    out_row[lane + 64u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 64u]))));
-  }
-  if (lane + 96u < head_dim) {
-    const float o = valid ? (a_lo.w / denom) : 0.0f;
-    out_row[lane + 96u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 96u]))));
-  }
-  if (lane + 128u < head_dim) {
-    const float o = valid ? (a_hi.x / denom) : 0.0f;
-    out_row[lane + 128u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 128u]))));
-  }
-  if (lane + 160u < head_dim) {
-    const float o = valid ? (a_hi.y / denom) : 0.0f;
-    out_row[lane + 160u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 160u]))));
-  }
-  if (lane + 192u < head_dim) {
-    const float o = valid ? (a_hi.z / denom) : 0.0f;
-    out_row[lane + 192u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 192u]))));
-  }
-  if (lane + 224u < head_dim) {
-    const float o = valid ? (a_hi.w / denom) : 0.0f;
-    out_row[lane + 224u] = bfloat(o / (1.0f + exp(-float(gate_row[lane + 224u]))));
-  }
-  (void)inv_d;
 }
 
 kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
@@ -2206,13 +2239,17 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32u) {
-    const float val = float(row[column]);
-    square_sum = fma(val, val, square_sum);
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32u) {
+      const float val = float(row[column]);
+      square_sum = fma(val, val, square_sum);
+    }
+    inverse_rms =
+        rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   }
-  const float inverse_rms =
-      rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   const uint half_rotary = params.rotary_dim / 2u;
   const uint logical_pos = positions[token];
   const float position = float(logical_pos);
@@ -2221,10 +2258,14 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
     for (uint pair = lane; pair < half_rotary; pair += 32u) {
       const uint first_index = pair;
       const uint second_index = pair + half_rotary;
-      const float first = float(row[first_index]) * inverse_rms *
-                          (float(norm[first_index]) + params.weight_offset);
-      const float second = float(row[second_index]) * inverse_rms *
-                           (float(norm[second_index]) + params.weight_offset);
+      const float first =
+          has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                         (float(norm[first_index]) + params.weight_offset))
+                      : float(row[first_index]);
+      const float second =
+          has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                         (float(norm[second_index]) + params.weight_offset))
+                      : float(row[second_index]);
       const float exponent = float(2u * pair) / float(params.rotary_dim);
       const float angle = position / pow(params.theta, exponent);
       const float cosine = cos(angle);
@@ -2232,10 +2273,12 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
       row[first_index] = bfloat(fma(-second, sine, first * cosine));
       row[second_index] = bfloat(fma(first, sine, second * cosine));
     }
-    for (uint column = params.rotary_dim + lane; column < params.head_dim;
-         column += 32u) {
-      row[column] = bfloat(float(row[column]) * inverse_rms *
-                           (float(norm[column]) + params.weight_offset));
+    if (has_qk_norm) {
+      for (uint column = params.rotary_dim + lane; column < params.head_dim;
+           column += 32u) {
+        row[column] = bfloat(float(row[column]) * inverse_rms *
+                             (float(norm[column]) + params.weight_offset));
+      }
     }
   } else {
     uint slot = 0u;
@@ -2260,10 +2303,14 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
     for (uint pair = lane; pair < half_rotary; pair += 32u) {
       const uint first_index = pair;
       const uint second_index = pair + half_rotary;
-      const float first = float(row[first_index]) * inverse_rms *
-                          (float(norm[first_index]) + params.weight_offset);
-      const float second = float(row[second_index]) * inverse_rms *
-                           (float(norm[second_index]) + params.weight_offset);
+      const float first =
+          has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                         (float(norm[first_index]) + params.weight_offset))
+                      : float(row[first_index]);
+      const float second =
+          has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                         (float(norm[second_index]) + params.weight_offset))
+                      : float(row[second_index]);
       const float exponent = float(2u * pair) / float(params.rotary_dim);
       const float angle = position / pow(params.theta, exponent);
       const float cosine = cos(angle);
@@ -2279,8 +2326,10 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_append_batched_exact(
     }
     for (uint column = params.rotary_dim + lane; column < params.head_dim;
          column += 32u) {
-      const bfloat kv_normed = bfloat(float(row[column]) * inverse_rms *
-                                      (float(norm[column]) + params.weight_offset));
+      const bfloat kv_normed =
+          has_qk_norm ? bfloat(float(row[column]) * inverse_rms *
+                               (float(norm[column]) + params.weight_offset))
+                      : row[column];
       row[column] = kv_normed;
       ck_head[column] = kv_normed;
       cv_head[column] = v_head[column];
@@ -2448,17 +2497,19 @@ kernel void omlx_m5_paged_causal_attention_batched_exact_1pass(
     }
 
     if (active) {
-      device const bfloat *gate_row =
-          gate + ulong(global_tok) * params.gate_token_stride +
-          ulong(query_head) * params.gate_head_stride;
-      device const bfloat4 *gv =
-          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-      const float4 g0 = float4(gv[0]);
-      const float4 g1 = float4(gv[1]);
       const float4 norm0 = (l_run > 0.0f) ? (acc_run0 / l_run) : float4(0.0f);
       const float4 norm1 = (l_run > 0.0f) ? (acc_run1 / l_run) : float4(0.0f);
-      const float4 o0 = norm0 / (1.0f + exp(-g0));
-      const float4 o1 = norm1 / (1.0f + exp(-g1));
+      float4 o0 = norm0;
+      float4 o1 = norm1;
+      if (params.gate_head_stride != 0u) {
+        device const bfloat *gate_row =
+            gate + ulong(global_tok) * params.gate_token_stride +
+            ulong(query_head) * params.gate_head_stride;
+        device const bfloat4 *gv =
+            reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+        o0 /= (1.0f + exp(-float4(gv[0])));
+        o1 /= (1.0f + exp(-float4(gv[1])));
+      }
       device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
           output + (ulong(global_tok) * params.query_heads + query_head) * 256ul +
           lane * 8u);
@@ -2543,14 +2594,16 @@ kernel void omlx_m5_paged_causal_attention_batched_exact_1pass(
       }
     }
 
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
     const float4 norm0 = (l_run > 0.0f) ? (acc_run0 / l_run) : float4(0.0f);
     const float4 norm1 = (l_run > 0.0f) ? (acc_run1 / l_run) : float4(0.0f);
-    const float4 o0 = norm0 / (1.0f + exp(-g0));
-    const float4 o1 = norm1 / (1.0f + exp(-g1));
+    float4 o0 = norm0;
+    float4 o1 = norm1;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      o0 /= (1.0f + exp(-float4(gv[0])));
+      o1 /= (1.0f + exp(-float4(gv[1])));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + (ulong(global_tok) * params.query_heads + query_head) * 256ul +
         lane * 8u);
@@ -2613,7 +2666,7 @@ kernel void omlx_m5_paged_causal_attention_batched_exact_1pass(
   device bfloat *out_row =
       output + (ulong(global_tok) * params.query_heads + query_head) * params.head_dim;
   exact_store_gated_gen8(acc_run_lo, acc_run_hi, l_run, gate_row, out_row, lane,
-                         params.head_dim);
+                         params.head_dim, params.gate_head_stride != 0u);
 }
 
 kernel void omlx_m5_paged_causal_attention_batched_exact(
@@ -2789,15 +2842,17 @@ kernel void omlx_m5_paged_causal_attention_batched_exact(
     }
 
     if (active) {
-      device const bfloat *gate_row =
-          gate + ulong(global_tok) * params.gate_token_stride +
-          ulong(query_head) * params.gate_head_stride;
-      device const bfloat4 *gv =
-          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-      const float4 g0 = float4(gv[0]);
-      const float4 g1 = float4(gv[1]);
-      const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-      const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+      float4 o0 = acc0 / denominator;
+      float4 o1 = acc1 / denominator;
+      if (params.gate_head_stride != 0u) {
+        device const bfloat *gate_row =
+            gate + ulong(global_tok) * params.gate_token_stride +
+            ulong(query_head) * params.gate_head_stride;
+        device const bfloat4 *gv =
+            reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+        o0 /= (1.0f + exp(-float4(gv[0])));
+        o1 /= (1.0f + exp(-float4(gv[1])));
+      }
       device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
           output + (ulong(global_tok) * params.query_heads + query_head) * 256ul +
           lane * 8u);
@@ -2877,12 +2932,14 @@ kernel void omlx_m5_paged_causal_attention_batched_exact(
         exact_v_accum_hd256(p0, v_page + ulong(within) * kv_width, lane, acc0, acc1);
       }
     }
-    device const bfloat4 *gv =
-        reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
-    const float4 g0 = float4(gv[0]);
-    const float4 g1 = float4(gv[1]);
-    const float4 o0 = (acc0 / denominator) / (1.0f + exp(-g0));
-    const float4 o1 = (acc1 / denominator) / (1.0f + exp(-g1));
+    float4 o0 = acc0 / denominator;
+    float4 o1 = acc1 / denominator;
+    if (params.gate_head_stride != 0u) {
+      device const bfloat4 *gv =
+          reinterpret_cast<device const bfloat4 *>(gate_row + lane * 8u);
+      o0 /= (1.0f + exp(-float4(gv[0])));
+      o1 /= (1.0f + exp(-float4(gv[1])));
+    }
     device bfloat4 *ov = reinterpret_cast<device bfloat4 *>(
         output + (ulong(global_tok) * params.query_heads + query_head) * 256ul +
         lane * 8u);
@@ -2925,5 +2982,5 @@ kernel void omlx_m5_paged_causal_attention_batched_exact(
   device bfloat *out_row =
       output + (ulong(global_tok) * params.query_heads + query_head) * params.head_dim;
   exact_store_gated_gen8(acc_lo, acc_hi, denominator, gate_row, out_row, lane,
-                         params.head_dim);
+                         params.head_dim, params.gate_head_stride != 0u);
 }

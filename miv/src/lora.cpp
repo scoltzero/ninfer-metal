@@ -905,39 +905,48 @@ load_lora_adapter_for_qwen(const std::filesystem::path &adapter_dir,
       }
       const auto proj = sub.substr(10);
       if (proj == "q_proj") {
-        // Support both fused [2*q_width, h] (Qwen3.5/3.8 standard) and split [q_width, h]
-        const std::uint32_t cand_out = [&]() -> std::uint32_t {
-          if (spec.format == LoraFormat::mlx && !fifo) {
-            return static_cast<std::uint32_t>(tb.info->shape[1]);
-          }
-          if (spec.format == LoraFormat::peft && !fifo) {
-            return static_cast<std::uint32_t>(tb.info->shape[0]);
-          }
-          const auto b0 = static_cast<std::uint32_t>(tb.info->shape[0]);
-          const auto b1 = static_cast<std::uint32_t>(tb.info->shape[1]);
-          if (b0 == 2U * q_width || b1 == 2U * q_width) {
-            return 2U * q_width;
-          }
-          if (b0 == q_width || b1 == q_width) {
-            return q_width;
-          }
-          return 2U * q_width;
-        }();
-        if (cand_out == q_width && q_width > 0) {
-          auto cf = canonicalize_factors(spec, raw_mod, norm_mod, ta, tb,
-                                         q_width, h, fifo);
-          const float sc = compute_lora_scale(spec, raw_mod, norm_mod, cf.rank);
-          auto &sq = split_q_by_layer[layer_idx];
-          if (sq.q_only.has_value()) {
-            throw std::invalid_argument("duplicate split q_proj on layer " +
-                                        std::to_string(layer_idx));
-          }
-          sq.q_only = SplitQHalf{cf.rank, sc, std::move(cf.a_rk),
-                                 std::move(cf.b_nr), norm_mod};
+        if (!config.has_attn_output_gate) {
+          emit_direct("attention_q", q_width, h);
         } else {
-          emit_direct("attention_q", 2U * q_width, h);
+          // Support both fused [2*q_width, h] (Qwen3.5/3.8 standard) and split [q_width, h]
+          const std::uint32_t cand_out = [&]() -> std::uint32_t {
+            if (spec.format == LoraFormat::mlx && !fifo) {
+              return static_cast<std::uint32_t>(tb.info->shape[1]);
+            }
+            if (spec.format == LoraFormat::peft && !fifo) {
+              return static_cast<std::uint32_t>(tb.info->shape[0]);
+            }
+            const auto b0 = static_cast<std::uint32_t>(tb.info->shape[0]);
+            const auto b1 = static_cast<std::uint32_t>(tb.info->shape[1]);
+            if (b0 == 2U * q_width || b1 == 2U * q_width) {
+              return 2U * q_width;
+            }
+            if (b0 == q_width || b1 == q_width) {
+              return q_width;
+            }
+            return 2U * q_width;
+          }();
+          if (cand_out == q_width && q_width > 0) {
+            auto cf = canonicalize_factors(spec, raw_mod, norm_mod, ta, tb,
+                                           q_width, h, fifo);
+            const float sc =
+                compute_lora_scale(spec, raw_mod, norm_mod, cf.rank);
+            auto &sq = split_q_by_layer[layer_idx];
+            if (sq.q_only.has_value()) {
+              throw std::invalid_argument("duplicate split q_proj on layer " +
+                                          std::to_string(layer_idx));
+            }
+            sq.q_only = SplitQHalf{cf.rank, sc, std::move(cf.a_rk),
+                                   std::move(cf.b_nr), norm_mod};
+          } else {
+            emit_direct("attention_q", 2U * q_width, h);
+          }
         }
       } else if (proj == "q_gate_proj") {
+        if (!config.has_attn_output_gate) {
+          throw std::invalid_argument(
+              "q_gate_proj is not valid for ungated attention models");
+        }
         auto cf = canonicalize_factors(spec, raw_mod, norm_mod, ta, tb, q_width,
                                        h, fifo);
         const float sc = compute_lora_scale(spec, raw_mod, norm_mod, cf.rank);

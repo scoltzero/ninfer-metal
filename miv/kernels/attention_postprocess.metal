@@ -58,22 +58,30 @@ kernel void omlx_m5_attention_qk_norm_rope(
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32) {
-    const float value = float(row[column]);
-    square_sum = fma(value, value, square_sum);
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32) {
+      const float value = float(row[column]);
+      square_sum = fma(value, value, square_sum);
+    }
+    inverse_rms =
+        rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   }
-  const float inverse_rms =
-      rsqrt(simd_sum(square_sum) / float(params.head_dim) + params.epsilon);
   const uint half_rotary = params.rotary_dim / 2;
   const float position = float(params.start_position + token);
   for (uint pair = lane; pair < half_rotary; pair += 32) {
     const uint first_index = pair;
     const uint second_index = pair + half_rotary;
-    const float first = float(row[first_index]) * inverse_rms *
-                        (float(norm[first_index]) + params.weight_offset);
-    const float second = float(row[second_index]) * inverse_rms *
-                         (float(norm[second_index]) + params.weight_offset);
+    const float first =
+        has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                       (float(norm[first_index]) + params.weight_offset))
+                    : float(row[first_index]);
+    const float second =
+        has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                       (float(norm[second_index]) + params.weight_offset))
+                    : float(row[second_index]);
     const float exponent = float(2 * pair) / float(params.rotary_dim);
     const float angle = position / pow(params.theta, exponent);
     const float cosine = cos(angle);
@@ -81,10 +89,12 @@ kernel void omlx_m5_attention_qk_norm_rope(
     row[first_index] = bfloat(fma(-second, sine, first * cosine));
     row[second_index] = bfloat(fma(first, sine, second * cosine));
   }
-  for (uint column = params.rotary_dim + lane; column < params.head_dim;
-       column += 32) {
-    row[column] = bfloat(float(row[column]) * inverse_rms *
-                         (float(norm[column]) + params.weight_offset));
+  if (has_qk_norm) {
+    for (uint column = params.rotary_dim + lane; column < params.head_dim;
+         column += 32) {
+      row[column] = bfloat(float(row[column]) * inverse_rms *
+                           (float(norm[column]) + params.weight_offset));
+    }
   }
 }
 
@@ -258,13 +268,15 @@ kernel void omlx_m5_paged_causal_attention(
   for (uint index = 0; index < 8; ++index) {
     const uint feature = lane + index * 32;
     if (feature < params.head_dim) {
-      const float gate_value = float(gate_row[feature]);
-      const float gated =
-          (denominator > 0.0f ? (accumulators[index] / denominator) : 0.0f) /
-          (1.0f + exp(-gate_value));
+      const float norm_o =
+          denominator > 0.0f ? (accumulators[index] / denominator) : 0.0f;
+      const float out_val =
+          (params.gate_head_stride != 0u)
+              ? (norm_o / (1.0f + exp(-float(gate_row[feature]))))
+              : norm_o;
       output[(ulong(token) * params.query_heads + query_head) *
                  params.head_dim +
-             feature] = bfloat(gated);
+             feature] = bfloat(out_val);
     }
   }
 }

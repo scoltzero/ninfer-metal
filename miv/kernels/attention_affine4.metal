@@ -1160,13 +1160,16 @@ inline void run_affine4_compat_core(
           partial_output + record * HeadDim + d_base) = o_acc;
     } else {
       const float inv_l = (l_run > 0.0f) ? (1.0f / l_run) : 0.0f;
-      const float4 norm_o = o_acc * inv_l;
-      const float4 g_val = float4(*reinterpret_cast<device const bfloat4 *>(
-          gate + ulong(tok) * gate_token_stride +
-          ulong(qh) * gate_head_stride + d_base));
+      float4 norm_o = o_acc * inv_l;
+      if (gate_head_stride != 0u) {
+        const float4 g_val = float4(*reinterpret_cast<device const bfloat4 *>(
+            gate + ulong(tok) * gate_token_stride +
+            ulong(qh) * gate_head_stride + d_base));
+        norm_o /= (float4(1.0f) + exp(-g_val));
+      }
       *reinterpret_cast<device bfloat4 *>(
           output + (ulong(tok) * query_heads + qh) * HeadDim + d_base) =
-          bfloat4(norm_o / (float4(1.0f) + exp(-g_val)));
+          bfloat4(norm_o);
     }
   }
 }
@@ -1279,16 +1282,20 @@ inline void qk_norm_rope_kv_append_affine4_impl(
                : key + ulong(token) * params.key_token_stride +
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32u) {
-    const float val = float(row[column]);
-    square_sum = fma(val, val, square_sum);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32u) {
+      const float val = float(row[column]);
+      square_sum = fma(val, val, square_sum);
+    }
+    // Use precise:: math so fused output matches attention_exact to 0 ULP!
+    inverse_rms = precise::rsqrt(
+        precise::divide(simd_sum(square_sum), float(params.head_dim)) +
+        params.epsilon);
   }
-  // Use precise:: math so fused output matches attention_exact to 0 ULP!
-  const float inverse_rms = precise::rsqrt(
-      precise::divide(simd_sum(square_sum), float(params.head_dim)) +
-      params.epsilon);
   const uint half_rotary = params.rotary_dim / 2u;
   const uint logical_pos = positions[token];
   const float position = float(logical_pos);
@@ -1296,10 +1303,12 @@ inline void qk_norm_rope_kv_append_affine4_impl(
   for (uint pair = lane; pair < half_rotary; pair += 32u) {
     const uint first_index = pair;
     const uint second_index = pair + half_rotary;
-    const float first = float(row[first_index]) * inverse_rms *
-                        (float(norm[first_index]) + params.weight_offset);
-    const float second = float(row[second_index]) * inverse_rms *
-                         (float(norm[second_index]) + params.weight_offset);
+    const float first_scale =
+        has_qk_norm ? (float(norm[first_index]) + params.weight_offset) : 1.0f;
+    const float second_scale =
+        has_qk_norm ? (float(norm[second_index]) + params.weight_offset) : 1.0f;
+    const float first = float(row[first_index]) * inverse_rms * first_scale;
+    const float second = float(row[second_index]) * inverse_rms * second_scale;
     const float exponent =
         precise::divide(float(2u * pair), float(params.rotary_dim));
     const float angle =
@@ -1320,8 +1329,10 @@ inline void qk_norm_rope_kv_append_affine4_impl(
   }
   for (uint column = params.rotary_dim + lane; column < params.head_dim;
        column += 32u) {
-    const bfloat normed = bfloat(float(row[column]) * inverse_rms *
-                                 (float(norm[column]) + params.weight_offset));
+    const bfloat normed =
+        has_qk_norm ? bfloat(float(row[column]) * inverse_rms *
+                             (float(norm[column]) + params.weight_offset))
+                    : row[column];
     row[column] = normed;
     if constexpr (PackQHalf) {
       tg_vec[column] = normed;
@@ -1432,16 +1443,20 @@ inline void qk_norm_rope_kv_append_batched_affine4_impl(
                : key + ulong(token) * params.key_token_stride +
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32u) {
-    const float val = float(row[column]);
-    square_sum = fma(val, val, square_sum);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32u) {
+      const float val = float(row[column]);
+      square_sum = fma(val, val, square_sum);
+    }
+    // Use precise:: math so fused output matches attention_exact to 0 ULP!
+    inverse_rms = precise::rsqrt(
+        precise::divide(simd_sum(square_sum), float(params.head_dim)) +
+        params.epsilon);
   }
-  // Use precise:: math so fused output matches attention_exact to 0 ULP!
-  const float inverse_rms = precise::rsqrt(
-      precise::divide(simd_sum(square_sum), float(params.head_dim)) +
-      params.epsilon);
   const uint half_rotary = params.rotary_dim / 2u;
   const uint logical_pos = positions[token];
   const float position = float(logical_pos);
@@ -1449,10 +1464,12 @@ inline void qk_norm_rope_kv_append_batched_affine4_impl(
   for (uint pair = lane; pair < half_rotary; pair += 32u) {
     const uint first_index = pair;
     const uint second_index = pair + half_rotary;
-    const float first = float(row[first_index]) * inverse_rms *
-                        (float(norm[first_index]) + params.weight_offset);
-    const float second = float(row[second_index]) * inverse_rms *
-                         (float(norm[second_index]) + params.weight_offset);
+    const float first_scale =
+        has_qk_norm ? (float(norm[first_index]) + params.weight_offset) : 1.0f;
+    const float second_scale =
+        has_qk_norm ? (float(norm[second_index]) + params.weight_offset) : 1.0f;
+    const float first = float(row[first_index]) * inverse_rms * first_scale;
+    const float second = float(row[second_index]) * inverse_rms * second_scale;
     const float exponent =
         precise::divide(float(2u * pair), float(params.rotary_dim));
     const float angle =
@@ -1473,8 +1490,10 @@ inline void qk_norm_rope_kv_append_batched_affine4_impl(
   }
   for (uint column = params.rotary_dim + lane; column < params.head_dim;
        column += 32u) {
-    const bfloat normed = bfloat(float(row[column]) * inverse_rms *
-                                 (float(norm[column]) + params.weight_offset));
+    const bfloat normed =
+        has_qk_norm ? bfloat(float(row[column]) * inverse_rms *
+                             (float(norm[column]) + params.weight_offset))
+                    : row[column];
     row[column] = normed;
     if constexpr (PackQHalf) {
       tg_vec[column] = normed;
@@ -2050,10 +2069,13 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_merge_half_4sg_hd256(
   AFFINE4_UNROLL
   for (uint k = 0u; k < 2u; ++k) {
     const uint d = tid + k * 128u;
-    const float val = (tg_o[0u * 256u + d] + tg_o[1u * 256u + d]) +
-                      (tg_o[2u * 256u + d] + tg_o[3u * 256u + d]);
-    const float g_val = float(gate_row[d]);
-    out_row[d] = bfloat(val / (1.0f + exp(-g_val)));
+    float val = (tg_o[0u * 256u + d] + tg_o[1u * 256u + d]) +
+                (tg_o[2u * 256u + d] + tg_o[3u * 256u + d]);
+    if (params.gate_head_stride != 0u) {
+      const float g_val = float(gate_row[d]);
+      val /= (1.0f + exp(-g_val));
+    }
+    out_row[d] = bfloat(val);
   }
 }
 
@@ -2748,27 +2770,31 @@ static inline void flash_bk32_wn4_affine4_hd256_core(
   #define AFF4_BK32_STORE_O(OREG, OFF_C)                                       \
     do {                                                                       \
       if (ep_qv0) {                                                            \
-        ushort4 gu0 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu0 = gqa_clean_bf4_u16(gu0);                                        \
+        float4 o0_f =                                                          \
+            float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu0 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu0 = gqa_clean_bf4_u16(gu0);                                      \
+          }                                                                    \
+          const float4 g0_f = float4(as_type<bfloat4>(gu0));                   \
+          o0_f /= (float4(1.0f) + exp(-g0_f));                                 \
         }                                                                      \
-        const float4 g0_f = float4(as_type<bfloat4>(gu0));                     \
-        const float4 o0_f =                                                    \
-            (float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0) /      \
-            (float4(1.0f) + exp(-g0_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row0 + (OFF_C)) = bfloat4(o0_f); \
       }                                                                        \
       if (ep_qv1) {                                                            \
-        ushort4 gu1 =                                                          \
-            *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));       \
-        if (!warp_full_rows) {                                                 \
-          gu1 = gqa_clean_bf4_u16(gu1);                                        \
+        float4 o1_f =                                                          \
+            float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1;         \
+        if (p.gate_head_stride != 0u) {                                        \
+          ushort4 gu1 =                                                        \
+              *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));     \
+          if (!warp_full_rows) {                                               \
+            gu1 = gqa_clean_bf4_u16(gu1);                                      \
+          }                                                                    \
+          const float4 g1_f = float4(as_type<bfloat4>(gu1));                   \
+          o1_f /= (float4(1.0f) + exp(-g1_f));                                 \
         }                                                                      \
-        const float4 g1_f = float4(as_type<bfloat4>(gu1));                     \
-        const float4 o1_f =                                                    \
-            (float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1) /      \
-            (float4(1.0f) + exp(-g1_f));                                       \
         *reinterpret_cast<device bfloat4 *>(o_row1 + (OFF_C)) = bfloat4(o1_f); \
       }                                                                        \
     } while (false)
@@ -3083,9 +3109,12 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_merge(
   for (uint i = 0u; i < values_per_lane; ++i) {
     const uint d = lane + i * 32u;
     if (d < params.head_dim) {
-      const float norm_o = (l_run > 0.0f) ? (acc[i] / l_run) : 0.0f;
-      const float g_val = float(gate_row[d]);
-      out_row[d] = bfloat(norm_o / (1.0f + exp(-g_val)));
+      float norm_o = (l_run > 0.0f) ? (acc[i] / l_run) : 0.0f;
+      if (params.gate_head_stride != 0u) {
+        const float g_val = float(gate_row[d]);
+        norm_o /= (1.0f + exp(-g_val));
+      }
+      out_row[d] = bfloat(norm_o);
     }
   }
 }

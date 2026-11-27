@@ -89,56 +89,36 @@ bool oq_format(std::string_view format) {
   return format.starts_with("oq_affine_q");
 }
 
-bool low_bit_oq_format(std::string_view format) {
-  return format.starts_with("oq_affine_q3_") ||
-         format.starts_with("oq_affine_q4_") ||
-         format.starts_with("oq_affine_q5_") ||
-         format.starts_with("oq_affine_q6_");
-}
-
 QwenQuantProfile classify_quant_profile(const ArtifactModel &artifact) {
-  const auto is_text = [](const ArtifactObject &object) {
-    return classify_model_component(object.name) == ModelComponent::text;
-  };
-  const bool has_mxfp4 =
-      std::ranges::any_of(artifact.objects(), [&](const ArtifactObject &object) {
-        return is_text(object) && object.format == "mxfp4_e2m1_g32_e8m0_v1";
-      });
-  const bool has_oq =
-      std::ranges::any_of(artifact.objects(), [&](const ArtifactObject &object) {
-        return is_text(object) && oq_format(object.format);
-      });
-  const bool has_low_bit_oq =
-      std::ranges::any_of(artifact.objects(), [&](const ArtifactObject &object) {
-        return is_text(object) && low_bit_oq_format(object.format);
-      });
-  if (has_mxfp4 && has_low_bit_oq) {
-    throw std::invalid_argument(
-        "MXFP4 topology cannot mix low-bit oQ weight formats");
+  std::uint64_t mxfp4_count = 0;
+  std::uint64_t oq_count = 0;
+  std::uint64_t direct_count = 0;
+  for (const auto &object : artifact.objects()) {
+    if (classify_model_component(object.name) != ModelComponent::text) {
+      continue;
+    }
+    if (object.format == "mxfp4_e2m1_g32_e8m0_v1") {
+      ++mxfp4_count;
+    } else if (oq_format(object.format)) {
+      ++oq_count;
+    } else if (direct_format(object.format)) {
+      ++direct_count;
+    }
   }
-  if (has_mxfp4) {
-    // Q8 protected/coverage layers are part of the frozen MXFP4 source
-    // profile; they do not turn the product profile into oQ.
+  if (mxfp4_count > 0 && mxfp4_count >= oq_count) {
     return QwenQuantProfile::mxfp4;
   }
-  if (has_oq) {
+  if (oq_count > 0 || mxfp4_count > 0 || direct_count > 0) {
     return QwenQuantProfile::oq_affine;
   }
   throw std::invalid_argument(
-      "topology contains neither oQ affine nor MXFP4 weights");
+      "topology contains no text weights");
 }
 
-void validate_profile_format(QwenQuantProfile profile,
+void validate_profile_format(QwenQuantProfile /*profile*/,
                              std::string_view format) {
-  if (direct_format(format)) {
-    return;
-  }
-  if (profile == QwenQuantProfile::oq_affine && oq_format(format)) {
-    return;
-  }
-  if (profile == QwenQuantProfile::mxfp4 &&
-      (format == "mxfp4_e2m1_g32_e8m0_v1" ||
-       format.starts_with("oq_affine_q8_"))) {
+  if (direct_format(format) || oq_format(format) ||
+      format == "mxfp4_e2m1_g32_e8m0_v1") {
     return;
   }
   throw std::invalid_argument("artifact format does not belong to profile");
