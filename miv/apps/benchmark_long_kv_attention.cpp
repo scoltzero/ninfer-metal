@@ -560,6 +560,12 @@ nlohmann::json benchmark_m2_prefill(
     const auto lo = plan_minference_scratch(chunk, qh, kvh, total_kv);
     scratch_buf.emplace(context.make_buffer(lo.total_bytes));
   }
+  std::optional<MetalBuffer> sage2_kv_ws_buf;
+  Sage2KvWorkspaceLayout sage2_kv_lo{};
+  if (mode == "sage2_fp16pv" || mode == "sage2_mxfp8pv") {
+    sage2_kv_lo = plan_sage2_kv_workspace(kvh, total_kv);
+    sage2_kv_ws_buf.emplace(context.make_private_buffer(sage2_kv_lo.total_bytes));
+  }
 
   Encoder enc(context, libraries, chunk, "bench.m2." + std::string(mode));
   if (mode == "exact_nax") {
@@ -595,7 +601,8 @@ nlohmann::json benchmark_m2_prefill(
     emit_paged_flash_prefill_sage2(
         enc, config, chunk, total_kv, is_affine4, minference, ref_of(qb),
         sub(ref_of(qb), hd * 2u), ref_of(*kb), ref_of(*vb), ref_of(out_buf),
-        ref_of(ptb), ref_of(posb), params, sc_ref, pv);
+        ref_of(ptb), ref_of(posb), params, ref_of(*sage2_kv_ws_buf),
+        sage2_kv_lo, sc_ref, pv);
   } else {
     throw std::invalid_argument("unknown --mode: " + std::string(mode));
   }

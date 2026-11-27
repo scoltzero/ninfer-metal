@@ -53,7 +53,8 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
                          U32 workspace_rows, bool affine4_kv,
                          U32 kv_pool_pages, bool flash_nax_prefill,
                          bool enable_w4a8_workspace,
-                         bool enable_minference_workspace) {
+                         bool enable_minference_workspace,
+                         bool enable_sage2_kv_workspace) {
   const U32 max_ws_rows = c.num_experts > 1 ? 4096U : 2048U;
   if (max_context == 0 || workspace_rows == 0 || workspace_rows > max_ws_rows ||
       c.num_hidden_layers <= 0 ||
@@ -211,11 +212,7 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     };
     const U64 max_kv_blocks =
         std::min<U64>(8192ULL, std::max<U64>(128ULL, (U64(max_context) + 31ULL) / 32ULL));
-    const U64 max_q_blocks = std::max({
-        q_blocks_for(U64(workspace_rows), 4ULL),
-        q_blocks_for(U64(workspace_rows), 6ULL),
-        q_blocks_for(U64(workspace_rows), 8ULL),
-    });
+    const U64 max_q_blocks = q_blocks_for(U64(workspace_rows), 2ULL);
     const U64 split_count =
         std::clamp<U64>((max_kv_blocks + 127ULL) / 128ULL, 1ULL, 64ULL);
     const auto align256 = [](U64 x) { return (x + 255ULL) & ~255ULL; };
@@ -236,6 +233,23 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     add_sub(multiply(multiply(multiply(kvh, max_q_blocks), 512ULL), 2ULL));
     add_sub(multiply(multiply(kvh, max_q_blocks), 4ULL));
     append("minference_scratch", cursor);
+  }
+  if (enable_sage2_kv_workspace && c.full_attention_layers() > 0 &&
+      c.head_dim == 256) {
+    const auto align256 = [](U64 x) noexcept { return (x + 255ULL) & ~255ULL; };
+    const U64 kvh = positive(c.num_key_value_heads);
+    const U64 max_kv_blocks = std::max<U64>(1ULL, (U64(max_context) + 31ULL) / 32ULL);
+    const U64 pad_kv_blocks = (max_kv_blocks + 15ULL) & ~15ULL;
+    const U64 k_int8_bytes =
+        align256(multiply(multiply(kvh, max_kv_blocks), 4ULL * 32ULL * 64ULL));
+    const U64 mu_k_bytes =
+        align256(multiply(multiply(kvh, pad_kv_blocks), 4ULL * 64ULL * 4ULL));
+    const U64 s_k_bytes =
+        align256(multiply(multiply(kvh, max_kv_blocks), 4ULL * 32ULL * 4ULL));
+    const U64 total_sage2_kv_bytes =
+        add(add(add(k_int8_bytes, mu_k_bytes), s_k_bytes), 256ULL);
+    plan.sage2_kv_workspace_bytes = total_sage2_kv_bytes;
+    append("sage2_kv_ws", total_sage2_kv_bytes);
   }
   append("zero", 256);
   append("argmax_partials", 1024ULL);

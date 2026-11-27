@@ -1,15 +1,14 @@
 #pragma once
 
-// Module 2 Route B.1 (SageAttention2) & Route B.2 (MInference Vertical-Slash)
-// host dispatch helpers & scratch workspace planner.
-// Self-contained header ready for Wave 2 qwen_forward.cpp / qwen_memory.cpp
-// wiring and standalone Wave 1 tests & benchmarks.
+// Phase 2 Work Package 2 (WP2.1 + WP2.2): SageAttention2 & MInference
+// host dispatch helpers, O(N_KV) K-smoothing workspace planner, & scratch layout.
 
 #include "attention_nax.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -70,91 +69,84 @@ inline bool minference_runtime_eligible(
              libs / "omlx_m5_attention_minference.metallib");
 }
 
+// ============================================================================
+// WP2.1 Reusable Single-Layer Transient K-Smoothing Workspace Layout (WN=4, D=64)
+//   * K_int8:   [kvh, max_kv_blocks, 4, 32, 64] int8_t  (256 MiB @ 256K, kvh=4)
+//   * mu_K:     [kvh, 4, pad_kv_blocks, 64]     float   ( 32 MiB @ 256K, kvh=4)
+//   * s_K:      [kvh, max_kv_blocks, 4, 32]     float   ( 16 MiB @ 256K, kvh=4)
+//   * valid_kv: [4]                             uint32  (256 B aligned)
+// ============================================================================
+struct Sage2KvWorkspaceLayout {
+  U64 max_kv_blocks = 0;
+  U64 pad_kv_blocks = 0;
+  U64 k_int8_off = 0, k_int8_bytes = 0;
+  U64 mu_k_off = 0, mu_k_bytes = 0;
+  U64 s_k_off = 0, s_k_bytes = 0;
+  U64 valid_kv_off = 0, valid_kv_bytes = 256ULL;
+  U64 total_bytes = 0;
+};
+
+[[nodiscard]] inline Sage2KvWorkspaceLayout
+plan_sage2_kv_workspace(U32 kvh, U32 max_kv_tokens) noexcept {
+  const auto align256 = [](U64 x) noexcept { return (x + 255ULL) & ~255ULL; };
+  Sage2KvWorkspaceLayout lo{};
+  lo.max_kv_blocks = std::max<U64>(1ULL, (U64(max_kv_tokens) + 31ULL) / 32ULL);
+  lo.pad_kv_blocks = (lo.max_kv_blocks + 15ULL) & ~15ULL;
+  lo.k_int8_bytes = align256(U64(kvh) * lo.max_kv_blocks * 4ULL * 32ULL * 64ULL);
+  lo.mu_k_bytes =
+      align256(U64(kvh) * 4ULL * lo.pad_kv_blocks * 64ULL * sizeof(float));
+  lo.s_k_bytes =
+      align256(U64(kvh) * lo.max_kv_blocks * 4ULL * 32ULL * sizeof(float));
+  lo.k_int8_off = 0ULL;
+  lo.mu_k_off = lo.k_int8_off + lo.k_int8_bytes;
+  lo.s_k_off = lo.mu_k_off + lo.mu_k_bytes;
+  lo.valid_kv_off = lo.s_k_off + lo.s_k_bytes;
+  lo.total_bytes = lo.valid_kv_off + lo.valid_kv_bytes;
+  return lo;
+}
+
 struct Sage2Tier {
-  U32 wm = 6u;
-  U32 tg_threads = 384u;
-  U32 bm_tok = 16u;
+  U32 wm = 2u;
+  U32 tg_threads = 256u;
+  U32 bm_tok = 5u;
 };
 
 inline Sage2Tier select_sage2_tier(U32 tokens, U32 query_heads, U32 kv_heads,
                                    U32 forced_wm = 0u) {
   (void)tokens;
+  (void)forced_wm;
   const U32 repeat = (kv_heads > 0u && query_heads >= kv_heads)
                          ? (query_heads / kv_heads)
                          : 1u;
-  U32 wm = forced_wm;
-  if (wm == 0u) {
-    if (const char *env = std::getenv("OMLX_M5_SAGE2_WM")) {
-      const std::string_view sv(env);
-      if (sv == "4") wm = 4u;
-      else if (sv == "6") wm = 6u;
-      else if (sv == "8") wm = 8u;
-    }
-  }
-  if (wm == 0u) {
-    // Real Apple10 M5 Ultra calibration: WM=4 (256 threads, M_TILE=64) keeps
-    // Q_i8 100% resident in 16 KiB threadgroup SRAM with NUM_WAVES=1 (zero wave
-    // serialization, 100% SG active, 6 barriers/block vs 24 for WM=8).
-    // Override via OMLX_M5_SAGE2_WM=4|6|8 for A/B diagnostics.
-    wm = 4u;
-  }
-  if (wm != 4u && wm != 6u && wm != 8u) {
-    wm = 6u;
-  }
-  const U32 m_tile = wm * 16u;
+  // Unified Apple10 zero-spill WN=4 tier: WM=2 (256 threads, M_TILE=32,
+  // 13.03 KiB FP16 / 15.16 KiB MXFP8, 0 B spills, 2 TG/core = 512 thr/core).
+  constexpr U32 wm = 2u;
+  constexpr U32 m_tile = wm * 16u;
   const U32 bm_tok = std::max<U32>(1u, m_tile / std::max<U32>(1u, repeat));
-  return {wm, wm * 64u, bm_tok};
+  return {wm, wm * 128u, bm_tok};
 }
 
 inline const char *sage2_kernel_name(U32 wm, bool is_affine4,
                                      Sage2PvMode pv_mode,
                                      bool sparse_minference) {
+  (void)wm;
   const bool mxfp8 = (pv_mode == Sage2PvMode::Mxfp8);
   if (is_affine4) {
     if (!sparse_minference) {
-      if (mxfp8) {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_mxfp8_affine4_g128_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_mxfp8_affine4_g128_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_mxfp8_affine4_g128_hd256_wm8";
-      } else {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_fp16_affine4_g128_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_fp16_affine4_g128_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_fp16_affine4_g128_hd256_wm8";
-      }
-    } else {
-      if (mxfp8) {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_affine4_g128_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_affine4_g128_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_affine4_g128_hd256_wm8";
-      } else {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_affine4_g128_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_affine4_g128_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_affine4_g128_hd256_wm8";
-      }
+      return mxfp8
+                 ? "omlx_m5_paged_flash_prefill_sage2_mxfp8_affine4_g128_hd256_wm2"
+                 : "omlx_m5_paged_flash_prefill_sage2_fp16_affine4_g128_hd256_wm2";
     }
-  } else {
-    if (!sparse_minference) {
-      if (mxfp8) {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_mxfp8_bf16_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_mxfp8_bf16_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_mxfp8_bf16_hd256_wm8";
-      } else {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_fp16_bf16_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_fp16_bf16_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_fp16_bf16_hd256_wm8";
-      }
-    } else {
-      if (mxfp8) {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_bf16_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_bf16_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_bf16_hd256_wm8";
-      } else {
-        if (wm == 4u) return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_bf16_hd256_wm4";
-        if (wm == 6u) return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_bf16_hd256_wm6";
-        return "omlx_m5_paged_flash_prefill_sage2_minf_fp16_bf16_hd256_wm8";
-      }
-    }
+    return mxfp8
+               ? "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_affine4_g128_hd256_wm2"
+               : "omlx_m5_paged_flash_prefill_sage2_minf_fp16_affine4_g128_hd256_wm2";
   }
+  if (!sparse_minference) {
+    return mxfp8 ? "omlx_m5_paged_flash_prefill_sage2_mxfp8_bf16_hd256_wm2"
+                 : "omlx_m5_paged_flash_prefill_sage2_fp16_bf16_hd256_wm2";
+  }
+  return mxfp8 ? "omlx_m5_paged_flash_prefill_sage2_minf_mxfp8_bf16_hd256_wm2"
+               : "omlx_m5_paged_flash_prefill_sage2_minf_fp16_bf16_hd256_wm2";
 }
 
 // Route B.2 MInference dynamic budget & scratch workspace layout (<= 2.26 MiB).
@@ -260,14 +252,77 @@ inline MInferenceScratchLayout plan_minference_scratch(
   return lo;
 }
 
+inline void emit_sage2_prepare_k(
+    Encoder &e, const QwenModelConfig &c, U32 context_envelope,
+    bool is_affine4, Ref state_k, Ref page_table, Ref attention_positions,
+    Ref sage2_kv_ws, const Sage2KvWorkspaceLayout &kv_lo,
+    const std::vector<std::byte> &base_params) {
+  if (sage2_kv_ws.buffer == nullptr || sage2_kv_ws.bytes < kv_lo.total_bytes) {
+    throw std::invalid_argument("Sage2 KV workspace buffer missing or too small");
+  }
+  if (base_params.size() < 14u * sizeof(U32)) {
+    throw std::invalid_argument("Sage2 prepare_k base_params too short");
+  }
+  const U32 kvh = U32(c.num_key_value_heads);
+  U32 cache_cap = 0u;
+  std::memcpy(&cache_cap, base_params.data() + 5u * sizeof(U32), sizeof(U32));
+  const U32 ws_tok_cap =
+      U32(std::min<U64>(kv_lo.max_kv_blocks * 32ULL, 0xFFFFFFFFULL));
+  const U32 max_kv_cap =
+      (cache_cap > 0u) ? std::min<U32>(cache_cap, ws_tok_cap) : ws_tok_cap;
+  const U32 eff_env = (context_envelope > 0u)
+                          ? std::min<U32>(context_envelope, max_kv_cap)
+                          : max_kv_cap;
+  const U32 env_blocks = std::max<U32>(1u, (eff_env + 31u) / 32u);
+  const U32 env_blocks_pad16 =
+      std::min<U32>(U32(kv_lo.pad_kv_blocks), (env_blocks + 15u) & ~15u);
+
+  std::array<U32, 20> prep{};
+  std::memcpy(prep.data(), base_params.data(), 14u * sizeof(U32));
+  prep[14] = U32(kv_lo.max_kv_blocks);
+  prep[15] = U32(kv_lo.pad_kv_blocks);
+  prep[16] = max_kv_cap;
+  prep[17] = env_blocks_pad16;
+  prep[18] = 0u;
+  prep[19] = 0u;
+  const auto prep_span = std::as_bytes(std::span<const U32>(prep));
+  const std::vector<std::byte> prep_bytes(prep_span.begin(), prep_span.end());
+
+  const auto sub_ws = [&](U64 off, U64 bytes) -> Ref {
+    return {sage2_kv_ws.buffer, sage2_kv_ws.offset + off, bytes};
+  };
+  const Ref k_int8_ref = sub_ws(kv_lo.k_int8_off, kv_lo.k_int8_bytes);
+  const Ref mu_k_ref = sub_ws(kv_lo.mu_k_off, kv_lo.mu_k_bytes);
+  const Ref s_k_ref = sub_ws(kv_lo.s_k_off, kv_lo.s_k_bytes);
+  const Ref valid_kv_ref = sub_ws(kv_lo.valid_kv_off, kv_lo.valid_kv_bytes);
+
+  auto &d_vkv = e.emit("attention_sage2", "omlx_m5_sage2_compute_valid_kv",
+                       {.width = 256u}, {.width = 256u},
+                       {attention_positions, valid_kv_ref});
+  e.dynamic(d_vkv, 2, prep_bytes, 3, 4);
+
+  const char *prep_fn = is_affine4
+                            ? "omlx_m5_sage2_prepare_k_affine4_g128_hd256"
+                            : "omlx_m5_sage2_prepare_k_bf16_hd256";
+  auto &d_pk = e.emit(
+      "attention_sage2", prep_fn,
+      {.width = U64(env_blocks_pad16) * 256u, .height = U64(kvh), .depth = 4u},
+      {.width = 256u},
+      {state_k, page_table, valid_kv_ref, k_int8_ref, mu_k_ref, s_k_ref});
+  e.dynamic(d_pk, 6, prep_bytes, 3, 4);
+}
+
 inline void emit_minference_build_sparse_indices(
     Encoder &e, const QwenModelConfig &c, U32 t, U32 context_envelope,
-    bool is_affine4, Ref query, Ref state_k, Ref page_table,
+    Ref query, Ref sage2_kv_ws, const Sage2KvWorkspaceLayout &kv_lo,
     Ref attention_positions, Ref scratch,
     const MInferenceScratchLayout &lo,
     const std::vector<std::byte> &base_params, U32 forced_wm = 0u) {
   if (scratch.buffer == nullptr || scratch.bytes < lo.total_bytes) {
     throw std::invalid_argument("MInference scratch buffer too small");
+  }
+  if (sage2_kv_ws.buffer == nullptr || sage2_kv_ws.bytes < kv_lo.total_bytes) {
+    throw std::invalid_argument("MInference Sage2 KV workspace buffer too small");
   }
   const U32 qh = U32(c.num_attention_heads);
   const U32 kvh = U32(c.num_key_value_heads);
@@ -281,12 +336,20 @@ inline void emit_minference_build_sparse_indices(
   const U32 q_probe_start = t - w_probe;
   const U32 nk_blocks_est =
       std::min<U32>(lo.max_kv_blocks, std::max<U32>(1u, (context_envelope + 31u) / 32u));
-  const U32 split_count = std::clamp<U32>(
-      lo.split_count, 1u, std::min<U32>(kMInferenceMaxSplits, nk_blocks_est));
-  const U32 split_blocks = (nk_blocks_est + split_count - 1u) / split_count;
+  // Keep split_blocks a multiple of 16 so every split's kb_start aligns to
+  // 16-block NAX mu_K tiles inside sage2_kv_ws without boundary checks.
+  const U32 max_splits = std::max<U32>(
+      1u, std::min<U32>(lo.split_count,
+                        std::min<U32>(kMInferenceMaxSplits,
+                                      (nk_blocks_est + 15u) / 16u)));
+  const U32 raw_sb = (nk_blocks_est + max_splits - 1u) / max_splits;
+  const U32 split_blocks = std::max<U32>(16u, (raw_sb + 15u) & ~15u);
+  const U32 split_count = std::max<U32>(
+      1u, std::min<U32>(lo.split_count,
+                        (nk_blocks_est + split_blocks - 1u) / split_blocks));
   const auto budget = minference_budget_for_kv_tokens(context_envelope);
 
-  std::array<U32, 28> mp{};
+  std::array<U32, 32> mp{};
   if (base_params.size() < 14u * sizeof(U32)) {
     throw std::invalid_argument("MInference base_params too short");
   }
@@ -305,12 +368,24 @@ inline void emit_minference_build_sparse_indices(
   mp[25] = budget.k_vertical;
   mp[26] = budget.k_slash;
   mp[27] = lo.top_stride;
+  mp[28] = U32(kv_lo.max_kv_blocks);
+  mp[29] = U32(kv_lo.pad_kv_blocks);
+  mp[30] = 0u;
+  mp[31] = 0u;
   const auto mp_span = std::as_bytes(std::span<const U32>(mp));
   const std::vector<std::byte> mp_bytes(mp_span.begin(), mp_span.end());
 
   const auto sub_ref = [&](U64 off, U64 bytes) -> Ref {
     return {scratch.buffer, scratch.offset + off, bytes};
   };
+  const auto sub_ws = [&](U64 off, U64 bytes) -> Ref {
+    return {sage2_kv_ws.buffer, sage2_kv_ws.offset + off, bytes};
+  };
+  const Ref k_int8_ref = sub_ws(kv_lo.k_int8_off, kv_lo.k_int8_bytes);
+  const Ref mu_k_ref = sub_ws(kv_lo.mu_k_off, kv_lo.mu_k_bytes);
+  const Ref s_k_ref = sub_ws(kv_lo.s_k_off, kv_lo.s_k_bytes);
+  const Ref valid_kv_ref = sub_ws(kv_lo.valid_kv_off, kv_lo.valid_kv_bytes);
+
   const Ref m_split = sub_ref(lo.probe_m_split_off, lo.probe_m_split_bytes);
   const Ref l_split = sub_ref(lo.probe_l_split_off, lo.probe_l_split_bytes);
   const Ref m_glob = sub_ref(lo.probe_m_global_off, lo.probe_m_global_bytes);
@@ -323,21 +398,16 @@ inline void emit_minference_build_sparse_indices(
   const Ref act_idx = sub_ref(lo.active_indices_off, lo.active_indices_bytes);
   const Ref act_cnt = sub_ref(lo.active_counts_off, lo.active_counts_bytes);
 
-  const U32 bm_tok_p = std::max<U32>(1u, 64u / std::max<U32>(1u, repeat));
+  const U32 bm_tok_p = std::max<U32>(1u, 32u / std::max<U32>(1u, repeat));
   const U32 n_probe_qblks = (w_probe + bm_tok_p - 1u) / bm_tok_p;
-  const char *stats_fn =
-      is_affine4 ? "omlx_m5_minference_probe_stats_affine4_g128_hd256"
-                 : "omlx_m5_minference_probe_stats_bf16_hd256";
-  const char *score_fn =
-      is_affine4 ? "omlx_m5_minference_probe_score_affine4_g128_hd256"
-                 : "omlx_m5_minference_probe_score_bf16_hd256";
 
   auto &d_stats = e.emit(
-      "attention_minference", stats_fn,
+      "attention_minference", "omlx_m5_minference_probe_stats_i8",
       {.width = U64(split_count) * 256u, .height = U64(n_probe_qblks) * kvh},
       {.width = 256u},
-      {query, state_k, page_table, attention_positions, m_split, l_split});
-  e.dynamic(d_stats, 6, mp_bytes, 3, 4);
+      {query, k_int8_ref, mu_k_ref, s_k_ref, valid_kv_ref, attention_positions,
+       m_split, l_split});
+  e.dynamic(d_stats, 8, mp_bytes, 3, 4);
 
   const U64 clear_or_rows = std::max<U64>(
       U64(w_probe) * qh, U64(kvh) * lo.max_kv_blocks);
@@ -348,12 +418,12 @@ inline void emit_minference_build_sparse_indices(
   e.dynamic(d_reduce, 6, mp_bytes, 3, 4);
 
   auto &d_score_op = e.emit(
-      "attention_minference", score_fn,
+      "attention_minference", "omlx_m5_minference_probe_accum_i8",
       {.width = U64(split_count) * 256u, .height = U64(n_probe_qblks) * kvh},
       {.width = 256u},
-      {query, state_k, page_table, attention_positions, m_glob, inv_z, v_score,
-       d_score});
-  e.dynamic(d_score_op, 8, mp_bytes, 3, 4);
+      {query, k_int8_ref, mu_k_ref, s_k_ref, valid_kv_ref, attention_positions,
+       m_glob, inv_z, v_score, d_score});
+  e.dynamic(d_score_op, 10, mp_bytes, 3, 4);
 
   auto &d_topk = e.emit(
       "attention_minference", "omlx_m5_minference_select_topk",
@@ -372,7 +442,8 @@ inline void emit_paged_flash_prefill_sage2(
     Encoder &e, const QwenModelConfig &c, U32 t, U32 context_envelope,
     bool is_affine4, bool sparse_minference, Ref query, Ref gate, Ref state_k,
     Ref state_v, Ref mixer, Ref page_table, Ref attention_positions,
-    const std::vector<std::byte> &base_params,
+    const std::vector<std::byte> &base_params, Ref sage2_kv_ws,
+    const Sage2KvWorkspaceLayout &kv_lo,
     std::optional<Ref> minf_scratch = std::nullopt,
     std::optional<Sage2PvMode> pv_mode_override = std::nullopt,
     U32 forced_wm = 0u) {
@@ -381,15 +452,28 @@ inline void emit_paged_flash_prefill_sage2(
   if (c.head_dim != 256 || kvh == 0u || (qh % kvh) != 0u) {
     throw std::invalid_argument("SageAttention2 requires hd256 and valid GQA");
   }
+  if (sage2_kv_ws.buffer == nullptr || sage2_kv_ws.bytes < kv_lo.total_bytes) {
+    throw std::invalid_argument("SageAttention2 requires valid sage2_kv_ws buffer");
+  }
   const auto tier = select_sage2_tier(t, qh, kvh, forced_wm);
-  const U32 q_blocks = (t + tier.bm_tok - 1u) / tier.bm_tok;
+  const U32 repeat = qh / kvh;
+  const U32 m_tile = tier.wm * 16u;
   const Sage2PvMode pv_mode = resolve_sage2_pv_mode(pv_mode_override);
+
+  // WP2.1: Run O(N_KV) K-smoothing prepass ONCE per layer before optional MInference & Sage2!
+  emit_sage2_prepare_k(e, c, context_envelope, is_affine4, state_k, page_table,
+                       attention_positions, sage2_kv_ws, kv_lo, base_params);
 
   // Automatic short-context bypass for MInference (< 4096 KV tokens).
   const bool use_minf = sparse_minference &&
                         (context_envelope >= kMInferenceMinContextTokens) &&
                         minf_scratch.has_value() &&
                         minf_scratch->buffer != nullptr;
+  // Dense mode uses flattened (q_tok, h_sub) packing (100% tile utilization on GQA 6 & 8);
+  // Sparse MInference uses integer bm_tok blocks aligned with active_indices.
+  const U32 q_blocks = use_minf
+                           ? ((t + tier.bm_tok - 1u) / tier.bm_tok)
+                           : ((t * repeat + m_tile - 1u) / m_tile);
 
   Ref act_idx = page_table; // Unused dummy binding when !use_minf
   Ref act_cnt = page_table;
@@ -400,7 +484,7 @@ inline void emit_paged_flash_prefill_sage2(
     const auto lo = plan_minference_scratch(t, qh, kvh, context_envelope,
                                             forced_wm);
     emit_minference_build_sparse_indices(
-        e, c, t, context_envelope, is_affine4, query, state_k, page_table,
+        e, c, t, context_envelope, query, sage2_kv_ws, kv_lo,
         attention_positions, *minf_scratch, lo, base_params, forced_wm);
     act_idx = {minf_scratch->buffer,
                minf_scratch->offset + lo.active_indices_off,
@@ -412,7 +496,7 @@ inline void emit_paged_flash_prefill_sage2(
     active_stride = lo.active_stride;
   }
 
-  std::array<U32, 18> sp{};
+  std::array<U32, 20> sp{};
   if (base_params.size() < 14u * sizeof(U32)) {
     throw std::invalid_argument("SageAttention2 base_params too short");
   }
@@ -420,26 +504,34 @@ inline void emit_paged_flash_prefill_sage2(
   sp[14] = max_q_blocks;
   sp[15] = active_stride;
   sp[16] = use_minf ? 1u : 0u;
-  sp[17] = 0u;
+  sp[17] = U32(kv_lo.max_kv_blocks);
+  sp[18] = U32(kv_lo.pad_kv_blocks);
+  sp[19] = 0u;
   const auto sp_span = std::as_bytes(std::span<const U32>(sp));
   std::vector<std::byte> sp_bytes(sp_span.begin(), sp_span.end());
 
+  const auto sub_ws = [&](U64 off, U64 bytes) -> Ref {
+    return {sage2_kv_ws.buffer, sage2_kv_ws.offset + off, bytes};
+  };
+  const Ref k_int8_ref = sub_ws(kv_lo.k_int8_off, kv_lo.k_int8_bytes);
+  const Ref mu_k_ref = sub_ws(kv_lo.mu_k_off, kv_lo.mu_k_bytes);
+  const Ref s_k_ref = sub_ws(kv_lo.s_k_off, kv_lo.s_k_bytes);
+  const Ref valid_kv_ref = sub_ws(kv_lo.valid_kv_off, kv_lo.valid_kv_bytes);
+
   const char *fn = sage2_kernel_name(tier.wm, is_affine4, pv_mode, use_minf);
-  // Note buffer(7) is unused so buffer(8)=active_indices, buffer(9)=active_counts,
-  // buffer(10)=Sage2AttentionParams match Section 6.3 exact binding contract!
   auto &attn = e.emit(
       "attention_sage2", fn,
       {.width = tier.tg_threads, .height = U64(q_blocks) * kvh},
       {.width = tier.tg_threads},
-      {query, gate, state_k, state_v, mixer, page_table, attention_positions,
-       page_table, act_idx, act_cnt});
+      {query, gate, k_int8_ref, state_v, mixer, page_table, attention_positions,
+       mu_k_ref, s_k_ref, valid_kv_ref, act_idx, act_cnt});
   e.profile.attention_kernel = fn;
   e.profile.attention_grid = attn.grid;
   e.profile.attention_numeric_contract_id =
       std::string("paged.sage2.") + (is_affine4 ? "affine4_g128." : "bf16.") +
       sage2_pv_mode_name(pv_mode) + (use_minf ? ".minference_vs.v1" : ".dense.v1");
   e.profile.attention_row_exact_eligible = false;
-  e.dynamic(attn, 10, std::move(sp_bytes), 3, 4);
+  e.dynamic(attn, 12, std::move(sp_bytes), 3, 4);
 }
 
 } // namespace omlx::m5::detail::forward
