@@ -87,6 +87,11 @@ struct MaterializedWeightView {
   std::uint64_t row_count = 0;
   std::uint64_t in_features = 0;
   std::vector<MaterializedPlaneView> planes;
+  std::string input_transform = "none";
+
+  [[nodiscard]] bool has_fwht64() const noexcept {
+    return input_transform == "fwht64";
+  }
 };
 
 struct MaterializedBindingView {

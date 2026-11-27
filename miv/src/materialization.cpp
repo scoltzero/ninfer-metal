@@ -351,6 +351,8 @@ public:
         .row_count = row_count,
         .in_features =
             object_record.shape.empty() ? 0 : object_record.shape.back(),
+        .planes = {},
+        .input_transform = object_record.input_transform,
     };
     result.planes.reserve(storage.planes.size());
     for (const auto &plane : storage.planes) {

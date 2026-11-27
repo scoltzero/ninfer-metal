@@ -13,6 +13,10 @@ namespace omlx::m5 {
 
 inline constexpr std::uint64_t kPayloadAlignment = 16384;
 inline constexpr std::uint64_t kLegacyPayloadAlignment = 4096;
+inline constexpr std::uint32_t kArtifactFlagFwht64 = 0x00000001U;
+inline constexpr std::uint32_t kArtifactFlagNaxLaneV2 = 0x00000002U;
+inline constexpr std::uint32_t kArtifactValidFlagsMask =
+    kArtifactFlagFwht64 | kArtifactFlagNaxLaneV2;
 
 struct ArtifactPlane {
   std::string kind;
@@ -35,6 +39,11 @@ struct ArtifactObject {
   std::string object_sha256;
   std::vector<ArtifactPlane> planes;
   std::vector<std::string> source_tensors;
+  std::string input_transform = "none";
+
+  [[nodiscard]] bool has_fwht64() const noexcept {
+    return input_transform == "fwht64";
+  }
 };
 
 struct ArtifactBinding {
@@ -76,6 +85,7 @@ struct ArtifactSummary {
   std::string source_revision;
   std::string source_profile;
   bool payload_verified = false;
+  std::uint32_t container_flags = 0;
 };
 
 class ArtifactModel final {
@@ -104,7 +114,8 @@ public:
   materialization_plan(std::uint64_t alignment = 256) const;
   [[nodiscard]] std::vector<float>
   decode_weight_row(const ArtifactObject &object, std::uint64_t row,
-                    std::uint64_t start, std::uint64_t count) const;
+                    std::uint64_t start, std::uint64_t count,
+                    bool logical_unrotated = true) const;
 
 private:
   class Impl;

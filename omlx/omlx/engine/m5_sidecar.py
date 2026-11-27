@@ -2886,10 +2886,11 @@ def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, fil
             ) = _OMLXM5_HEADER_STRUCT.unpack(header)
             if (
                 magic != _OMLXM5_MAGIC
-                or version != 1
+                or version not in (1, 2)
                 or header_bytes != _OMLXM5_HEADER_BYTES
                 or manifest_offset != _OMLXM5_HEADER_BYTES
-                or flags != 0
+                or (version == 1 and flags != 0)
+                or (flags & ~0x3) != 0
             ):
                 return None
             if (zlib.crc32(header[:56]) & 0xFFFFFFFF) != header_crc:
