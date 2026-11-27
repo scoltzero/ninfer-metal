@@ -3062,7 +3062,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             ),
             encoding="utf-8",
         )
-        miv_payload = b"OMLXM5A1" + (b"\x00" * 4096)
+        miv_payload = b"MIV00001" + (b"\x00" * 4096)
         (pure_dir / "model.miv").write_bytes(miv_payload)
 
         # 2) Legacy pure .omlxm5 HF Hub cache snapshot remains backward-compatible
@@ -3081,7 +3081,8 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             json.dumps({"model_type": "qwen3_5", "hidden_size": 2048}),
             encoding="utf-8",
         )
-        (hf_snap / "model.omlxm5").write_bytes(miv_payload)
+        legacy_payload = b"OMLXM5A1" + (b"\x00" * 4096)
+        (hf_snap / "model.omlxm5").write_bytes(legacy_payload)
 
         discovered = discover_models(models_root)
         assert "Qwen3.8-27B-PureMiv" in discovered
@@ -3109,7 +3110,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
         fake_tool.write_text(
             "import pathlib, sys\n"
             "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
-            "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 128)\n",
+            "out.write_bytes(b'MIV00001' + b'\\x00' * 128)\n",
             encoding="utf-8",
         )
         monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
@@ -3198,7 +3199,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             (miv_ver / "tools" / "m5_artifact.py").write_text(
                 "import pathlib, sys\n"
                 "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
-                "out.write_bytes(b'OMLXM5A1' + b'\\x00' * 256)\n",
+                "out.write_bytes(b'MIV00001' + b'\\x00' * 256)\n",
                 encoding="utf-8",
             )
             (miv_ver / "provider.json").write_text(
@@ -3610,7 +3611,7 @@ class TestDFlash2WhitelistAndAutoRepack:
             "args = sys.argv[1:]\n"
             "out = pathlib.Path(args[args.index('--output') + 1])\n"
             "manifest = b'{\"objects\":[]}'\n"
-            "hdr_prefix = struct.pack('<8sIIQQQQII', b'OMLXM5A1', 1, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
+            "hdr_prefix = struct.pack('<8sIIQQQQII', b'MIV00001', 2, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
             "hdr = hdr_prefix + struct.pack('<II', zlib.crc32(hdr_prefix) & 0xFFFFFFFF, 0)\n"
             "out.write_bytes(hdr + manifest)\n",
             encoding="utf-8",
@@ -3730,7 +3731,7 @@ class TestDFlash2WhitelistAndAutoRepack:
                 "import pathlib, struct, sys, zlib\n"
                 "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
                 "manifest = b'{\"objects\":[]}'\n"
-                "hdr_prefix = struct.pack('<8sIIQQQQII', b'OMLXM5A1', 1, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
+                "hdr_prefix = struct.pack('<8sIIQQQQII', b'MIV00001', 2, 64, 64, len(manifest), 64 + len(manifest), 0, 0, zlib.crc32(manifest) & 0xFFFFFFFF)\n"
                 "hdr = hdr_prefix + struct.pack('<II', zlib.crc32(hdr_prefix) & 0xFFFFFFFF, 0)\n"
                 "out.write_bytes(hdr + manifest)\n",
                 encoding="utf-8",
@@ -4616,16 +4617,27 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
 
 
 def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     import struct
     import zlib
 
     def _write_container(
-        path: Path, *, version: int, flags: int, object_names: list[str]
+        path: Path,
+        *,
+        version: int,
+        flags: int,
+        object_names: list[str],
+        magic: bytes = b"MIV00001",
+        schema: str | None = None,
     ) -> Path:
+        if schema is None:
+            if magic == b"OMLXM5A1":
+                schema = "omlx-m5-artifact-v2" if version == 2 else "omlx-m5-artifact-v1"
+            else:
+                schema = "miv-artifact-v2" if version == 2 else "miv-artifact-v1"
         manifest = {
-            "schema": "omlx-m5-artifact-v2" if version == 2 else "omlx-m5-artifact-v1",
+            "schema": schema,
             "container_version": version,
             "objects": [{"name": name} for name in object_names],
         }
@@ -4634,7 +4646,7 @@ def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
         payload_offset = ((64 + len(raw_manifest) + 4095) // 4096) * 4096
         prefix = struct.pack(
             "<8sIIQQQQII",
-            b"OMLXM5A1",
+            magic,
             version,
             64,
             64,
@@ -4649,61 +4661,114 @@ def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
         path.write_bytes(hdr + raw_manifest + b"\x00" * (payload_offset - 64 - len(raw_manifest)))
         return path
 
-    # v1 valid (flags == 0)
-    v1_mtp = _write_container(
-        tmp_path / "v1_mtp.miv",
-        version=1,
-        flags=0,
-        object_names=["language_model.model.layers.0.mlp.down_proj", "language_model.mtp.layers.0.mlp.down_proj"],
-    )
-    v1_no_mtp = _write_container(
-        tmp_path / "v1_no_mtp.miv",
-        version=1,
-        flags=0,
-        object_names=["language_model.model.layers.0.mlp.down_proj"],
-    )
-    assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_mtp) is True
-    assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_no_mtp) is False
-
-    # v2 valid for every valid flag bitmask (0, 1=FWHT64, 2=NAX_LANE_V2, 3=both)
-    for flags in (0, 1, 2, 3):
-        v2_mtp = _write_container(
-            tmp_path / f"v2_f{flags}_mtp.miv",
-            version=2,
-            flags=flags,
-            object_names=["language_model.mtp.layers.0.self_attn.o_proj"],
+    # Accept BOTH new MIV00001 + miv-artifact-v{1,2} AND legacy OMLXM5A1 + omlx-m5-artifact-v{1,2}
+    for tag, magic in (("new", b"MIV00001"), ("legacy", b"OMLXM5A1")):
+        v1_mtp = _write_container(
+            tmp_path / f"{tag}_v1_mtp.miv",
+            version=1,
+            flags=0,
+            object_names=[
+                "language_model.model.layers.0.mlp.down_proj",
+                "language_model.mtp.layers.0.mlp.down_proj",
+            ],
+            magic=magic,
         )
-        v2_no_mtp = _write_container(
-            tmp_path / f"v2_f{flags}_nomtp.miv",
-            version=2,
-            flags=flags,
-            object_names=["language_model.model.layers.0.self_attn.o_proj"],
+        v1_no_mtp = _write_container(
+            tmp_path / f"{tag}_v1_no_mtp.miv",
+            version=1,
+            flags=0,
+            object_names=["language_model.model.layers.0.mlp.down_proj"],
+            magic=magic,
         )
-        assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_mtp) is True
-        assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_no_mtp) is False
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_mtp) is True
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_no_mtp) is False
 
-    # Invalid headers must return None: v1 with nonzero flags, v2 with reserved flags, version 3
-    bad_v1_flags = _write_container(
-        tmp_path / "bad_v1_flags.miv",
-        version=1,
-        flags=1,
-        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
-    )
-    bad_v2_flags = _write_container(
-        tmp_path / "bad_v2_flags.miv",
-        version=2,
-        flags=4,
-        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
-    )
-    bad_v3 = _write_container(
-        tmp_path / "bad_v3.miv",
-        version=3,
-        flags=0,
-        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
-    )
-    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v1_flags) is None
-    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v2_flags) is None
-    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v3) is None
+        # v2 valid for every valid flag bitmask (0, 1=FWHT64, 2=NAX_LANE_V2, 3=both)
+        for flags in (0, 1, 2, 3):
+            v2_mtp = _write_container(
+                tmp_path / f"{tag}_v2_f{flags}_mtp.miv",
+                version=2,
+                flags=flags,
+                object_names=["language_model.mtp.layers.0.self_attn.o_proj"],
+                magic=magic,
+            )
+            v2_no_mtp = _write_container(
+                tmp_path / f"{tag}_v2_f{flags}_nomtp.miv",
+                version=2,
+                flags=flags,
+                object_names=["language_model.model.layers.0.self_attn.o_proj"],
+                magic=magic,
+            )
+            assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_mtp) is True
+            assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_no_mtp) is False
+
+    # Invalid headers/magics/version-schema mismatches must return None
+    invalid_cases = [
+        ("bad_v1_flags.miv", dict(version=1, flags=1)),
+        ("bad_v2_flags.miv", dict(version=2, flags=4)),
+        ("bad_v3.miv", dict(version=3, flags=0)),
+        ("bad_alt_magic_v1.miv", dict(version=1, flags=0, magic=b"MIVART" + b"01", schema="miv-artifact-v1")),
+        ("bad_alt_magic_v2.miv", dict(version=2, flags=3, magic=b"MIVART" + b"01", schema="miv-artifact-v2")),
+        ("bad_random_magic.miv", dict(version=2, flags=0, magic=b"BADMAGIC", schema="miv-artifact-v2")),
+        ("v1_new_v2_schema.miv", dict(version=1, flags=0, magic=b"MIV00001", schema="miv-artifact-v2")),
+        ("v1_legacy_v2_schema.miv", dict(version=1, flags=0, magic=b"OMLXM5A1", schema="omlx-m5-artifact-v2")),
+        ("v2_new_v1_schema.miv", dict(version=2, flags=3, magic=b"MIV00001", schema="miv-artifact-v1")),
+        ("v2_legacy_v1_schema.miv", dict(version=2, flags=3, magic=b"OMLXM5A1", schema="omlx-m5-artifact-v1")),
+        ("unknown_schema.miv", dict(version=2, flags=0, magic=b"MIV00001", schema="other-artifact-v2")),
+    ]
+    for fname, kwargs in invalid_cases:
+        bad = _write_container(
+            tmp_path / fname,
+            object_names=["language_model.mtp.layers.0.mlp.down_proj"],
+            **kwargs,
+        )
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(bad) is None, f"expected None for {fname}"
+
+    # Post-conversion header validator accepts BOTH MIV00001 and legacy OMLXM5A1, rejects invalid magics
+    prov_root = tmp_path / "provider_magic_check"
+    (prov_root / "bin").mkdir(parents=True)
+    (prov_root / "metallib").mkdir(parents=True)
+    (prov_root / "tools").mkdir(parents=True)
+    fake_bin = _fake_daemon_script(prov_root / "bin" / "mseries_backendd", "miv-v0.01", protocol=2)
+    (prov_root / "metallib" / "omlx_m5_qwen_ar.metallib").write_bytes(b"MTLB")
+    fake_tool = prov_root / "tools" / "m5_artifact.py"
+    monkeypatch.delenv("NINFER_METAL_ARTIFACT_TOOL", raising=False)
+
+    for label, emitted_magic, should_pass in (
+        ("new_magic", b"MIV00001", True),
+        ("legacy_magic", b"OMLXM5A1", True),
+        ("rejected_alt_magic", b"MIVART" + b"01", False),
+    ):
+        fake_tool.write_text(
+            "import pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            f"out.write_bytes({emitted_magic!r} + b'\\x00' * 128)\n",
+            encoding="utf-8",
+        )
+        mdir = tmp_path / f"qwen_conv_{label}"
+        mdir.mkdir()
+        (mdir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (mdir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+        if should_pass:
+            res = m5_mod.convert_model_to_miv(
+                mdir, source_repo=f"test/{label}", configured_binary=str(fake_bin)
+            )
+            assert res["already_existed"] is False
+            assert (mdir / "model.miv").read_bytes()[:8] == emitted_magic
+        else:
+            with pytest.raises(ValueError, match="valid MIV00001/OMLXM5A1 header"):
+                m5_mod.convert_model_to_miv(
+                    mdir, source_repo=f"test/{label}", configured_binary=str(fake_bin)
+                )
+            assert not (mdir / "model.miv").exists()
 
 
 

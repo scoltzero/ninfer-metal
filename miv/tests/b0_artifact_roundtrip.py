@@ -412,7 +412,9 @@ def test_roundtrip(
 def rewrite_manifest(source: Path, target: Path, mutate) -> None:
     raw = source.read_bytes()
     header = artifact.HEADER_STRUCT.unpack(raw[: artifact.HEADER_BYTES])
+    magic, version = header[0], header[1]
     manifest_offset, manifest_bytes, old_payload_offset, payload_bytes = header[3:7]
+    flags = header[10]
     manifest = json.loads(raw[manifest_offset : manifest_offset + manifest_bytes])
     mutate(manifest)
     encoded = artifact.canonical_json(manifest)
@@ -421,8 +423,8 @@ def rewrite_manifest(source: Path, target: Path, mutate) -> None:
     )
     manifest_crc = artifact.crc32(encoded)
     prefix = artifact.HEADER_STRUCT.pack(
-        artifact.MAGIC,
-        artifact.VERSION,
+        magic,
+        version,
         artifact.HEADER_BYTES,
         artifact.HEADER_BYTES,
         len(encoded),
@@ -431,11 +433,11 @@ def rewrite_manifest(source: Path, target: Path, mutate) -> None:
         len(manifest["objects"]),
         manifest_crc,
         0,
-        0,
+        flags,
     )
     header_bytes = artifact.HEADER_STRUCT.pack(
-        artifact.MAGIC,
-        artifact.VERSION,
+        magic,
+        version,
         artifact.HEADER_BYTES,
         artifact.HEADER_BYTES,
         len(encoded),
@@ -444,7 +446,7 @@ def rewrite_manifest(source: Path, target: Path, mutate) -> None:
         len(manifest["objects"]),
         manifest_crc,
         artifact.crc32(prefix[:56]),
-        0,
+        flags,
     )
     payload = raw[old_payload_offset : old_payload_offset + payload_bytes]
     target.write_bytes(
@@ -552,6 +554,30 @@ def test_corruption(
         handle.seek(padding_offset)
         handle.write(b"\x01")
     expect_rejected(bad_padding, cpp_inspector)
+
+    for label, bad_magic in (
+        ("rejected-alt-magic", b"MIVART" + b"01"),
+        ("random-magic", b"BADMAGIC"),
+    ):
+        bad_magic_path = root / f"{label}.miv"
+        raw = bytearray(source.read_bytes())
+        raw[:8] = bad_magic
+        struct.pack_into("<I", raw, 56, zlib.crc32(raw[:56]) & 0xFFFFFFFF)
+        bad_magic_path.write_bytes(raw)
+        expect_rejected(bad_magic_path, cpp_inspector)
+
+    for label, bad_schema in (
+        ("v1-mismatched-new-v2-schema", "miv-artifact-v2"),
+        ("v1-mismatched-legacy-v2-schema", "omlx-m5-artifact-v2"),
+        ("v1-unknown-schema", "unknown-artifact-v1"),
+    ):
+        bad_schema_path = root / f"{label}.miv"
+        rewrite_manifest(
+            source,
+            bad_schema_path,
+            lambda value, s=bad_schema: value.__setitem__("schema", s),
+        )
+        expect_rejected(bad_schema_path, cpp_inspector)
 
 
 def test_unsafe_source_index(root: Path) -> None:
@@ -1062,11 +1088,117 @@ def test_miv_v2_fwht64_pi64_roundtrip(
 
     summary, manifest = artifact.read_artifact(out_j4, verify_payload=True)
     expect(
-        summary["container_version"] == 2
+        out_j4.read_bytes()[:8] == b"MIV00001"
+        and summary["container_magic"] == "MIV00001"
+        and summary["container_version"] == 2
         and summary["container_flags"] == 3
-        and summary["schema"] == "omlx-m5-artifact-v2",
-        "v2 summary header/flags/schema mismatch",
+        and summary["schema"] == "miv-artifact-v2"
+        and manifest["converter"]["name"] == "miv-artifact",
+        "v2 summary header/magic/flags/schema/converter mismatch",
     )
+
+    # Dual Magic/Schema interop: --artifact-version 1 (new branding) and --legacy-magic (v1 & v2)
+    out_v1_new = root / "v1_oq_new.miv"
+    out_v1_legacy = root / "v1_oq_legacy.miv"
+    out_v2_legacy = root / "v2_oq_legacy.miv"
+    for out_p, extra, exp_magic, exp_ver, exp_schema, exp_conv in (
+        (
+            out_v1_new,
+            ["--artifact-version", "1", "--nax-pretile", "--jobs", "2"],
+            b"MIV00001",
+            1,
+            "miv-artifact-v1",
+            "miv-artifact",
+        ),
+        (
+            out_v1_legacy,
+            ["--artifact-version", "1", "--legacy-magic", "--nax-pretile", "--jobs", "2"],
+            b"OMLXM5A1",
+            1,
+            "omlx-m5-artifact-v1",
+            "omlx-m5-artifact",
+        ),
+        (
+            out_v2_legacy,
+            ["--legacy-magic", "--nax-pretile", "--jobs", "2"],
+            b"OMLXM5A1",
+            2,
+            "omlx-m5-artifact-v2",
+            "omlx-m5-artifact",
+        ),
+    ):
+        subprocess.run(
+            [
+                sys.executable,
+                str(MIV_ROOT / "tools" / "m5_artifact.py"),
+                "convert",
+                "--source",
+                str(oq_src),
+                "--output",
+                str(out_p),
+                "--source-repo",
+                "fixture/v2-oq",
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        expect(out_p.read_bytes()[:8] == exp_magic, f"{out_p.name} magic mismatch")
+        s_b, m_b = artifact.read_artifact(out_p, verify_payload=True)
+        expect(
+            s_b["container_magic"] == exp_magic.decode("ascii")
+            and s_b["container_version"] == exp_ver
+            and s_b["schema"] == exp_schema
+            and m_b["converter"]["name"] == exp_conv,
+            f"{out_p.name} dual-branding summary/converter mismatch",
+        )
+        if cpp_inspector is not None:
+            native_b = json.loads(
+                subprocess.check_output(
+                    [
+                        str(cpp_inspector),
+                        str(out_p),
+                        "--verify-payload",
+                        "--sample-object",
+                        "model.layers.0.mlp.down_proj",
+                        "--sample-row",
+                        "0",
+                        "--sample-start",
+                        "0",
+                        "--sample-count",
+                        "64",
+                    ],
+                    text=True,
+                )
+            )
+            expect(
+                native_b["schema"] == "miv-artifact-inspection-v1"
+                and native_b["container_magic"] == exp_magic.decode("ascii")
+                and native_b["manifest_schema"] == exp_schema
+                and native_b["container_version"] == exp_ver,
+                f"{out_p.name} C++ inspector dual-branding metadata mismatch",
+            )
+            py_b = artifact.decode_artifact_row(
+                out_p, m_b, "model.layers.0.mlp.down_proj", 0, 0, 64
+            )
+            expect(
+                np.allclose(native_b["sample"]["values"], py_b, rtol=1e-6, atol=1e-6),
+                f"{out_p.name} C++ vs Python dual-branding decode mismatch",
+            )
+
+    # Strict v2 version/schema mismatch rejection in both Python and C++
+    for bad_name, bad_schema in (
+        ("v2_bad_new_v1_schema.miv", "miv-artifact-v1"),
+        ("v2_bad_legacy_v1_schema.miv", "omlx-m5-artifact-v1"),
+    ):
+        bad_v2_p = root / bad_name
+        rewrite_manifest(
+            out_j4,
+            bad_v2_p,
+            lambda value, s=bad_schema: value.__setitem__("schema", s),
+        )
+        expect_rejected(bad_v2_p, cpp_inspector)
     objs = {o["name"]: o for o in manifest["objects"]}
     expect(objs["model.layers.0.self_attn.q_proj"]["layout"] == "oq_nax_lane_g64_v2", "q_proj layout")
     expect(objs["model.layers.0.self_attn.q_proj"].get("input_transform", "none") == "none", "q_proj unrotated")

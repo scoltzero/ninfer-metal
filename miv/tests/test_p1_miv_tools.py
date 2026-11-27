@@ -1601,9 +1601,12 @@ def test_miv_v2_cli_defaults_qda_bf16_prerotate_dflash2_and_mtp(
     _ = capsys.readouterr()
 
     summary, manifest = m5_artifact.read_artifact(v2_art, verify_payload=True)
+    assert v2_art.read_bytes()[:8] == b"MIV00001"
+    assert summary["container_magic"] == "MIV00001"
     assert summary["container_version"] == 2
     assert summary["container_flags"] == (m5_artifact.FLAG_FWHT64 | m5_artifact.FLAG_NAX_LANE_V2)
-    assert summary["schema"] == "omlx-m5-artifact-v2"
+    assert summary["schema"] == "miv-artifact-v2"
+    assert manifest["converter"]["name"] == "miv-artifact"
     assert manifest["format_features"]["fwht64_prerotated"] is True
     assert manifest["format_features"]["nax_lane_layout"] == "pi64_quartet_v2"
     objs = {o["name"]: o for o in manifest["objects"]}
@@ -1684,6 +1687,193 @@ def test_miv_v2_cli_defaults_qda_bf16_prerotate_dflash2_and_mtp(
     )
     _ = capsys.readouterr()
     mtp_sum, mtp_man = m5_artifact.read_artifact(mtp_v2, verify_payload=True)
+    assert mtp_sum["container_magic"] == "MIV00001"
+    assert mtp_sum["schema"] == "miv-artifact-v2"
+    assert mtp_man["converter"]["name"] == "miv-artifact"
     assert mtp_sum["container_version"] == 2
     assert (mtp_sum["container_flags"] & m5_artifact.FLAG_NAX_LANE_V2) != 0
     assert mtp_man["objects"][0]["layout"] in ("oq_nax_lane_g64_v2", "oq_nax_lane_g128_v2")
+
+
+def test_dual_magic_and_schema_branding_interop(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import struct
+    import zlib
+
+    src = _make_oq_checkpoint(tmp_path / "brand_src", include_mtp=True)
+
+    # 1) Default writes emit MIV00001 + miv-artifact-v{1,2} + converter.name == "miv-artifact"
+    #    --legacy-magic emits OMLXM5A1 + omlx-m5-artifact-v{1,2} + converter.name == "omlx-m5-artifact"
+    cases = [
+        ("new_v2.miv", [], b"MIV00001", 2, "miv-artifact-v2", "miv-artifact"),
+        ("new_v1.miv", ["--artifact-version", "1"], b"MIV00001", 1, "miv-artifact-v1", "miv-artifact"),
+        ("legacy_v2.miv", ["--legacy-magic"], b"OMLXM5A1", 2, "omlx-m5-artifact-v2", "omlx-m5-artifact"),
+        (
+            "legacy_v1.miv",
+            ["--artifact-version", "1", "--legacy-magic"],
+            b"OMLXM5A1",
+            1,
+            "omlx-m5-artifact-v1",
+            "omlx-m5-artifact",
+        ),
+    ]
+    paths: dict[str, Path] = {}
+    for filename, extra_args, exp_magic, exp_ver, exp_schema, exp_conv in cases:
+        out = tmp_path / filename
+        paths[filename] = out
+        m5_artifact.command_convert(
+            m5_artifact.build_parser().parse_args(
+                [
+                    "convert",
+                    "--source",
+                    str(src),
+                    "--output",
+                    str(out),
+                    "--source-repo",
+                    "test/brand-interop",
+                    "--jobs",
+                    "2",
+                    *extra_args,
+                ]
+            )
+        )
+        _ = capsys.readouterr()
+        assert out.read_bytes()[:8] == exp_magic
+        summary, manifest = m5_artifact.read_artifact(out, verify_payload=True)
+        assert summary["container_magic"] == exp_magic.decode("ascii")
+        assert summary["container_version"] == exp_ver
+        assert summary["schema"] == exp_schema
+        assert manifest["converter"]["name"] == exp_conv
+
+    # 2) pretile reads legacy OMLXM5A1 v1 and emits new MIV00001 v2 by default (or legacy with --legacy-magic)
+    upgraded = tmp_path / "legacy_to_new_v2.miv"
+    m5_artifact.command_pretile(
+        m5_artifact.build_parser().parse_args(
+            [
+                "pretile",
+                "--input",
+                str(paths["legacy_v1.miv"]),
+                "--output",
+                str(upgraded),
+                "--jobs",
+                "2",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    assert upgraded.read_bytes()[:8] == b"MIV00001"
+    up_sum, up_man = m5_artifact.read_artifact(upgraded, verify_payload=True)
+    assert up_sum["container_magic"] == "MIV00001"
+    assert up_sum["container_version"] == 2
+    assert up_sum["schema"] == "miv-artifact-v2"
+    assert up_man["converter"]["name"] == "miv-artifact"
+
+    kept_legacy = tmp_path / "legacy_to_legacy_v1.miv"
+    m5_artifact.command_pretile(
+        m5_artifact.build_parser().parse_args(
+            [
+                "pretile",
+                "--input",
+                str(paths["legacy_v1.miv"]),
+                "--output",
+                str(kept_legacy),
+                "--artifact-version",
+                "1",
+                "--legacy-magic",
+                "--jobs",
+                "2",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    assert kept_legacy.read_bytes()[:8] == b"OMLXM5A1"
+    kl_sum, kl_man = m5_artifact.read_artifact(kept_legacy, verify_payload=True)
+    assert kl_sum["container_magic"] == "OMLXM5A1"
+    assert kl_sum["container_version"] == 1
+    assert kl_sum["schema"] == "omlx-m5-artifact-v1"
+    assert kl_man["converter"]["name"] == "omlx-m5-artifact"
+
+    # 3) extract-mtp and bundle-mtp support both reading legacy and emitting new/legacy
+    mtp_legacy = tmp_path / "mtp_legacy.miv"
+    m5_artifact.command_extract_mtp(
+        m5_artifact.build_parser().parse_args(
+            [
+                "extract-mtp",
+                "--source",
+                str(paths["legacy_v1.miv"]),
+                "--output",
+                str(mtp_legacy),
+                "--legacy-magic",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    assert mtp_legacy.read_bytes()[:8] == b"OMLXM5A1"
+    ml_sum, ml_man = m5_artifact.read_artifact(mtp_legacy, verify_payload=True)
+    assert ml_sum["schema"] == "omlx-m5-artifact-v1"
+    assert ml_man["converter"]["name"] == "omlx-m5-artifact"
+
+    bundled_new = tmp_path / "bundled_new.miv"
+    m5_artifact.command_bundle_mtp(
+        m5_artifact.build_parser().parse_args(
+            [
+                "bundle-mtp",
+                "--base",
+                str(paths["legacy_v1.miv"]),
+                "--mtp",
+                str(mtp_legacy),
+                "--output",
+                str(bundled_new),
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    assert bundled_new.read_bytes()[:8] == b"MIV00001"
+    bn_sum, bn_man = m5_artifact.read_artifact(bundled_new, verify_payload=True)
+    assert bn_sum["schema"] == "miv-artifact-v1"
+    assert bn_man["converter"]["name"] == "miv-artifact"
+
+    # 4) Reject invalid magics (including rejected alternate magic) and version/schema mismatches
+    for bad_magic in (b"MIVART" + b"01", b"BADMAGIC"):
+        bad_path = tmp_path / f"bad_magic_{bad_magic.decode('ascii')}.miv"
+        raw = bytearray(paths["new_v2.miv"].read_bytes())
+        raw[:8] = bad_magic
+        struct.pack_into("<I", raw, 56, zlib.crc32(raw[:56]) & 0xFFFFFFFF)
+        bad_path.write_bytes(raw)
+        with pytest.raises(ValueError, match="unsupported artifact header"):
+            m5_artifact.read_artifact(bad_path, verify_payload=False)
+
+    def _rewrite_schema(src_art: Path, dst_art: Path, new_schema: str) -> None:
+        raw = src_art.read_bytes()
+        hdr = m5_artifact.HEADER_STRUCT.unpack(raw[: m5_artifact.HEADER_BYTES])
+        magic, ver, _, m_off, m_len, old_pay_off, pay_len, _, _, _, flags = hdr
+        man = json.loads(raw[m_off : m_off + m_len])
+        man["schema"] = new_schema
+        enc = m5_artifact.canonical_json(man)
+        pay_off = m5_artifact.align_up(m5_artifact.HEADER_BYTES + len(enc), m5_artifact.PAYLOAD_ALIGNMENT)
+        m_crc = m5_artifact.crc32(enc)
+        prefix = m5_artifact.HEADER_STRUCT.pack(
+            magic, ver, m5_artifact.HEADER_BYTES, m5_artifact.HEADER_BYTES,
+            len(enc), pay_off, pay_len, len(man["objects"]), m_crc, 0, flags
+        )
+        h_crc = m5_artifact.crc32(prefix[:56])
+        full_hdr = m5_artifact.HEADER_STRUCT.pack(
+            magic, ver, m5_artifact.HEADER_BYTES, m5_artifact.HEADER_BYTES,
+            len(enc), pay_off, pay_len, len(man["objects"]), m_crc, h_crc, flags
+        )
+        dst_art.write_bytes(
+            full_hdr + enc + bytes(pay_off - m5_artifact.HEADER_BYTES - len(enc)) + raw[old_pay_off : old_pay_off + pay_len]
+        )
+
+    for src_key, bad_schema in (
+        ("new_v1.miv", "miv-artifact-v2"),
+        ("legacy_v1.miv", "omlx-m5-artifact-v2"),
+        ("new_v2.miv", "miv-artifact-v1"),
+        ("legacy_v2.miv", "omlx-m5-artifact-v1"),
+        ("new_v2.miv", "bogus-artifact-v2"),
+    ):
+        dst = tmp_path / f"mismatch_{src_key}_{bad_schema}.miv"
+        _rewrite_schema(paths[src_key], dst, bad_schema)
+        with pytest.raises(ValueError, match="artifact manifest contract mismatch"):
+            m5_artifact.read_artifact(dst, verify_payload=False)

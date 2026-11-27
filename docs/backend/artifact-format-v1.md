@@ -1,17 +1,18 @@
-# `.miv`（兼容历史 `.omlxm5`）artifact format v1
+# `.miv`（兼容历史 `.omlxm5`）容器格式规范
 
-> 状态：B0冻结；little-endian；schema `omlx-m5-artifact-v1`（magic `OMLXM5A1`）  
-> 生产实现：`miv/tools/m5_artifact.py`、`miv/src/artifact.cpp`  
-> R1范围：Qwen3.6/3.8 Dense与Qwen3.6 MoE的oQ affine Q4/Q5/Q6/Q8、MXFP4；MXFP8不在v1中
+> 状态：little-endian；默认写入 magic `MIV00001`、schema `miv-artifact-v2`（`--artifact-version 1` 时为 `miv-artifact-v1`）、`converter.name = "miv-artifact"`；同时零破坏向后兼容读取历史 magic `OMLXM5A1` 与 schema `omlx-m5-artifact-v1` / `omlx-m5-artifact-v2`  
+> 生产实现：`miv/tools/m5_artifact.py`、`miv/src/artifact.cpp`、`miv/apps/inspect_artifact.cpp`、`omlx/omlx/engine/m5_sidecar.py`  
+> 文件命名：统一输出为 `model.miv`（内部 `version=2` 与 `flags` 仅作为二进制安全护栏，防止旧版引擎误读 `FWHT64/W4A8` 优化布局；对外文档与 UI 统一表述为 `.miv` 容器及其 `FWHT64/W4A8` 优化布局）  
+> 覆盖范围：Qwen3.5/3.6/3.8 Dense 与 MoE 的 oQ affine Q3/Q4/Q5/Q6/Q8、MXFP4 以及 DFlash2 `direct_bf16_v1`；MXFP8 见独立演进路线图
 
 ## 1. 设计目标
 
-`.miv`（向后兼容历史后缀 `.omlxm5`）是backend自有的只读权重容器。safetensors和compressed-tensors只在
-离线导入时使用；运行时mmap容器后直接得到各plane的非拥有视图，不解包、不转置、
-不按请求重排。格式把数值语义、物理布局、来源版本和activation policy一起冻结，
-防止converter和kernel各自猜测布局。
+`.miv`（向后兼容历史后缀 `.omlxm5`）是 backend 自有的只读权重容器。safetensors 和 compressed-tensors 只在
+离线导入时使用；运行时 mmap 容器后直接得到各 plane 的非拥有视图，不解包、不转置、
+不按请求重排。格式把数值语义、物理布局、预旋转变换（`input_transform`）、来源版本和 activation policy 一起冻结，
+防止 converter 和 kernel 各自猜测布局。
 
-v1有以下量化对象族：
+容器有以下量化对象族：
 
 | format id | 数值合同 | plane顺序 | layout id |
 |---|---|---|---|
@@ -33,22 +34,31 @@ rank-3 MoE expert parent使用相同format id，但layout改为
 
 header固定64字节，所有整数为little-endian：
 
-| offset | 类型 | 字段 | v1约束 |
+| offset | 类型 | 字段 | 约束 |
 |---:|---|---|---|
-| 0 | `char[8]` | magic | `OMLXM5A1` |
-| 8 | `u32` | version | `1` |
+| 0 | `char[8]` | magic | 默认写入 `MIV00001`；reader 同时向后兼容读取历史 `OMLXM5A1`（转换器提供 `--legacy-magic` 仅用于向后兼容回归测试）；其他任意 magic 一律拒绝 |
+| 8 | `u32` | version | `1` 或 `2`（默认写入 `2`；`version=2` 作为二进制安全护栏，防止旧版引擎误读 `FWHT64` 与 `oq_nax_lane_g{64,128}_v2`） |
 | 12 | `u32` | header bytes | `64` |
 | 16 | `u64` | manifest offset | `64` |
 | 24 | `u64` | manifest bytes | 大于0 |
-| 32 | `u64` | payload offset | 4096字节对齐 |
+| 32 | `u64` | payload offset | 写入按 16384 字节对齐（reader 同时兼容历史 4096 字节对齐） |
 | 40 | `u64` | payload bytes | 文件必须恰好在payload末尾结束 |
 | 48 | `u32` | object count | 等于manifest `objects`长度 |
 | 52 | `u32` | manifest CRC32 | zlib/IEEE CRC32 |
 | 56 | `u32` | header CRC32 | 对header `[0,56)`计算 |
-| 60 | `u32` | flags | v1固定为0 |
+| 60 | `u32` | flags | `version=1` 固定为 `0`；`version=2` 仅允许 `0x1`（`FWHT64` 预旋转）与 `0x2`（`NAX_LANE_V2` $\pi_{64}$ lane 重排）的位组合，其余保留位必须为 `0` |
+
+### 2.1 双品牌与版本严格匹配规则
+
+| 类别 | Header Magic | Manifest `schema`（`version=1`） | Manifest `schema`（`version=2`） | Manifest `converter.name` |
+|---|---|---|---|---|
+| 当前标准（默认写入） | `MIV00001` | `miv-artifact-v1` | `miv-artifact-v2` | `miv-artifact` |
+| 历史兼容（只读，或 `--legacy-magic` 回归写出） | `OMLXM5A1` | `omlx-m5-artifact-v1` | `omlx-m5-artifact-v2` | `omlx-m5-artifact` |
+
+所有 reader（C++ `ArtifactModel::open`、`miv/apps/inspect_artifact.cpp`、Python `m5_artifact.read_artifact` 及 `omlx/omlx/engine/m5_sidecar.py`）均强制执行版本与 schema 严格匹配：`version == 1` 仅接受 `miv-artifact-v1` / `omlx-m5-artifact-v1`，`version == 2` 仅接受 `miv-artifact-v2` / `omlx-m5-artifact-v2`，拒绝任何跨版本错配或未知 magic/schema。
 
 manifest是UTF-8 canonical JSON：key排序、无多余空白、`,`/`:`紧凑分隔。manifest到
-payload之间必须用零填充。reader拒绝未知版本、非canonical manifest、非零padding、
+payload之间必须用零填充。reader拒绝未知magic、未知版本、版本/schema错配、非canonical manifest、非零padding、
 越界/溢出、尾随字节和CRC错误。
 
 ## 3. object directory与校验
@@ -145,6 +155,17 @@ checkpoint recipe、保护层和质量结论仍分别保留，不因共用kernel
 | `oq_affine_q5_g{64,128}_bf16_v1` / `oq_affine_q6_g{64,128}_bf16_v1` | `oq_nax_tiled_g64_v1` | `nax_codes, nax_high2, nax_sb` | 同上，附加 `nax_high2` 按 `[N_pad/BN, K/64, BN, 16]` 2-bit 高位平面存储（Q5 低位保存第 5 bit；`G128` 沿相邻两 `K/64` 块重复 `nax_sb`） |
 
 运行时 `Mxfp4NaxCache` 与 `AffineNaxCache` 检测到上述预重排 layout 后直接零拷贝绑定 `ModelPlaneBinding`（不分配额外 Metal 权重 buffer，亦不派发 repack kernel），`decode_artifact_row` 与 `read_artifact(verify_payload=True)` 保持逐元素 bit-exact 校验。
+
+### 5.2 `.miv` `FWHT64/W4A8` 优化布局（内部 `version=2` 安全护栏）
+
+为进一步提升 Apple10 M5 `W4A8` 预填充精度与 NAX 寄存器发射效率，`miv/tools/m5_artifact.py` 默认写入 `MIV00001`（`version=2`，输出文件名统一仍为 `model.miv`），并在内部通过 `flags` 与对象级元数据保护以下优化布局，确保旧版仅支持 `version=1` 的引擎 fail-closed 拒载而不会产生静默数值错误：
+
+1. **离线块状 `FWHT-64` 权重预旋转（`flags & 0x1`，对象字段 `"input_transform": "fwht64"`）**：
+   - 对符合条件的 `mlp.down_proj`、`shared_expert.down_proj`、`switch_mlp.down_proj`（及启用 `--fwht64-o-proj` 时的 `self_attn.o_proj`）权重沿 `K` 维按 64 元素分块施加正交对称 Sylvester Walsh-Hadamard 变换 $H_{64}/\sqrt{64}$，显著压制激活通道离群值，从而改善 `W4A8` INT8 预填充精度；
+   - 运行时在激活进入对应投影前同步执行融合 `FWHT-64`（`H64` 自逆）；离线检测工具（`decode_artifact_row` / `decode_weight_row(..., logical_unrotated=true)`）自动反旋转还原逻辑权重。
+2. **$\pi_{64}$ NAX Lane 预重排布局（`flags & 0x2`，layout `oq_nax_lane_g64_v2` / `oq_nax_lane_g128_v2`）**：
+   - 保持与 `oq_nax_tiled_g64_v1` 相同的 plane 组成（`nax_codes`、可选 `nax_high1`/`nax_high2`、`nax_sb`）与总字节数，在 64 元素组内按对合置换 $\pi_{64}(\text{off}) = ((\text{off} \mathbin{\&} 12) \ll 2) \mid ((\text{off} \gg 2) \mathbin{\&} 12) \mid (\text{off} \mathbin{\&} 3)$ 预排列以对齐 Apple10 NAX lane 解包次序；
+   - `manifest["format_features"]` 记录 `fwht64_prerotated`、`fwht64_targets` 与 `nax_lane_layout` 供自检与诊断展示。
 
 ## 6. fused parent与view规则
 

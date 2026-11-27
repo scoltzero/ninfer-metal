@@ -457,7 +457,7 @@ public:
           {"source_revision", source_rev}}},
         {"objects", std::move(j_objects)},
         {"payload_bytes", payload.size()},
-        {"schema", "omlx-m5-artifact-v1"},
+        {"schema", std::string(kArtifactSchemaV1)},
         {"views", Json::array()},
     };
     const std::string manifest_str = manifest.dump();
@@ -468,8 +468,7 @@ public:
     const U32 manifest_crc = artifact_crc32(manifest_bytes);
 
     std::vector<std::byte> file;
-    constexpr char kMagic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-    for (char c : kMagic) {
+    for (char c : kArtifactMagic) {
       file.push_back(static_cast<std::byte>(c));
     }
     append_u32(file, 1U);

@@ -387,7 +387,7 @@ void write_synthetic_artifact(const std::filesystem::path &path,
     json << "],\"source_tensors\":[\"" << obj.spec.name << "\"]}";
   }
   json << "],\"payload_bytes\":" << payload.size()
-       << ",\"schema\":\"omlx-m5-artifact-v1\",\"views\":[]}";
+       << ",\"schema\":\"" << omlx::m5::kArtifactSchemaV1 << "\",\"views\":[]}";
 
   const auto manifest_str = json.str();
   const auto manifest_bytes =
@@ -398,8 +398,7 @@ void write_synthetic_artifact(const std::filesystem::path &path,
   const std::uint32_t manifest_crc = omlx::m5::artifact_crc32(manifest_bytes);
 
   std::vector<std::byte> file;
-  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-  for (char c : magic) {
+  for (char c : omlx::m5::kArtifactMagic) {
     file.push_back(static_cast<std::byte>(c));
   }
   append_u32(file, 1U);

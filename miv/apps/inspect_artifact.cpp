@@ -1,3 +1,6 @@
+// Inspect a `.miv` container (supports both `MIV00001` / `miv-artifact-v{1,2}`
+// and legacy `OMLXM5A1` / `omlx-m5-artifact-v{1,2}`, including FWHT64/W4A8
+// optimized layouts).
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -78,9 +81,12 @@ int main(int argc, const char *const *argv) {
       ++formats[object.format];
     }
     Json output = {
-        {"schema", "omlx-m5-artifact-inspection-v1"},
+        {"schema", "miv-artifact-inspection-v1"},
         {"artifact", artifact.path().string()},
+        {"container_magic", summary.container_magic},
+        {"manifest_schema", summary.manifest_schema},
         {"container_version", summary.container_version},
+        {"container_flags", summary.container_flags},
         {"artifact_bytes", summary.artifact_bytes},
         {"manifest_bytes", summary.manifest_bytes},
         {"payload_offset", summary.payload_offset},
@@ -100,6 +106,7 @@ int main(int argc, const char *const *argv) {
                                      {"name", object.name},
                                      {"format", object.format},
                                      {"layout", object.layout},
+                                     {"input_transform", object.input_transform},
                                      {"shape", object.shape},
                                      {"padded_k", object.padded_k},
                                      {"object_bytes", object.object_bytes},

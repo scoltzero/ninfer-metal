@@ -40,11 +40,24 @@ START_SERVE_SCRIPT = REPO_ROOT / "omlx-extend" / "scripts" / "start_ninfer_serve
 SYNC_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "sync-omlx-extend.yml"
 
 
-def _write_omlxm5_container(path: Path, object_names: list[str]) -> Path:
-    """Create a minimal valid OMLXM5A1 v1 container with the given manifest object names."""
+def _write_omlxm5_container(
+    path: Path,
+    object_names: list[str],
+    *,
+    magic: bytes = b"MIV00001",
+    version: int = 1,
+    flags: int = 0,
+    schema: str | None = None,
+) -> Path:
+    """Create a minimal valid MIV00001 or legacy OMLXM5A1 container with the given manifest object names."""
+    if schema is None:
+        if magic == b"OMLXM5A1":
+            schema = "omlx-m5-artifact-v2" if version == 2 else "omlx-m5-artifact-v1"
+        else:
+            schema = "miv-artifact-v2" if version == 2 else "miv-artifact-v1"
     manifest = {
-        "schema": "omlx-m5-artifact-v1",
-        "container_version": 1,
+        "schema": schema,
+        "container_version": version,
         "payload_bytes": 0,
         "model": {},
         "objects": [{"name": name} for name in object_names],
@@ -56,8 +69,8 @@ def _write_omlxm5_container(path: Path, object_names: list[str]) -> Path:
     payload_offset = ((64 + len(manifest_bytes) + 4095) // 4096) * 4096
     prefix = struct.pack(
         "<8sIIQQQQII",
-        b"OMLXM5A1",
-        1,
+        magic,
+        version,
         64,
         64,
         len(manifest_bytes),
@@ -67,7 +80,7 @@ def _write_omlxm5_container(path: Path, object_names: list[str]) -> Path:
         manifest_crc,
     )
     header_crc = zlib.crc32(prefix) & 0xFFFFFFFF
-    header = prefix + struct.pack("<II", header_crc, 0)
+    header = prefix + struct.pack("<II", header_crc, flags)
     assert len(header) == 64
     padding = b"\x00" * (payload_offset - 64 - len(manifest_bytes))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -788,6 +801,40 @@ class TestExt5SpeculativeAutoMtp:
             ph_dir, ph_target, ModelSettings(), default_context=4096, memory_budget_bytes=0
         )
         assert opts_ph.speculative_backend == "mtp"
+
+        # 5) Dual Magic/Schema interop: MIV00001 (v1/v2) & legacy OMLXM5A1 (v1/v2), reject invalid magic
+        for label, magic, version, flags in (
+            ("new_v1", b"MIV00001", 1, 0),
+            ("new_v2", b"MIV00001", 2, 3),
+            ("legacy_v1", b"OMLXM5A1", 1, 0),
+            ("legacy_v2", b"OMLXM5A1", 2, 3),
+        ):
+            c_mtp = _write_omlxm5_container(
+                tmp_path / f"spi_{label}_mtp.miv",
+                ["model.layers.0.q_proj", "language_model.mtp.norm.weight"],
+                magic=magic,
+                version=version,
+                flags=flags,
+            )
+            c_plain = _write_omlxm5_container(
+                tmp_path / f"spi_{label}_plain.miv",
+                ["model.layers.0.q_proj"],
+                magic=magic,
+                version=version,
+                flags=flags,
+            )
+            assert m5_mod.inspect_omlxm5_has_mtp_weights(c_mtp) is True
+            assert m5_mod.inspect_omlxm5_has_mtp_weights(c_plain) is False
+
+        bad_alt_magic = _write_omlxm5_container(
+            tmp_path / "spi_bad_alt_magic.miv",
+            ["language_model.mtp.norm.weight"],
+            magic=b"MIVART" + b"01",
+            version=2,
+            flags=3,
+            schema="miv-artifact-v2",
+        )
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_alt_magic) is None
 
 
 # ---------------------------------------------------------------------------

@@ -2837,21 +2837,27 @@ def _text_config(config: dict[str, Any]) -> dict[str, Any]:
     return nested if isinstance(nested, dict) else config
 
 
-_OMLXM5_MAGIC = b"OMLXM5A1"
+_MIV_MAGIC = b"MIV00001"
+_LEGACY_OMLXM5_MAGIC = b"OMLXM5A1"
+_MIV_VALID_MAGICS: tuple[bytes, ...] = (_MIV_MAGIC, _LEGACY_OMLXM5_MAGIC)
+_OMLXM5_MAGIC = _LEGACY_OMLXM5_MAGIC
+_MIV_SCHEMAS_V1: tuple[str, ...] = ("miv-artifact-v1", "omlx-m5-artifact-v1")
+_MIV_SCHEMAS_V2: tuple[str, ...] = ("miv-artifact-v2", "omlx-m5-artifact-v2")
 _OMLXM5_HEADER_STRUCT = struct.Struct("<8sIIQQQQIIII")
 _OMLXM5_HEADER_BYTES = 64
 _OMLXM5_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 
 
 def inspect_omlxm5_has_mtp_weights(artifact_path: Path | None) -> bool | None:
-    """Inspect an `.omlxm5` v1 header + manifest for embedded MTP objects.
+    """Inspect a `.miv` (or legacy `.omlxm5`) header + manifest for embedded MTP objects.
 
     Returns:
-      - ``True`` if ``artifact_path`` is a valid ``OMLXM5A1`` container with at least
-        one MTP object (``mtp.*`` or ``*.mtp.*``), matching C++ ``has_mtp_weights``.
-      - ``False`` if it is a valid ``OMLXM5A1`` container with no MTP objects.
-      - ``None`` if the file does not exist or is not a valid ``OMLXM5A1`` container
-        (e.g. a synthetic test placeholder).
+      - ``True`` if ``artifact_path`` is a valid ``MIV00001`` or legacy ``OMLXM5A1``
+        container with at least one MTP object (``mtp.*`` or ``*.mtp.*``), matching
+        C++ ``has_mtp_weights``.
+      - ``False`` if it is a valid ``MIV00001`` / ``OMLXM5A1`` container with no MTP objects.
+      - ``None`` if the file does not exist or is not a valid container
+        (e.g. a synthetic test placeholder or mismatched header/schema).
     """
     if artifact_path is None:
         return None
@@ -2885,7 +2891,7 @@ def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, fil
                 flags,
             ) = _OMLXM5_HEADER_STRUCT.unpack(header)
             if (
-                magic != _OMLXM5_MAGIC
+                magic not in _MIV_VALID_MAGICS
                 or version not in (1, 2)
                 or header_bytes != _OMLXM5_HEADER_BYTES
                 or manifest_offset != _OMLXM5_HEADER_BYTES
@@ -2912,6 +2918,12 @@ def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, fil
     except (UnicodeDecodeError, ValueError):
         return None
     if not isinstance(manifest, dict):
+        return None
+    if "schema" in manifest:
+        valid_schemas = _MIV_SCHEMAS_V2 if version == 2 else _MIV_SCHEMAS_V1
+        if manifest["schema"] not in valid_schemas:
+            return None
+    if "container_version" in manifest and manifest["container_version"] != version:
         return None
     objects = manifest.get("objects")
     if not isinstance(objects, list):
@@ -7704,8 +7716,10 @@ def convert_provider_model(
                 if tmp_out.stat().st_size < _OMLXM5_HEADER_BYTES:
                     raise ValueError("Converter produced a truncated .miv container")
                 with tmp_out.open("rb") as fh:
-                    if fh.read(len(_OMLXM5_MAGIC)) != _OMLXM5_MAGIC:
-                        raise ValueError("Converted .miv file does not have a valid OMLXM5A1 header")
+                    if fh.read(len(_MIV_MAGIC)) not in _MIV_VALID_MAGICS:
+                        raise ValueError(
+                            "Converted .miv file does not have a valid MIV00001/OMLXM5A1 header"
+                        )
             os.replace(tmp_out, out_path)
         finally:
             with suppress(OSError):

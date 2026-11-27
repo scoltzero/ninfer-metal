@@ -60,7 +60,10 @@ void append_u64(std::vector<std::byte> &out, std::uint64_t v) {
   }
 }
 
-std::vector<std::byte> build_test_artifact(std::uint64_t payload_alignment) {
+std::vector<std::byte> build_test_artifact(
+    std::uint64_t payload_alignment,
+    std::array<char, 8> magic = omlx::m5::kArtifactMagic,
+    std::string_view schema = omlx::m5::kArtifactSchemaV1) {
   // Object 0: multi-plane oq_affine_q4_g64_bf16_v1 [2, 128] with 256B plane alignment
   // Object 1: single-plane direct_bf16_v1 [4]
   std::vector<std::byte> base_code(128, std::byte{0x5AU});
@@ -139,7 +142,7 @@ std::vector<std::byte> build_test_artifact(std::uint64_t payload_alignment) {
        << ",\"sha256\":\"" << omlx::m5::artifact_sha256_hex(norm_data) << "\"}"
        << "],\"shape\":[4],\"source_tensors\":[\"norm.weight\"]}"
        << "],\"payload_bytes\":" << payload.size()
-       << ",\"schema\":\"omlx-m5-artifact-v1\",\"views\":[]}";
+       << ",\"schema\":\"" << schema << "\",\"views\":[]}";
 
   const auto manifest_str = json.str();
   const auto manifest_bytes =
@@ -150,7 +153,6 @@ std::vector<std::byte> build_test_artifact(std::uint64_t payload_alignment) {
   const std::uint32_t manifest_crc = omlx::m5::artifact_crc32(manifest_bytes);
 
   std::vector<std::byte> file;
-  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
   for (char c : magic) {
     file.push_back(static_cast<std::byte>(c));
   }
@@ -442,7 +444,7 @@ std::vector<std::byte> build_affine8_pretiled_artifact(
        << "],\"shape\":[" << n << "," << k
        << "],\"source_tensors\":[\"linear.weight\"]}],"
        << "\"payload_bytes\":" << payload.size()
-       << ",\"schema\":\"omlx-m5-artifact-v1\",\"views\":[]}";
+       << ",\"schema\":\"" << omlx::m5::kArtifactSchemaV1 << "\",\"views\":[]}";
 
   const auto manifest_str = json.str();
   const auto manifest_bytes =
@@ -452,8 +454,7 @@ std::vector<std::byte> build_affine8_pretiled_artifact(
   const std::uint32_t manifest_crc = omlx::m5::artifact_crc32(manifest_bytes);
 
   std::vector<std::byte> file;
-  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-  for (char c : magic) {
+  for (char c : omlx::m5::kArtifactMagic) {
     file.push_back(static_cast<std::byte>(c));
   }
   append_u32(file, 1U);
@@ -611,7 +612,9 @@ std::vector<std::byte> build_v2_affine_lane_artifact(
     std::uint32_t flags_override, const std::string &layout_override,
     const std::string &transform_override,
     std::vector<float> *out_raw_stored = nullptr,
-    std::vector<float> *out_logical_unrotated = nullptr) {
+    std::vector<float> *out_logical_unrotated = nullptr,
+    std::array<char, 8> magic_override = omlx::m5::kArtifactMagic,
+    const std::string &schema_override = "") {
   const std::uint32_t bn = (n >= 65536U) ? 32U : 16U;
   const std::uint32_t padded_n = ((n + bn - 1U) / bn) * bn;
   const std::uint32_t padded_k = ((k + 127U) / 128U) * 128U;
@@ -743,9 +746,11 @@ std::vector<std::byte> build_v2_affine_lane_artifact(
       layout_override.empty()
           ? (group_size == 128U ? "oq_nax_lane_g128_v2" : "oq_nax_lane_g64_v2")
           : layout_override;
-  const std::string schema = (version_override == 2U)
-                                 ? "omlx-m5-artifact-v2"
-                                 : "omlx-m5-artifact-v1";
+  const std::string schema =
+      !schema_override.empty()
+          ? schema_override
+          : (version_override == 2U ? std::string(omlx::m5::kArtifactSchemaV2)
+                                    : std::string(omlx::m5::kArtifactSchemaV1));
   const std::string transform =
       transform_override.empty() ? (with_fwht64 ? "fwht64" : "")
                                  : transform_override;
@@ -801,8 +806,7 @@ std::vector<std::byte> build_v2_affine_lane_artifact(
   const std::uint32_t manifest_crc = omlx::m5::artifact_crc32(manifest_bytes);
 
   std::vector<std::byte> file;
-  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-  for (char c : magic) {
+  for (char c : magic_override) {
     file.push_back(static_cast<std::byte>(c));
   }
   append_u32(file, version_override);
@@ -952,6 +956,145 @@ void test_v2_artifact_pi64_fwht64_and_materialization() {
   expect_open_fail(p_bad_gs, "g128 affine format with oq_nax_lane_g64_v2 accepted");
 }
 
+void test_dual_magic_and_schema_interop() {
+  const auto tmp_dir = std::filesystem::temp_directory_path() /
+                       ("omlx-m5-b0-brand-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(tmp_dir);
+  struct Cleanup {
+    std::filesystem::path dir;
+    ~Cleanup() { std::filesystem::remove_all(dir); }
+  } cleanup{tmp_dir};
+
+  const auto write_bytes = [](const std::filesystem::path &p,
+                              const std::vector<std::byte> &data) {
+    std::ofstream out(p, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(data.data()),
+              static_cast<std::streamsize>(data.size()));
+  };
+  const auto expect_open_fail = [&](const std::filesystem::path &path,
+                                    const std::string &why) {
+    bool failed = false;
+    try {
+      static_cast<void>(omlx::m5::ArtifactModel::open(path, true));
+    } catch (const std::exception &) {
+      failed = true;
+    }
+    expect(failed, why);
+  };
+
+  auto ctx = omlx::m5::MetalContext::create();
+
+  // 1) v1: accept both MIV00001 + miv-artifact-v1 AND legacy OMLXM5A1 + omlx-m5-artifact-v1
+  const std::array<std::pair<std::array<char, 8>, std::string_view>, 2> v1_cases = {{
+      {omlx::m5::kArtifactMagic, omlx::m5::kArtifactSchemaV1},
+      {omlx::m5::kLegacyArtifactMagic, omlx::m5::kLegacyArtifactSchemaV1},
+  }};
+  for (std::size_t idx = 0; idx < v1_cases.size(); ++idx) {
+    const auto &[magic, schema] = v1_cases[idx];
+    const auto path = tmp_dir / ("v1_brand_" + std::to_string(idx) + ".miv");
+    write_bytes(path, build_test_artifact(omlx::m5::kPayloadAlignment, magic, schema));
+    const auto art = omlx::m5::ArtifactModel::open(path, true);
+    expect(art.summary().container_version == 1U &&
+               art.summary().container_magic == std::string(magic.data(), magic.size()) &&
+               art.summary().manifest_schema == schema,
+           "v1 dual-branding summary mismatch");
+    auto plan = omlx::m5::plan_model_materialization(
+        art, ctx, {.require_verified_payload = true});
+    auto mat = omlx::m5::materialize_model(art, std::move(plan), ctx);
+    expect(mat.parent_view("linear").format == "oq_affine_q4_g64_bf16_v1",
+           "v1 dual-branding materialization mismatch");
+  }
+
+  // 2) v2: accept both MIV00001 + miv-artifact-v2 AND legacy OMLXM5A1 + omlx-m5-artifact-v2
+  const std::array<std::pair<std::array<char, 8>, std::string>, 2> v2_cases = {{
+      {omlx::m5::kArtifactMagic, std::string(omlx::m5::kArtifactSchemaV2)},
+      {omlx::m5::kLegacyArtifactMagic, std::string(omlx::m5::kLegacyArtifactSchemaV2)},
+  }};
+  const std::uint32_t v2_flags =
+      omlx::m5::kArtifactFlagFwht64 | omlx::m5::kArtifactFlagNaxLaneV2;
+  for (std::size_t idx = 0; idx < v2_cases.size(); ++idx) {
+    const auto &[magic, schema] = v2_cases[idx];
+    std::vector<float> logical_ref;
+    std::vector<float> raw_ref;
+    const auto path = tmp_dir / ("v2_brand_" + std::to_string(idx) + ".miv");
+    write_bytes(path, build_v2_affine_lane_artifact(
+                          4U, 64U, 16U, 512U, true, 2U, v2_flags, "", "",
+                          &raw_ref, &logical_ref, magic, schema));
+    const auto art = omlx::m5::ArtifactModel::open(path, true);
+    expect(art.summary().container_version == 2U &&
+               art.summary().container_flags == v2_flags &&
+               art.summary().container_magic == std::string(magic.data(), magic.size()) &&
+               art.summary().manifest_schema == schema,
+           "v2 dual-branding summary mismatch");
+    const auto dec = art.decode_weight_row(art.object(0U), 0U, 0U, 512U, true);
+    for (std::size_t col = 0; col < 512U; ++col) {
+      expect(dec[col] == logical_ref[col], "v2 dual-branding decode mismatch");
+    }
+    auto plan = omlx::m5::plan_model_materialization(
+        art, ctx, {.require_verified_payload = true});
+    auto mat = omlx::m5::materialize_model(art, std::move(plan), ctx);
+    expect(mat.parent_view(0U).has_fwht64(),
+           "v2 dual-branding materialization lost fwht64");
+  }
+
+  // 3) Reject unknown magics (including rejected alternate magic and random magic)
+  const std::array<std::array<char, 8>, 2> invalid_magics = {{
+      {'M', 'I', 'V', 'A', 'R', 'T', '0', '1'},
+      {'B', 'A', 'D', 'M', 'A', 'G', 'I', 'C'},
+  }};
+  for (std::size_t i = 0; i < invalid_magics.size(); ++i) {
+    const auto p1 = tmp_dir / ("bad_magic_v1_" + std::to_string(i) + ".miv");
+    write_bytes(p1, build_test_artifact(omlx::m5::kPayloadAlignment, invalid_magics[i],
+                                        omlx::m5::kArtifactSchemaV1));
+    expect_open_fail(p1, "invalid v1 magic accepted");
+
+    const auto p2 = tmp_dir / ("bad_magic_v2_" + std::to_string(i) + ".miv");
+    write_bytes(p2, build_v2_affine_lane_artifact(
+                        4U, 64U, 16U, 512U, true, 2U, v2_flags, "", "",
+                        nullptr, nullptr, invalid_magics[i],
+                        std::string(omlx::m5::kArtifactSchemaV2)));
+    expect_open_fail(p2, "invalid v2 magic accepted");
+  }
+
+  // 4) Strict version/schema matching: reject cross-version and unknown schemas
+  const auto p_v1_with_v2_new = tmp_dir / "v1_with_v2_new_schema.miv";
+  write_bytes(p_v1_with_v2_new,
+              build_test_artifact(omlx::m5::kPayloadAlignment,
+                                  omlx::m5::kArtifactMagic,
+                                  omlx::m5::kArtifactSchemaV2));
+  expect_open_fail(p_v1_with_v2_new, "v1 accepted miv-artifact-v2 schema");
+
+  const auto p_v1_with_v2_leg = tmp_dir / "v1_with_v2_legacy_schema.miv";
+  write_bytes(p_v1_with_v2_leg,
+              build_test_artifact(omlx::m5::kPayloadAlignment,
+                                  omlx::m5::kLegacyArtifactMagic,
+                                  omlx::m5::kLegacyArtifactSchemaV2));
+  expect_open_fail(p_v1_with_v2_leg, "v1 accepted omlx-m5-artifact-v2 schema");
+
+  const auto p_v2_with_v1_new = tmp_dir / "v2_with_v1_new_schema.miv";
+  write_bytes(p_v2_with_v1_new,
+              build_v2_affine_lane_artifact(
+                  4U, 64U, 16U, 512U, false, 2U, omlx::m5::kArtifactFlagNaxLaneV2,
+                  "", "", nullptr, nullptr, omlx::m5::kArtifactMagic,
+                  std::string(omlx::m5::kArtifactSchemaV1)));
+  expect_open_fail(p_v2_with_v1_new, "v2 accepted miv-artifact-v1 schema");
+
+  const auto p_v2_with_v1_leg = tmp_dir / "v2_with_v1_legacy_schema.miv";
+  write_bytes(p_v2_with_v1_leg,
+              build_v2_affine_lane_artifact(
+                  4U, 64U, 16U, 512U, false, 2U, omlx::m5::kArtifactFlagNaxLaneV2,
+                  "", "", nullptr, nullptr, omlx::m5::kLegacyArtifactMagic,
+                  std::string(omlx::m5::kLegacyArtifactSchemaV1)));
+  expect_open_fail(p_v2_with_v1_leg, "v2 accepted omlx-m5-artifact-v1 schema");
+
+  const auto p_bad_schema = tmp_dir / "bad_unknown_schema.miv";
+  write_bytes(p_bad_schema,
+              build_test_artifact(omlx::m5::kPayloadAlignment,
+                                  omlx::m5::kArtifactMagic,
+                                  "unknown-artifact-v1"));
+  expect_open_fail(p_bad_schema, "v1 accepted unknown schema");
+}
+
 } // namespace
 
 int main() {
@@ -960,6 +1103,7 @@ int main() {
     test_16kib_and_legacy_4kib_artifacts();
     test_affine8_nax_pretile_contract_and_decode();
     test_v2_artifact_pi64_fwht64_and_materialization();
+    test_dual_magic_and_schema_interop();
     std::cout << "b0 artifact native tests passed\n";
     return 0;
   } catch (const std::exception &error) {

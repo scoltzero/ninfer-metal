@@ -37,15 +37,30 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr std::array<char, 8> kMagic = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
 constexpr std::uint32_t kVersionV1 = 1;
 constexpr std::uint32_t kVersionV2 = 2;
 constexpr std::uint32_t kHeaderBytes = 64;
 constexpr std::uint64_t kObjectAlignment = 256;
 constexpr std::uint64_t kPlaneAlignment = 256;
 constexpr std::size_t kVerifyStreamChunkBytes = 256 * 1024;
-constexpr std::string_view kSchemaV1 = "omlx-m5-artifact-v1";
-constexpr std::string_view kSchemaV2 = "omlx-m5-artifact-v2";
+
+bool is_supported_magic(const std::byte *header) noexcept {
+  const auto *magic = reinterpret_cast<const char *>(header);
+  return std::equal(kArtifactMagic.begin(), kArtifactMagic.end(), magic) ||
+         std::equal(kLegacyArtifactMagic.begin(), kLegacyArtifactMagic.end(),
+                    magic);
+}
+
+bool is_supported_schema(std::string_view schema,
+                         std::uint32_t version) noexcept {
+  if (version == kVersionV2) {
+    return schema == kArtifactSchemaV2 || schema == kLegacyArtifactSchemaV2;
+  }
+  if (version == kVersionV1) {
+    return schema == kArtifactSchemaV1 || schema == kLegacyArtifactSchemaV1;
+  }
+  return false;
+}
 
 constexpr bool is_affine_nax_v2_layout(std::string_view layout) noexcept {
   return layout == "oq_nax_lane_g64_v2" || layout == "oq_nax_lane_g128_v2";
@@ -768,10 +783,10 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
     throw std::runtime_error("artifact header is truncated");
   }
   const auto *header = file.data();
-  if (!std::equal(kMagic.begin(), kMagic.end(),
-                  reinterpret_cast<const char *>(header))) {
+  if (!is_supported_magic(header)) {
     throw std::runtime_error("artifact magic mismatch");
   }
+  const std::string detected_magic(reinterpret_cast<const char *>(header), 8);
   const auto version = read_u32(header + 8);
   const auto header_bytes = read_u32(header + 12);
   const auto manifest_offset = read_u64(header + 16);
@@ -822,9 +837,8 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
       std::string_view(manifest_begin, manifest_span.size())) {
     throw std::runtime_error("artifact manifest is not canonical JSON");
   }
-  const std::string_view expected_schema =
-      (version == kVersionV2) ? kSchemaV2 : kSchemaV1;
-  if (manifest.value("schema", "") != expected_schema ||
+  const std::string manifest_schema = manifest.value("schema", "");
+  if (!is_supported_schema(manifest_schema, version) ||
       manifest.value("container_version", 0U) != version ||
       manifest.value("payload_bytes", std::uint64_t{0}) != payload_bytes ||
       !manifest.contains("model") || !manifest.contains("objects") ||
@@ -856,6 +870,8 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
       .source_profile = manifest.at("model").value("source_profile", ""),
       .payload_verified = verify_payload,
       .container_flags = flags,
+      .container_magic = detected_magic,
+      .manifest_schema = manifest_schema,
   };
   if (verify_payload) {
     impl->file.advise_sequential(true);

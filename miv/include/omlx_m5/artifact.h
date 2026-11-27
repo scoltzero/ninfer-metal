@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -10,6 +11,17 @@
 #include <vector>
 
 namespace omlx::m5 {
+
+inline constexpr std::array<char, 8> kArtifactMagic = {
+    'M', 'I', 'V', '0', '0', '0', '0', '1'};
+inline constexpr std::array<char, 8> kLegacyArtifactMagic = {
+    'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
+inline constexpr std::string_view kArtifactSchemaV1 = "miv-artifact-v1";
+inline constexpr std::string_view kArtifactSchemaV2 = "miv-artifact-v2";
+inline constexpr std::string_view kLegacyArtifactSchemaV1 =
+    "omlx-m5-artifact-v1";
+inline constexpr std::string_view kLegacyArtifactSchemaV2 =
+    "omlx-m5-artifact-v2";
 
 inline constexpr std::uint64_t kPayloadAlignment = 16384;
 inline constexpr std::uint64_t kLegacyPayloadAlignment = 4096;
@@ -86,6 +98,8 @@ struct ArtifactSummary {
   std::string source_profile;
   bool payload_verified = false;
   std::uint32_t container_flags = 0;
+  std::string container_magic;
+  std::string manifest_schema;
 };
 
 class ArtifactModel final {

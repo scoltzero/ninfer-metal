@@ -23,7 +23,9 @@ from typing import Any, BinaryIO
 
 import numpy as np
 
-MAGIC = b"OMLXM5A1"
+MAGIC = b"MIV00001"
+LEGACY_MAGIC = b"OMLXM5A1"
+VALID_MAGICS = (MAGIC, LEGACY_MAGIC)
 VERSION = 1
 VERSION_V1 = 1
 VERSION_V2 = 2
@@ -37,10 +39,30 @@ LEGACY_PAYLOAD_ALIGNMENT = 4096
 OBJECT_ALIGNMENT = 256
 PLANE_ALIGNMENT = 256
 HEADER_STRUCT = struct.Struct("<8sIIQQQQIIII")
-SCHEMA = "omlx-m5-artifact-v1"
-SCHEMA_V1 = "omlx-m5-artifact-v1"
-SCHEMA_V2 = "omlx-m5-artifact-v2"
+SCHEMA = "miv-artifact-v1"
+SCHEMA_V1 = "miv-artifact-v1"
+SCHEMA_V2 = "miv-artifact-v2"
+LEGACY_SCHEMA_V1 = "omlx-m5-artifact-v1"
+LEGACY_SCHEMA_V2 = "omlx-m5-artifact-v2"
+VALID_SCHEMAS_V1 = (SCHEMA_V1, LEGACY_SCHEMA_V1)
+VALID_SCHEMAS_V2 = (SCHEMA_V2, LEGACY_SCHEMA_V2)
+CONVERTER_NAME = "miv-artifact"
+LEGACY_CONVERTER_NAME = "omlx-m5-artifact"
 DEFAULT_JOBS = min(32, os.cpu_count() or 8)
+
+
+def _branding_for_write(
+    artifact_version: int, *, legacy_magic: bool = False
+) -> tuple[bytes, str, str]:
+    if legacy_magic:
+        magic = LEGACY_MAGIC
+        schema_id = LEGACY_SCHEMA_V2 if artifact_version == VERSION_V2 else LEGACY_SCHEMA_V1
+        converter_name = LEGACY_CONVERTER_NAME
+    else:
+        magic = MAGIC
+        schema_id = SCHEMA_V2 if artifact_version == VERSION_V2 else SCHEMA_V1
+        converter_name = CONVERTER_NAME
+    return magic, schema_id, converter_name
 
 _E2M1_MAG_LUT = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 _E2M1_LUT = np.array(
@@ -1934,7 +1956,10 @@ def _write_artifact_container(
     *,
     artifact_version: int,
     flags: int,
+    magic: bytes = MAGIC,
 ) -> tuple[str, int, str]:
+    if magic not in VALID_MAGICS:
+        raise ValueError(f"unsupported artifact magic: {magic!r}")
     manifest_bytes = canonical_json(manifest)
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     manifest_crc = crc32(manifest_bytes)
@@ -1942,7 +1967,7 @@ def _write_artifact_container(
     payload_bytes = int(manifest["payload_bytes"])
     object_count = len(manifest["objects"])
     header_prefix = HEADER_STRUCT.pack(
-        MAGIC,
+        magic,
         artifact_version,
         HEADER_BYTES,
         HEADER_BYTES,
@@ -1956,7 +1981,7 @@ def _write_artifact_container(
     )
     header_crc = crc32(header_prefix[:56])
     header = HEADER_STRUCT.pack(
-        MAGIC,
+        magic,
         artifact_version,
         HEADER_BYTES,
         HEADER_BYTES,
@@ -2009,6 +2034,7 @@ def write_artifact(
     fwht64_o_proj: bool = True,
     jobs: int = DEFAULT_JOBS,
     prerotated_modules: set[str] | frozenset[str] | None = None,
+    legacy_magic: bool = False,
 ) -> dict:
     t0 = time.monotonic()
     detected = detect_profile(source) if profile == "auto" else profile
@@ -2197,15 +2223,16 @@ def write_artifact(
             )
         )
 
+        magic, schema_id, converter_name = _branding_for_write(
+            artifact_version, legacy_magic=legacy_magic
+        )
         if artifact_version == VERSION_V2:
             flags, format_features = _compute_v2_flags_and_features(
                 object_records, fwht64_o_proj=fwht64_o_proj
             )
-            schema_id = SCHEMA_V2
         else:
             flags = 0
             format_features = None
-            schema_id = SCHEMA_V1
 
         manifest: dict[str, Any] = {
             "schema": schema_id,
@@ -2226,7 +2253,7 @@ def write_artifact(
                 ),
             },
             "converter": {
-                "name": "omlx-m5-artifact",
+                "name": converter_name,
                 "version": artifact_version,
                 "endianness": "little",
             },
@@ -2245,6 +2272,7 @@ def write_artifact(
             payload_name,
             artifact_version=artifact_version,
             flags=flags,
+            magic=magic,
         )
         elapsed = time.monotonic() - t0
         counts = Counter(record["format"] for record in object_records)
@@ -2526,7 +2554,7 @@ def read_artifact(path: Path, verify_payload: bool = False) -> tuple[dict, dict]
             else ((flags & ~VALID_V2_FLAGS_MASK) == 0)
         )
         if (
-            magic != MAGIC
+            magic not in VALID_MAGICS
             or not valid_version
             or header_bytes != HEADER_BYTES
             or not valid_flags
@@ -2553,9 +2581,9 @@ def read_artifact(path: Path, verify_payload: bool = False) -> tuple[dict, dict]
             raise ValueError(f"artifact manifest JSON is invalid: {exc}") from exc
         if canonical_json(manifest) != manifest_raw:
             raise ValueError("artifact manifest is not canonical JSON")
-        expected_schema = SCHEMA_V2 if version == VERSION_V2 else SCHEMA_V1
+        valid_schemas = VALID_SCHEMAS_V2 if version == VERSION_V2 else VALID_SCHEMAS_V1
         if (
-            manifest.get("schema") != expected_schema
+            manifest.get("schema") not in valid_schemas
             or manifest.get("container_version") != version
             or manifest.get("payload_bytes") != payload_bytes
             or not isinstance(manifest.get("model"), dict)
@@ -2699,6 +2727,7 @@ def read_artifact(path: Path, verify_payload: bool = False) -> tuple[dict, dict]
         if bound_ids != quantized_ids:
             raise ValueError("artifact quantized binding coverage is incomplete")
         summary = {
+            "container_magic": magic.decode("ascii"),
             "schema": manifest["schema"],
             "container_version": version,
             "container_flags": flags,
@@ -3032,6 +3061,7 @@ def pretile_artifact(
     fwht64: bool | None = None,
     fwht64_o_proj: bool = True,
     jobs: int = DEFAULT_JOBS,
+    legacy_magic: bool = False,
 ) -> dict:
     t0 = time.monotonic()
     input_path = input_path.resolve()
@@ -3454,16 +3484,21 @@ def pretile_artifact(
                 rec.pop("input_transform", None)
             new_objects.append(rec)
 
+        magic, schema_id, converter_name = _branding_for_write(
+            target_version, legacy_magic=legacy_magic
+        )
         converter_meta = dict(
             src_manifest.get(
                 "converter",
-                {"name": "omlx-m5-artifact", "version": target_version, "endianness": "little"},
+                {"name": converter_name, "version": target_version, "endianness": "little"},
             )
         )
+        converter_meta["name"] = converter_name
         converter_meta["version"] = target_version
+        converter_meta.setdefault("endianness", "little")
         manifest: dict[str, Any] = {
             **src_manifest,
-            "schema": SCHEMA_V2 if target_version == VERSION_V2 else SCHEMA_V1,
+            "schema": schema_id,
             "container_version": target_version,
             "converter": converter_meta,
             "objects": new_objects,
@@ -3484,6 +3519,7 @@ def pretile_artifact(
             payload_name,
             artifact_version=target_version,
             flags=flags,
+            magic=magic,
         )
     finally:
         os.close(src_fd)
@@ -3562,6 +3598,7 @@ def command_convert(args: argparse.Namespace) -> None:
             fwht64=getattr(args, "fwht64", None),
             fwht64_o_proj=bool(getattr(args, "fwht64_o_proj", True)),
             jobs=int(getattr(args, "jobs", DEFAULT_JOBS)),
+            legacy_magic=bool(getattr(args, "legacy_magic", False)),
         )
         print(
             json.dumps(
@@ -3582,6 +3619,7 @@ def command_pretile(args: argparse.Namespace) -> None:
         fwht64=getattr(args, "fwht64", None),
         fwht64_o_proj=bool(getattr(args, "fwht64_o_proj", True)),
         jobs=int(getattr(args, "jobs", DEFAULT_JOBS)),
+        legacy_magic=bool(getattr(args, "legacy_magic", False)),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 
@@ -3920,6 +3958,7 @@ def quantize_source_with_recipe_to_artifact(
     fwht64: bool | None = None,
     fwht64_o_proj: bool = True,
     jobs: int = DEFAULT_JOBS,
+    legacy_magic: bool = False,
 ) -> dict:
     """Apply #5292 oQe WLS+flip quantization using a QDA recipe and emit .miv (v1 or v2)."""
     eff_fwht64 = resolve_fwht64_enabled(artifact_version, fwht64, "oq_affine")
@@ -4076,6 +4115,7 @@ def quantize_source_with_recipe_to_artifact(
                     fwht64_o_proj=fwht64_o_proj,
                     jobs=jobs,
                     prerotated_modules=prerotated_modules,
+                    legacy_magic=legacy_magic,
                 )
             finally:
                 q_src.close()
@@ -4110,6 +4150,7 @@ def command_qda_search(args: argparse.Namespace) -> None:
             fwht64=getattr(args, "fwht64", None),
             fwht64_o_proj=bool(getattr(args, "fwht64_o_proj", True)),
             jobs=int(getattr(args, "jobs", DEFAULT_JOBS)),
+            legacy_magic=bool(getattr(args, "legacy_magic", False)),
         )
         summary["artifact"] = str(args.output_artifact.resolve())
         summary["artifact_bytes"] = art_rep["artifact_bytes"]
@@ -4184,23 +4225,41 @@ def _format_registry_for_objects(object_records: list[dict]) -> dict[str, dict]:
 
 
 def _write_container_from_payload(
-    output_path: Path, manifest: dict, payload_name: str
+    output_path: Path,
+    manifest: dict,
+    payload_name: str,
+    *,
+    legacy_magic: bool = False,
 ) -> tuple[str, int, str]:
     artifact_version = int(manifest.get("container_version", VERSION_V1))
+    magic, schema_id, converter_name = _branding_for_write(
+        artifact_version, legacy_magic=legacy_magic
+    )
+    conv_meta = dict(
+        manifest.get(
+            "converter",
+            {"name": converter_name, "version": artifact_version, "endianness": "little"},
+        )
+    )
+    conv_meta["name"] = converter_name
+    conv_meta["version"] = artifact_version
+    conv_meta.setdefault("endianness", "little")
     if artifact_version == VERSION_V2:
         flags, format_features = _compute_v2_flags_and_features(manifest["objects"])
         manifest = {
             **manifest,
-            "schema": SCHEMA_V2,
+            "schema": schema_id,
             "container_version": VERSION_V2,
+            "converter": conv_meta,
             "format_features": manifest.get("format_features", format_features),
         }
     else:
         flags = 0
         manifest = {
             **manifest,
-            "schema": SCHEMA_V1,
+            "schema": schema_id,
             "container_version": VERSION_V1,
+            "converter": conv_meta,
         }
         manifest.pop("format_features", None)
     return _write_artifact_container(
@@ -4209,6 +4268,7 @@ def _write_container_from_payload(
         payload_name,
         artifact_version=artifact_version,
         flags=flags,
+        magic=magic,
     )
 
 
@@ -4274,6 +4334,7 @@ def extract_mtp_artifact(
     fwht64: bool | None = None,
     fwht64_o_proj: bool = True,
     jobs: int = DEFAULT_JOBS,
+    legacy_magic: bool = False,
 ) -> dict:
     """Extract only ModelComponent::mtp weights from a checkpoint dir or .miv into a standalone .miv."""
     source_path = source_path.resolve()
@@ -4325,6 +4386,7 @@ def extract_mtp_artifact(
                     fwht64=eff_fwht64,
                     fwht64_o_proj=fwht64_o_proj,
                     jobs=jobs,
+                    legacy_magic=legacy_magic,
                 )
                 rep["artifact"] = pt["artifact"]
                 rep["artifact_version"] = pt["artifact_version"]
@@ -4370,15 +4432,20 @@ def extract_mtp_artifact(
             model_meta = dict(src_manifest.get("model", {}))
             if source_repo:
                 model_meta["source_repo"] = source_repo
+            _, schema_id, converter_name = _branding_for_write(
+                target_ver, legacy_magic=legacy_magic
+            )
             conv_meta = dict(
                 src_manifest.get(
                     "converter",
-                    {"name": "omlx-m5-artifact", "version": target_ver, "endianness": "little"},
+                    {"name": converter_name, "version": target_ver, "endianness": "little"},
                 )
             )
+            conv_meta["name"] = converter_name
             conv_meta["version"] = target_ver
+            conv_meta.setdefault("endianness", "little")
             manifest: dict[str, Any] = {
-                "schema": SCHEMA_V2 if target_ver == VERSION_V2 else SCHEMA_V1,
+                "schema": schema_id,
                 "container_version": target_ver,
                 "model": model_meta,
                 "converter": conv_meta,
@@ -4392,7 +4459,7 @@ def extract_mtp_artifact(
                 _, features = _compute_v2_flags_and_features(objects, fwht64_o_proj=fwht64_o_proj)
                 manifest["format_features"] = features
             art_sha, manifest_crc, manifest_sha = _write_container_from_payload(
-                output_path, manifest, payload_name
+                output_path, manifest, payload_name, legacy_magic=legacy_magic
             )
             counts = Counter(str(r["format"]) for r in objects)
             return {
@@ -4608,8 +4675,11 @@ def extract_mtp_artifact(
                     bindings.append({**recipe.binding, "object_id": oid})
 
             repo_tag = source_repo or source.model_dir.name
+            magic, schema_id, converter_name = _branding_for_write(
+                target_ver, legacy_magic=legacy_magic
+            )
             manifest = {
-                "schema": SCHEMA_V2 if target_ver == VERSION_V2 else SCHEMA_V1,
+                "schema": schema_id,
                 "container_version": target_ver,
                 "model": {
                     "model_type": source.config.get("model_type", ""),
@@ -4631,7 +4701,7 @@ def extract_mtp_artifact(
                     ),
                 },
                 "converter": {
-                    "name": "omlx-m5-artifact",
+                    "name": converter_name,
                     "version": target_ver,
                     "endianness": "little",
                 },
@@ -4654,6 +4724,7 @@ def extract_mtp_artifact(
                 payload_name,
                 artifact_version=target_ver,
                 flags=flags,
+                magic=magic,
             )
             counts = Counter(str(r["format"]) for r in object_records)
             rep = {
@@ -4693,6 +4764,7 @@ def bundle_mtp_artifact(
     output_path: Path,
     *,
     nax_pretile: bool = False,
+    legacy_magic: bool = False,
 ) -> dict:
     """Bundle MTP objects from a checkpoint dir or .miv into an existing base .miv without mutating backbone planes."""
     base_artifact_path = base_artifact_path.resolve()
@@ -4850,10 +4922,23 @@ def bundle_mtp_artifact(
                 os.fsync(dst_payload.fileno())
                 payload_bytes = writer.offset
 
+            _, schema_id, converter_name = _branding_for_write(
+                target_version, legacy_magic=legacy_magic
+            )
+            conv_meta = dict(
+                base_manifest.get(
+                    "converter",
+                    {"name": converter_name, "version": target_version, "endianness": "little"},
+                )
+            )
+            conv_meta["name"] = converter_name
+            conv_meta["version"] = target_version
+            conv_meta.setdefault("endianness", "little")
             manifest = {
                 **base_manifest,
-                "schema": SCHEMA_V2 if target_version == VERSION_V2 else SCHEMA_V1,
+                "schema": schema_id,
                 "container_version": target_version,
+                "converter": conv_meta,
                 "format_registry": _format_registry_for_objects(merged_objects),
                 "objects": merged_objects,
                 "views": [],
@@ -4866,7 +4951,7 @@ def bundle_mtp_artifact(
             else:
                 manifest.pop("format_features", None)
             art_sha, manifest_crc, manifest_sha = _write_container_from_payload(
-                output_path, manifest, payload_name
+                output_path, manifest, payload_name, legacy_magic=legacy_magic
             )
             return {
                 "schema": "omlx-m5-mtp-bundle-report-v1",
@@ -4900,6 +4985,7 @@ def command_extract_mtp(args: argparse.Namespace) -> None:
         fwht64=getattr(args, "fwht64", None),
         fwht64_o_proj=bool(getattr(args, "fwht64_o_proj", True)),
         jobs=int(getattr(args, "jobs", DEFAULT_JOBS)),
+        legacy_magic=bool(getattr(args, "legacy_magic", False)),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
@@ -4910,6 +4996,7 @@ def command_bundle_mtp(args: argparse.Namespace) -> None:
         args.mtp,
         args.output,
         nax_pretile=args.nax_pretile,
+        legacy_magic=bool(getattr(args, "legacy_magic", False)),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
@@ -4943,6 +5030,11 @@ def _add_v2_artifact_args(
         type=int,
         default=DEFAULT_JOBS,
         help=f"parallel worker count for quantization/pre-tiling (default: {DEFAULT_JOBS})",
+    )
+    subparser.add_argument(
+        "--legacy-magic",
+        action="store_true",
+        help="emit legacy OMLXM5A1 magic, omlx-m5-artifact-v{1,2} schema, and omlx-m5-artifact converter name for backward-compat regression tests",
     )
 
 
@@ -5010,6 +5102,11 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_mtp.add_argument("--mtp", type=Path, required=True)
     bundle_mtp.add_argument("--output", type=Path, required=True)
     bundle_mtp.add_argument("--nax-pretile", action="store_true")
+    bundle_mtp.add_argument(
+        "--legacy-magic",
+        action="store_true",
+        help="emit legacy OMLXM5A1 magic, omlx-m5-artifact-v{1,2} schema, and omlx-m5-artifact converter name for backward-compat regression tests",
+    )
     bundle_mtp.set_defaults(func=command_bundle_mtp)
     qda = subparsers.add_parser(
         "qda-search",

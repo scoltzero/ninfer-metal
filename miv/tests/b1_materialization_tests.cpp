@@ -147,76 +147,93 @@ void test_16kib_mmap_direct_materialization() {
   }
   const auto sha = omlx::m5::artifact_sha256_hex(payload);
   const auto crc = hex_crc32(omlx::m5::artifact_crc32(payload));
-  std::ostringstream json;
-  json << "{\"bindings\":[],\"container_version\":1,"
-       << "\"model\":{\"source_profile\":\"dflash2_bf16\","
-       << "\"source_repo\":\"test/b1\",\"source_revision\":\"r1\"},"
-       << "\"objects\":[{\"format\":\"direct_bf16_v1\",\"id\":0,"
-       << "\"layout\":\"contiguous_le_v1\","
-       << "\"name\":\"language_model.model.norm.weight\","
-       << "\"object_bytes\":512,\"object_offset\":0,"
-       << "\"object_sha256\":\"" << sha << "\","
-       << "\"planes\":[{\"alignment\":256,\"bytes\":512,\"crc32\":\"" << crc
-       << "\",\"kind\":\"data\",\"offset\":0,\"sha256\":\"" << sha << "\"}],"
-       << "\"shape\":[256],\"source_tensors\":[\"norm.weight\"]}],"
-       << "\"payload_bytes\":512,\"schema\":\"omlx-m5-artifact-v1\","
-       << "\"views\":[]}";
-  const auto manifest_str = json.str();
-  const auto manifest_span =
-      std::as_bytes(std::span(manifest_str.data(), manifest_str.size()));
   const std::uint64_t payload_offset = omlx::m5::kPayloadAlignment;
 
-  std::vector<std::byte> file;
-  constexpr char magic[8] = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-  for (char c : magic) {
-    file.push_back(static_cast<std::byte>(c));
-  }
-  append_u32(file, 1U);
-  append_u32(file, 64U);
-  append_u64(file, 64ULL);
-  append_u64(file, manifest_span.size());
-  append_u64(file, payload_offset);
-  append_u64(file, payload.size());
-  append_u32(file, 1U);
-  append_u32(file, omlx::m5::artifact_crc32(manifest_span));
-  append_u32(
-      file, omlx::m5::artifact_crc32(std::span<const std::byte>(file.data(), 56)));
-  append_u32(file, 0U);
-  file.insert(file.end(), manifest_span.begin(), manifest_span.end());
-  file.resize(static_cast<std::size_t>(payload_offset), std::byte{0});
-  file.insert(file.end(), payload.begin(), payload.end());
-
-  const auto artifact_path = tmp_dir / "direct_16k.omlxm5";
-  {
-    std::ofstream out(artifact_path, std::ios::binary);
-    out.write(reinterpret_cast<const char *>(file.data()),
-              static_cast<std::streamsize>(file.size()));
-  }
+  struct BrandingCase {
+    std::array<char, 8> magic;
+    std::string_view schema;
+    const char *filename;
+  };
+  const std::array<BrandingCase, 2> cases = {{
+      {omlx::m5::kArtifactMagic, omlx::m5::kArtifactSchemaV1, "direct_16k.miv"},
+      {omlx::m5::kLegacyArtifactMagic, omlx::m5::kLegacyArtifactSchemaV1,
+       "direct_16k_legacy.omlxm5"},
+  }};
 
   auto context = omlx::m5::MetalContext::create();
-  const auto before = context.registry_stats();
-  {
-    auto artifact = omlx::m5::ArtifactModel::open(artifact_path, false);
-    expect(artifact.summary().payload_offset == 16384,
-           "16 KiB payload alignment missing");
-    const auto &obj = artifact.object(0U);
-    const auto mmap_ptr = reinterpret_cast<std::uintptr_t>(
-        artifact.plane_bytes(obj, artifact.plane(obj, "data")).data());
-    expect(mmap_ptr % 16384 == 0,
-           "mapped payload start is not 16 KiB page-aligned");
-    artifact.verify_payload();
-    auto plan = omlx::m5::plan_model_materialization(artifact, context);
-    auto materialized =
-        omlx::m5::materialize_model(artifact, std::move(plan), context);
-    const auto mid = context.registry_stats();
-    expect(mid.current_buffer_count == before.current_buffer_count + 1 &&
-               mid.upload_count == before.upload_count + 1 &&
-               mid.uploaded_bytes == before.uploaded_bytes + 512,
-           "direct mmap materialization created unexpected buffers/uploads");
-    const auto view =
-        materialized.parent_view("language_model.model.norm.weight");
-    expect(view.planes.front().buffer->read(0, 512) == payload,
-           "materialized GPU segment bytes differ from mmap payload");
+  for (const auto &item : cases) {
+    std::ostringstream json;
+    json << "{\"bindings\":[],\"container_version\":1,"
+         << "\"model\":{\"source_profile\":\"dflash2_bf16\","
+         << "\"source_repo\":\"test/b1\",\"source_revision\":\"r1\"},"
+         << "\"objects\":[{\"format\":\"direct_bf16_v1\",\"id\":0,"
+         << "\"layout\":\"contiguous_le_v1\","
+         << "\"name\":\"language_model.model.norm.weight\","
+         << "\"object_bytes\":512,\"object_offset\":0,"
+         << "\"object_sha256\":\"" << sha << "\","
+         << "\"planes\":[{\"alignment\":256,\"bytes\":512,\"crc32\":\"" << crc
+         << "\",\"kind\":\"data\",\"offset\":0,\"sha256\":\"" << sha << "\"}],"
+         << "\"shape\":[256],\"source_tensors\":[\"norm.weight\"]}],"
+         << "\"payload_bytes\":512,\"schema\":\"" << item.schema
+         << "\",\"views\":[]}";
+    const auto manifest_str = json.str();
+    const auto manifest_span =
+        std::as_bytes(std::span(manifest_str.data(), manifest_str.size()));
+
+    std::vector<std::byte> file;
+    for (char c : item.magic) {
+      file.push_back(static_cast<std::byte>(c));
+    }
+    append_u32(file, 1U);
+    append_u32(file, 64U);
+    append_u64(file, 64ULL);
+    append_u64(file, manifest_span.size());
+    append_u64(file, payload_offset);
+    append_u64(file, payload.size());
+    append_u32(file, 1U);
+    append_u32(file, omlx::m5::artifact_crc32(manifest_span));
+    append_u32(file, omlx::m5::artifact_crc32(
+                         std::span<const std::byte>(file.data(), 56)));
+    append_u32(file, 0U);
+    file.insert(file.end(), manifest_span.begin(), manifest_span.end());
+    file.resize(static_cast<std::size_t>(payload_offset), std::byte{0});
+    file.insert(file.end(), payload.begin(), payload.end());
+
+    const auto artifact_path = tmp_dir / item.filename;
+    {
+      std::ofstream out(artifact_path, std::ios::binary);
+      out.write(reinterpret_cast<const char *>(file.data()),
+                static_cast<std::streamsize>(file.size()));
+    }
+
+    const auto before = context.registry_stats();
+    {
+      auto artifact = omlx::m5::ArtifactModel::open(artifact_path, false);
+      expect(artifact.summary().container_magic ==
+                     std::string(item.magic.data(), item.magic.size()) &&
+                 artifact.summary().manifest_schema == item.schema,
+             "artifact summary magic/schema mismatch");
+      expect(artifact.summary().payload_offset == 16384,
+             "16 KiB payload alignment missing");
+      const auto &obj = artifact.object(0U);
+      const auto mmap_ptr = reinterpret_cast<std::uintptr_t>(
+          artifact.plane_bytes(obj, artifact.plane(obj, "data")).data());
+      expect(mmap_ptr % 16384 == 0,
+             "mapped payload start is not 16 KiB page-aligned");
+      artifact.verify_payload();
+      auto plan = omlx::m5::plan_model_materialization(artifact, context);
+      auto materialized =
+          omlx::m5::materialize_model(artifact, std::move(plan), context);
+      const auto mid = context.registry_stats();
+      expect(mid.current_buffer_count == before.current_buffer_count + 1 &&
+                 mid.upload_count == before.upload_count + 1 &&
+                 mid.uploaded_bytes == before.uploaded_bytes + 512,
+             "direct mmap materialization created unexpected buffers/uploads");
+      const auto view =
+          materialized.parent_view("language_model.model.norm.weight");
+      expect(view.planes.front().buffer->read(0, 512) == payload,
+             "materialized GPU segment bytes differ from mmap payload");
+    }
   }
 }
 
