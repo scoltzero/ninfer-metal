@@ -786,6 +786,11 @@ public:
 
     std::optional<ArtifactModel> artifact(
         ArtifactModel::open(artifact_path, false));
+    reconcile_qwen_config_with_artifact(config, *artifact);
+    if (std::string cfg_reason;
+        !QwenForward::supports_config(config, &cfg_reason)) {
+      throw std::invalid_argument("Unsupported model config: " + cfg_reason);
+    }
     const bool speculative =
         options.speculative.backend == SpeculativeBackend::dflash2;
     const auto ext_mtp_path = resolve_external_mtp_artifact_path(options);
@@ -873,7 +878,12 @@ public:
     slot_route_override = diagnostic_route;
     slot_moe_override = moe_route;
     slot_libraries = libraries;
-    const KvStorageFormat kv_format = parse_kv_storage_format(options.kv_dtype);
+    KvStorageFormat kv_format = parse_kv_storage_format(options.kv_dtype);
+    if (kv_format == KvStorageFormat::Affine4Group128 &&
+        config.head_dim != 64 && config.head_dim != 128 &&
+        config.head_dim != 256) {
+      kv_format = KvStorageFormat::BFloat16;
+    }
     slot_kv_dtype = std::string(kv_storage_format_name(kv_format));
 
     const bool affine4_kv = (kv_format == KvStorageFormat::Affine4Group128);

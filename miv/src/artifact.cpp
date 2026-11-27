@@ -966,6 +966,8 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
     impl->file.advise_sequential(false);
   }
   std::unordered_set<std::uint32_t> bound_ids;
+  std::unordered_set<std::uint32_t> primary_bound_ids;
+  std::unordered_set<std::string> binding_names;
   for (const auto &record : manifest.at("bindings")) {
     ArtifactBinding binding{
         .name = record.at("name").get<std::string>(),
@@ -978,15 +980,27 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
         .out_features = record.at("out_features").get<std::uint64_t>(),
         .in_features = record.at("in_features").get<std::uint64_t>(),
     };
-    if (binding.object_id >= impl->objects.size() ||
-        !bound_ids.emplace(binding.object_id).second || binding.use.empty() ||
-        binding.name != impl->objects[binding.object_id].name ||
+    if (binding.object_id >= impl->objects.size() || binding.use.empty() ||
+        !binding_names.emplace(binding.name).second ||
         binding.format != impl->objects[binding.object_id].format ||
         (binding.activation_policy != "A16Only" &&
          binding.activation_policy != "AllowA4")) {
       throw std::runtime_error("artifact binding is invalid");
     }
     const auto &object = impl->objects[binding.object_id];
+    const bool is_primary = (binding.name == object.name);
+    const bool is_lm_head_alias =
+        !is_primary && binding.use == "lm_head" &&
+        (binding.name == "lm_head" || binding.name == "lm_head.weight" ||
+         binding.name.ends_with(".lm_head") ||
+         binding.name.ends_with(".lm_head.weight"));
+    if (!is_primary && !is_lm_head_alias) {
+      throw std::runtime_error("artifact binding is invalid");
+    }
+    if (is_primary && !primary_bound_ids.emplace(binding.object_id).second) {
+      throw std::runtime_error("artifact binding is invalid");
+    }
+    bound_ids.insert(binding.object_id);
     if (object.shape.size() < 2) {
       throw std::runtime_error("artifact binding rank is invalid");
     }
@@ -1004,7 +1018,7 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
   }
   for (const auto &object : impl->objects) {
     const bool quantized = !object.format.starts_with("direct_");
-    if (quantized != bound_ids.contains(object.id)) {
+    if (quantized && !bound_ids.contains(object.id)) {
       throw std::runtime_error(
           "artifact quantized binding coverage is invalid");
     }

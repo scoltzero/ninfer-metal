@@ -1115,18 +1115,29 @@ static inline void paged_flash_prefill_sage2_apple9_fallback(
     const float rcp = (l_val > 0.0f) ? ((UseMxfp8PV ? kInvFp8E4M3Max : 1.0f) / l_val) : 0.0f;
     const uint qh_o = kvh * repeat + g_sub;
     const uint d_off = dp * 64u + h_me * 32u;
-    device const bfloat4 *gp = reinterpret_cast<device const bfloat4 *>(
-        gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_off);
     device bfloat4 *op = reinterpret_cast<device bfloat4 *>(
         output + (ulong(tok) * sp.base.query_heads + qh_o) * BD + d_off);
-    op[0] = bfloat4((o0 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[0]))));
-    op[1] = bfloat4((o1 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[1]))));
-    op[2] = bfloat4((o2 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[2]))));
-    op[3] = bfloat4((o3 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[3]))));
-    op[4] = bfloat4((o4 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[4]))));
-    op[5] = bfloat4((o5 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[5]))));
-    op[6] = bfloat4((o6 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[6]))));
-    op[7] = bfloat4((o7 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[7]))));
+    if (sp.base.gate_head_stride != 0u) {
+      device const bfloat4 *gp = reinterpret_cast<device const bfloat4 *>(
+          gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_off);
+      op[0] = bfloat4((o0 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[0]))));
+      op[1] = bfloat4((o1 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[1]))));
+      op[2] = bfloat4((o2 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[2]))));
+      op[3] = bfloat4((o3 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[3]))));
+      op[4] = bfloat4((o4 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[4]))));
+      op[5] = bfloat4((o5 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[5]))));
+      op[6] = bfloat4((o6 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[6]))));
+      op[7] = bfloat4((o7 * rcp) / (float4(1.0f) + fast::exp(-float4(gp[7]))));
+    } else {
+      op[0] = bfloat4(o0 * rcp);
+      op[1] = bfloat4(o1 * rcp);
+      op[2] = bfloat4(o2 * rcp);
+      op[3] = bfloat4(o3 * rcp);
+      op[4] = bfloat4(o4 * rcp);
+      op[5] = bfloat4(o5 * rcp);
+      op[6] = bfloat4(o6 * rcp);
+      op[7] = bfloat4(o7 * rcp);
+    }
   }
 }
 
@@ -1519,12 +1530,19 @@ static inline void paged_flash_prefill_sage2_hd256_impl(
         if (decode_m_row<kFlattened>(tm + uint(sm), q_m_base, q_base, total_m_rows, repeat, tok, g_sub)) {
           const float rcp = tg_mem.fac[tm + uint(sm)];
           const uint qh_o = kvh_e * repeat + g_sub;
-          device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
           device bfloat *op = output + (ulong(tok) * sp.base.query_heads + qh_o) * BD + d_offset + uint(sn);
-          *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[0],O0[1],O0[2],O0[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[0],O1[1],O1[2],O1[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[0],O2[1],O2[2],O2[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[0],O3[1],O3[2],O3[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          if (sp.base.gate_head_stride != 0u) {
+            device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[0],O0[1],O0[2],O0[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[0],O1[1],O1[2],O1[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[0],O2[1],O2[2],O2[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[0],O3[1],O3[2],O3[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          } else {
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4(float4(O0[0],O0[1],O0[2],O0[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4(float4(O1[0],O1[1],O1[2],O1[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4(float4(O2[0],O2[1],O2[2],O2[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4(float4(O3[0],O3[1],O3[2],O3[3]) * rcp);
+          }
         }
       }
       {
@@ -1532,12 +1550,19 @@ static inline void paged_flash_prefill_sage2_hd256_impl(
         if (decode_m_row<kFlattened>(tm + 8u + uint(sm), q_m_base, q_base, total_m_rows, repeat, tok, g_sub)) {
           const float rcp = tg_mem.fac[tm + 8u + uint(sm)];
           const uint qh_o = kvh_e * repeat + g_sub;
-          device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
           device bfloat *op = output + (ulong(tok) * sp.base.query_heads + qh_o) * BD + d_offset + uint(sn);
-          *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[4],O0[5],O0[6],O0[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[4],O1[5],O1[6],O1[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[4],O2[5],O2[6],O2[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[4],O3[5],O3[6],O3[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          if (sp.base.gate_head_stride != 0u) {
+            device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[4],O0[5],O0[6],O0[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[4],O1[5],O1[6],O1[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[4],O2[5],O2[6],O2[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[4],O3[5],O3[6],O3[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          } else {
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4(float4(O0[4],O0[5],O0[6],O0[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4(float4(O1[4],O1[5],O1[6],O1[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4(float4(O2[4],O2[5],O2[6],O2[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4(float4(O3[4],O3[5],O3[6],O3[7]) * rcp);
+          }
         }
       }
     }
@@ -1844,12 +1869,19 @@ static inline void paged_flash_prefill_sage2_hd256_impl(
         if (decode_m_row<kFlattened>(tm + uint(sm), q_m_base, q_base, total_m_rows, repeat, tok, g_sub)) {
           const float rcp = tg_mem.fac[tm + uint(sm)];
           const uint qh_o = kvh_e * repeat + g_sub;
-          device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
           device bfloat *op = output + (ulong(tok) * sp.base.query_heads + qh_o) * BD + d_offset + uint(sn);
-          *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[0],O0[1],O0[2],O0[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[0],O1[1],O1[2],O1[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[0],O2[1],O2[2],O2[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[0],O3[1],O3[2],O3[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          if (sp.base.gate_head_stride != 0u) {
+            device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[0],O0[1],O0[2],O0[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[0],O1[1],O1[2],O1[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[0],O2[1],O2[2],O2[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[0],O3[1],O3[2],O3[3]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          } else {
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4(float4(O0[0],O0[1],O0[2],O0[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4(float4(O1[0],O1[1],O1[2],O1[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4(float4(O2[0],O2[1],O2[2],O2[3]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4(float4(O3[0],O3[1],O3[2],O3[3]) * rcp);
+          }
         }
       }
       {
@@ -1857,12 +1889,19 @@ static inline void paged_flash_prefill_sage2_hd256_impl(
         if (decode_m_row<kFlattened>(tm + 8u + uint(sm), q_m_base, q_base, total_m_rows, repeat, tok, g_sub)) {
           const float rcp = tg_mem.fac[tm + 8u + uint(sm)];
           const uint qh_o = kvh_e * repeat + g_sub;
-          device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
           device bfloat *op = output + (ulong(tok) * sp.base.query_heads + qh_o) * BD + d_offset + uint(sn);
-          *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[4],O0[5],O0[6],O0[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[4],O1[5],O1[6],O1[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[4],O2[5],O2[6],O2[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
-          *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[4],O3[5],O3[6],O3[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          if (sp.base.gate_head_stride != 0u) {
+            device const bfloat *gp = gate + ulong(tok) * sp.base.gate_token_stride + ulong(qh_o) * sp.base.gate_head_stride + d_offset + uint(sn);
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4((float4(O0[4],O0[5],O0[6],O0[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp +  0u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4((float4(O1[4],O1[5],O1[6],O1[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 16u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4((float4(O2[4],O2[5],O2[6],O2[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 32u)))));
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4((float4(O3[4],O3[5],O3[6],O3[7]) * rcp) / (float4(1.0f) + fast::exp(-float4(*reinterpret_cast<device const bfloat4 *>(gp + 48u)))));
+          } else {
+            *reinterpret_cast<device bfloat4 *>(op +  0u) = bfloat4(float4(O0[4],O0[5],O0[6],O0[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 16u) = bfloat4(float4(O1[4],O1[5],O1[6],O1[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 32u) = bfloat4(float4(O2[4],O2[5],O2[6],O2[7]) * rcp);
+            *reinterpret_cast<device bfloat4 *>(op + 48u) = bfloat4(float4(O3[4],O3[5],O3[6],O3[7]) * rcp);
+          }
         }
       }
     }

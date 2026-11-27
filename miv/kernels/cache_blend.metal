@@ -380,7 +380,7 @@ kernel void omlx_m5_blend_extract_kv_prerope_affine4_g128(
   // strided reduction order, NO RoPE!) then quantize g0 & g1.
   float4 k_g0_f32 = float4(*reinterpret_cast<device const bfloat4 *>(k_src + lane * 4u));
   float4 k_g1 = float4(*reinterpret_cast<device const bfloat4 *>(k_src + 128u + lane * 4u));
-  if (params.apply_k_norm != 0u) {
+  if (params.apply_k_norm != 0u && params.epsilon >= 0.0f) {
     float square_sum = 0.0f;
     for (uint column = lane; column < 256u; column += 32u) {
       const float val = float(k_src[column]);
@@ -1757,14 +1757,18 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128(
                      ulong(head) * params.key_head_stride;
   device const bfloat *norm = is_query ? query_norm : key_norm;
 
-  float square_sum = 0.0f;
-  for (uint column = lane; column < params.head_dim; column += 32u) {
-    const float val = float(row[column]);
-    square_sum = fma(val, val, square_sum);
+  const bool has_qk_norm = (params.epsilon >= 0.0f);
+  float inverse_rms = 1.0f;
+  if (has_qk_norm) {
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.head_dim; column += 32u) {
+      const float val = float(row[column]);
+      square_sum = fma(val, val, square_sum);
+    }
+    inverse_rms = precise::rsqrt(
+        precise::divide(simd_sum(square_sum), float(params.head_dim)) +
+        params.epsilon);
   }
-  const float inverse_rms = precise::rsqrt(
-      precise::divide(simd_sum(square_sum), float(params.head_dim)) +
-      params.epsilon);
 
   const uint half_rotary = params.rotary_dim / 2u;
   const uint logical_pos = active_pos[token];
@@ -1773,10 +1777,14 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128(
   for (uint pair = lane; pair < half_rotary; pair += 32u) {
     const uint first_index = pair;
     const uint second_index = pair + half_rotary;
-    const float first = float(row[first_index]) * inverse_rms *
-                        (float(norm[first_index]) + params.weight_offset);
-    const float second = float(row[second_index]) * inverse_rms *
-                         (float(norm[second_index]) + params.weight_offset);
+    const float first =
+        has_qk_norm ? (float(row[first_index]) * inverse_rms *
+                       (float(norm[first_index]) + params.weight_offset))
+                    : float(row[first_index]);
+    const float second =
+        has_qk_norm ? (float(row[second_index]) * inverse_rms *
+                       (float(norm[second_index]) + params.weight_offset))
+                    : float(row[second_index]);
     const float exponent =
         precise::divide(float(2u * pair), float(params.rotary_dim));
     const float angle =
@@ -1794,8 +1802,10 @@ kernel void omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128(
   }
   for (uint column = params.rotary_dim + lane; column < params.head_dim;
        column += 32u) {
-    const bfloat normed = bfloat(float(row[column]) * inverse_rms *
-                                 (float(norm[column]) + params.weight_offset));
+    const bfloat normed =
+        has_qk_norm ? bfloat(float(row[column]) * inverse_rms *
+                             (float(norm[column]) + params.weight_offset))
+                    : row[column];
     row[column] = normed;
     if (!is_query) {
       tg_vec[column] = normed;

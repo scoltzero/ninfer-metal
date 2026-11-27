@@ -567,7 +567,7 @@ void test_bundled_companions_and_q3_pretiled() {
            "dispatch table empty for Q3 NAX pre-tiled artifact");
   }
 
-  // 3. MIVE-8: MXFP4 + Q3 mixed inside text component must be rejected.
+  // 3. Per-tensor mixed precision: MXFP4 + low-bit oQ mixed inside text component succeeds.
   {
     auto specs = make_text_layer0_specs(
         "mxfp4_e2m1_g32_e8m0_v1", "mx_nax_tiled_bk128_v1", "AllowA4");
@@ -582,12 +582,13 @@ void test_bundled_companions_and_q3_pretiled() {
     write_synthetic_artifact(path, "mlx_mxfp4", specs);
     auto artifact = ArtifactModel::open(path, true);
     auto catalog = build_qwen_layer_catalog(artifact, cfg, 1024, 64);
-    expect_throws(
-        [&] {
-          static_cast<void>(
-              describe_qwen_topology(artifact, cfg, catalog, 1024, 64));
-        },
-        "MXFP4 + Q3 text artifact was not rejected");
+    auto desc = describe_qwen_topology(artifact, cfg, catalog, 1024, 64);
+    expect(desc.quant_profile == QwenQuantProfile::mxfp4,
+           "MXFP4 majority mixed topology did not classify as mxfp4");
+    auto profiles = compile_topology_profiles(desc);
+    auto table = build_qwen_program_dispatch_table(artifact, catalog, profiles);
+    expect(table.stats().candidate_count > 0,
+           "dispatch table empty for mixed MXFP4 + Q3 text artifact");
   }
 
   std::filesystem::remove_all(dir);

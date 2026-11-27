@@ -9,6 +9,8 @@
 
 namespace omlx::m5 {
 
+class ArtifactModel;
+
 enum class LayerType {
   linear_attention,
   full_attention,
@@ -45,6 +47,11 @@ struct QwenModelConfig {
   double rope_theta = 10000.0;
   double partial_rotary_factor = 1.0;
   bool rope_interleaved = true;
+  bool has_attn_output_gate = true;
+  bool has_attn_output_gate_explicit = false;
+  bool has_qk_norm = true;
+  bool has_shared_expert_gate = true;
+  bool tie_word_embeddings = false;
   std::vector<LayerType> layer_types;
   QuantizationSpec default_quantization;
   std::unordered_map<std::string, QuantizationSpec> quantization_overrides;
@@ -57,6 +64,8 @@ struct QwenModelConfig {
 
 [[nodiscard]] QwenModelConfig
 load_qwen_model_config(const std::filesystem::path &config_path);
+void reconcile_qwen_config_with_artifact(QwenModelConfig &config,
+                                         const ArtifactModel &artifact);
 void validate_qwen38_27b_target(const QwenModelConfig &config);
 
 } // namespace omlx::m5

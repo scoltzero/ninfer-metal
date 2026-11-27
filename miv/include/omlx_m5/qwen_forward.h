@@ -318,6 +318,9 @@ private:
 // object.
 class QwenForward final {
 public:
+  [[nodiscard]] static bool supports_config(const QwenModelConfig &config,
+                                            std::string *reason = nullptr);
+
   QwenForward(const MetalContext &, const MaterializedModel &,
               const QwenLayerCatalog &, QwenModelConfig,
               std::uint32_t max_context,

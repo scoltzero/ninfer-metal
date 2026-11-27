@@ -6,6 +6,12 @@ struct ForwardRowParams {
   uint rows;
   uint width;
 };
+struct ForwardRouterParams {
+  uint rows;
+  uint num_experts;
+  uint top_k;
+  uint norm_topk_prob;
+};
 struct ForwardLinearParams {
   uint n;
   uint k;
@@ -167,6 +173,164 @@ kernel void omlx_m5_forward_router_top8_logits(
   }
 }
 
+kernel void omlx_m5_forward_router_topk_logits(
+    device const bfloat *logits [[buffer(0)]],
+    device uint *indices [[buffer(1)]],
+    device bfloat *scores [[buffer(2)]],
+    constant ForwardRouterParams &p [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+  const uint row = group.y;
+  if (row >= p.rows || p.num_experts == 0u || p.num_experts > 256u ||
+      p.top_k == 0u || p.top_k > 8u)
+    return;
+  const uint top_k = min(p.top_k, p.num_experts);
+  device const ushort *row_raw =
+      reinterpret_cast<device const ushort *>(logits + ulong(row) * p.num_experts);
+  ushort raw[8];
+  bool avail[8];
+  bool local_nan = false;
+#pragma clang loop unroll(full)
+  for (uint i = 0; i < 8u; ++i) {
+    const uint idx = lane * 8u + i;
+    if (idx < p.num_experts) {
+      raw[i] = row_raw[idx];
+      avail[i] = true;
+      local_nan |= ((raw[i] & 0x7FFFu) > 0x7F80u);
+    } else {
+      raw[i] = 0u;
+      avail[i] = false;
+    }
+  }
+  float selected[8];
+  uint ids[8];
+  for (uint k = 0; k < 8u; ++k) {
+    selected[k] = -INFINITY;
+    ids[k] = 0u;
+  }
+  if (!simd_any(local_nan)) {
+    uint packed[8];
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < 8u; ++i) {
+      if (avail[i]) {
+        const uint bf = ((raw[i] & 0x7FFFu) == 0u) ? 0u : uint(raw[i]);
+        const uint key16 =
+            (bf & 0x8000u) ? ((~bf) & 0xFFFFu) : (bf | 0x8000u);
+        packed[i] = (key16 << 16u) | 0x0100u | (lane * 8u + i);
+      } else {
+        packed[i] = 0u;
+      }
+    }
+    for (uint k = 0; k < top_k; ++k) {
+      const uint best_p =
+          max(max(max(packed[0], packed[1]), max(packed[2], packed[3])),
+              max(max(packed[4], packed[5]), max(packed[6], packed[7])));
+      const uint win_p = simd_max(best_p);
+      if ((win_p & 0x0100u) == 0u) {
+        selected[k] = -INFINITY;
+        ids[k] = 0u;
+        continue;
+      }
+      const uint winner = win_p & 0xFFu;
+      const uint win_key16 = win_p >> 16u;
+      const uint orig_bf = (win_key16 & 0x8000u) ? (win_key16 & 0x7FFFu)
+                                                 : ((~win_key16) & 0xFFFFu);
+      selected[k] = as_type<float>(orig_bf << 16u);
+      ids[k] = winner;
+      if ((winner >> 3u) == lane) {
+        packed[winner & 7u] = 0u;
+      }
+    }
+  } else {
+    float values[8];
+    bool taken[8];
+    for (uint i = 0; i < 8u; ++i) {
+      values[i] = avail[i] ? as_type<float>(uint(raw[i]) << 16u) : -INFINITY;
+      taken[i] = !avail[i];
+    }
+    for (uint k = 0; k < top_k; ++k) {
+      int tier = -1;
+      float best = -INFINITY;
+      uint best_local = 0;
+      for (uint i = 0; i < 8u; ++i) {
+        if (taken[i])
+          continue;
+        const int candidate_tier = isnan(values[i]) ? 0 : 1;
+        const float candidate_val = candidate_tier == 1 ? values[i] : -INFINITY;
+        if (candidate_tier > tier ||
+            (candidate_tier == tier && candidate_val >= best)) {
+          tier = candidate_tier;
+          best = candidate_val;
+          best_local = i;
+        }
+      }
+      const int global_tier = simd_max(tier);
+      if (global_tier < 0) {
+        selected[k] = -INFINITY;
+        ids[k] = 0u;
+        continue;
+      }
+      const bool in_tier = (tier == global_tier);
+      const float maximum = simd_max(in_tier ? best : -INFINITY);
+      const bool is_best = in_tier && (best == maximum);
+      const uint id = lane * 8u + best_local;
+      const uint winner = simd_max(is_best ? id : 0u);
+      if (is_best && id == winner)
+        taken[best_local] = true;
+      selected[k] = global_tier == 1 ? maximum : -INFINITY;
+      ids[k] = winner;
+    }
+  }
+
+  float full_denom = 0.0f;
+  if (p.norm_topk_prob == 0u) {
+    const float max_l = simd_broadcast_first(selected[0]);
+    float local_sum = 0.0f;
+    for (uint i = 0; i < 8u; ++i) {
+      if (!avail[i])
+        continue;
+      const float v = as_type<float>(uint(raw[i]) << 16u);
+      if (max_l == -INFINITY || isnan(max_l) || isnan(v)) {
+        continue;
+      } else if (max_l == INFINITY) {
+        local_sum += (v == INFINITY) ? 1.0f : 0.0f;
+      } else if (v > -INFINITY) {
+        local_sum += exp(v - max_l);
+      }
+    }
+    full_denom = simd_sum(local_sum);
+  }
+
+  if (lane == 0u) {
+    float sum = 0.0f;
+    float probabilities[8];
+    const float max_logit = selected[0];
+    for (uint k = 0; k < top_k; ++k) {
+      if (max_logit == -INFINITY || isnan(max_logit) || isnan(selected[k])) {
+        probabilities[k] = 0.0f;
+      } else if (max_logit == INFINITY) {
+        probabilities[k] = selected[k] == INFINITY ? 1.0f : 0.0f;
+      } else {
+        probabilities[k] =
+            selected[k] == -INFINITY ? 0.0f : exp(selected[k] - max_logit);
+      }
+      sum += probabilities[k];
+    }
+    const float denom = (p.norm_topk_prob != 0u) ? sum : full_denom;
+    for (uint k = 0; k < p.top_k; ++k) {
+      if (k < top_k) {
+        indices[ulong(row) * p.top_k + k] = ids[k];
+        scores[ulong(row) * p.top_k + k] =
+            denom > 0.0f && isfinite(denom) ? bfloat(probabilities[k] / denom)
+                                            : bfloat(0.0f);
+      } else {
+        indices[ulong(row) * p.top_k + k] = 0u;
+        scores[ulong(row) * p.top_k + k] = bfloat(0.0f);
+      }
+    }
+  }
+}
+
 kernel void omlx_m5_forward_capture(device const bfloat *hidden [[buffer(0)]],
                                     device bfloat *features [[buffer(1)]],
                                     constant FeatureParams &p [[buffer(2)]],
@@ -278,6 +442,28 @@ omlx_m5_forward_bf16_linear(device const bfloat *x [[buffer(0)]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint3 group [[threadgroup_position_in_grid]]) {
+  uint row = group.x * 4 + sg;
+  uint token = group.y;
+  if (row >= p.n || token >= p.tokens)
+    return;
+  const ulong w_stride = ulong(p.padded_k ? p.padded_k : p.k);
+  float sum = 0.0f;
+  for (uint k = lane; k < p.k; k += 32)
+    sum = fma(float(x[ulong(token) * p.k + k]),
+              float(w[ulong(row) * w_stride + k]), sum);
+  sum = simd_sum(sum);
+  if (lane == 0)
+    y[ulong(token) * p.n + row] = bfloat(sum);
+}
+
+kernel void
+omlx_m5_forward_f16_linear(device const bfloat *x [[buffer(0)]],
+                           device const half *w [[buffer(1)]],
+                           device bfloat *y [[buffer(2)]],
+                           constant ForwardLinearParams &p [[buffer(3)]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint3 group [[threadgroup_position_in_grid]]) {
   uint row = group.x * 4 + sg;
   uint token = group.y;
   if (row >= p.n || token >= p.tokens)
@@ -439,6 +625,26 @@ kernel void omlx_m5_forward_embedding_q3_g128(
     uint gid [[thread_position_in_grid]]) {
   forward_embedding_q3_impl<128u>(token_ids, low_2bit, high_bit, scales, biases,
                                   hidden, p, gid);
+}
+
+kernel void omlx_m5_forward_embedding_f16(
+    device const uint *token_ids [[buffer(0)]],
+    device const half *table [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant ForwardEmbedParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+  const ulong total = ulong(p.tokens) * p.hidden;
+  if (ulong(gid) >= total)
+    return;
+  const uint t = gid / p.hidden;
+  const uint col = gid % p.hidden;
+  const uint tok = token_ids[t];
+  if (tok >= p.vocab) {
+    hidden[gid] = bfloat(0.0f);
+    return;
+  }
+  const ulong stride = ulong(p.padded_k ? p.padded_k : p.hidden);
+  hidden[gid] = bfloat(float(table[ulong(tok) * stride + col]));
 }
 
 #include "fwht64.h"
@@ -898,11 +1104,13 @@ kernel void omlx_m5_forward_paged_causal_attention_affine4_exact(
   for (uint idx = 0; idx < 8u; ++idx) {
     const uint d = lane + idx * 32u;
     if (d < p.head_dim) {
-      const float gv = float(g_row[d]);
-      const float gated =
-          (denom > 0.0f ? (acc[idx] / denom) : 0.0f) / (1.0f + exp(-gv));
+      const float norm_o = denom > 0.0f ? (acc[idx] / denom) : 0.0f;
+      const float out_val =
+          (p.gate_head_stride != 0u)
+              ? (norm_o / (1.0f + exp(-float(g_row[d]))))
+              : norm_o;
       output[(ulong(token) * p.query_heads + qh) * p.head_dim + d] =
-          bfloat(gated);
+          bfloat(out_val);
     }
   }
 }

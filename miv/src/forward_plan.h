@@ -554,7 +554,7 @@ inline MetalDispatchSize linear_grid(const ForwardLinearSelection &route,
     return {.width = U64((n + 31) / 32) * 128};
   return {.width = U64((n + 3) / 4) * 128,
           .height = route.row_exact || format == "direct_bf16_v1" ||
-                            route.bits == 3
+                            format == "direct_f16_v1" || route.bits == 3
                         ? t
                     : route.broad ? U64((t + 15) / 16)
                                   : 1};
@@ -583,6 +583,12 @@ select_linear_route(std::string_view format, U32 n, U32 k, U32 t,
     route.library = "qwen_forward";
     route.function = "omlx_m5_forward_bf16_linear";
     route.family = "direct_bf16";
+    return route;
+  }
+  if (format == "direct_f16_v1") {
+    route.library = "qwen_forward";
+    route.function = "omlx_m5_forward_f16_linear";
+    route.family = "direct_f16";
     return route;
   }
   if (format == "mxfp4_e2m1_g32_e8m0_v1") {
@@ -693,6 +699,10 @@ inline ForwardLinearSelection select_row_exact_linear_route(
   if (format == "direct_bf16_v1") {
     route.function = "omlx_m5_row_exact_bf16";
     route.row_exact_group = "bf16.simd32.sequential_fma.v1";
+  } else if (format == "direct_f16_v1") {
+    route.library = "qwen_forward";
+    route.function = "omlx_m5_forward_f16_linear";
+    route.row_exact_group = "f16.simd32.sequential_fma.v1";
   } else if (format == "mxfp4_e2m1_g32_e8m0_v1") {
     if (k % 32) throw std::invalid_argument("row-exact MXFP4 K alignment");
     route.function = "omlx_m5_row_exact_mxfp4";
@@ -750,7 +760,7 @@ inline ForwardLinearDecision resolve_linear_route(
       diagnostic_override->capacity == capacity;
   if (matched) {
     const auto &choice = diagnostic_override->choice;
-    if (weight.format == "direct_bf16_v1" ||
+    if (weight.format == "direct_bf16_v1" || weight.format == "direct_f16_v1" ||
         (choice != "baseline" && choice != "lane" && choice != "matrix") ||
         (choice == "lane" && capacity != 1 && capacity != 8) ||
         (choice == "matrix" && capacity != 1 && capacity != 8))
@@ -870,7 +880,7 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
     ++e.profile.short_matrix_calls;
   if (route.lane)
     ++e.profile.short_lane_calls;
-  if (w.format == "direct_bf16_v1") {
+  if (w.format == "direct_bf16_v1" || w.format == "direct_f16_v1") {
     auto &d = e.emit(route.library, route.function, grid, {.width = 128},
                      {x, plane(w, "data"), y});
     e.dynamic(d, 3, std::move(params), tokens_patch);
@@ -949,7 +959,8 @@ inline void linear_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
       gate_w.row_count != expected_n || gate_w.in_features != expected_k ||
       up_w.row_count != expected_n || up_w.in_features != expected_k ||
       gate_w.format != up_w.format || gate_w.padded_k != up_w.padded_k ||
-      !route.row_exact || gate_w.format == "direct_bf16_v1") {
+      !route.row_exact || gate_w.format == "direct_bf16_v1" ||
+      gate_w.format == "direct_f16_v1") {
     throw std::invalid_argument("Qwen fused SwiGLU Linear geometry mismatch");
   }
   if (gate_w.layout == "mx_nax_tiled_bk128_v1" ||
@@ -1019,6 +1030,11 @@ inline void embedding_lookup(Encoder &e,
     auto &d =
         e.emit("vocab", function + "bf16", {.width = U64(t) * h},
                {.width = 256}, {token_ids, plane(embedding, "data"), hidden});
+    e.dynamic(d, 3, embed_params, tok_word);
+  } else if (embedding.format == "direct_f16_v1") {
+    auto &d = e.emit("qwen_forward", "omlx_m5_forward_embedding_f16",
+                     {.width = U64(t) * h}, {.width = 256},
+                     {token_ids, plane(embedding, "data"), hidden});
     e.dynamic(d, 3, embed_params, tok_word);
   } else if (embedding.format == "mxfp4_e2m1_g32_e8m0_v1") {
     auto &d = e.emit("vocab", function + "mxfp4", {.width = U64(t) * h},

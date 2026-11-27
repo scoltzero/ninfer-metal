@@ -3081,3 +3081,33 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
         "${OMLX_M5_METAL_OUTPUT_DIR}")
   endif()
 endif()
+
+add_executable(
+  omlx_m5_universal_capability_tests
+  tests/universal_capability_tests.cpp)
+target_include_directories(
+  omlx_m5_universal_capability_tests
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+target_compile_options(
+  omlx_m5_universal_capability_tests
+  PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror)
+target_link_libraries(
+  omlx_m5_universal_capability_tests
+  PRIVATE
+  omlx_m5_core_runtime)
+add_dependencies(
+  omlx_m5_universal_capability_tests
+  omlx_m5_qwen_forward_resources
+  mseries_backendd)
+add_test(
+  NAME omlx_m5_universal_capability
+  COMMAND
+    $<TARGET_FILE:omlx_m5_universal_capability_tests>
+    "${OMLX_M5_METAL_OUTPUT_DIR}"
+    $<TARGET_FILE:mseries_backendd>)

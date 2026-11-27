@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -466,31 +467,25 @@ public:
          c.full_attention_layers() == 0))
       throw std::invalid_argument(
           "split Attention diagnostic requires Apple GPU family 9+ Attention");
-    if (c.num_experts != 0 &&
-        (c.num_experts != 256 || c.num_experts_per_token != 8 ||
-         c.shared_expert_intermediate_size <= 0 ||
-         c.shared_expert_intermediate_size % 64))
-      throw std::invalid_argument(
-          "Qwen MoE requires 256 experts, top-8 and aligned shared FFN");
-    if (c.hidden_size <= 0 || c.vocab_size <= 0 || c.intermediate_size <= 0 ||
-        c.num_hidden_layers != static_cast<int>(layers.layers().size()) ||
-        c.hidden_size % 64 || c.intermediate_size % 64 || max_context == 0 ||
-        c.num_attention_heads <= 0 || c.num_key_value_heads <= 0 ||
-        c.num_attention_heads % c.num_key_value_heads || c.head_dim <= 0 ||
-        c.head_dim > 256 || c.linear_num_key_heads <= 0 ||
-        c.linear_num_value_heads <= 0 || c.linear_key_head_dim <= 0 ||
-        c.linear_value_head_dim <= 0 || c.linear_conv_kernel_dim <= 1 ||
-        c.linear_num_value_heads % c.linear_num_key_heads)
+    if (std::string reason; !QwenForward::supports_config(c, &reason))
+      throw std::invalid_argument("unsupported Qwen execution geometry: " +
+                                  reason);
+    if (c.num_hidden_layers != static_cast<int>(layers.layers().size()) ||
+        max_context == 0)
       throw std::invalid_argument("unsupported Qwen execution geometry");
 
+    const bool has_gdn = c.linear_attention_layers() > 0;
     h = U32(c.hidden_size);
     f = U32(c.intermediate_size);
     v = U32(c.vocab_size);
     q = U32(c.num_attention_heads * c.head_dim);
+    q_out = c.has_attn_output_gate ? (2U * q) : q;
+    q_head_stride =
+        c.has_attn_output_gate ? U32(c.head_dim * 2) : U32(c.head_dim);
     kv = U32(c.num_key_value_heads * c.head_dim);
-    gk = U32(c.linear_num_key_heads * c.linear_key_head_dim);
-    gv = U32(c.linear_num_value_heads * c.linear_value_head_dim);
-    conv = 2 * gk + gv;
+    gk = has_gdn ? U32(c.linear_num_key_heads * c.linear_key_head_dim) : 0U;
+    gv = has_gdn ? U32(c.linear_num_value_heads * c.linear_value_head_dim) : 0U;
+    conv = has_gdn ? (2U * gk + gv) : 0U;
 
     const bool affine4_kv = (kv_format_ == KvStorageFormat::Affine4Group128);
     const bool enable_w4a8_ws =
@@ -524,12 +519,14 @@ public:
     query = allocate("query");
     key = allocate("key");
     value = allocate("value");
-    qkv = allocate("qkv");
-    z = allocate("z");
-    a = allocate("a");
-    b = allocate("b");
-    convolved = allocate("convolved");
-    recurrent = allocate("recurrent");
+    if (has_gdn) {
+      qkv = allocate("qkv");
+      z = allocate("z");
+      a = allocate("a");
+      b = allocate("b");
+      convolved = allocate("convolved");
+      recurrent = allocate("recurrent");
+    }
     mixer = allocate("mixer");
     if (enable_attention_split) {
       split_max = allocate("attention_split_max");
@@ -552,8 +549,12 @@ public:
       route_scores = allocate("route_scores");
       expert_output = allocate("expert_output");
       routed = allocate("routed");
-      shared = allocate("shared");
-      shared_gate = allocate("shared_gate");
+      if (c.shared_expert_intermediate_size > 0) {
+        shared = allocate("shared");
+        if (c.has_shared_expert_gate) {
+          shared_gate = allocate("shared_gate");
+        }
+      }
     }
     logits = allocate("logits");
     last_logits = allocate("last_logits");
@@ -793,6 +794,7 @@ public:
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          linear_policy == LinearNumericPolicy::Legacy) &&
         moe_nax_runtime_eligible(context, libraries) && !blocks.empty() &&
+        blocks.front().operands.contains("moe_expert_gate") &&
         moe_nax_weight_eligible(blocks.front().get("moe_expert_gate"),
                                 blocks.front().get("moe_expert_up"),
                                 blocks.front().get("moe_expert_down"), h, f)) {
@@ -873,8 +875,11 @@ public:
       }
       if (mxfp4_nax_cache && mxfp4_nax_cache->active()) {
         const U32 max_mp = mxfp4_w4a4_mp(workspace_rows_);
-        const U32 max_k = std::max(
-            {h, f, q, gv, U32(config.shared_expert_intermediate_size)});
+        const U32 shared_f_cap =
+            config.shared_expert_intermediate_size > 0
+                ? U32(config.shared_expert_intermediate_size)
+                : 0U;
+        const U32 max_k = std::max({h, f, q_out, gv, shared_f_cap});
         const U64 f16_norm_bytes = mul(mul(max_mp, h), 2u);
         const U64 f16_bytes = mul(mul(max_mp, max_k), 2u);
         const U64 rs_bytes = mul(max_mp, 4u);
@@ -957,8 +962,11 @@ public:
       }
       if (affine_nax_cache && affine_nax_cache->active()) {
         const U32 max_mp = affine_nax_mp(workspace_rows_);
-        const U32 max_k = std::max(
-            {h, f, q, gv, U32(config.shared_expert_intermediate_size)});
+        const U32 shared_f_cap =
+            config.shared_expert_intermediate_size > 0
+                ? U32(config.shared_expert_intermediate_size)
+                : 0U;
+        const U32 max_k = std::max({h, f, q_out, gv, shared_f_cap});
         const U64 xs_bytes = mul(mul(max_mp, max_k / 64u), 4u);
         auto xs_buf =
             std::make_unique<MetalBuffer>(context.make_private_buffer(xs_bytes));
@@ -972,8 +980,11 @@ public:
       if (f16_scratch.buffer != nullptr) {
         fwht_scratch = f16_scratch;
       } else {
-        const U32 max_k = std::max(
-            {h, f, q, gv, U32(config.shared_expert_intermediate_size)});
+        const U32 shared_f_cap =
+            config.shared_expert_intermediate_size > 0
+                ? U32(config.shared_expert_intermediate_size)
+                : 0U;
+        const U32 max_k = std::max({h, f, q_out, gv, shared_f_cap});
         const U64 fw_bytes = mul(mul(workspace_rows_, max_k), 2ULL);
         auto fw_buf = std::make_unique<MetalBuffer>(
             context.make_private_buffer(fw_bytes));
@@ -984,8 +995,11 @@ public:
     }
     if (w4a8_requested && any_fwht64) {
       const U32 max_mp = w4a8_nax_mp(workspace_rows_);
-      const U32 max_mid_k =
-          std::max({f, U32(config.shared_expert_intermediate_size)});
+      const U32 shared_f_cap =
+          config.shared_expert_intermediate_size > 0
+              ? U32(config.shared_expert_intermediate_size)
+              : 0U;
+      const U32 max_mid_k = std::max({f, shared_f_cap});
       if (max_mid_k > 0U && (max_mid_k % 64U) == 0U) {
         const U64 qa_bytes = mul(max_mp, max_mid_k);
         const U64 s_bytes = mul(mul(max_mp, max_mid_k / 64U), 4ULL);
@@ -1016,8 +1030,9 @@ public:
 
     if ((mxfp4_nax_active() || affine_nax_active()) &&
         !sibling_concat_disabled()) {
-      const U32 max_concat_n = std::max(
-          2U * q + 2U * kv, conv + gv + 2U * U32(c.linear_num_value_heads));
+      const U32 gdn_concat_n =
+          has_gdn ? (conv + gv + 2U * U32(c.linear_num_value_heads)) : 0U;
+      const U32 max_concat_n = std::max(q_out + 2U * kv, gdn_concat_n);
       const U64 concat_bytes = mul(mul(workspace_rows_, max_concat_n), 2U);
       auto c_buf = std::make_unique<MetalBuffer>(
           context.make_private_buffer(concat_bytes));
@@ -1388,8 +1403,12 @@ public:
         verify_profiles.push_back(compile(verify_tail, true));
         ensure_profile_icb(context, verify_profiles.back());
       }
-      commit_profile = compile_commit();
-      ensure_profile_icb(context, commit_profile);
+      if (config.linear_attention_layers() > 0 ||
+          feature_history.buffer != nullptr) {
+        commit_profile = compile_commit();
+        ensure_profile_icb(context, commit_profile);
+        has_commit_profile = true;
+      }
     }
     if (page_pool) {
       kv_cow_profile = compile_kv_cow();
@@ -1668,9 +1687,53 @@ public:
   }
 
   Ref direct(const MaterializedWeightView &w, U64 count) {
-    if (w.format != "direct_bf16_v1" || plane(w, "data").bytes != mul(count, 2))
-      throw std::invalid_argument("Qwen BF16 parameter geometry: " + w.name);
-    return plane(w, "data");
+    if (w.format == "direct_bf16_v1") {
+      if (plane(w, "data").bytes != mul(count, 2))
+        throw std::invalid_argument("Qwen BF16 parameter geometry: " + w.name);
+      return plane(w, "data");
+    }
+    if (w.format == "direct_f16_v1") {
+      const Ref src = plane(w, "data");
+      if (src.bytes != mul(count, 2))
+        throw std::invalid_argument("Qwen FP16 parameter geometry: " + w.name);
+      if (const auto it = f16_direct_cache_.find(w.object_id);
+          it != f16_direct_cache_.end() && it->second.bytes == src.bytes) {
+        return it->second;
+      }
+      const auto raw = src.buffer->read(src.offset, src.bytes);
+      std::vector<std::uint16_t> bf16_out(count, 0U);
+      for (U64 i = 0; i < count; ++i) {
+        std::uint16_t h16 = 0U;
+        std::memcpy(&h16, raw.data() + 2 * i, 2);
+        const U32 sign = U32(h16 & 0x8000U) << 16U;
+        const U32 exp = (h16 >> 10U) & 0x1FU;
+        const U32 mant = h16 & 0x03FFU;
+        U32 f32 = 0U;
+        if (exp == 0U) {
+          if (mant != 0U) {
+            float sub_f = std::ldexp(float(mant), -24);
+            if (sign)
+              sub_f = -sub_f;
+            f32 = std::bit_cast<U32>(sub_f);
+          } else {
+            f32 = sign;
+          }
+        } else if (exp == 31U) {
+          f32 = sign | 0x7F800000U | (mant << 13U);
+        } else {
+          f32 = sign | ((exp + 112U) << 23U) | (mant << 13U);
+        }
+        const U32 lsb = (f32 >> 16U) & 1U;
+        bf16_out[i] = static_cast<std::uint16_t>((f32 + 0x7FFFU + lsb) >> 16U);
+      }
+      auto buf = std::make_unique<MetalBuffer>(context.make_buffer(src.bytes));
+      buf->write(std::as_bytes(std::span<const std::uint16_t>(bf16_out)));
+      const Ref dst{buf.get(), 0, src.bytes};
+      buffers.push_back(std::move(buf));
+      f16_direct_cache_[w.object_id] = dst;
+      return dst;
+    }
+    throw std::invalid_argument("Qwen direct parameter geometry: " + w.name);
   }
 
   bool is_overridden(const MaterializedWeightView &w) const {
@@ -3722,7 +3785,7 @@ public:
                  NaxWidePrefillTile::none;
     };
     if (block.type == LayerType::full_attention)
-      return has("attention_q", 2 * q, h) && has("attention_k", kv, h) &&
+      return has("attention_q", q_out, h) && has("attention_k", kv, h) &&
              has("attention_v", kv, h);
     return has("gdn_qkv", conv, h) && has("gdn_z", gv, h) &&
            has("gdn_a", U32(config.linear_num_value_heads), h) &&
@@ -3783,8 +3846,17 @@ public:
         pos_placeholder.has_value() ? std::optional<U32>{}
                                     : std::optional<U32>{9U};
 
+    const bool has_gate = c.has_attn_output_gate;
+    const bool has_qkn = c.has_qk_norm && block.operands.contains("q_norm") &&
+                         block.operands.contains("k_norm");
+    const U32 gate_tok_stride = has_gate ? q_out : 0U;
+    const U32 gate_head_stride = has_gate ? U32(c.head_dim * 2) : 0U;
+    const U32 eps_word = word(has_qkn ? float(c.rms_norm_eps) : -1.0F);
+    Ref q_norm_ref = has_qkn ? direct(block.get("q_norm"), c.head_dim) : zero;
+    Ref k_norm_ref = has_qkn ? direct(block.get("k_norm"), c.head_dim) : zero;
+
     Ref table_ref{&slot_pool.table_buffer(), 0, slot_pool.table_buffer().size()};
-    Ref gate_ref = sub(q_ref, U64(c.head_dim) * 2);
+    Ref gate_ref = has_gate ? sub(q_ref, U64(c.head_dim) * 2) : zero;
     const bool affine4_nax_ok =
         (slot_kv_fmt == KvStorageFormat::Affine4Group128) &&
         (attn_pos_ref.buffer != nullptr) &&
@@ -3810,16 +3882,15 @@ public:
            .height =
                U64(t) * (c.num_attention_heads + c.num_key_value_heads)},
           {.width = 32},
-          {q_ref, k_ref, v_ref, direct(block.get("q_norm"), c.head_dim),
-           direct(block.get("k_norm"), c.head_dim), state_block.state0,
+          {q_ref, k_ref, v_ref, q_norm_ref, k_norm_ref, state_block.state0,
            state_block.state1, table_ref, attn_pos_ref});
       const U64 off_post = e.dynamic(
           post_kv, 9,
           words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
                  U32(c.head_dim),
                  U32(std::llround(c.head_dim * c.partial_rotary_factor)), t,
-                 q * 2, U32(c.head_dim * 2), kv, U32(c.head_dim), pos_init,
-                 word(float(c.rms_norm_eps)), word(float(c.rope_theta)),
+                 q_out, q_head_stride, kv, U32(c.head_dim), pos_init, eps_word,
+                 word(float(c.rope_theta)),
                  word(normalization_weight_offset)}),
           tok_word_post, pos_word_post);
       if (pos_patches)
@@ -3835,10 +3906,9 @@ public:
       auto post_words = words(
           {U32(c.num_attention_heads), U32(c.num_key_value_heads),
            U32(c.head_dim),
-           U32(std::llround(c.head_dim * c.partial_rotary_factor)), t, q * 2,
-           U32(c.head_dim * 2), kv, U32(c.head_dim), pos_init,
-           word(float(c.rms_norm_eps)), word(float(c.rope_theta)),
-           word(normalization_weight_offset)});
+           U32(std::llround(c.head_dim * c.partial_rotary_factor)), t, q_out,
+           q_head_stride, kv, U32(c.head_dim), pos_init, eps_word,
+           word(float(c.rope_theta)), word(normalization_weight_offset)});
       if (split && c.head_dim == 256 && lo_t1.fits) {
         const Ref q_half_ref{split_output.buffer,
                              split_output.offset + lo_t1.q_half_offset,
@@ -3853,8 +3923,7 @@ public:
              .height =
                  U64(t) * (c.num_attention_heads + c.num_key_value_heads)},
             {.width = 32},
-            {q_ref, k_ref, v_ref, direct(block.get("q_norm"), c.head_dim),
-             direct(block.get("k_norm"), c.head_dim), state_block.state0,
+            {q_ref, k_ref, v_ref, q_norm_ref, k_norm_ref, state_block.state0,
              state_block.state1, table_ref, attn_pos_ref, q_half_ref,
              q_sum_ref});
         const U64 off_post = e.dynamic(post_kv, 11, std::move(post_words),
@@ -3870,8 +3939,7 @@ public:
              .height =
                  U64(t) * (c.num_attention_heads + c.num_key_value_heads)},
             {.width = 32},
-            {q_ref, k_ref, v_ref, direct(block.get("q_norm"), c.head_dim),
-             direct(block.get("k_norm"), c.head_dim), state_block.state0,
+            {q_ref, k_ref, v_ref, q_norm_ref, k_norm_ref, state_block.state0,
              state_block.state1, table_ref, attn_pos_ref});
         const U64 off_post = e.dynamic(post_kv, 9, std::move(post_words),
                                        tok_word_post, pos_word_post);
@@ -3886,22 +3954,20 @@ public:
                         .height = U64(t) *
                                   (c.num_attention_heads + c.num_key_value_heads)},
                        {.width = 32},
-                       {q_ref, k_ref, direct(block.get("q_norm"), c.head_dim),
-                        direct(block.get("k_norm"), c.head_dim), attn_pos_ref})
+                       {q_ref, k_ref, q_norm_ref, k_norm_ref, attn_pos_ref})
               : e.emit("attention_postprocess", "omlx_m5_attention_qk_norm_rope",
                        {.width = 32,
                         .height = U64(t) *
                                   (c.num_attention_heads + c.num_key_value_heads)},
                        {.width = 32},
-                       {q_ref, k_ref, direct(block.get("q_norm"), c.head_dim),
-                        direct(block.get("k_norm"), c.head_dim)});
+                       {q_ref, k_ref, q_norm_ref, k_norm_ref});
       const U64 off_post = e.dynamic(
           post, exact_attention ? 5 : 4,
           words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
                  U32(c.head_dim),
                  U32(std::llround(c.head_dim * c.partial_rotary_factor)), t,
-                 q * 2, U32(c.head_dim * 2), kv, U32(c.head_dim), pos_init,
-                 word(float(c.rms_norm_eps)), word(float(c.rope_theta)),
+                 q_out, q_head_stride, kv, U32(c.head_dim), pos_init, eps_word,
+                 word(float(c.rope_theta)),
                  word(normalization_weight_offset)}),
           tok_word_post, pos_word_post);
       if (pos_patches)
@@ -3916,12 +3982,12 @@ public:
                          slot_max_context,
                          64,
                          slot_pool.physical_pages(),
-                         q * 2,
-                         U32(c.head_dim * 2),
+                         q_out,
+                         q_head_stride,
                          kv,
                          kv,
-                         q * 2,
-                         U32(c.head_dim * 2)});
+                         gate_tok_stride,
+                         gate_head_stride});
     const std::optional<U32> tok_word_attn =
         dynamic_tokens ? std::optional<U32>{3U} : std::optional<U32>{};
     const std::optional<U32> pos_word_attn =
@@ -4111,8 +4177,8 @@ public:
           auto split_params = words(
               {U32(c.num_attention_heads), U32(c.num_key_value_heads),
                U32(c.head_dim), t, pos_init, slot_max_context, 64,
-               slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv, kv,
-               q * 2, U32(c.head_dim * 2), tail_splits, tail_chunk});
+               slot_pool.physical_pages(), q_out, q_head_stride, kv, kv,
+               gate_tok_stride, gate_head_stride, tail_splits, tail_chunk});
           emit_paged_split_attention_exact_1pass_gqa(
               e, context, libraries, c, t, tail_splits, q_ref, gate_ref,
               state_block.state0, state_block.state1, mix_ref, table_ref,
@@ -4140,8 +4206,8 @@ public:
         auto split_params =
             words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
                    U32(c.head_dim), t, pos_init, slot_max_context, 64,
-                   slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
-                   kv, q * 2, U32(c.head_dim * 2), splits, 512});
+                   slot_pool.physical_pages(), q_out, q_head_stride, kv, kv,
+                   gate_tok_stride, gate_head_stride, splits, 512});
         emit_paged_split_attention_exact_gqa(
             e, c, t, splits, q_ref, gate_ref, state_block.state0,
             state_block.state1, mix_ref, table_ref, split_max, attn_pos_ref,
@@ -4164,8 +4230,8 @@ public:
         auto split_params =
             words({U32(c.num_attention_heads), U32(c.num_key_value_heads),
                    U32(c.head_dim), t, pos_init, slot_max_context, 64,
-                   slot_pool.physical_pages(), q * 2, U32(c.head_dim * 2), kv,
-                   kv, q * 2, U32(c.head_dim * 2), splits, chunk_tokens});
+                   slot_pool.physical_pages(), q_out, q_head_stride, kv, kv,
+                   gate_tok_stride, gate_head_stride, splits, chunk_tokens});
         emit_paged_split_attention_exact_1pass_gqa(
             e, context, libraries, c, t, splits, q_ref, gate_ref,
             state_block.state0, state_block.state1, mix_ref, table_ref,
@@ -4218,12 +4284,12 @@ public:
                                  slot_max_context,
                                  64,
                                  slot_pool.physical_pages(),
-                                 q * 2,
-                                 U32(c.head_dim * 2),
+                                 q_out,
+                                 q_head_stride,
                                  kv,
                                  kv,
-                                 q * 2,
-                                 U32(c.head_dim * 2),
+                                 gate_tok_stride,
+                                 gate_head_stride,
                                  splits,
                                  chunk_tokens});
       auto &partial = e.emit(
@@ -4306,7 +4372,7 @@ public:
     const std::array<MaterializedWeightView, 3> parts{
         block.get("attention_q"), block.get("attention_k"),
         block.get("attention_v")};
-    const std::array<U32, 3> part_ns{2 * q, kv, kv};
+    const std::array<U32, 3> part_ns{q_out, kv, kv};
     const auto *qkv_bypass =
         find_bypass_group(block.layer_index, QwenBypassGroupKind::attn_qkv);
     Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{};
@@ -4315,8 +4381,8 @@ public:
     if (io_sq_slot != nullptr && io_sq_slot->has_value()) {
       const U32 sq_in = **io_sq_slot;
       *io_sq_slot = std::nullopt;
-      if (qkv_bypass == nullptr && t == 1U && !input_is_f16 && 2 * q < 65536U &&
-          kv < 65536U && parts[0].row_count == 2 * q &&
+      if (qkv_bypass == nullptr && t == 1U && !input_is_f16 && q_out < 65536U &&
+          kv < 65536U && parts[0].row_count == q_out &&
           parts[1].row_count == kv && parts[2].row_count == kv &&
           parts[0].in_features == h && parts[1].in_features == h &&
           parts[2].in_features == h) {
@@ -4324,9 +4390,9 @@ public:
             resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
             resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
           const Ref nw_ref = direct(block.get("input_norm"), h);
-          const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+          const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
           const U32 rows_per_tg = use_r4 ? 8U : 4U;
-          const U32 tgs = ((2 * q + rows_per_tg - 1U) / rows_per_tg) +
+          const U32 tgs = ((q_out + rows_per_tg - 1U) / rows_per_tg) +
                           2U * ((kv + rows_per_tg - 1U) / rows_per_tg);
           const char *fn =
               use_r4 ? "omlx_m5_pretiled_qmv_mxfp4_concat3_bn16_r4_norm_t1"
@@ -4335,7 +4401,7 @@ public:
                            {.width = 64U},
                            {hidden, nw_ref, rms_sq_buf, d0, s0, d1, s1, d2, s2,
                             query, key, value});
-          e.dynamic(d, 12, fused_norm_params(2 * q, kv, kv, 0U, h, 0U, sq_in));
+          e.dynamic(d, 12, fused_norm_params(q_out, kv, kv, 0U, h, 0U, sq_in));
           for (std::size_t i = 0; i < 3; ++i) {
             e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
                             "pretiled_mxfp4_qmv_concat3_norm_t1_v4", {},
@@ -4352,9 +4418,9 @@ public:
           const U32 b1 = affine_nax_bits(parts[1].format);
           const U32 b2 = affine_nax_bits(parts[2].format);
           const U32 packed_bits = b0 | (b1 << 8U) | (b2 << 16U);
-          const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+          const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
           const U32 rows_per_tg = use_r4 ? 8U : 4U;
-          const U32 tgs = ((2 * q + rows_per_tg - 1U) / rows_per_tg) +
+          const U32 tgs = ((q_out + rows_per_tg - 1U) / rows_per_tg) +
                           2U * ((kv + rows_per_tg - 1U) / rows_per_tg);
           const bool all_q456 = (b0 >= 4U && b0 <= 6U) &&
                                 (b1 >= 4U && b1 <= 6U) &&
@@ -4379,7 +4445,7 @@ public:
                             d2, h2, s2, query, key, value});
           e.dynamic(
               d, 15,
-              fused_norm_params(2 * q, kv, kv, 0U,
+              fused_norm_params(q_out, kv, kv, 0U,
                                 pretiled_k_flags(h, lv0, false), packed_bits,
                                 sq_in));
           for (std::size_t i = 0; i < 3; ++i) {
@@ -4395,23 +4461,23 @@ public:
       }
     }
     if (!fused_qkv_norm && t == 1U && !input_is_f16 &&
-        parts[0].row_count == 2 * q &&
+        parts[0].row_count == q_out &&
         parts[1].row_count == kv && parts[2].row_count == kv &&
         parts[0].in_features == h && parts[1].in_features == h &&
         parts[2].in_features == h &&
         resolve_pretiled_mxfp4_t1(parts[0], 1U, &d0, &s0) &&
         resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
         resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
-      const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+      const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
       const U32 rows_per_tg = use_r4 ? 8U : 4U;
-      const U32 tgs = ((2 * q + rows_per_tg - 1U) / rows_per_tg) +
+      const U32 tgs = ((q_out + rows_per_tg - 1U) / rows_per_tg) +
                       2U * ((kv + rows_per_tg - 1U) / rows_per_tg);
       const char *fn = use_r4 ? "omlx_m5_pretiled_qmv_mxfp4_concat3_bn16_r4_t1"
                               : "omlx_m5_pretiled_qmv_mxfp4_concat3_bn16_r2_t1";
       auto &d =
           e.emit("row_exact", fn, {.width = U64(tgs) * 64U}, {.width = 64U},
                  {norm, d0, s0, d1, s1, d2, s2, query, key, value});
-      e.dynamic(d, 10, words({2 * q, kv, kv, h}));
+      e.dynamic(d, 10, words({q_out, kv, kv, h}));
       for (std::size_t i = 0; i < 3; ++i) {
         e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
                         "pretiled_mxfp4_qmv_concat3_t1_v3", {},
@@ -4419,7 +4485,7 @@ public:
       }
     } else if (bool lv0 = false, lv1 = false, lv2 = false;
                !fused_qkv_norm && t == 1U && !input_is_f16 &&
-               parts[0].row_count == 2 * q && parts[1].row_count == kv &&
+               parts[0].row_count == q_out && parts[1].row_count == kv &&
                parts[2].row_count == kv && parts[0].in_features == h &&
                parts[1].in_features == h && parts[2].in_features == h &&
                resolve_pretiled_affine_t1(parts[0], 1U, &d0, &h0, &s0, &lv0) &&
@@ -4430,9 +4496,9 @@ public:
       const U32 b1 = affine_nax_bits(parts[1].format);
       const U32 b2 = affine_nax_bits(parts[2].format);
       const U32 packed_bits = b0 | (b1 << 8U) | (b2 << 16U);
-      const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+      const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
       const U32 rows_per_tg = use_r4 ? 8U : 4U;
-      const U32 tgs = ((2 * q + rows_per_tg - 1U) / rows_per_tg) +
+      const U32 tgs = ((q_out + rows_per_tg - 1U) / rows_per_tg) +
                       2U * ((kv + rows_per_tg - 1U) / rows_per_tg);
       const bool all_q456 = (b0 >= 4U && b0 <= 6U) && (b1 >= 4U && b1 <= 6U) &&
                             (b2 >= 4U && b2 <= 6U);
@@ -4449,7 +4515,7 @@ public:
           "row_exact", fn, {.width = U64(tgs) * 64U}, {.width = 64U},
           {norm, d0, h0, s0, d1, h1, s1, d2, h2, s2, query, key, value});
       e.dynamic(d, 13,
-                words({2 * q, kv, kv, pretiled_k_flags(h, lv0, false),
+                words({q_out, kv, kv, pretiled_k_flags(h, lv0, false),
                        packed_bits}));
       for (std::size_t i = 0; i < 3; ++i) {
         e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
@@ -4459,11 +4525,11 @@ public:
     } else if (!fused_qkv_norm && input_is_a8 &&
                try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
                                    norm, concat_out)) {
-      emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+      emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
     } else if (!fused_qkv_norm && input_is_a8) {
-      if (!try_linear_w4a8_base(e, block.get("attention_q"), norm, query, 2 * q,
+      if (!try_linear_w4a8_base(e, block.get("attention_q"), norm, query, q_out,
                                 h))
-        linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+        linear_base(e, block.get("attention_q"), norm, query, q_out, h);
       if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key, kv, h))
         linear_base(e, block.get("attention_k"), norm, key, kv, h);
       if (!try_linear_w4a8_base(e, block.get("attention_v"), norm, value, kv,
@@ -4473,27 +4539,27 @@ public:
                try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h,
                               input_is_f16, norm, concat_out)) {
       if (t == 1U) {
-        q_ref = Ref{concat_out.buffer, 0, mul(2 * q, 2)};
-        k_ref = Ref{concat_out.buffer, mul(2 * q, 2), mul(kv, 2)};
-        v_ref = Ref{concat_out.buffer, mul(2 * q + kv, 2), mul(kv, 2)};
+        q_ref = Ref{concat_out.buffer, 0, mul(q_out, 2)};
+        k_ref = Ref{concat_out.buffer, mul(q_out, 2), mul(kv, 2)};
+        v_ref = Ref{concat_out.buffer, mul(q_out + kv, 2), mul(kv, 2)};
       } else {
-        emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+        emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
       }
     } else if (!fused_qkv_norm && input_is_f16) {
       linear_from_f16(e, block.get("attention_q"), f16_norm, f16_ones_scale,
-                      query, 2 * q, h);
+                      query, q_out, h);
       linear_from_f16(e, block.get("attention_k"), f16_norm, f16_ones_scale,
                       key, kv, h);
       linear_from_f16(e, block.get("attention_v"), f16_norm, f16_ones_scale,
                       value, kv, h);
     } else if (!fused_qkv_norm) {
-      linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+      linear_base(e, block.get("attention_q"), norm, query, q_out, h);
       linear_base(e, block.get("attention_k"), norm, key, kv, h);
       linear_base(e, block.get("attention_v"), norm, value, kv, h);
     }
     if (qkv_bypass != nullptr) {
       const std::array<detail::lora_rt::BypassPartDest, 3> dests{{
-          {q_ref, 2 * q, 0U},
+          {q_ref, q_out, 0U},
           {k_ref, kv, 0U},
           {v_ref, kv, 0U},
       }};
@@ -5183,7 +5249,9 @@ public:
   void expert_linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
                      U32 n, U32 k, bool down,
                      std::optional<U32> explicit_t = {}) {
-    if (w.parent_shape != std::vector<U64>{256, n, k})
+    const U32 num_exp = U32(config.num_experts);
+    const U32 top_k = U32(config.num_experts_per_token);
+    if (w.parent_shape != std::vector<U64>{num_exp, n, k})
       throw std::invalid_argument("Qwen expert bank shape mismatch: " + w.name);
     const U32 t = explicit_t.value_or(e.profile.capacity);
     const bool diagnostic =
@@ -5203,12 +5271,12 @@ public:
     const auto family = fallback ? "fallback_a16" : "grouped_a16";
     const auto source = diagnostic ? "p12_exact_ab" : "baseline";
     const auto params =
-        words({256, 8, n, k, U32(w.padded_k), t, U32(down), U32(down)});
+        words({num_exp, top_k, n, k, U32(w.padded_k), t, U32(down), U32(down)});
     const std::optional<U32> tok_w5 =
         explicit_t.has_value() ? std::optional<U32>{} : std::optional<U32>{5U};
     const MetalDispatchSize grid{
-        .width = fallback ? U64(t) * 8 * n * 32
-                          : U64(t) * 8 * ((n + 3) / 4) * 128};
+        .width = fallback ? U64(t) * top_k * n * 32
+                          : U64(t) * top_k * ((n + 3) / 4) * 128};
     const MetalDispatchSize threads{.width = fallback ? 32U : 128U};
     if (w.format == "mxfp4_e2m1_g32_e8m0_v1") {
       auto &d = e.emit(
@@ -5228,7 +5296,7 @@ public:
     Ref high = bits == 5   ? plane(w, "high_bit")
                : bits == 6 ? plane(w, "high_2bit")
                            : zero;
-    const U32 mult = down ? 8U : 1U;
+    const U32 mult = down ? top_k : 1U;
     const bool dyn_rows = !explicit_t.has_value() && (t != 1 || mult != 1);
     const Encoder::GroupSumKey sum_key{sums.buffer, sums.offset, x.buffer,
                                        x.offset,    k,           group,
@@ -5257,13 +5325,14 @@ public:
     if (moe_override || !moe_nax_ws.active || t > moe_nax_ws.max_t ||
         t < moe_nax_min_tokens())
       return false;
+    const U64 num_exp = U64(config.num_experts);
     const auto &gw = block.get("moe_expert_gate");
     const auto &uw = block.get("moe_expert_up");
     const auto &dw = block.get("moe_expert_down");
     if (gw.format != uw.format || gw.padded_k != uw.padded_k ||
-        gw.parent_shape != std::vector<U64>{256, f, h} ||
-        uw.parent_shape != std::vector<U64>{256, f, h} ||
-        dw.parent_shape != std::vector<U64>{256, h, f})
+        gw.parent_shape != std::vector<U64>{num_exp, f, h} ||
+        uw.parent_shape != std::vector<U64>{num_exp, f, h} ||
+        dw.parent_shape != std::vector<U64>{num_exp, h, f})
       return false;
     const bool has_moe_min_env =
         (std::getenv("OMLX_M5_MOE_NAX_MIN_T") != nullptr);
@@ -5286,20 +5355,22 @@ public:
   }
 
   bool try_fused_moe_ffn(Encoder &e, const Block &block,
-                         bool &wrote_expert_output,
+                         bool &wrote_expert_output, Ref reduced_out,
                          Ref fused_router_logits = {},
                          std::optional<U32> explicit_t = {},
                          bool verify = false, bool input_is_a8 = false) {
     wrote_expert_output = false;
     if (moe_override)
       return false;
+    const U32 num_exp = U32(config.num_experts);
+    const U32 top_k = U32(config.num_experts_per_token);
     const auto &gw = block.get("moe_expert_gate");
     const auto &uw = block.get("moe_expert_up");
     const auto &dw = block.get("moe_expert_down");
     if (gw.format != uw.format || gw.padded_k != uw.padded_k ||
-        gw.parent_shape != std::vector<U64>{256, f, h} ||
-        uw.parent_shape != std::vector<U64>{256, f, h} ||
-        dw.parent_shape != std::vector<U64>{256, h, f}) {
+        gw.parent_shape != std::vector<U64>{num_exp, f, h} ||
+        uw.parent_shape != std::vector<U64>{num_exp, f, h} ||
+        dw.parent_shape != std::vector<U64>{num_exp, h, f}) {
       return false;
     }
     const U32 t = explicit_t.value_or(e.profile.capacity);
@@ -5309,8 +5380,8 @@ public:
         ensure_a8_quant(e, norm, h, explicit_t) &&
         emit_moe_w4a8_nax_ffn(e, moe_nax_ws, gw, uw, dw, a8_qa, a8_sa, a8_ra,
                               w4a8_nax_mp(t), route_ids, route_scores,
-                              expert_output, routed, t, h, f, 8u, 256u,
-                              explicit_t, fused_router_logits,
+                              expert_output, reduced_out, t, h, f, top_k,
+                              num_exp, explicit_t, fused_router_logits,
                               /*emit_reduce=*/false, w4a8_down_proj_)) {
       wrote_expert_output = true;
       return true;
@@ -5337,19 +5408,22 @@ public:
         !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_SWIGLU_OUT64");
     if (t >= eff_moe_min_t &&
         emit_moe_nax_ffn(e, moe_nax_ws, gw, uw, dw, norm, route_ids,
-                         route_scores, expert_output, routed, t, h, f, 8u, 256u,
-                         silicon_tuning.gpu_cores, explicit_t,
+                         route_scores, expert_output, reduced_out, t, h, f,
+                         top_k, num_exp, silicon_tuning.gpu_cores, explicit_t,
                          fused_router_logits, /*emit_reduce=*/false,
                          use_out64)) {
       wrote_expert_output = true;
       return true;
     }
 
-    const auto up_params = words({256, 8, f, h, U32(gw.padded_k), t, 0U, 0U});
-    const auto down_params = words({256, 8, h, f, U32(dw.padded_k), t, 1U, 1U});
+    const auto up_params =
+        words({num_exp, top_k, f, h, U32(gw.padded_k), t, 0U, 0U});
+    const auto down_params =
+        words({num_exp, top_k, h, f, U32(dw.padded_k), t, 1U, 1U});
     const std::optional<U32> tok_w5 =
         explicit_t.has_value() ? std::optional<U32>{} : std::optional<U32>{5U};
-    const MetalDispatchSize up_grid{.width = U64(t) * 8 * ((f + 15) / 16) * 128};
+    const MetalDispatchSize up_grid{
+        .width = U64(t) * top_k * ((f + 15) / 16) * 128};
     const MetalDispatchSize up_threads{.width = 128U};
     const MetalDispatchSize down_grid{.width = U64(t) * h * 256U};
     const MetalDispatchSize down_threads{.width = 256U};
@@ -5371,12 +5445,12 @@ public:
                       false, explicit_t);
       if (dw.has_fwht64()) {
         detail::forward::emit_fwht64_bf16(e, product, product, f, explicit_t,
-                                          8U);
+                                          top_k);
       }
       auto &d2 = e.emit("moe", "omlx_m5_mxfp4_moe_w4a16_down_reduce",
                         mxfp4_down_grid, down_threads,
                         {product, route_ids, route_scores, plane(dw, "data"),
-                         plane(dw, "scale"), routed});
+                         plane(dw, "scale"), reduced_out});
       e.dynamic(d2, 6, down_params, tok_w5);
       e.record_weight(dw, h, f, "grouped_a16", "fused_down_reduce_v3",
                       "expert_candidate_unqualified", "legacy_route_v1", {},
@@ -5434,17 +5508,17 @@ public:
 
       if (dw.has_fwht64()) {
         detail::forward::emit_fwht64_bf16(e, product, product, f, explicit_t,
-                                          8U);
+                                          top_k);
       }
       const Encoder::GroupSumKey d_sum_key{
           sums.buffer,    sums.offset,    product.buffer,
           product.offset, f,              d_group,
-          t * 8U,         !explicit_t.has_value(),
-          8U,             dw.has_fwht64()};
+          t * top_k,      !explicit_t.has_value(),
+          top_k,          dw.has_fwht64()};
       if (!e.has_group_sum(d_sum_key)) {
         auto &sum =
             e.emit("moe", "omlx_m5_moe_group_sum_g" + std::to_string(d_group),
-                   {.width = U64(t) * 8U * (f / d_group) * 32}, {.width = 32},
+                   {.width = U64(t) * top_k * (f / d_group) * 32}, {.width = 32},
                    {product, sums});
         e.dynamic(sum, 2, down_params, tok_w5);
         e.set_group_sum(d_sum_key);
@@ -5455,7 +5529,7 @@ public:
           "moe", fn2, down_grid, down_threads,
           {product, route_ids, route_scores,
            plane(dw, d_bits == 8 ? "code" : "base_code"), d_high,
-           plane(dw, "scale"), plane(dw, "bias"), sums, routed});
+           plane(dw, "scale"), plane(dw, "bias"), sums, reduced_out});
       e.dynamic(d2, 9, down_params, tok_w5);
       e.record_weight(dw, h, f, "grouped_a16", "fused_down_reduce_v3",
                       "expert_candidate_unqualified", "legacy_route_v1", {},
@@ -5586,10 +5660,24 @@ public:
         block, {"moe_shared_mlp_gate", "moe_shared_mlp_up",
                 "moe_shared_mlp_down", "moe_shared_gate", "moe_router"});
 
-    if (!moe_has_bypass && e.profile.capacity == 1U && t == 1U &&
+    const U32 num_exp = U32(config.num_experts);
+    const U32 top_k = U32(config.num_experts_per_token);
+    const U32 shared_f = config.shared_expert_intermediate_size > 0
+                             ? U32(config.shared_expert_intermediate_size)
+                             : 0U;
+    const bool has_shared =
+        shared_f > 0U && block.operands.contains("moe_shared_mlp_gate") &&
+        block.operands.contains("moe_shared_mlp_up") &&
+        block.operands.contains("moe_shared_mlp_down");
+    const bool has_sgate = has_shared && config.has_shared_expert_gate &&
+                           block.operands.contains("moe_shared_gate");
+    const bool moe9_geom_ok =
+        (num_exp == 256U && top_k == 8U && has_shared && has_sgate);
+
+    if (!moe_has_bypass && moe9_geom_ok && e.profile.capacity == 1U && t == 1U &&
         !speculative_enabled && allow_tdom_t1() && t_domain_active() &&
         !moe_override) {
-      const U32 shared_f_t1 = U32(config.shared_expert_intermediate_size);
+      const U32 shared_f_t1 = shared_f;
       const auto &gw = block.get("moe_expert_gate");
       const auto &uw = block.get("moe_expert_up");
       const auto &dw = block.get("moe_expert_down");
@@ -5635,10 +5723,10 @@ public:
                 explicit_t, &fused_sgate)) {
           linear(e, rw, norm, router, 256, h, explicit_t);
           auto &route =
-              e.emit("qwen_forward", "omlx_m5_forward_router_top8_logits",
+              e.emit("qwen_forward", "omlx_m5_forward_router_topk_logits",
                      {.width = 32, .height = 1}, {.width = 32},
                      {router, route_ids, route_scores});
-          e.dynamic(route, 3, words({1U, 256U}), tok_w0);
+          e.dynamic(route, 3, words({1U, 256U, 8U, 1U}), tok_w0);
         }
         if (trace_routes) {
           auto &trace =
@@ -5682,10 +5770,11 @@ public:
       }
     }
 
-    if (!moe_has_bypass && allow_moe9_bt && explicit_t.has_value() && t >= 2U &&
+    if (!moe_has_bypass && moe9_geom_ok && allow_moe9_bt &&
+        explicit_t.has_value() && t >= 2U &&
         t <= 8U && !speculative_enabled && t_domain_active() &&
         !moe_override) {
-      const U32 shared_f_bt = U32(config.shared_expert_intermediate_size);
+      const U32 shared_f_bt = shared_f;
       const auto &gw = block.get("moe_expert_gate");
       const auto &uw = block.get("moe_expert_up");
       const auto &dw = block.get("moe_expert_down");
@@ -5733,10 +5822,10 @@ public:
         if (!router_done) {
           linear(e, rw, norm, router, 256, h, explicit_t);
           auto &route =
-              e.emit("qwen_forward", "omlx_m5_forward_router_top8_logits",
+              e.emit("qwen_forward", "omlx_m5_forward_router_topk_logits",
                      {.width = 32, .height = t}, {.width = 32},
                      {router, route_ids, route_scores});
-          e.dynamic(route, 3, words({t, 256U}), tok_w0);
+          e.dynamic(route, 3, words({t, 256U, 8U, 1U}), tok_w0);
         }
         if (!fused_sgate) {
           linear(e, sgate_w, norm, shared_gate, 1, h, explicit_t);
@@ -5764,50 +5853,63 @@ public:
       normalize(e, block.get("post_attention_norm"), hidden, norm, explicit_t);
       *io_sq_slot = std::nullopt;
     }
-    linear(e, block.get("moe_router"), norm, router, 256, h, explicit_t);
-    const bool fuse_router_nax =
-        !trace_routes && can_moe_nax_for(block, t, explicit_t);
+    linear(e, block.get("moe_router"), norm, router, num_exp, h, explicit_t);
+    const bool fuse_router_nax = !trace_routes && num_exp == 256U &&
+                                 top_k == 8U &&
+                                 can_moe_nax_for(block, t, explicit_t);
     if (!fuse_router_nax) {
-      auto &route = e.emit("qwen_forward", "omlx_m5_forward_router_top8_logits",
+      auto &route = e.emit("qwen_forward", "omlx_m5_forward_router_topk_logits",
                            {.width = 32, .height = t}, {.width = 32},
                            {router, route_ids, route_scores});
-      e.dynamic(route, 3, words({t, 256}), tok_w0);
+      e.dynamic(route, 3, words({t, num_exp, top_k, 1U}), tok_w0);
     }
     if (trace_routes) {
       auto &trace = e.emit("qwen_forward", "omlx_m5_forward_capture_routes",
-                           {.width = U64(t) * 8}, {.width = 128},
+                           {.width = U64(t) * top_k}, {.width = 128},
                            {route_ids, route_trace});
       e.dynamic(trace, 2,
-                words({t, 8, U32(config.num_hidden_layers), layer_index}), 0);
+                words({t, top_k, U32(config.num_hidden_layers), layer_index}),
+                0);
       auto &logits_trace = e.emit("qwen_forward", "omlx_m5_forward_capture",
-                                  {.width = U64(t) * 256}, {.width = 128},
+                                  {.width = U64(t) * num_exp}, {.width = 128},
                                   {router, router_logits_trace});
       e.dynamic(logits_trace, 2,
-                words({t, 256, U32(config.num_hidden_layers), layer_index}), 0);
+                words({t, num_exp, U32(config.num_hidden_layers), layer_index}),
+                0);
       auto &scores_trace = e.emit("qwen_forward", "omlx_m5_forward_capture",
-                                  {.width = U64(t) * 8}, {.width = 128},
+                                  {.width = U64(t) * top_k}, {.width = 128},
                                   {route_scores, router_scores_trace});
       e.dynamic(scores_trace, 2,
-                words({t, 8, U32(config.num_hidden_layers), layer_index}), 0);
+                words({t, top_k, U32(config.num_hidden_layers), layer_index}),
+                0);
     }
+    const Ref reduced_dst = has_sgate ? routed : delta;
     bool wrote_expert_output = false;
-    if (!try_fused_moe_ffn(e, block, wrote_expert_output,
+    if (!try_fused_moe_ffn(e, block, wrote_expert_output, reduced_dst,
                            fuse_router_nax ? router : Ref{}, explicit_t,
                            verify, input_is_a8)) {
       expert_linear(e, block.get("moe_expert_gate"), norm, gate, f, h, false,
                     explicit_t);
       expert_linear(e, block.get("moe_expert_up"), norm, up, f, h, false,
                     explicit_t);
-      swiglu(e, t * 8, f, explicit_t);
+      swiglu(e, t * top_k, f, explicit_t);
       if (block.get("moe_expert_down").has_fwht64()) {
         detail::forward::emit_fwht64_bf16(e, product, product, f, explicit_t,
-                                          8U);
+                                          top_k);
       }
       expert_linear(e, block.get("moe_expert_down"), product, expert_output, h,
                     f, true, explicit_t);
       wrote_expert_output = true;
     }
-    U32 shared_f = U32(config.shared_expert_intermediate_size);
+    if (!has_shared) {
+      if (wrote_expert_output) {
+        auto &red = e.emit("mlp", "omlx_m5_moe_topk_reduce",
+                           {.width = U64(t) * h}, {.width = 128},
+                           {expert_output, delta});
+        e.dynamic(red, 2, words({t, top_k, h, 0}), tok_w0);
+      }
+      return;
+    }
     const auto &sdw_v = block.get("moe_shared_mlp_down");
     const bool shared_down_w4a8 = sdw_v.has_fwht64() || w4a8_down_proj_;
     const bool shared_mode_b =
@@ -5860,18 +5962,32 @@ public:
     } else {
       linear(e, sdw_v, product, shared, h, shared_f, explicit_t);
     }
-    linear(e, block.get("moe_shared_gate"), norm, shared_gate, 1, h, explicit_t);
-    if (wrote_expert_output) {
-      auto &combine =
-          e.emit("mlp", "omlx_m5_moe_topk_shared_combine",
-                 {.width = U64(t) * h}, {.width = 128},
-                 {expert_output, shared, shared_gate, delta});
-      e.dynamic(combine, 4, words({t, 8, h, 0}), tok_w0);
+    if (has_sgate) {
+      linear(e, block.get("moe_shared_gate"), norm, shared_gate, 1, h,
+             explicit_t);
+      if (wrote_expert_output) {
+        auto &combine =
+            e.emit("mlp", "omlx_m5_moe_topk_shared_combine",
+                   {.width = U64(t) * h}, {.width = 128},
+                   {expert_output, shared, shared_gate, delta});
+        e.dynamic(combine, 4, words({t, top_k, h, 0}), tok_w0);
+      } else {
+        auto &combine =
+            e.emit("mlp", "omlx_m5_moe_shared_combine", {.width = U64(t) * h},
+                   {.width = 128}, {routed, shared, shared_gate, delta});
+        e.dynamic(combine, 4, words({t, top_k, h, 0}), tok_w0);
+      }
     } else {
-      auto &combine =
-          e.emit("mlp", "omlx_m5_moe_shared_combine", {.width = U64(t) * h},
-                 {.width = 128}, {routed, shared, shared_gate, delta});
-      e.dynamic(combine, 4, words({t, 8, h, 0}), tok_w0);
+      if (wrote_expert_output) {
+        auto &red = e.emit("mlp", "omlx_m5_moe_topk_reduce",
+                           {.width = U64(t) * h}, {.width = 128},
+                           {expert_output, delta});
+        e.dynamic(red, 2, words({t, top_k, h, 0}), tok_w0);
+      }
+      auto &add_sh = e.emit("qwen_forward", "omlx_m5_forward_add",
+                            {.width = U64(t) * h}, {.width = 128},
+                            {delta, shared});
+      e.dynamic(add_sh, 2, words({t, h}), tok_w0);
     }
   }
 
@@ -5923,7 +6039,10 @@ public:
         std::to_string(config.linear_conv_kernel_dim) + ".exp" +
         std::to_string(config.num_experts) + "x" +
         std::to_string(config.num_experts_per_token) + ".sf" +
-        std::to_string(config.shared_expert_intermediate_size) + ".eps" +
+        std::to_string(config.shared_expert_intermediate_size) + ".og" +
+        (config.has_attn_output_gate ? "1" : "0") + ".qkn" +
+        (config.has_qk_norm ? "1" : "0") + ".seg" +
+        (config.has_shared_expert_gate ? "1" : "0") + ".eps" +
         std::to_string(word(float(config.rms_norm_eps))) + ".th" +
         std::to_string(word(float(config.rope_theta))) + ".no" +
         std::to_string(word(normalization_weight_offset)) + ".ctx" +
@@ -6094,7 +6213,7 @@ public:
       if (blk.type == LayerType::full_attention) {
         return block_has_any_bypass(
                    blk, {"attention_q", "attention_k", "attention_v"}) ||
-               !can_w4a8_weight(blk.get("attention_q"), 2 * q, h) ||
+               !can_w4a8_weight(blk.get("attention_q"), q_out, h) ||
                !can_w4a8_weight(blk.get("attention_k"), kv, h) ||
                !can_w4a8_weight(blk.get("attention_v"), kv, h);
       }
@@ -6683,8 +6802,11 @@ public:
          moe_tg_done_buf.buffer != nullptr && h < 65536U);
     const U32 m2_sq_mul = config.num_experts ? 4U : 1U;
     const bool allow_moe9_bt =
-        (config.num_experts > 0 && !skey.verify && !speculative_enabled &&
-         t_domain_active() && total_m >= 2U && total_m <= 8U);
+        (config.num_experts == 256 && config.num_experts_per_token == 8 &&
+         config.shared_expert_intermediate_size > 0 &&
+         config.has_shared_expert_gate && !skey.verify &&
+         !speculative_enabled && t_domain_active() && total_m >= 2U &&
+         total_m <= 8U);
 
     ScopedTdomOverride tdom_guard{tdom_batch_override_, single_t1_tdom};
 
@@ -6841,7 +6963,7 @@ public:
         const std::array<MaterializedWeightView, 3> parts{
             block.get("attention_q"), block.get("attention_k"),
             block.get("attention_v")};
-        const std::array<U32, 3> part_ns{2 * q, kv, kv};
+        const std::array<U32, 3> part_ns{q_out, kv, kv};
 
         bool can_batched_attn =
             batched_attn_base && (skey.bf16_split_env == 0U);
@@ -6900,17 +7022,17 @@ public:
           const U32 sq_in = *pending_sq_slot;
           pending_sq_slot.reset();
           Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{}, h0{}, h1{}, h2{};
-          if (qkv_bypass == nullptr && 2 * q < 65536U && kv < 65536U &&
-              parts[0].row_count == 2 * q && parts[1].row_count == kv &&
+          if (qkv_bypass == nullptr && q_out < 65536U && kv < 65536U &&
+              parts[0].row_count == q_out && parts[1].row_count == kv &&
               parts[2].row_count == kv && parts[0].in_features == h &&
               parts[1].in_features == h && parts[2].in_features == h) {
             if (resolve_pretiled_mxfp4_t1(parts[0], 1U, &d0, &s0) &&
                 resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
                 resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
               const Ref nw_ref = direct(block.get("input_norm"), h);
-              const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+              const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
               const U32 rptg = use_r4 ? 8U : 4U;
-              const U32 tgs = ((2 * q + rptg - 1U) / rptg) +
+              const U32 tgs = ((q_out + rptg - 1U) / rptg) +
                               2U * ((kv + rptg - 1U) / rptg);
               const char *fn =
                   use_r4 ? "omlx_m5_pretiled_qmv_mxfp4_concat3_bn16_r4_norm_t1"
@@ -6920,7 +7042,7 @@ public:
                                {hidden, nw_ref, rms_sq_buf, d0, s0, d1, s1, d2,
                                 s2, query, key, value});
               e.dynamic(d, 12,
-                        fused_norm_params(2 * q, kv, kv, 0U, h, 0U, sq_in));
+                        fused_norm_params(q_out, kv, kv, 0U, h, 0U, sq_in));
               for (std::size_t i = 0; i < 3; ++i)
                 e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
                                 "pretiled_mxfp4_qmv_concat3_norm_t1_v4", {},
@@ -6939,9 +7061,9 @@ public:
               const U32 b1 = affine_nax_bits(parts[1].format);
               const U32 b2 = affine_nax_bits(parts[2].format);
               const U32 packed_bits = b0 | (b1 << 8U) | (b2 << 16U);
-              const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+              const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
               const U32 rptg = use_r4 ? 8U : 4U;
-              const U32 tgs = ((2 * q + rptg - 1U) / rptg) +
+              const U32 tgs = ((q_out + rptg - 1U) / rptg) +
                               2U * ((kv + rptg - 1U) / rptg);
               const bool all_q456 = (b0 >= 4U && b0 <= 6U) &&
                                     (b1 >= 4U && b1 <= 6U) &&
@@ -6966,7 +7088,7 @@ public:
                                {hidden, nw_ref, rms_sq_buf, d0, h0, s0, d1, h1,
                                 s1, d2, h2, s2, query, key, value});
               e.dynamic(d, 15,
-                        fused_norm_params(2 * q, kv, kv, 0U,
+                        fused_norm_params(q_out, kv, kv, 0U,
                                           pretiled_k_flags(h, lv0, false),
                                           packed_bits, sq_in));
               for (std::size_t i = 0; i < 3; ++i)
@@ -6990,15 +7112,15 @@ public:
 
         if (!qkv_done && single_t1_tdom && !in_f16) {
           Ref d0{}, s0{}, d1{}, s1{}, d2{}, s2{}, h0{}, h1{}, h2{};
-          if (parts[0].row_count == 2 * q && parts[1].row_count == kv &&
+          if (parts[0].row_count == q_out && parts[1].row_count == kv &&
               parts[2].row_count == kv && parts[0].in_features == h &&
               parts[1].in_features == h && parts[2].in_features == h) {
             if (resolve_pretiled_mxfp4_t1(parts[0], 1U, &d0, &s0) &&
                 resolve_pretiled_mxfp4_t1(parts[1], 1U, &d1, &s1) &&
                 resolve_pretiled_mxfp4_t1(parts[2], 1U, &d2, &s2)) {
-              const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+              const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
               const U32 rptg = use_r4 ? 8U : 4U;
-              const U32 tgs = ((2 * q + rptg - 1U) / rptg) +
+              const U32 tgs = ((q_out + rptg - 1U) / rptg) +
                               2U * ((kv + rptg - 1U) / rptg);
               const char *fn =
                   use_r4 ? "omlx_m5_pretiled_qmv_mxfp4_concat3_bn16_r4_t1"
@@ -7007,7 +7129,7 @@ public:
                                {.width = 64U},
                                {norm, d0, s0, d1, s1, d2, s2, query, key,
                                 value});
-              e.dynamic(d, 10, words({2 * q, kv, kv, h}));
+              e.dynamic(d, 10, words({q_out, kv, kv, h}));
               for (std::size_t i = 0; i < 3; ++i)
                 e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
                                 "pretiled_mxfp4_qmv_concat3_t1_v3", {},
@@ -7025,9 +7147,9 @@ public:
               const U32 b1 = affine_nax_bits(parts[1].format);
               const U32 b2 = affine_nax_bits(parts[2].format);
               const U32 packed_bits = b0 | (b1 << 8U) | (b2 << 16U);
-              const bool use_r4 = ((2 * q + 2 * kv) >= 2048U);
+              const bool use_r4 = ((q_out + 2 * kv) >= 2048U);
               const U32 rptg = use_r4 ? 8U : 4U;
-              const U32 tgs = ((2 * q + rptg - 1U) / rptg) +
+              const U32 tgs = ((q_out + rptg - 1U) / rptg) +
                               2U * ((kv + rptg - 1U) / rptg);
               const bool all_q456 = (b0 >= 4U && b0 <= 6U) &&
                                     (b1 >= 4U && b1 <= 6U) &&
@@ -7048,7 +7170,7 @@ public:
                                {norm, d0, h0, s0, d1, h1, s1, d2, h2, s2, query,
                                 key, value});
               e.dynamic(d, 13,
-                        words({2 * q, kv, kv, pretiled_k_flags(h, lv0, false),
+                        words({q_out, kv, kv, pretiled_k_flags(h, lv0, false),
                                packed_bits}));
               for (std::size_t i = 0; i < 3; ++i)
                 e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
@@ -7068,7 +7190,7 @@ public:
           if (can_batched_attn || can_batched_affine4_attn || total_m == 1U) {
             used_strided_qkv = true;
           } else {
-            emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv,
+            emit_split3(e, concat_out, query, key, value, q_out, kv, kv,
                         total_m);
           }
           qkv_done = true;
@@ -7076,15 +7198,15 @@ public:
         if (!qkv_done) {
           if (in_f16) {
             linear_from_f16(e, block.get("attention_q"), f16_norm,
-                            f16_ones_scale, query, 2 * q, h, total_m);
+                            f16_ones_scale, query, q_out, h, total_m);
             linear_from_f16(e, block.get("attention_k"), f16_norm,
                             f16_ones_scale, key, kv, h, total_m);
             linear_from_f16(e, block.get("attention_v"), f16_norm,
                             f16_ones_scale, value, kv, h, total_m);
           } else if (use_m2) {
             if (!try_linear_m2_base(e, block.get("attention_q"), norm, query,
-                                    2 * q, h))
-              linear_base(e, block.get("attention_q"), norm, query, 2 * q, h,
+                                    q_out, h))
+              linear_base(e, block.get("attention_q"), norm, query, q_out, h,
                           total_m);
             if (!try_linear_m2_base(e, block.get("attention_k"), norm, key, kv,
                                     h))
@@ -7095,7 +7217,7 @@ public:
               linear_base(e, block.get("attention_v"), norm, value, kv, h,
                           total_m);
           } else {
-            linear_base(e, block.get("attention_q"), norm, query, 2 * q, h,
+            linear_base(e, block.get("attention_q"), norm, query, q_out, h,
                         total_m);
             linear_base(e, block.get("attention_k"), norm, key, kv, h, total_m);
             linear_base(e, block.get("attention_v"), norm, value, kv, h,
@@ -7103,16 +7225,16 @@ public:
           }
         }
         if (qkv_bypass != nullptr) {
-          const U32 qkv_tot = 2 * q + 2 * kv;
+          const U32 qkv_tot = q_out + 2 * kv;
           const std::array<detail::lora_rt::BypassPartDest, 3> dests =
               used_strided_qkv
                   ? std::array<detail::lora_rt::BypassPartDest, 3>{{
                         {concat_out, qkv_tot, 0U},
-                        {concat_out, qkv_tot, 2 * q},
-                        {concat_out, qkv_tot, 2 * q + kv},
+                        {concat_out, qkv_tot, q_out},
+                        {concat_out, qkv_tot, q_out + kv},
                     }}
                   : std::array<detail::lora_rt::BypassPartDest, 3>{{
-                        {query, 2 * q, 0U},
+                        {query, q_out, 0U},
                         {key, kv, 0U},
                         {value, kv, 0U},
                     }};
@@ -7126,26 +7248,39 @@ public:
           const U32 hd = U32(c.head_dim);
           const U32 qh = U32(c.num_attention_heads);
           const U32 kvh = U32(c.num_key_value_heads);
-          const U32 qkv_stride = used_strided_qkv ? (2 * q + 2 * kv) : 0U;
+          const bool has_gate = c.has_attn_output_gate;
+          const bool has_qkn = block.operands.contains("q_norm") &&
+                               block.operands.contains("k_norm");
+          const Ref q_norm_ref =
+              has_qkn ? direct(block.get("q_norm"), hd) : zero;
+          const Ref k_norm_ref =
+              has_qkn ? direct(block.get("k_norm"), hd) : zero;
+          const U32 eps_word = word(has_qkn ? float(c.rms_norm_eps) : -1.0F);
+          const U32 qkv_stride = used_strided_qkv ? (q_out + 2 * kv) : 0U;
           Ref q_ref = used_strided_qkv ? concat_out : query;
           Ref gate_ref =
-              used_strided_qkv
-                  ? Ref{concat_out.buffer, concat_out.offset + mul(hd, 2U),
-                        concat_out.bytes - mul(hd, 2U)}
-                  : Ref{query.buffer, query.offset + mul(hd, 2U),
-                        query.bytes - mul(hd, 2U)};
+              has_gate
+                  ? (used_strided_qkv
+                         ? Ref{concat_out.buffer,
+                               concat_out.offset + mul(hd, 2U),
+                               concat_out.bytes - mul(hd, 2U)}
+                         : Ref{query.buffer, query.offset + mul(hd, 2U),
+                               query.bytes - mul(hd, 2U)})
+                  : zero;
           Ref k_ref =
               used_strided_qkv
-                  ? Ref{concat_out.buffer, concat_out.offset + mul(2 * q, 2U),
-                        concat_out.bytes - mul(2 * q, 2U)}
+                  ? Ref{concat_out.buffer, concat_out.offset + mul(q_out, 2U),
+                        concat_out.bytes - mul(q_out, 2U)}
                   : key;
           Ref v_ref =
               used_strided_qkv
                   ? Ref{concat_out.buffer,
-                        concat_out.offset + mul(2 * q + kv, 2U),
-                        concat_out.bytes - mul(2 * q + kv, 2U)}
+                        concat_out.offset + mul(q_out + kv, 2U),
+                        concat_out.bytes - mul(q_out + kv, 2U)}
                   : value;
-          const U32 q_tok_stride = used_strided_qkv ? qkv_stride : (2 * q);
+          const U32 q_tok_stride = used_strided_qkv ? qkv_stride : q_out;
+          const U32 g_tok_stride = has_gate ? q_tok_stride : 0U;
+          const U32 g_head_stride = has_gate ? (hd * 2U) : 0U;
           const U32 k_tok_stride = used_strided_qkv ? qkv_stride : kv;
           const U32 v_tok_stride = used_strided_qkv ? qkv_stride : kv;
 
@@ -7164,12 +7299,12 @@ public:
                                   rot_dim,
                                   total_m,
                                   q_tok_stride,
-                                  hd * 2U,
+                                  q_head_stride,
                                   k_tok_stride,
                                   hd,
                                   v_tok_stride,
                                   U32(B),
-                                  word(float(c.rms_norm_eps)),
+                                  eps_word,
                                   word(float(c.rope_theta)),
                                   word(normalization_weight_offset)};
           post_w.insert(post_w.end(), row_offs_8.begin(), row_offs_8.end());
@@ -7179,10 +7314,9 @@ public:
               "omlx_m5_attention_qk_norm_rope_kv_append_batched_exact",
               {.width = 32U, .height = U64(total_m) * (qh + kvh)},
               {.width = 32U},
-              {q_ref, k_ref, v_ref, direct(block.get("q_norm"), hd),
-               direct(block.get("k_norm"), hd), s0_blk.state0, s0_blk.state1,
-               attention_positions, pt[0], pt[1], pt[2], pt[3], pt[4], pt[5],
-               pt[6], pt[7]});
+              {q_ref, k_ref, v_ref, q_norm_ref, k_norm_ref, s0_blk.state0,
+               s0_blk.state1, attention_positions, pt[0], pt[1], pt[2], pt[3],
+               pt[4], pt[5], pt[6], pt[7]});
           e.dynamic(post, 16, words_span(post_w));
 
           const char *attn_fn =
@@ -7232,9 +7366,9 @@ public:
                                   64U,
                                   skey.slots[0]->page_pool->physical_pages(),
                                   q_tok_stride,
-                                  hd * 2U,
-                                  q_tok_stride,
-                                  hd * 2U};
+                                  q_head_stride,
+                                  g_tok_stride,
+                                  g_head_stride};
           attn_w.insert(attn_w.end(), row_offs_8.begin(), row_offs_8.end());
           attn_w.insert(attn_w.end(), widths_8.begin(), widths_8.end());
           attn_w.insert(attn_w.end(), caps_8.begin(), caps_8.end());
@@ -7256,26 +7390,36 @@ public:
         } else if (can_batched_affine4_attn) {
           const auto &c = config;
           const U32 hd = U32(c.head_dim);
-          const U32 qkv_stride = used_strided_qkv ? (2 * q + 2 * kv) : 0U;
+          const bool has_gate = c.has_attn_output_gate;
+          const bool has_qkn = block.operands.contains("q_norm") &&
+                               block.operands.contains("k_norm");
+          const Ref q_norm_ref =
+              has_qkn ? direct(block.get("q_norm"), hd) : zero;
+          const Ref k_norm_ref =
+              has_qkn ? direct(block.get("k_norm"), hd) : zero;
+          const U32 qkv_stride = used_strided_qkv ? (q_out + 2 * kv) : 0U;
           Ref q_ref = used_strided_qkv ? concat_out : query;
           Ref gate_ref =
-              used_strided_qkv
-                  ? Ref{concat_out.buffer, concat_out.offset + mul(hd, 2U),
-                        concat_out.bytes - mul(hd, 2U)}
-                  : Ref{query.buffer, query.offset + mul(hd, 2U),
-                        query.bytes - mul(hd, 2U)};
+              has_gate
+                  ? (used_strided_qkv
+                         ? Ref{concat_out.buffer,
+                               concat_out.offset + mul(hd, 2U),
+                               concat_out.bytes - mul(hd, 2U)}
+                         : Ref{query.buffer, query.offset + mul(hd, 2U),
+                               query.bytes - mul(hd, 2U)})
+                  : zero;
           Ref k_ref =
               used_strided_qkv
-                  ? Ref{concat_out.buffer, concat_out.offset + mul(2 * q, 2U),
-                        concat_out.bytes - mul(2 * q, 2U)}
+                  ? Ref{concat_out.buffer, concat_out.offset + mul(q_out, 2U),
+                        concat_out.bytes - mul(q_out, 2U)}
                   : key;
           Ref v_ref =
               used_strided_qkv
                   ? Ref{concat_out.buffer,
-                        concat_out.offset + mul(2 * q + kv, 2U),
-                        concat_out.bytes - mul(2 * q + kv, 2U)}
+                        concat_out.offset + mul(q_out + kv, 2U),
+                        concat_out.bytes - mul(q_out + kv, 2U)}
                   : value;
-          const U32 q_tok_stride = used_strided_qkv ? qkv_stride : (2 * q);
+          const U32 q_tok_stride = used_strided_qkv ? qkv_stride : q_out;
           const U32 k_tok_stride = used_strided_qkv ? qkv_stride : kv;
           const U32 v_tok_stride = used_strided_qkv ? qkv_stride : kv;
 
@@ -7292,10 +7436,9 @@ public:
               skey.slots[0]->max_context,
               skey.slots[0]->page_pool->physical_pages(), q_tok_stride,
               k_tok_stride, v_tok_stride, normalization_weight_offset, q_ref,
-              gate_ref, k_ref, v_ref, direct(block.get("q_norm"), hd),
-              direct(block.get("k_norm"), hd), s0_blk.state0, s0_blk.state1,
-              mixer, attention_positions, pt, row_offs_8, widths_8, split_max,
-              split_sum, split_output);
+              gate_ref, k_ref, v_ref, q_norm_ref, k_norm_ref, s0_blk.state0,
+              s0_blk.state1, mixer, attention_positions, pt, row_offs_8,
+              widths_8, split_max, split_sum, split_output);
         } else {
           for (std::size_t b_idx = 0; b_idx < B; ++b_idx) {
             const auto &sp = *skey.slots[b_idx];
@@ -7307,14 +7450,14 @@ public:
                     ? row_slice_ref(attention_positions, r_off, w_b, 1U, 4U)
                     : Ref{};
             Ref q_s = used_strided_qkv
-                          ? Ref{concat_out.buffer, 0, mul(2 * q, 2)}
-                          : row_slice_ref(query, r_off, w_b, 2 * q);
+                          ? Ref{concat_out.buffer, 0, mul(q_out, 2)}
+                          : row_slice_ref(query, r_off, w_b, q_out);
             Ref k_s = used_strided_qkv
-                          ? Ref{concat_out.buffer, mul(2 * q, 2), mul(kv, 2)}
+                          ? Ref{concat_out.buffer, mul(q_out, 2), mul(kv, 2)}
                           : row_slice_ref(key, r_off, w_b, kv);
             Ref v_s =
                 used_strided_qkv
-                    ? Ref{concat_out.buffer, mul(2 * q + kv, 2), mul(kv, 2)}
+                    ? Ref{concat_out.buffer, mul(q_out + kv, 2), mul(kv, 2)}
                     : row_slice_ref(value, r_off, w_b, kv);
             const bool slot_split =
                 (skey.bf16_split_env > 0U) &&
@@ -9052,14 +9195,14 @@ public:
             const std::array<MaterializedWeightView, 3> parts{
                 block.get("attention_q"), block.get("attention_k"),
                 block.get("attention_v")};
-            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            const std::array<U32, 3> part_ns{q_out, kv, kv};
             if (try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
                                     norm, concat_out)) {
-              emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+              emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
             } else {
               if (!try_linear_w4a8_base(e, block.get("attention_q"), norm,
-                                        query, 2 * q, h))
-                linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+                                        query, q_out, h))
+                linear_base(e, block.get("attention_q"), norm, query, q_out, h);
               if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key,
                                         kv, h))
                 linear_base(e, block.get("attention_k"), norm, key, kv, h);
@@ -9071,12 +9214,12 @@ public:
             const std::array<MaterializedWeightView, 3> parts{
                 block.get("attention_q"), block.get("attention_k"),
                 block.get("attention_v")};
-            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            const std::array<U32, 3> part_ns{q_out, kv, kv};
             if (try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h, false,
                                norm, concat_out)) {
-              emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+              emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
             } else {
-              linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+              linear_base(e, block.get("attention_q"), norm, query, q_out, h);
               linear_base(e, block.get("attention_k"), norm, key, kv, h);
               linear_base(e, block.get("attention_v"), norm, value, kv, h);
             }
@@ -9629,9 +9772,10 @@ public:
                                U32 start_pos_for_params, U32 context_envelope,
                                Ref attn_pos_ref) {
     const auto &c = config;
+    const bool has_gate = c.has_attn_output_gate;
     const Ref table_ref{&page_pool->table_buffer(), 0,
                         page_pool->table_buffer().size()};
-    const Ref gate_ref = sub(query, U64(c.head_dim) * 2);
+    const Ref gate_ref = has_gate ? sub(query, U64(c.head_dim) * 2) : zero;
     auto params = words({U32(c.num_attention_heads),
                          U32(c.num_key_value_heads),
                          U32(c.head_dim),
@@ -9640,12 +9784,12 @@ public:
                          max_context,
                          64U,
                          page_pool->physical_pages(),
-                         q * 2,
-                         U32(c.head_dim * 2),
+                         q_out,
+                         q_head_stride,
                          kv,
                          kv,
-                         q * 2,
-                         U32(c.head_dim * 2)});
+                         has_gate ? q_out : 0U,
+                         has_gate ? q_head_stride : 0U});
     const auto route =
         select_chunk_attention_route(m_rows, start_pos_for_params);
     if (route != ChunkAttentionRoute::ExactNax && sage2_enabled_ &&
@@ -9846,28 +9990,32 @@ public:
         const std::array<MaterializedWeightView, 3> parts{
             block.get("attention_q"), block.get("attention_k"),
             block.get("attention_v")};
-        const std::array<U32, 3> part_ns{2 * q, kv, kv};
+        const std::array<U32, 3> part_ns{q_out, kv, kv};
         if (use_w4a8 &&
             try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h, norm,
                                 concat_out)) {
-          emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+          emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
         } else if (use_w4a8) {
-          if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
-            linear_base(e, parts[0], norm, query, 2 * q, h);
+          if (!try_linear_w4a8_base(e, parts[0], norm, query, q_out, h))
+            linear_base(e, parts[0], norm, query, q_out, h);
           if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
             linear_base(e, parts[1], norm, key, kv, h);
           if (!try_linear_w4a8_base(e, parts[2], norm, value, kv, h))
             linear_base(e, parts[2], norm, value, kv, h);
         } else if (try_concat_nax(e, block.concat_qkv_id, parts, part_ns, h,
                                   false, norm, concat_out)) {
-          emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+          emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
         } else {
-          linear_base(e, parts[0], norm, query, 2 * q, h);
+          linear_base(e, parts[0], norm, query, q_out, h);
           linear_base(e, parts[1], norm, key, kv, h);
           linear_base(e, parts[2], norm, value, kv, h);
         }
 
         // Capture pre-RoPE K (post k_norm) + V BEFORE emit_attention_state_step mutates key!
+        const bool has_qkn = block.operands.contains("q_norm") &&
+                             block.operands.contains("k_norm");
+        const Ref k_norm_ref =
+            has_qkn ? direct(block.get("k_norm"), config.head_dim) : zero;
         detail::BlendExtractPreRopeKvParams ep{};
         ep.key_value_heads = kvh;
         ep.head_dim = U32(config.head_dim);
@@ -9875,7 +10023,7 @@ public:
         ep.tokens = lm;
         ep.key_token_stride = kv;
         ep.value_token_stride = kv;
-        ep.apply_k_norm = 1U;
+        ep.apply_k_norm = has_qkn ? 1U : 0U;
         ep.write_rotary_bf16 = 1U;
         ep.epsilon = float(config.rms_norm_eps);
         ep.weight_offset = normalization_weight_offset;
@@ -9891,8 +10039,7 @@ public:
         auto &ext = e.emit(
             "cache_blend", "omlx_m5_blend_extract_kv_prerope_affine4_g128",
             {.width = 32U, .height = U64(lm) * kvh}, {.width = 32U},
-            {key, value, direct(block.get("k_norm"), config.head_dim),
-             dst_k_pre, dst_k_rot, dst_v});
+            {key, value, k_norm_ref, dst_k_pre, dst_k_rot, dst_v});
         e.dynamic(ext, 6, pod_bytes(ep));
 
         // Run live attention (populates KvPagePool & produces mixer).
@@ -10564,6 +10711,15 @@ public:
           normalize(e1, pblk.get("input_norm"), full_hidden_ref, norm);
         }
 
+        const bool probe_qkn = pblk.operands.contains("q_norm") &&
+                               pblk.operands.contains("k_norm");
+        const Ref probe_q_norm =
+            probe_qkn ? direct(pblk.get("q_norm"), config.head_dim) : zero;
+        const Ref probe_k_norm =
+            probe_qkn ? direct(pblk.get("k_norm"), config.head_dim) : zero;
+        const float probe_eps =
+            probe_qkn ? float(config.rms_norm_eps) : -1.0F;
+
         if (m_mand > 0U) {
           e1.delegated_prefill = (m_mand >= 16U);
           detail::BlendGatherScatterParams gp{
@@ -10594,22 +10750,21 @@ public:
           sp.head_dim = U32(config.head_dim);
           sp.rotary_dim = rot_dim;
           sp.max_active_tokens = m_mand;
-          sp.query_token_stride = q * 2U;
-          sp.query_head_stride = U32(config.head_dim * 2);
+          sp.query_token_stride = q_out;
+          sp.query_head_stride = q_head_stride;
           sp.key_token_stride = kv;
           sp.key_head_stride = U32(config.head_dim);
           sp.value_token_stride = kv;
           sp.page_tokens = 64U;
           sp.use_device_count = 0U;
-          sp.epsilon = float(config.rms_norm_eps);
+          sp.epsilon = probe_eps;
           sp.theta = float(config.rope_theta);
           sp.weight_offset = normalization_weight_offset;
           auto &skv = e1.emit(
               "cache_blend",
               "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
               {.width = 32U, .height = U64(m_mand) * kvh}, {.width = 32U},
-              {query, key, value, direct(pblk.get("q_norm"), config.head_dim),
-               direct(pblk.get("k_norm"), config.head_dim), pblk.state0,
+              {query, key, value, probe_q_norm, probe_k_norm, pblk.state0,
                pblk.state1, table_ref, mand_pos_ref, zero});
           e1.dynamic(skv, 10, pod_bytes(sp));
           emit_refresh_pages(e1, pblk);
@@ -10617,21 +10772,20 @@ public:
 
         if (!(use_w4a8_win &&
               try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
-                                   2 * q, h))) {
-          linear_base(e1, pblk.get("attention_q"), norm, query, 2 * q, h);
+                                   q_out, h))) {
+          linear_base(e1, pblk.get("attention_q"), norm, query, q_out, h);
         }
         {
           auto &post = e1.emit(
               "attention_exact", "omlx_m5_attention_qk_norm_rope_exact",
               {.width = 32U, .height = U64(win_len) * (qh + kvh)},
               {.width = 32U},
-              {query, key, direct(pblk.get("q_norm"), config.head_dim),
-               direct(pblk.get("k_norm"), config.head_dim), prompt_pos_ref});
+              {query, key, probe_q_norm, probe_k_norm, prompt_pos_ref});
           e1.dynamic(post, 5,
                      words({qh, kvh, U32(config.head_dim), rot_dim, win_len,
-                            q * 2, U32(config.head_dim * 2), kv,
+                            q_out, q_head_stride, kv,
                             U32(config.head_dim), win_prefix,
-                            word(float(config.rms_norm_eps)),
+                            word(probe_eps),
                             word(float(config.rope_theta)),
                             word(normalization_weight_offset)}));
         }
@@ -11142,40 +11296,46 @@ public:
               const std::array<MaterializedWeightView, 3> parts{
                   blk.get("attention_q"), blk.get("attention_k"),
                   blk.get("attention_v")};
-              const std::array<U32, 3> part_ns{2 * q, kv, kv};
+              const std::array<U32, 3> part_ns{q_out, kv, kv};
               if (use_w4a8_active &&
                   try_concat_w4a8_nax(e, blk.concat_qkv_id, parts, part_ns, h,
                                       norm, concat_out)) {
-                emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+                emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
               } else if (use_w4a8_active) {
-                if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h))
-                  linear_base(e, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a8_base(e, parts[0], norm, query, q_out, h))
+                  linear_base(e, parts[0], norm, query, q_out, h);
                 if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h))
                   linear_base(e, parts[1], norm, key, kv, h);
                 if (!try_linear_w4a8_base(e, parts[2], norm, value, kv, h))
                   linear_base(e, parts[2], norm, value, kv, h);
               } else if (try_concat_nax(e, blk.concat_qkv_id, parts, part_ns, h,
                                         false, norm, concat_out)) {
-                emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+                emit_split3(e, concat_out, query, key, value, q_out, kv, kv);
               } else {
-                linear_base(e, parts[0], norm, query, 2 * q, h);
+                linear_base(e, parts[0], norm, query, q_out, h);
                 linear_base(e, parts[1], norm, key, kv, h);
                 linear_base(e, parts[2], norm, value, kv, h);
               }
+              const bool blk_qkn = blk.operands.contains("q_norm") &&
+                                   blk.operands.contains("k_norm");
+              const Ref blk_q_norm =
+                  blk_qkn ? direct(blk.get("q_norm"), config.head_dim) : zero;
+              const Ref blk_k_norm =
+                  blk_qkn ? direct(blk.get("k_norm"), config.head_dim) : zero;
               detail::BlendQkNormRopeScatterParams sp{};
               sp.query_heads = qh;
               sp.key_value_heads = kvh;
               sp.head_dim = U32(config.head_dim);
               sp.rotary_dim = rot_dim;
               sp.max_active_tokens = m_active;
-              sp.query_token_stride = q * 2U;
-              sp.query_head_stride = U32(config.head_dim * 2);
+              sp.query_token_stride = q_out;
+              sp.query_head_stride = q_head_stride;
               sp.key_token_stride = kv;
               sp.key_head_stride = U32(config.head_dim);
               sp.value_token_stride = kv;
               sp.page_tokens = 64U;
               sp.use_device_count = 0U;
-              sp.epsilon = float(config.rms_norm_eps);
+              sp.epsilon = blk_qkn ? float(config.rms_norm_eps) : -1.0F;
               sp.theta = float(config.rope_theta);
               sp.weight_offset = normalization_weight_offset;
               auto &sc = e.emit(
@@ -11183,8 +11343,7 @@ public:
                   "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
                   {.width = 32U, .height = U64(m_active) * (qh + kvh)},
                   {.width = 32U},
-                  {query, key, value, direct(blk.get("q_norm"), config.head_dim),
-                   direct(blk.get("k_norm"), config.head_dim), blk.state0,
+                  {query, key, value, blk_q_norm, blk_k_norm, blk.state0,
                    blk.state1, table_ref, attention_positions, zero});
               e.dynamic(sc, 10, pod_bytes(sp));
               emit_refresh_pages(e, blk);
@@ -11366,41 +11525,47 @@ public:
             const std::array<MaterializedWeightView, 3> parts{
                 blk.get("attention_q"), blk.get("attention_k"),
                 blk.get("attention_v")};
-            const std::array<U32, 3> part_ns{2 * q, kv, kv};
+            const std::array<U32, 3> part_ns{q_out, kv, kv};
             if (use_w4a8_active &&
                 try_concat_w4a8_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
                                     norm, concat_out)) {
-              emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+              emit_split3(e2, concat_out, query, key, value, q_out, kv, kv);
             } else if (use_w4a8_active) {
-              if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h))
-                linear_base(e2, parts[0], norm, query, 2 * q, h);
+              if (!try_linear_w4a8_base(e2, parts[0], norm, query, q_out, h))
+                linear_base(e2, parts[0], norm, query, q_out, h);
               if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h))
                 linear_base(e2, parts[1], norm, key, kv, h);
               if (!try_linear_w4a8_base(e2, parts[2], norm, value, kv, h))
                 linear_base(e2, parts[2], norm, value, kv, h);
             } else if (try_concat_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
                                       false, norm, concat_out)) {
-              emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+              emit_split3(e2, concat_out, query, key, value, q_out, kv, kv);
             } else {
-              linear_base(e2, parts[0], norm, query, 2 * q, h);
+              linear_base(e2, parts[0], norm, query, q_out, h);
               linear_base(e2, parts[1], norm, key, kv, h);
               linear_base(e2, parts[2], norm, value, kv, h);
             }
 
+            const bool blk_qkn = blk.operands.contains("q_norm") &&
+                                 blk.operands.contains("k_norm");
+            const Ref blk_q_norm =
+                blk_qkn ? direct(blk.get("q_norm"), config.head_dim) : zero;
+            const Ref blk_k_norm =
+                blk_qkn ? direct(blk.get("k_norm"), config.head_dim) : zero;
             detail::BlendQkNormRopeScatterParams sp{};
             sp.query_heads = qh;
             sp.key_value_heads = kvh;
             sp.head_dim = U32(config.head_dim);
             sp.rotary_dim = rot_dim;
             sp.max_active_tokens = m_active;
-            sp.query_token_stride = q * 2U;
-            sp.query_head_stride = U32(config.head_dim * 2);
+            sp.query_token_stride = q_out;
+            sp.query_head_stride = q_head_stride;
             sp.key_token_stride = kv;
             sp.key_head_stride = U32(config.head_dim);
             sp.value_token_stride = kv;
             sp.page_tokens = 64U;
             sp.use_device_count = 0U;
-            sp.epsilon = float(config.rms_norm_eps);
+            sp.epsilon = blk_qkn ? float(config.rms_norm_eps) : -1.0F;
             sp.theta = float(config.rope_theta);
             sp.weight_offset = normalization_weight_offset;
             auto &sc = e2.emit(
@@ -11408,8 +11573,7 @@ public:
                 "omlx_m5_attention_qk_norm_rope_kv_scatter_affine4_g128",
                 {.width = 32U, .height = U64(m_active) * (qh + kvh)},
                 {.width = 32U},
-                {query, key, value, direct(blk.get("q_norm"), config.head_dim),
-                 direct(blk.get("k_norm"), config.head_dim), blk.state0,
+                {query, key, value, blk_q_norm, blk_k_norm, blk.state0,
                  blk.state1, table_ref, attention_positions, zero});
             e2.dynamic(sc, 10, pod_bytes(sp));
             emit_refresh_pages(e2, blk);
@@ -11670,7 +11834,8 @@ public:
   U32 workspace_rows_ = 1024U;
   U32 feature_ring_rows_ = 0U;
   U64 feature_epoch_ = 0ULL;
-  U32 h = 0, f = 0, v = 0, q = 0, kv = 0, gk = 0, gv = 0, conv = 0;
+  U32 h = 0, f = 0, v = 0, q = 0, q_out = 0, q_head_stride = 0, kv = 0,
+      gk = 0, gv = 0, conv = 0;
   float normalization_weight_offset = 0.0F;
   QwenForwardMemoryPlan allocation_plan;
   std::set<std::string> allocation_names;
@@ -11719,6 +11884,7 @@ public:
   Ref feature_history;
   std::vector<Profile> verify_profiles;
   Profile commit_profile;
+  bool has_commit_profile = false;
   Profile kv_cow_profile;
   Profile inspect_norm_profile;
   Profile inspect_head_chunk_profile;
@@ -11798,6 +11964,7 @@ public:
   std::shared_ptr<const QwenBypassLoraRuntime> bypass_lora_;
   std::unique_ptr<MetalBuffer> lora_bypass_tmp_buf_;
   Ref lora_bypass_tmp_{};
+  std::unordered_map<U32, Ref> f16_direct_cache_;
 
   struct UmaCheckpointPool {
     static constexpr std::size_t kDefaultMaxPooledSlabs = 16U;
@@ -11999,6 +12166,82 @@ MetalIcbProfile *QwenPreparedStep::icb_profile() const {
 }
 U32 QwenPreparedStep::width() const { return impl_->count; }
 bool QwenPreparedStep::verifying() const { return impl_->verify; }
+
+bool QwenForward::supports_config(const QwenModelConfig &config,
+                                  std::string *reason) {
+  auto fail = [&](std::string msg) {
+    if (reason != nullptr) {
+      *reason = std::move(msg);
+    }
+    return false;
+  };
+  if (config.hidden_size <= 0 || (config.hidden_size % 64) != 0) {
+    return fail("hidden_size must be positive and divisible by 64");
+  }
+  if (config.intermediate_size <= 0 || (config.intermediate_size % 64) != 0) {
+    return fail("intermediate_size must be positive and divisible by 64");
+  }
+  if (config.vocab_size <= 0) {
+    return fail("vocab_size must be positive");
+  }
+  if (config.num_hidden_layers <= 0 ||
+      config.layer_types.size() != std::size_t(config.num_hidden_layers)) {
+    return fail("num_hidden_layers must be positive and match layer_types");
+  }
+  if (config.num_attention_heads <= 0 || config.num_key_value_heads <= 0 ||
+      (config.num_attention_heads % config.num_key_value_heads) != 0) {
+    return fail("num_attention_heads must be a positive multiple of num_key_value_heads");
+  }
+  if (config.head_dim <= 0 || config.head_dim > 256 ||
+      (config.head_dim % 2) != 0) {
+    return fail("head_dim must be an even integer in 2..256");
+  }
+  if (!std::isfinite(config.partial_rotary_factor) ||
+      config.partial_rotary_factor <= 0.0 ||
+      config.partial_rotary_factor > 1.0) {
+    return fail("partial_rotary_factor must be in (0, 1]");
+  }
+  const auto rotary_dim =
+      std::llround(double(config.head_dim) * config.partial_rotary_factor);
+  if (rotary_dim <= 0 || (rotary_dim % 2) != 0 ||
+      rotary_dim > config.head_dim) {
+    return fail("rotary_dim must be a positive even integer <= head_dim");
+  }
+  if (!std::isfinite(config.rms_norm_eps) || config.rms_norm_eps <= 0.0 ||
+      !std::isfinite(config.rope_theta) || config.rope_theta <= 0.0) {
+    return fail("rms_norm_eps and rope_theta must be positive finite values");
+  }
+  if (config.linear_attention_layers() > 0) {
+    if (config.linear_num_key_heads <= 0 ||
+        config.linear_num_value_heads <= 0 ||
+        (config.linear_num_value_heads % config.linear_num_key_heads) != 0 ||
+        config.linear_key_head_dim <= 0 || config.linear_value_head_dim <= 0 ||
+        config.linear_conv_kernel_dim <= 1) {
+      return fail(
+          "linear_attention layers require valid positive linear head/dim/conv parameters");
+    }
+  }
+  if (config.num_experts < 0 || config.num_experts == 1 ||
+      config.num_experts > 256) {
+    return fail("num_experts must be 0 (dense) or in 2..256");
+  }
+  if (config.num_experts >= 2) {
+    if (config.num_experts_per_token < 1 || config.num_experts_per_token > 8 ||
+        config.num_experts_per_token > config.num_experts) {
+      return fail("num_experts_per_token must be in 1..8 and <= num_experts");
+    }
+    if (config.shared_expert_intermediate_size < 0 ||
+        (config.shared_expert_intermediate_size > 0 &&
+         (config.shared_expert_intermediate_size % 64) != 0)) {
+      return fail(
+          "shared_expert_intermediate_size must be 0 or a positive multiple of 64");
+    }
+  }
+  if (reason != nullptr) {
+    reason->clear();
+  }
+  return true;
+}
 
 QwenForward::QwenForward(
     const MetalContext &context, const MaterializedModel &weights,
@@ -13150,15 +13393,17 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
     }
   }
   if (inspect_tensors) {
-    if (p.route_trace.buffer) {
-      const auto count = mul(tokens.size(), mul(p.blocks.size(), 8));
+    if (p.route_trace.buffer && p.config.num_experts > 0) {
+      const U64 top_k = U64(p.config.num_experts_per_token);
+      const U64 num_exp = U64(p.config.num_experts);
+      const auto count = mul(tokens.size(), mul(p.blocks.size(), top_k));
       const auto bytes = p.route_trace.buffer->read(0, count * 4);
       result.layer_routes.resize(count);
       std::memcpy(result.layer_routes.data(), bytes.data(), bytes.size());
       result.host_read_bytes += bytes.size();
       result.router_logits =
           bf16_values(*p.router_logits_trace.buffer,
-                      mul(tokens.size(), mul(p.blocks.size(), 256)));
+                      mul(tokens.size(), mul(p.blocks.size(), num_exp)));
       result.router_scores = bf16_values(*p.router_scores_trace.buffer, count);
       result.host_read_bytes +=
           2 * (result.router_logits.size() + result.router_scores.size());
@@ -13286,7 +13531,7 @@ MetalIcbProfile *QwenForward::prepare_commit_prefix(U32 count) {
   auto &p = *impl_;
   if (!p.pending_verify || count > p.pending_verify)
     throw std::invalid_argument("Qwen commit outside pending prefix");
-  if (!count)
+  if (!count || !p.has_commit_profile)
     return nullptr;
   auto &profile = p.commit_profile;
   for (const auto &patch : profile.patches) {
@@ -13304,7 +13549,7 @@ MetalSubmission QwenForward::finish_commit_prefix(U32 count,
   if (!p.pending_verify || count > p.pending_verify)
     throw std::invalid_argument("Qwen commit outside pending prefix");
   MetalSubmission result;
-  if (count && !already_executed) {
+  if (count && !already_executed && p.has_commit_profile) {
     auto &profile = p.commit_profile;
     if (profile.icb)
       result = p.context.replay_icb(*profile.icb);
@@ -13480,28 +13725,31 @@ std::vector<U32> QwenForward::inspect_kv_page_table() const {
 QwenMoeRouteSnapshot QwenForward::read_moe_route_trace(U32 layer) const {
   const auto &p = *impl_;
   if (!p.route_trace.buffer || !p.router_scores_trace.buffer ||
+      p.config.num_experts <= 0 || p.config.num_experts_per_token <= 0 ||
       p.pending_verify || !p.last_trace_tokens ||
       layer >= U32(p.config.num_hidden_layers) ||
       p.last_trace_tokens > p.next_position)
     throw std::logic_error("Qwen committed MoE route trace unavailable");
   const U32 t = p.last_trace_tokens;
   const U64 layers = U64(p.config.num_hidden_layers);
-  const auto id_bytes = p.route_trace.buffer->read(0, U64(t) * layers * 8 * 4);
+  const U64 top_k = U64(p.config.num_experts_per_token);
+  const auto id_bytes =
+      p.route_trace.buffer->read(0, U64(t) * layers * top_k * 4);
   const auto score_bytes =
-      p.router_scores_trace.buffer->read(0, U64(t) * layers * 8 * 2);
+      p.router_scores_trace.buffer->read(0, U64(t) * layers * top_k * 2);
   QwenMoeRouteSnapshot result{.layer = layer,
                               .tokens = t,
                               .start_position = p.next_position - t,
                               .readback_bytes =
                                   id_bytes.size() + score_bytes.size()};
-  result.expert_ids.resize(U64(t) * 8);
-  result.scores_bf16.resize(U64(t) * 8);
+  result.expert_ids.resize(U64(t) * top_k);
+  result.scores_bf16.resize(U64(t) * top_k);
   for (U32 token = 0; token < t; ++token) {
-    const U64 source = (U64(token) * layers + layer) * 8;
-    std::memcpy(result.expert_ids.data() + U64(token) * 8,
-                id_bytes.data() + source * 4, 8 * 4);
-    std::memcpy(result.scores_bf16.data() + U64(token) * 8,
-                score_bytes.data() + source * 2, 8 * 2);
+    const U64 source = (U64(token) * layers + layer) * top_k;
+    std::memcpy(result.expert_ids.data() + U64(token) * top_k,
+                id_bytes.data() + source * 4, top_k * 4);
+    std::memcpy(result.scores_bf16.data() + U64(token) * top_k,
+                score_bytes.data() + source * 2, top_k * 2);
   }
   return result;
 }

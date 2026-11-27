@@ -437,6 +437,10 @@ inline void emit_paged_split_attention_bf16_frag48(
   const U32 hd = U32(c.head_dim);
   const U32 q_width = qh * hd;
   const U32 kv_width = kvh * hd;
+  const U32 q_tok_stride = c.has_attn_output_gate ? (q_width * 2u) : q_width;
+  const U32 q_head_stride = c.has_attn_output_gate ? (hd * 2u) : hd;
+  const U32 g_tok_stride = c.has_attn_output_gate ? (q_width * 2u) : 0u;
+  const U32 g_head_stride = c.has_attn_output_gate ? (hd * 2u) : 0u;
   const U32 chunk_tokens = (context_envelope <= 32768u) ? 1024u : 2048u;
   const U32 splits = (context_envelope + chunk_tokens - 1u) / chunk_tokens;
   const U64 partial_half_bytes = U64(t) * qh * splits * hd * 2u;
@@ -452,8 +456,8 @@ inline void emit_paged_split_attention_bf16_frag48(
   e.profile.split_workspace_bytes =
       U64(t) * qh * splits * (8u + U64(hd) * 2u);
   auto split_params = words(
-      {qh, kvh, hd, t, 0u, max_context, 64u, physical_pages, q_width * 2u,
-       hd * 2u, kv_width, kv_width, q_width * 2u, hd * 2u, splits,
+      {qh, kvh, hd, t, 0u, max_context, 64u, physical_pages, q_tok_stride,
+       q_head_stride, kv_width, kv_width, g_tok_stride, g_head_stride, splits,
        chunk_tokens});
   auto &partial = e.emit(
       "attention_nax_prefill",
@@ -587,18 +591,23 @@ inline void emit_batched_attention_affine4_g128(
     return std::vector<std::byte>(raw.begin(), raw.end());
   };
 
+  const U32 q_head_stride = c.has_attn_output_gate ? (hd * 2u) : hd;
+  const U32 g_tok_stride = c.has_attn_output_gate ? q_tok_stride : 0u;
+  const U32 g_head_stride = c.has_attn_output_gate ? (hd * 2u) : 0u;
+  const float eps_f = c.has_qk_norm ? float(c.rms_norm_eps) : -1.0f;
+
   std::vector<U32> post_w{qh,
                           kvh,
                           hd,
                           rot_dim,
                           total_m,
                           q_tok_stride,
-                          hd * 2u,
+                          q_head_stride,
                           k_tok_stride,
                           hd,
                           v_tok_stride,
                           batch_size,
-                          word(float(c.rms_norm_eps)),
+                          word(eps_f),
                           word(float(c.rope_theta)),
                           word(norm_weight_offset),
                           use_flash_prefill ? 0u : split_plan.r_stride};
@@ -615,10 +624,10 @@ inline void emit_batched_attention_affine4_g128(
          pt[7]});
     e.dynamic(post, 16, to_bytes(post_w));
 
-    std::vector<U32> attn_w{qh,           kvh,          hd,
-                            batch_size,   64u,          physical_pages,
-                            q_tok_stride, hd * 2u,      q_tok_stride,
-                            hd * 2u,      0u,           0u,
+    std::vector<U32> attn_w{qh,           kvh,           hd,
+                            batch_size,   64u,           physical_pages,
+                            q_tok_stride, q_head_stride, g_tok_stride,
+                            g_head_stride, 0u,           0u,
                             0u,           0u};
     attn_w.insert(attn_w.end(), row_offs_8.begin(), row_offs_8.end());
     attn_w.insert(attn_w.end(), widths_8.begin(), widths_8.end());
@@ -665,9 +674,9 @@ inline void emit_batched_attention_affine4_g128(
                           64u,
                           physical_pages,
                           q_tok_stride,
-                          hd * 2u,
-                          q_tok_stride,
-                          hd * 2u,
+                          q_head_stride,
+                          g_tok_stride,
+                          g_head_stride,
                           split_plan.splits,
                           split_plan.split_tokens,
                           split_plan.r_stride,
@@ -702,8 +711,8 @@ inline void emit_batched_attention_affine4_g128(
   const U32 kv_width = kvh * hd;
   auto merge_params = words(
       {qh, kvh, hd, total_m, 0u, max_context, 64u, physical_pages, q_tok_stride,
-       hd * 2u, kv_width, kv_width, q_tok_stride, hd * 2u, split_plan.splits,
-       split_plan.split_tokens});
+       q_head_stride, kv_width, kv_width, g_tok_stride, g_head_stride,
+       split_plan.splits, split_plan.split_tokens});
   auto &merge = e.emit(
       "attention_affine4",
       "omlx_m5_paged_attention_affine4_g128_split_merge_half_4sg_hd256",
@@ -849,6 +858,10 @@ inline void emit_paged_attention_affine4_g128(
   const U32 tg_width = groups * 32u;
   const U32 q_width = qh * hd;
   const U32 kv_width = kvh * hd;
+  const U32 q_tok_stride = c.has_attn_output_gate ? (q_width * 2u) : q_width;
+  const U32 q_head_stride = c.has_attn_output_gate ? (hd * 2u) : hd;
+  const U32 g_tok_stride = c.has_attn_output_gate ? (q_width * 2u) : 0u;
+  const U32 g_head_stride = c.has_attn_output_gate ? (hd * 2u) : 0u;
 
   const auto make_split_params = [&](U32 splits, U32 split_tokens) {
     std::array<U32, 16> w{qh,
@@ -859,12 +872,12 @@ inline void emit_paged_attention_affine4_g128(
                           max_context,
                           64u,
                           physical_pages,
-                          q_width * 2u,
-                          hd * 2u,
+                          q_tok_stride,
+                          q_head_stride,
                           kv_width,
                           kv_width,
-                          q_width * 2u,
-                          hd * 2u,
+                          g_tok_stride,
+                          g_head_stride,
                           splits,
                           split_tokens};
     if (params.size() >= 14u * sizeof(U32)) {

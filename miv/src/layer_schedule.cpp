@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <unordered_map>
@@ -71,8 +72,14 @@ struct Resolver {
     return *found;
   }
 
-  const ArtifactObject &resolve_use_or_suffix(std::string_view use,
-                                              std::string_view suffix) {
+  bool has(std::string_view name) const {
+    return bindings.contains(std::string(name)) ||
+           objects.contains(std::string(name)) ||
+           objects.contains(std::string(name) + ".weight");
+  }
+
+  const ArtifactObject *try_resolve_use_or_suffix(std::string_view use,
+                                                  std::string_view suffix) {
     ++lookups;
     const auto binding = std::ranges::find_if(
         artifact.bindings(), [&](const ArtifactBinding &record) {
@@ -81,19 +88,27 @@ struct Resolver {
                  record.use == use;
         });
     if (binding != artifact.bindings().end()) {
-      return artifact.object(binding->object_id);
+      return &artifact.object(binding->object_id);
     }
     const auto found = std::ranges::find_if(
         artifact.objects(), [&](const ArtifactObject &object) {
           return classify_model_component(object.name) ==
                      ModelComponent::text &&
-                 object.name.ends_with(suffix);
+                 (object.name == suffix || object.name.ends_with(suffix));
         });
-    if (found == artifact.objects().end()) {
-      throw std::out_of_range("global schedule object is absent: " +
-                              std::string(suffix));
+    if (found != artifact.objects().end()) {
+      return &(*found);
     }
-    return *found;
+    return nullptr;
+  }
+
+  const ArtifactObject &resolve_use_or_suffix(std::string_view use,
+                                              std::string_view suffix) {
+    if (const auto *obj = try_resolve_use_or_suffix(use, suffix)) {
+      return *obj;
+    }
+    throw std::out_of_range("global schedule object is absent: " +
+                            std::string(suffix));
   }
 };
 
@@ -143,18 +158,31 @@ void add_kernel_stage(QwenLayerSchedule &layer, LayerStageKind kind,
 }
 
 std::string layer_prefix(const ArtifactModel &artifact, std::uint32_t layer) {
-  const auto marker = ".layers." + std::to_string(layer) + ".";
-  const auto found = std::ranges::find_if(
-      artifact.bindings(), [&](const ArtifactBinding &binding) {
-        return classify_model_component(binding.name) ==
-                   ModelComponent::text &&
-               binding.name.find(marker) != std::string::npos;
-      });
-  if (found == artifact.bindings().end()) {
-    throw std::out_of_range("layer prefix is absent");
+  const auto dot_marker = ".layers." + std::to_string(layer) + ".";
+  const auto root_marker = "layers." + std::to_string(layer) + ".";
+  const auto extract = [&](std::string_view name) -> std::optional<std::string> {
+    if (classify_model_component(name) != ModelComponent::text) {
+      return std::nullopt;
+    }
+    if (const auto pos = name.find(dot_marker); pos != std::string_view::npos) {
+      return std::string(name.substr(0, pos + dot_marker.size() - 1));
+    }
+    if (name.starts_with(root_marker)) {
+      return std::string(name.substr(0, root_marker.size() - 1));
+    }
+    return std::nullopt;
+  };
+  for (const auto &binding : artifact.bindings()) {
+    if (auto p = extract(binding.name)) {
+      return *p;
+    }
   }
-  const auto position = found->name.find(marker);
-  return found->name.substr(0, position + marker.size() - 1);
+  for (const auto &object : artifact.objects()) {
+    if (auto p = extract(object.name)) {
+      return *p;
+    }
+  }
+  throw std::out_of_range("layer prefix is absent");
 }
 
 LayerStageRecord global_object_stage(Resolver &resolver, LayerStageKind kind,
@@ -227,14 +255,27 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
   catalog.layers_.reserve(config.num_hidden_layers);
   const auto query_width = checked_multiply(config.num_attention_heads,
                                             config.head_dim, "query width");
+  const auto query_out_width =
+      config.has_attn_output_gate
+          ? checked_multiply(query_width, 2, "gated query width")
+          : query_width;
   const auto kv_width =
       checked_multiply(config.num_key_value_heads, config.head_dim, "KV width");
-  const auto gdn_key_width = checked_multiply(
-      config.linear_num_key_heads, config.linear_key_head_dim, "GDN key width");
+  const bool has_gdn = config.linear_attention_layers() > 0;
+  if (has_gdn && config.linear_conv_kernel_dim < 1) {
+    throw std::invalid_argument("GDN layers require linear_conv_kernel_dim >= 1");
+  }
+  const auto gdn_key_width =
+      has_gdn ? checked_multiply(config.linear_num_key_heads,
+                                 config.linear_key_head_dim, "GDN key width")
+              : 0ULL;
   const auto gdn_value_width =
-      checked_multiply(config.linear_num_value_heads,
-                       config.linear_value_head_dim, "GDN value width");
-  const auto gdn_conv_width = gdn_key_width * 2 + gdn_value_width;
+      has_gdn ? checked_multiply(config.linear_num_value_heads,
+                                 config.linear_value_head_dim,
+                                 "GDN value width")
+              : 0ULL;
+  const auto gdn_conv_width =
+      has_gdn ? (gdn_key_width * 2 + gdn_value_width) : 0ULL;
   const auto kv_pages =
       (static_cast<std::uint64_t>(max_context) + kv_page_tokens - 1) /
       kv_page_tokens;
@@ -242,10 +283,13 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
       checked_multiply(kv_pages, kv_page_tokens, "KV capacity"),
       checked_multiply(kv_width, 4, "KV K/V BF16"), "attention state");
   const auto gdn_state =
-      checked_multiply(gdn_value_width, config.linear_key_head_dim * 4ULL,
-                       "GDN recurrent state") +
-      checked_multiply(config.linear_conv_kernel_dim - 1, gdn_conv_width * 2ULL,
-                       "GDN history");
+      has_gdn ? (checked_multiply(gdn_value_width,
+                                  config.linear_key_head_dim * 4ULL,
+                                  "GDN recurrent state") +
+                 checked_multiply(
+                     static_cast<std::uint64_t>(config.linear_conv_kernel_dim - 1),
+                     gdn_conv_width * 2ULL, "GDN history"))
+              : 0ULL;
 
   for (std::uint32_t index = 0;
        index < static_cast<std::uint32_t>(config.num_hidden_layers); ++index) {
@@ -262,12 +306,17 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
       add_linear(layer, resolver, "attention_q", attention + ".q_proj");
       add_linear(layer, resolver, "attention_k", attention + ".k_proj");
       add_linear(layer, resolver, "attention_v", attention + ".v_proj");
-      add_object_stage(layer, resolver, LayerStageKind::attention_postprocess,
-                       "q_norm", attention + ".q_norm.weight", 0);
-      add_object_stage(layer, resolver, LayerStageKind::attention_postprocess,
-                       "k_norm", attention + ".k_norm.weight", 1);
+      if (config.has_qk_norm && resolver.has(attention + ".q_norm")) {
+        add_object_stage(layer, resolver, LayerStageKind::attention_postprocess,
+                         "q_norm", attention + ".q_norm", 0);
+        add_object_stage(layer, resolver, LayerStageKind::attention_postprocess,
+                         "k_norm", attention + ".k_norm", 1);
+      } else {
+        add_kernel_stage(layer, LayerStageKind::attention_postprocess,
+                         "qk_rope", 1);
+      }
       add_kernel_stage(layer, LayerStageKind::attention, "paged_attention", 2,
-                       query_width * 2, attention_state);
+                       query_out_width * 2, attention_state);
       add_linear(layer, resolver, "attention_o", attention + ".o_proj");
       ++catalog.stats_.full_attention_layers;
     } else {
@@ -300,6 +349,11 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
       add_linear(layer, resolver, "mlp_down", mlp + ".down_proj");
       ++catalog.stats_.dense_mlp_layers;
     } else {
+      if (config.num_experts < 2 || config.num_experts_per_token < 1) {
+        throw std::invalid_argument("invalid MoE schedule expert geometry");
+      }
+      const auto top_k_u64 =
+          static_cast<std::uint64_t>(config.num_experts_per_token);
       const auto mlp = layer.prefix + ".mlp";
       add_linear(layer, resolver, "moe_router", mlp + ".gate");
       add_kernel_stage(layer, LayerStageKind::router, "moe_top8", 1);
@@ -307,18 +361,28 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
       add_linear(layer, resolver, "moe_expert_gate", expert + ".gate_proj");
       add_linear(layer, resolver, "moe_expert_up", expert + ".up_proj");
       add_kernel_stage(layer, LayerStageKind::swiglu, "moe_swiglu", 1,
-                       config.intermediate_size * 8ULL * 2);
+                       checked_multiply(config.intermediate_size,
+                                        top_k_u64 * 2ULL,
+                                        "MoE SwiGLU workspace"));
       add_linear(layer, resolver, "moe_expert_down", expert + ".down_proj");
       add_kernel_stage(layer, LayerStageKind::reduce, "moe_top8_reduce", 1);
-      add_linear(layer, resolver, "moe_shared_gate",
-                 mlp + ".shared_expert_gate");
-      const auto shared = mlp + ".shared_expert";
-      add_linear(layer, resolver, "moe_shared_mlp_gate", shared + ".gate_proj");
-      add_linear(layer, resolver, "moe_shared_mlp_up", shared + ".up_proj");
-      add_kernel_stage(layer, LayerStageKind::swiglu, "moe_shared_swiglu", 1,
-                       config.shared_expert_intermediate_size * 2ULL);
-      add_linear(layer, resolver, "moe_shared_mlp_down", shared + ".down_proj");
-      add_kernel_stage(layer, LayerStageKind::combine, "moe_shared_combine", 1);
+      if (config.shared_expert_intermediate_size > 0) {
+        if (config.has_shared_expert_gate &&
+            resolver.has(mlp + ".shared_expert_gate")) {
+          add_linear(layer, resolver, "moe_shared_gate",
+                     mlp + ".shared_expert_gate");
+        }
+        const auto shared = mlp + ".shared_expert";
+        add_linear(layer, resolver, "moe_shared_mlp_gate",
+                   shared + ".gate_proj");
+        add_linear(layer, resolver, "moe_shared_mlp_up", shared + ".up_proj");
+        add_kernel_stage(layer, LayerStageKind::swiglu, "moe_shared_swiglu", 1,
+                         config.shared_expert_intermediate_size * 2ULL);
+        add_linear(layer, resolver, "moe_shared_mlp_down",
+                   shared + ".down_proj");
+        add_kernel_stage(layer, LayerStageKind::combine, "moe_shared_combine",
+                         1);
+      }
       ++catalog.stats_.moe_mlp_layers;
     }
     catalog.stats_.stage_count += layer.stages.size();
@@ -333,11 +397,47 @@ QwenLayerCatalog build_qwen_layer_catalog(const ArtifactModel &artifact,
     catalog.layers_.push_back(std::move(layer));
   }
 
-  const auto &embedding =
-      resolver.resolve_use_or_suffix("embedding", "embed_tokens.weight");
-  const auto &final_norm = resolver.resolve_suffix("model.norm.weight");
-  const auto &lm_head =
-      resolver.resolve_use_or_suffix("lm_head", "lm_head.weight");
+  const ArtifactObject *emb_ptr =
+      resolver.try_resolve_use_or_suffix("embedding", "embed_tokens.weight");
+  if (emb_ptr == nullptr) {
+    emb_ptr = resolver.try_resolve_use_or_suffix("embedding", "embed_tokens");
+  }
+  if (emb_ptr == nullptr) {
+    throw std::out_of_range("global schedule object is absent: embed_tokens");
+  }
+  const auto &embedding = *emb_ptr;
+
+  const ArtifactObject *final_norm_ptr = nullptr;
+  ++resolver.lookups;
+  for (const auto &object : artifact.objects()) {
+    if (classify_model_component(object.name) == ModelComponent::text &&
+        object.name.ends_with("model.norm.weight")) {
+      final_norm_ptr = &object;
+      break;
+    }
+  }
+  if (final_norm_ptr == nullptr) {
+    for (const auto &object : artifact.objects()) {
+      if (classify_model_component(object.name) == ModelComponent::text &&
+          (object.name == "norm.weight" ||
+           (object.name.ends_with(".norm.weight") &&
+            object.name.find("layers.") == std::string::npos))) {
+        final_norm_ptr = &object;
+        break;
+      }
+    }
+  }
+  if (final_norm_ptr == nullptr) {
+    throw std::out_of_range("global schedule object is absent: model.norm.weight");
+  }
+  const auto &final_norm = *final_norm_ptr;
+
+  const ArtifactObject *lm_head_ptr =
+      resolver.try_resolve_use_or_suffix("lm_head", "lm_head.weight");
+  if (lm_head_ptr == nullptr) {
+    lm_head_ptr = resolver.try_resolve_use_or_suffix("lm_head", "lm_head");
+  }
+  const auto &lm_head = (lm_head_ptr != nullptr) ? *lm_head_ptr : embedding;
   catalog.global_stages_.push_back(global_object_stage(
       resolver, LayerStageKind::linear, "embedding", embedding, 1));
   catalog.global_stages_.push_back(global_object_stage(
