@@ -27,10 +27,10 @@ struct FeatureRingParams {
   uint ring_rows;
 };
 
-constant float kQfMag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-
 inline float qf_decode_e2m1(uchar code) {
-  const float m = kQfMag[code & 0x7u];
+  // Pure 32-bit ALU E2M1 decode (avoids Metal 4 shader-validation constant-LUT trap).
+  const uint mag = uint(code) & 7u;
+  const float m = float((0xC8643210u >> (mag * 4u)) & 0xFu) * 0.5f;
   return (code & 0x8u) ? -m : m;
 }
 
@@ -441,8 +441,10 @@ kernel void omlx_m5_forward_embedding_q3_g128(
                                   hidden, p, gid);
 }
 
+#include "fwht64.h"
+
 // Bug #1 portable SIMD32 fallback kernels directly reading pre-tiled NAX planes
-// (mx_nax_tiled_bk128_v1 and oq_nax_tiled_g64_v1) on non-NAX dev hosts (M4)
+// (mx_nax_tiled_bk128_v1 and oq_nax_{tiled,lane}_g{64,128}_v{1,2}) on non-NAX dev hosts (M4)
 // or T-domain / SharedHeadProjection fallbacks.
 kernel void omlx_m5_forward_pretiled_mxfp4_linear(
     device const bfloat *x [[buffer(0)]],
@@ -457,6 +459,7 @@ kernel void omlx_m5_forward_pretiled_mxfp4_linear(
   const uint token = group.y;
   if (row >= p.n || token >= p.tokens)
     return;
+  const bool fwht64 = ((p.padded_k >> 31u) != 0u);
   const uint bn = (p.n >= 65536u) ? 32u : 16u;
   const uint k_blocks = p.k / 128u;
   const uint rn = row % bn;
@@ -469,13 +472,28 @@ kernel void omlx_m5_forward_pretiled_mxfp4_linear(
         nax_data + tile_idx * (ulong(bn) * 64ul) + ulong(rn) * 64ul;
     device const uchar *s_row =
         nax_scale + tile_idx * (ulong(bn) * 4ul) + ulong(rn) * 4ul;
-    for (uint sub = 0; sub < 4u; ++sub) {
-      const uint col = blk * 128u + sub * 32u + lane;
-      const uchar packed = d_row[sub * 16u + (lane >> 1u)];
-      const uchar code = (packed >> ((lane & 1u) * 4u)) & 0xFu;
-      const float wv = qf_decode_e2m1(code) * qf_decode_e8m0(s_row[sub]);
-      const float xv = float(x[ulong(token) * p.k + col]);
-      total = fma(xv, wv, total);
+    if (!fwht64) {
+      for (uint sub = 0; sub < 4u; ++sub) {
+        const uint col = blk * 128u + sub * 32u + lane;
+        const uchar packed = d_row[sub * 16u + (lane >> 1u)];
+        const uchar code = (packed >> ((lane & 1u) * 4u)) & 0xFu;
+        const float wv = qf_decode_e2m1(code) * qf_decode_e8m0(s_row[sub]);
+        const float xv = float(x[ulong(token) * p.k + col]);
+        total = fma(xv, wv, total);
+      }
+    } else {
+      for (uint h64 = 0u; h64 < 2u; ++h64) {
+        const uint base_k = blk * 128u + h64 * 64u;
+        float v0 = float(x[ulong(token) * p.k + base_k + lane * 2u + 0u]);
+        float v1 = float(x[ulong(token) * p.k + base_k + lane * 2u + 1u]);
+        omlx_m5_fwht64_sg32(v0, v1, lane);
+        const uint sub = h64 * 2u + (lane >> 4u);
+        const float sc = qf_decode_e8m0(s_row[sub]);
+        const uchar packed = d_row[h64 * 32u + lane];
+        const float w0 = qf_decode_e2m1(packed & 0xFu) * sc;
+        const float w1 = qf_decode_e2m1((packed >> 4u) & 0xFu) * sc;
+        total = fma(v0, w0, fma(v1, w1, total));
+      }
     }
   }
   total = simd_sum(total);
@@ -506,6 +524,9 @@ kernel void omlx_m5_forward_pretiled_affine_linear(
   const uint token = group.y;
   if (row >= p.n || token >= p.tokens)
     return;
+  const uint bits = p.bits & 0xFFu;
+  const bool is_lane_v2 = ((p.bits & (1u << 30u)) != 0u);
+  const bool fwht64 = ((p.bits & (1u << 31u)) != 0u);
   const uint bn = (p.n >= 65536u) ? 32u : 16u;
   const uint padded_n = ((p.n + bn - 1u) / bn) * bn;
   const uint groups = p.k / 64u;
@@ -515,35 +536,41 @@ kernel void omlx_m5_forward_pretiled_affine_linear(
   float total = 0.0f;
   for (uint g = 0; g < groups; ++g) {
     const ulong tile_idx = ulong(tile_row) * groups + g;
+    float v0 = float(x[ulong(token) * p.k + g * 64u + lane * 2u + 0u]);
+    float v1 = float(x[ulong(token) * p.k + g * 64u + lane * 2u + 1u]);
+    if (fwht64) {
+      omlx_m5_fwht64_sg32(v0, v1, lane);
+    }
     float g_dot = 0.0f;
-    float g_xsum = 0.0f;
-    for (uint off = lane; off < 64u; off += 32u) {
-      const uint col = g * 64u + off;
-      const float xv = float(x[ulong(token) * p.k + col]);
+    float g_xsum = v0 + v1;
+    #pragma clang loop unroll(full)
+    for (uint e = 0u; e < 2u; ++e) {
+      const uint off = lane * 2u + e;
+      const uint slot = is_lane_v2 ? omlx_m5_pi64(off) : off;
+      const float xv = (e == 0u) ? v0 : v1;
       uint q = 0u;
-      if (p.bits == 3u) {
+      if (bits == 3u) {
         const uchar lb =
-            nax_codes[tile_idx * (ulong(bn) * 16ul) + ulong(rn) * 16ul + off / 4u];
+            nax_codes[tile_idx * (ulong(bn) * 16ul) + ulong(rn) * 16ul + slot / 4u];
         const uchar hb =
-            nax_high[tile_idx * (ulong(bn) * 8ul) + ulong(rn) * 8ul + off / 8u];
-        q = ((uint(lb) >> ((off & 3u) * 2u)) & 3u) |
-            (((uint(hb) >> (off & 7u)) & 1u) << 2u);
-      } else if (p.bits == 8u) {
+            nax_high[tile_idx * (ulong(bn) * 8ul) + ulong(rn) * 8ul + slot / 8u];
+        q = ((uint(lb) >> ((slot & 3u) * 2u)) & 3u) |
+            (((uint(hb) >> (slot & 7u)) & 1u) << 2u);
+      } else if (bits == 8u) {
         q = uint(
-            nax_codes[tile_idx * (ulong(bn) * 64ul) + ulong(rn) * 64ul + off]);
+            nax_codes[tile_idx * (ulong(bn) * 64ul) + ulong(rn) * 64ul + slot]);
       } else {
         const uchar cb =
-            nax_codes[tile_idx * (ulong(bn) * 32ul) + ulong(rn) * 32ul + off / 2u];
-        q = (uint(cb) >> ((off & 1u) * 4u)) & 0xFu;
-        if (p.bits == 5u || p.bits == 6u) {
+            nax_codes[tile_idx * (ulong(bn) * 32ul) + ulong(rn) * 32ul + slot / 2u];
+        q = (uint(cb) >> ((slot & 1u) * 4u)) & 0xFu;
+        if (bits == 5u || bits == 6u) {
           const uchar hb =
-              nax_high[tile_idx * (ulong(bn) * 16ul) + ulong(rn) * 16ul + off / 4u];
-          const uint h2 = (uint(hb) >> ((off & 3u) * 2u)) & 3u;
-          q |= (p.bits == 5u ? (h2 & 1u) : h2) << 4u;
+              nax_high[tile_idx * (ulong(bn) * 16ul) + ulong(rn) * 16ul + slot / 4u];
+          const uint h2 = (uint(hb) >> ((slot & 3u) * 2u)) & 3u;
+          q |= (bits == 5u ? (h2 & 1u) : h2) << 4u;
         }
       }
       g_dot = fma(xv, float(q), g_dot);
-      g_xsum += xv;
     }
     g_dot = simd_sum(g_dot);
     g_xsum = simd_sum(g_xsum);
@@ -558,6 +585,38 @@ kernel void omlx_m5_forward_pretiled_affine_linear(
   if (lane == 0u) {
     y[ulong(token) * p.n + row] = bfloat(total);
   }
+}
+
+struct Fwht64Bf16Params {
+  uint k;
+  uint reserved0;
+  uint reserved1;
+  uint rows;
+};
+
+// Universal out-of-place or in-place BF16 FWHT-64 rotation (H_64 = (1/8)*H_tilde_64).
+// Grid: width = (k / 64) * 32, height = rows * row_mul, threads = 32. 0 B Threadgroup SRAM.
+[[max_total_threads_per_threadgroup(32)]]
+kernel void omlx_m5_fwht64_bf16(
+    device const bfloat *src [[buffer(0)]],
+    device bfloat *dst [[buffer(1)]],
+    constant Fwht64Bf16Params &p [[buffer(2)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]) {
+  const uint g = tg.x;
+  const uint row = tg.y;
+  const uint groups = p.k / 64u;
+  const uint row_mul = (p.reserved0 != 0u) ? p.reserved0 : 1u;
+  const uint total_rows = p.rows * row_mul;
+  if (g >= groups || row >= total_rows) {
+    return;
+  }
+  const ulong off = ulong(row) * p.k + ulong(g) * 64ul + ulong(lane) * 2ul;
+  const bfloat2 in2 = *reinterpret_cast<device const bfloat2 *>(src + off);
+  float v0 = float(in2.x);
+  float v1 = float(in2.y);
+  omlx_m5_fwht64_sg32(v0, v1, lane);
+  *reinterpret_cast<device bfloat2 *>(dst + off) = bfloat2(bfloat(v0), bfloat(v1));
 }
 
 kernel void omlx_m5_forward_copy_bytes(device const uchar *source [[buffer(0)]],

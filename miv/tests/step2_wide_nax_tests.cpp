@@ -237,9 +237,13 @@ static std::uint8_t expand_1_to_2bit_cpu(std::uint32_t nibble) {
   return std::uint8_t(out);
 }
 
+static std::uint32_t pi16_cpu(std::uint32_t c4) {
+  return ((c4 & 3u) << 2u) | ((c4 >> 2u) & 3u);
+}
+
 OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
                                U32 bits, U32 gs, U32 seed, bool pretiled,
-                               U32 bn_override = 0u) {
+                               U32 bn_override = 0u, bool lane_v2 = false) {
   OwnedWeight w;
   const U32 bn = bn_override ? bn_override : affine_nax_bn(n);
   const U32 padded_n = ((n + bn - 1u) / bn) * bn;
@@ -248,7 +252,11 @@ OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k
                     std::to_string(gs) + "." + std::to_string(obj_id),
             .format = "oq_affine_q" + std::to_string(bits) + "_g" +
                       std::to_string(gs) + "_bf16_v1",
-            .layout = pretiled ? "oq_nax_tiled_g64_v1" : "oq_rowsplit_k128_v1",
+            .layout = pretiled ? (lane_v2 ? (gs == 128u ? "oq_nax_lane_g128_v2"
+                                                        : "oq_nax_lane_g64_v2")
+                                          : (gs == 128u ? "oq_nax_tiled_g128_v1"
+                                                        : "oq_nax_tiled_g64_v1"))
+                               : "oq_rowsplit_k128_v1",
             .parent_shape = {n, k},
             .padded_k = k,
             .row_count = n,
@@ -326,17 +334,51 @@ OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k
     const U32 rn = r % bn;
     for (U32 g = 0; g < groups; ++g) {
       const U64 idx = U64(tn) * groups + g;
-      std::memcpy(nax_codes.data() + idx * bn * c64 + rn * c64,
-                  raw_code.data() + U64(r) * code_stride + g * c64, c64);
-      if (bits == 3u || bits == 6u) {
-        std::memcpy(nax_high.data() + idx * bn * h64 + rn * h64,
-                    raw_high.data() + U64(r) * high_stride + g * h64, h64);
-      } else if (bits == 5u) {
-        const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
-        auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
-        for (U32 bi = 0; bi < 8u; ++bi) {
-          dh[bi * 2u] = expand_1_to_2bit_cpu(sh[bi] & 0x0Fu);
-          dh[bi * 2u + 1u] = expand_1_to_2bit_cpu(sh[bi] >> 4u);
+      auto *dc = nax_codes.data() + idx * bn * c64 + rn * c64;
+      const auto *sc = raw_code.data() + U64(r) * code_stride + g * c64;
+      if (!lane_v2) {
+        std::memcpy(dc, sc, c64);
+        if (bits == 3u || bits == 6u) {
+          std::memcpy(nax_high.data() + idx * bn * h64 + rn * h64,
+                      raw_high.data() + U64(r) * high_stride + g * h64, h64);
+        } else if (bits == 5u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 bi = 0; bi < 8u; ++bi) {
+            dh[bi * 2u] = expand_1_to_2bit_cpu(sh[bi] & 0x0Fu);
+            dh[bi * 2u + 1u] = expand_1_to_2bit_cpu(sh[bi] >> 4u);
+          }
+        }
+      } else {
+        const U32 chunk_bytes = c64 / 16u;
+        for (U32 cs = 0; cs < 16u; ++cs) {
+          std::memcpy(dc + cs * chunk_bytes, sc + pi16_cpu(cs) * chunk_bytes,
+                      chunk_bytes);
+        }
+        if (bits == 3u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 8u + rn * 8u;
+          for (U32 b = 0; b < 8u; ++b) {
+            const U32 s0 = pi16_cpu(b * 2u + 0u);
+            const U32 s1 = pi16_cpu(b * 2u + 1u);
+            const U32 n0 = (U32(sh[s0 >> 1u]) >> ((s0 & 1u) * 4u)) & 0x0Fu;
+            const U32 n1 = (U32(sh[s1 >> 1u]) >> ((s1 & 1u) * 4u)) & 0x0Fu;
+            dh[b] = std::uint8_t(n0 | (n1 << 4u));
+          }
+        } else if (bits == 5u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 cs = 0; cs < 16u; ++cs) {
+            const U32 s = pi16_cpu(cs);
+            const U32 nib = (U32(sh[s >> 1u]) >> ((s & 1u) * 4u)) & 0x0Fu;
+            dh[cs] = expand_1_to_2bit_cpu(nib);
+          }
+        } else if (bits == 6u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 16u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 cs = 0; cs < 16u; ++cs) {
+            dh[cs] = sh[pi16_cpu(cs)];
+          }
         }
       }
       const U32 sg_idx = (gs == 128u) ? (g >> 1u) : g;
@@ -626,7 +668,6 @@ Json test_pso_and_tg_sram_budget(const MetalContext &ctx,
 
   for (const char *fn : {"omlx_m5_affine_nax_q5_h1_bm16_bns16_sk2",
                          "omlx_m5_affine_nax_q5_h1_bm16_bns16_sk4",
-                         "omlx_m5_affine_nax_q5_h1_bm16_bns16_sk8",
                          "omlx_m5_affine_nax_q5_h1_bm16_bns32_sk2",
                          "omlx_m5_affine_nax_q5_h1_bm16_bns32_sk4",
                          "omlx_m5_affine_nax_q5_h1_swiglu_bm16_sk2",
@@ -635,8 +676,9 @@ Json test_pso_and_tg_sram_budget(const MetalContext &ctx,
                                            .library_key = "step2.affine",
                                            .function_name = fn,
                                            .support_indirect_command_buffers = true});
-    require(info.static_threadgroup_memory_bytes <= 32768ULL,
-            std::string(fn) + " exceeded 32 KiB Apple10 TG SRAM ceiling");
+    require(info.static_threadgroup_memory_bytes <=
+                (shader_val ? 32768ULL : 16384ULL),
+            std::string(fn) + " exceeded 16 KiB Apple10 TG SRAM ceiling");
     ++compiled;
   }
 
@@ -967,7 +1009,7 @@ Json test_live_gpu_accuracy_and_parity(const MetalContext &ctx,
 
       auto w_raw = make_affine_weight(ctx, id_raw, kN, kK, bits, gs, bits * 10u + gs, false);
       auto w_pre16 = make_affine_weight(ctx, id_pre16, kN, kK, bits, gs, bits * 10u + gs, true, 16u);
-      auto w_pre32 = make_affine_weight(ctx, id_pre32, kN, kK, bits, gs, bits * 10u + gs, true, 32u);
+      auto w_pre32 = make_affine_weight(ctx, id_pre32, kN, kK, bits, gs, bits * 10u + gs, true, 32u, true);
       auto w_g = make_affine_weight(ctx, id_g, kN2, kK, bits, gs, bits * 20u + gs, true, 16u);
       auto w_u = make_affine_weight(ctx, id_u, kN2, kK, bits, gs, bits * 30u + gs, true, 16u);
 

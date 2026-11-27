@@ -96,6 +96,7 @@ struct Fnv1a64 {
     str(w.name);
     str(w.format);
     str(w.layout);
+    str(w.input_transform);
     u64(w.row_start);
     u64(w.row_count);
     u64(w.in_features);
@@ -216,6 +217,7 @@ public:
     U32 capacity_rows = 0;
     bool dynamic_rows = false;
     U32 multiplier = 1;
+    bool fwht64 = false;
     bool operator==(const GroupSumKey &) const = default;
   };
   struct F16CastKey {
@@ -228,6 +230,7 @@ public:
     U32 cols = 0;
     U32 capacity_rows = 0;
     bool dynamic_rows = false;
+    bool fwht64 = false;
     bool operator==(const F16CastKey &) const = default;
   };
   struct A8QuantKey {
@@ -243,6 +246,7 @@ public:
     U32 rows = 0;
     U32 mp = 0;
     bool dynamic_tokens = false;
+    bool fwht64 = false;
     bool operator==(const A8QuantKey &) const = default;
   };
 
@@ -812,15 +816,23 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
     auto &d = e.emit("qwen_forward", "omlx_m5_forward_pretiled_mxfp4_linear",
                      pgrid, {.width = 128},
                      {x, plane(w, "nax_data"), plane(w, "nax_scale"), y});
-    e.dynamic(d, 4, words({n, k, U32(w.padded_k), t}), tokens_patch);
+    const U32 pk_flags =
+        U32(w.padded_k) | (w.has_fwht64() ? (1u << 31u) : 0u);
+    e.dynamic(d, 4, words({n, k, pk_flags, t}), tokens_patch);
     return;
   }
   if (w.layout == "oq_nax_tiled_g64_v1" ||
-      w.layout == "oq_nax_tiled_g128_v1") {
+      w.layout == "oq_nax_tiled_g128_v1" ||
+      w.layout == "oq_nax_lane_g64_v2" ||
+      w.layout == "oq_nax_lane_g128_v2") {
     if ((k % 64u) != 0u) {
       throw std::invalid_argument(
           "Qwen pre-tiled affine linear requires K divisible by 64");
     }
+    const bool is_lane_v2 = (w.layout == "oq_nax_lane_g64_v2" ||
+                             w.layout == "oq_nax_lane_g128_v2");
+    const bool is_g128 = (w.layout == "oq_nax_tiled_g128_v1" ||
+                          w.layout == "oq_nax_lane_g128_v2");
     const U32 bn = (n >= 65536u) ? 32u : 16u;
     const U32 padded_n = ((n + bn - 1u) / bn) * bn;
     const Ref sb = plane(w, "nax_sb");
@@ -828,7 +840,7 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
     const U64 sb_bytes_g128 =
         (k % 128u == 0u) ? mul(mul(U64(padded_n), k / 128u), 4u) : 0ULL;
     const U32 sb_group_size =
-        (w.layout == "oq_nax_tiled_g128_v1" && (k % 128u) == 0u &&
+        (is_g128 && (k % 128u) == 0u &&
          sb.bytes < sb_bytes_g64 && sb.bytes >= sb_bytes_g128)
             ? 128u
             : 64u;
@@ -842,10 +854,13 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
     Ref high = route.bits == 3 ? plane(w, "nax_high1")
                : (route.bits == 5 || route.bits == 6) ? plane(w, "nax_high2")
                                                       : zero;
+    const U32 bits_flags = route.bits |
+                           (is_lane_v2 ? (1u << 30u) : 0u) |
+                           (w.has_fwht64() ? (1u << 31u) : 0u);
     auto &d = e.emit("qwen_forward", "omlx_m5_forward_pretiled_affine_linear",
                      pgrid, {.width = 128},
                      {x, plane(w, "nax_codes"), high, sb, y});
-    e.dynamic(d, 5, words({n, k, route.bits, t, sb_group_size}), tokens_patch);
+    e.dynamic(d, 5, words({n, k, bits_flags, t, sb_group_size}), tokens_patch);
     return;
   }
 
@@ -908,6 +923,23 @@ inline void linear(Encoder &e, const MaterializedWeightView &w, Ref x, Ref y,
   e.dynamic(d, 7, std::move(params), tokens_patch);
 }
 
+// Universal BF16 FWHT-64 transform (supports both out-of-place and in-place).
+inline void emit_fwht64_bf16(Encoder &e, Ref src, Ref dst, U32 k,
+                             std::optional<U32> explicit_t = {},
+                             U32 row_mul = 1u) {
+  if ((k % 64u) != 0u || k == 0u) {
+    throw std::invalid_argument("emit_fwht64_bf16 requires k % 64 == 0");
+  }
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 eff_mul = (row_mul > 0u) ? row_mul : 1u;
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  auto &d = e.emit("qwen_forward", "omlx_m5_fwht64_bf16",
+                   {.width = U64(k / 64u) * 32u, .height = U64(t) * eff_mul},
+                   {.width = 32u}, {src, dst});
+  e.dynamic(d, 2, words({k, eff_mul, 0u, t}), tokens_patch);
+}
+
 // NInfer-style fused row-exact gate + up + SwiGLU projection.
 inline void linear_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
                           const MaterializedWeightView &up_w, Ref x, Ref y,
@@ -922,7 +954,9 @@ inline void linear_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
   }
   if (gate_w.layout == "mx_nax_tiled_bk128_v1" ||
       gate_w.layout == "oq_nax_tiled_g64_v1" ||
-      gate_w.layout == "oq_nax_tiled_g128_v1" || route.bits == 3) {
+      gate_w.layout == "oq_nax_tiled_g128_v1" ||
+      gate_w.layout == "oq_nax_lane_g64_v2" ||
+      gate_w.layout == "oq_nax_lane_g128_v2" || route.bits == 3) {
     throw std::invalid_argument("pre-tiled/q3 SwiGLU requires separate or NAX route");
   }
   const U32 n = expected_n, k = expected_k, t = e.profile.capacity;

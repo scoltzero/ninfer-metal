@@ -1326,7 +1326,9 @@ bool ane_weight_view_supported(const MaterializedWeightView &w) noexcept {
   if (const auto af = parse_affine_format(w.format); af.has_value()) {
     return (w.layout == "oq_rowsplit_k128_v1" ||
             w.layout == "oq_nax_tiled_g64_v1" ||
-            w.layout == "oq_nax_tiled_g128_v1") &&
+            w.layout == "oq_nax_tiled_g128_v1" ||
+            w.layout == "oq_nax_lane_g64_v2" ||
+            w.layout == "oq_nax_lane_g128_v2") &&
            w.padded_k >= w.in_features && (w.padded_k % 128u) == 0;
   }
   if (w.format == "direct_bf16_v1" || w.format == "direct_f16_v1" ||
@@ -1335,6 +1337,37 @@ bool ane_weight_view_supported(const MaterializedWeightView &w) noexcept {
   }
   return false;
 }
+
+namespace {
+
+inline std::uint64_t ane_pi64(std::uint64_t off) noexcept {
+  return ((off & 12ULL) << 2u) | ((off >> 2u) & 12ULL) | (off & 3ULL);
+}
+
+inline void ane_fwht64_inplace_rows_f32(float *data, std::uint64_t rows,
+                                        std::uint64_t k) noexcept {
+  for (std::uint64_t r = 0; r < rows; ++r) {
+    float *row = data + static_cast<std::size_t>(r * k);
+    for (std::uint64_t base = 0; base + 64u <= k; base += 64u) {
+      float *x = row + static_cast<std::size_t>(base);
+      for (std::uint64_t len = 1; len < 64u; len <<= 1u) {
+        for (std::uint64_t i = 0; i < 64u; i += (len << 1u)) {
+          for (std::uint64_t j = 0; j < len; ++j) {
+            const float a = x[i + j];
+            const float b = x[i + j + len];
+            x[i + j] = a + b;
+            x[i + j + len] = a - b;
+          }
+        }
+      }
+      for (std::uint64_t i = 0; i < 64u; ++i) {
+        x[i] *= 0.125f;
+      }
+    }
+  }
+}
+
+} // namespace
 
 std::vector<float> dequantize_miv_weight_slice_f32(
     const MaterializedWeightView &w, std::uint64_t row_start,
@@ -1377,11 +1410,8 @@ std::vector<float> dequantize_miv_weight_slice_f32(
         }
       }
     }
-    return out;
-  }
-
-  // 2. MXFP4 (mxfp4_e2m1_g32_e8m0_v1) — both untiled and NAX pre-tiled
-  if (w.format == "mxfp4_e2m1_g32_e8m0_v1") {
+  } else if (w.format == "mxfp4_e2m1_g32_e8m0_v1") {
+    // 2. MXFP4 (mxfp4_e2m1_g32_e8m0_v1) — both untiled and NAX pre-tiled
     if (w.layout == "mx_nax_tiled_bk128_v1") {
       const std::uint64_t bn = total_parent_rows >= 65536u ? 32u : 16u;
       const std::uint64_t k_blocks = K / 128u;
@@ -1413,168 +1443,177 @@ std::vector<float> dequantize_miv_weight_slice_f32(
           }
         }
       }
-      return out;
-    }
-
-    // Untiled mx_rowsplit_k128_v1
-    const auto data = plane_span(require_view_plane(w, "data"));
-    const auto scale = plane_span(require_view_plane(w, "scale"));
-    const std::uint64_t data_row = padded_k / 2u;
-    const std::uint64_t scale_row = padded_k / 32u;
-    const std::uint64_t g32_count = K / 32u;
-    for (std::uint64_t lr = 0; lr < row_count; ++lr) {
-      const std::uint64_t r = row_start + lr;
-      const auto *d_row =
-          reinterpret_cast<const std::uint8_t *>(data.data() + r * data_row);
-      const auto *s_row =
-          reinterpret_cast<const std::uint8_t *>(scale.data() + r * scale_row);
-      float *dst = out.data() + static_cast<std::size_t>(lr * K);
-      for (std::uint64_t g = 0; g < g32_count; ++g) {
-        const float sc = decode_e8m0(s_row[g]);
-        if (!std::isfinite(sc)) {
-          throw std::runtime_error("MXFP4 untiled decode produced NaN scale");
-        }
-        const auto *dp = d_row + g * 16u;
-        float *dp_out = dst + g * 32u;
-        for (std::uint64_t b = 0; b < 16u; ++b) {
-          const std::uint8_t packed = dp[b];
-          dp_out[b * 2u] = decode_e2m1(packed & 0x0Fu) * sc;
-          dp_out[b * 2u + 1u] = decode_e2m1(packed >> 4u) * sc;
+    } else {
+      // Untiled mx_rowsplit_k128_v1
+      const auto data = plane_span(require_view_plane(w, "data"));
+      const auto scale = plane_span(require_view_plane(w, "scale"));
+      const std::uint64_t data_row = padded_k / 2u;
+      const std::uint64_t scale_row = padded_k / 32u;
+      const std::uint64_t g32_count = K / 32u;
+      for (std::uint64_t lr = 0; lr < row_count; ++lr) {
+        const std::uint64_t r = row_start + lr;
+        const auto *d_row =
+            reinterpret_cast<const std::uint8_t *>(data.data() + r * data_row);
+        const auto *s_row =
+            reinterpret_cast<const std::uint8_t *>(scale.data() + r * scale_row);
+        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        for (std::uint64_t g = 0; g < g32_count; ++g) {
+          const float sc = decode_e8m0(s_row[g]);
+          if (!std::isfinite(sc)) {
+            throw std::runtime_error("MXFP4 untiled decode produced NaN scale");
+          }
+          const auto *dp = d_row + g * 16u;
+          float *dp_out = dst + g * 32u;
+          for (std::uint64_t b = 0; b < 16u; ++b) {
+            const std::uint8_t packed = dp[b];
+            dp_out[b * 2u] = decode_e2m1(packed & 0x0Fu) * sc;
+            dp_out[b * 2u + 1u] = decode_e2m1(packed >> 4u) * sc;
+          }
         }
       }
     }
-    return out;
-  }
-
-  // 3. oQ Affine (q3/q4/q5/q6/q8, g64/g128) — both untiled and NAX pre-tiled
-  const auto af = parse_affine_format(w.format);
-  if (!af.has_value()) {
-    throw std::invalid_argument("unexpected affine format: " + w.format);
-  }
-  const std::uint32_t bits = af->bits;
-  const std::uint32_t gs = af->group_size;
-
-  if (w.layout == "oq_nax_tiled_g64_v1" || w.layout == "oq_nax_tiled_g128_v1") {
-    const std::uint64_t bn = total_parent_rows >= 65536u ? 32u : 16u;
-    const std::uint64_t padded_n = ((total_parent_rows + bn - 1u) / bn) * bn;
-    const std::uint64_t groups64 = K / 64u;
-    const auto codes = plane_span(require_view_plane(w, "nax_codes"));
-    const auto sb = plane_span(require_view_plane(w, "nax_sb"));
-    std::span<const std::byte> high{};
-    if (bits == 3u) {
-      high = plane_span(require_view_plane(w, "nax_high1"));
-    } else if (bits == 5u || bits == 6u) {
-      high = plane_span(require_view_plane(w, "nax_high2"));
+  } else {
+    // 3. oQ Affine (q3/q4/q5/q6/q8, g64/g128) — untiled, v1 tiled, and v2 lane-permuted
+    const auto af = parse_affine_format(w.format);
+    if (!af.has_value()) {
+      throw std::invalid_argument("unexpected affine format: " + w.format);
     }
+    const std::uint32_t bits = af->bits;
+    const std::uint32_t gs = af->group_size;
+    const bool is_lane_v2 =
+        (w.layout == "oq_nax_lane_g64_v2" || w.layout == "oq_nax_lane_g128_v2");
 
-    for (std::uint64_t lr = 0; lr < row_count; ++lr) {
-      const std::uint64_t r = w.row_start + row_start + lr;
-      const std::uint64_t rn = r % bn;
-      const std::uint64_t row_tile_base = (r / bn) * groups64;
-      float *dst = out.data() + static_cast<std::size_t>(lr * K);
-      for (std::uint64_t g = 0; g < groups64; ++g) {
-        const std::uint64_t tile_idx = row_tile_base + g;
-        const std::uint32_t packed_sb =
-            load_u32_le(sb.data() + (g * padded_n + r) * 4u);
-        const float sc =
-            bf16_to_float(static_cast<std::uint16_t>(packed_sb & 0xFFFFu));
-        const float bi =
-            bf16_to_float(static_cast<std::uint16_t>(packed_sb >> 16u));
-        float *g_out = dst + g * 64u;
+    if (w.layout == "oq_nax_tiled_g64_v1" || w.layout == "oq_nax_tiled_g128_v1" ||
+        is_lane_v2) {
+      const std::uint64_t bn = total_parent_rows >= 65536u ? 32u : 16u;
+      const std::uint64_t padded_n = ((total_parent_rows + bn - 1u) / bn) * bn;
+      const std::uint64_t groups64 = K / 64u;
+      const auto codes = plane_span(require_view_plane(w, "nax_codes"));
+      const auto sb = plane_span(require_view_plane(w, "nax_sb"));
+      std::span<const std::byte> high{};
+      if (bits == 3u) {
+        high = plane_span(require_view_plane(w, "nax_high1"));
+      } else if (bits == 5u || bits == 6u) {
+        high = plane_span(require_view_plane(w, "nax_high2"));
+      }
 
-        if (bits == 3u) {
-          const auto *cp = reinterpret_cast<const std::uint8_t *>(
-              codes.data() + tile_idx * (bn * 16u) + rn * 16u);
-          const auto *hp = reinterpret_cast<const std::uint8_t *>(
-              high.data() + tile_idx * (bn * 8u) + rn * 8u);
-          for (std::uint64_t c = 0; c < 64u; ++c) {
-            const std::uint32_t code =
-                ((cp[c / 4u] >> ((c & 3u) * 2u)) & 0x03u) |
-                (((hp[c / 8u] >> (c & 7u)) & 1u) << 2u);
-            g_out[c] = std::fma(sc, static_cast<float>(code), bi);
-          }
-        } else if (bits == 8u) {
-          const auto *cp = reinterpret_cast<const std::uint8_t *>(
-              codes.data() + tile_idx * (bn * 64u) + rn * 64u);
-          for (std::uint64_t c = 0; c < 64u; ++c) {
-            g_out[c] = std::fma(sc, static_cast<float>(cp[c]), bi);
-          }
-        } else {
-          const auto *cp = reinterpret_cast<const std::uint8_t *>(
-              codes.data() + tile_idx * (bn * 32u) + rn * 32u);
-          const auto *hp =
-              (bits == 5u || bits == 6u)
-                  ? reinterpret_cast<const std::uint8_t *>(
-                        high.data() + tile_idx * (bn * 16u) + rn * 16u)
-                  : nullptr;
-          for (std::uint64_t c = 0; c < 64u; ++c) {
-            std::uint32_t code = (cp[c / 2u] >> ((c & 1u) * 4u)) & 0x0Fu;
-            if (hp != nullptr) {
-              const std::uint32_t h2 = (hp[c / 4u] >> ((c & 3u) * 2u)) & 0x03u;
-              code |= (bits == 5u ? (h2 & 1u) : h2) << 4u;
+      for (std::uint64_t lr = 0; lr < row_count; ++lr) {
+        const std::uint64_t r = w.row_start + row_start + lr;
+        const std::uint64_t rn = r % bn;
+        const std::uint64_t row_tile_base = (r / bn) * groups64;
+        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        for (std::uint64_t g = 0; g < groups64; ++g) {
+          const std::uint64_t tile_idx = row_tile_base + g;
+          const std::uint32_t packed_sb =
+              load_u32_le(sb.data() + (g * padded_n + r) * 4u);
+          const float sc =
+              bf16_to_float(static_cast<std::uint16_t>(packed_sb & 0xFFFFu));
+          const float bi =
+              bf16_to_float(static_cast<std::uint16_t>(packed_sb >> 16u));
+          float *g_out = dst + g * 64u;
+
+          if (bits == 3u) {
+            const auto *cp = reinterpret_cast<const std::uint8_t *>(
+                codes.data() + tile_idx * (bn * 16u) + rn * 16u);
+            const auto *hp = reinterpret_cast<const std::uint8_t *>(
+                high.data() + tile_idx * (bn * 8u) + rn * 8u);
+            for (std::uint64_t c = 0; c < 64u; ++c) {
+              const std::uint64_t slot = is_lane_v2 ? ane_pi64(c) : c;
+              const std::uint32_t code =
+                  ((cp[slot / 4u] >> ((slot & 3u) * 2u)) & 0x03u) |
+                  (((hp[slot / 8u] >> (slot & 7u)) & 1u) << 2u);
+              g_out[c] = std::fma(sc, static_cast<float>(code), bi);
             }
-            g_out[c] = std::fma(sc, static_cast<float>(code), bi);
+          } else if (bits == 8u) {
+            const auto *cp = reinterpret_cast<const std::uint8_t *>(
+                codes.data() + tile_idx * (bn * 64u) + rn * 64u);
+            for (std::uint64_t c = 0; c < 64u; ++c) {
+              const std::uint64_t slot = is_lane_v2 ? ane_pi64(c) : c;
+              g_out[c] = std::fma(sc, static_cast<float>(cp[slot]), bi);
+            }
+          } else {
+            const auto *cp = reinterpret_cast<const std::uint8_t *>(
+                codes.data() + tile_idx * (bn * 32u) + rn * 32u);
+            const auto *hp =
+                (bits == 5u || bits == 6u)
+                    ? reinterpret_cast<const std::uint8_t *>(
+                          high.data() + tile_idx * (bn * 16u) + rn * 16u)
+                    : nullptr;
+            for (std::uint64_t c = 0; c < 64u; ++c) {
+              const std::uint64_t slot = is_lane_v2 ? ane_pi64(c) : c;
+              std::uint32_t code = (cp[slot / 2u] >> ((slot & 1u) * 4u)) & 0x0Fu;
+              if (hp != nullptr) {
+                const std::uint32_t h2 =
+                    (hp[slot / 4u] >> ((slot & 3u) * 2u)) & 0x03u;
+                code |= (bits == 5u ? (h2 & 1u) : h2) << 4u;
+              }
+              g_out[c] = std::fma(sc, static_cast<float>(code), bi);
+            }
+          }
+        }
+      }
+    } else {
+      // Untiled oq_rowsplit_k128_v1
+      const char *code_kind =
+          bits == 8u ? "code" : (bits == 3u ? "low_2bit" : "base_code");
+      const auto base = plane_span(require_view_plane(w, code_kind));
+      const auto scale = plane_span(require_view_plane(w, "scale"));
+      const auto bias = plane_span(require_view_plane(w, "bias"));
+      std::span<const std::byte> high{};
+      if (bits == 3u || bits == 5u) {
+        high = plane_span(require_view_plane(w, "high_bit"));
+      } else if (bits == 6u) {
+        high = plane_span(require_view_plane(w, "high_2bit"));
+      }
+      const std::uint64_t base_row =
+          bits == 8u ? padded_k : (bits == 3u ? padded_k / 4u : padded_k / 2u);
+      const std::uint64_t high_row =
+          (bits == 3u || bits == 5u) ? padded_k / 8u : padded_k / 4u;
+      const std::uint64_t group_row = padded_k / gs;
+
+      for (std::uint64_t lr = 0; lr < row_count; ++lr) {
+        const std::uint64_t r = row_start + lr;
+        const auto *b_row =
+            reinterpret_cast<const std::uint8_t *>(base.data() + r * base_row);
+        const auto *h_row =
+            high.empty()
+                ? nullptr
+                : reinterpret_cast<const std::uint8_t *>(high.data() + r * high_row);
+        const auto *s_row = scale.data() + r * group_row * 2u;
+        const auto *bi_row = bias.data() + r * group_row * 2u;
+        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+
+        const std::uint64_t num_groups = K / gs;
+        for (std::uint64_t g = 0; g < num_groups; ++g) {
+          const float sc = bf16_to_float(load_u16_le(s_row + g * 2u));
+          const float bi = bf16_to_float(load_u16_le(bi_row + g * 2u));
+          const std::uint64_t col_start = g * gs;
+          for (std::uint64_t i = 0; i < gs; ++i) {
+            const std::uint64_t c = col_start + i;
+            std::uint32_t code = 0u;
+            if (bits == 8u) {
+              code = b_row[c];
+            } else if (bits == 3u) {
+              code = ((b_row[c / 4u] >> ((c & 3u) * 2u)) & 0x03u) |
+                     (((h_row[c / 8u] >> (c & 7u)) & 1u) << 2u);
+            } else {
+              code = (b_row[c / 2u] >> ((c & 1u) * 4u)) & 0x0Fu;
+              if (bits == 5u) {
+                code |= ((h_row[c / 8u] >> (c & 7u)) & 1u) << 4u;
+              } else if (bits == 6u) {
+                code |= ((h_row[c / 4u] >> ((c & 3u) * 2u)) & 3u) << 4u;
+              }
+            }
+            dst[c] = std::fma(sc, static_cast<float>(code), bi);
           }
         }
       }
     }
-    return out;
   }
 
-  // Untiled oq_rowsplit_k128_v1
-  const char *code_kind =
-      bits == 8u ? "code" : (bits == 3u ? "low_2bit" : "base_code");
-  const auto base = plane_span(require_view_plane(w, code_kind));
-  const auto scale = plane_span(require_view_plane(w, "scale"));
-  const auto bias = plane_span(require_view_plane(w, "bias"));
-  std::span<const std::byte> high{};
-  if (bits == 3u || bits == 5u) {
-    high = plane_span(require_view_plane(w, "high_bit"));
-  } else if (bits == 6u) {
-    high = plane_span(require_view_plane(w, "high_2bit"));
-  }
-  const std::uint64_t base_row =
-      bits == 8u ? padded_k : (bits == 3u ? padded_k / 4u : padded_k / 2u);
-  const std::uint64_t high_row =
-      (bits == 3u || bits == 5u) ? padded_k / 8u : padded_k / 4u;
-  const std::uint64_t group_row = padded_k / gs;
-
-  for (std::uint64_t lr = 0; lr < row_count; ++lr) {
-    const std::uint64_t r = row_start + lr;
-    const auto *b_row =
-        reinterpret_cast<const std::uint8_t *>(base.data() + r * base_row);
-    const auto *h_row =
-        high.empty()
-            ? nullptr
-            : reinterpret_cast<const std::uint8_t *>(high.data() + r * high_row);
-    const auto *s_row = scale.data() + r * group_row * 2u;
-    const auto *bi_row = bias.data() + r * group_row * 2u;
-    float *dst = out.data() + static_cast<std::size_t>(lr * K);
-
-    const std::uint64_t num_groups = K / gs;
-    for (std::uint64_t g = 0; g < num_groups; ++g) {
-      const float sc = bf16_to_float(load_u16_le(s_row + g * 2u));
-      const float bi = bf16_to_float(load_u16_le(bi_row + g * 2u));
-      const std::uint64_t col_start = g * gs;
-      for (std::uint64_t i = 0; i < gs; ++i) {
-        const std::uint64_t c = col_start + i;
-        std::uint32_t code = 0u;
-        if (bits == 8u) {
-          code = b_row[c];
-        } else if (bits == 3u) {
-          code = ((b_row[c / 4u] >> ((c & 3u) * 2u)) & 0x03u) |
-                 (((h_row[c / 8u] >> (c & 7u)) & 1u) << 2u);
-        } else {
-          code = (b_row[c / 2u] >> ((c & 1u) * 4u)) & 0x0Fu;
-          if (bits == 5u) {
-            code |= ((h_row[c / 8u] >> (c & 7u)) & 1u) << 4u;
-          } else if (bits == 6u) {
-            code |= ((h_row[c / 4u] >> ((c & 3u) * 2u)) & 3u) << 4u;
-          }
-        }
-        dst[c] = std::fma(sc, static_cast<float>(code), bi);
-      }
-    }
+  // WP1 Part B: Unrotate W' H_64 = W so ANE consumes unrotated FP16/BF16 activations!
+  if (w.has_fwht64()) {
+    ane_fwht64_inplace_rows_f32(out.data(), row_count, K);
   }
   return out;
 }
@@ -2261,10 +2300,11 @@ std::string AneDualOffloadEngine::compute_cache_key(
   for (const auto &s : specs) {
     oss << ";" << s.layer_index << ":" << static_cast<int>(s.role) << ":"
         << s.name << ":" << s.weight.object_id << ":" << s.weight.format << ":"
-        << s.weight.layout << ":" << s.weight.row_count << "x"
-        << s.weight.in_features;
+        << s.weight.layout << ":" << s.weight.input_transform << ":"
+        << s.weight.row_count << "x" << s.weight.in_features;
     if (s.up_weight.has_value()) {
-      oss << "+" << s.up_weight->object_id << ":" << s.up_weight->format;
+      oss << "+" << s.up_weight->object_id << ":" << s.up_weight->format
+          << ":" << s.up_weight->input_transform;
     }
   }
   return sha256_hex_string(oss.str());

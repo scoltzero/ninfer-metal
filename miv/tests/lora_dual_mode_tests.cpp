@@ -1371,20 +1371,24 @@ void test_task1_mixed_mxfp4_affine8_accuracy(
     const auto *tw_q = cache->find(q_view.object_id);
     const auto *tw_o = cache->find(o_view.object_id);
     const auto *tw_a = cache->find(a_untiled.object_id);
+    const bool q_is_v2 = detail::forward::is_oq_nax_lane_v2_layout(q_view.layout);
+    const bool o_is_v2 = detail::forward::is_oq_nax_lane_v2_layout(o_view.layout);
     require(tw_q != nullptr && tw_q->bits == 8U && tw_q->group_size == 64U,
             "q8_g64 pre-tiled missing from AffineNaxCache");
-    require(tw_q->codes.buffer == q_view.planes[0].buffer &&
-                tw_q->codes.offset == q_view.planes[0].offset &&
+    require((!q_is_v2 || (tw_q->codes.buffer == q_view.planes[0].buffer &&
+                          tw_q->codes.offset == q_view.planes[0].offset)) &&
+                tw_q->codes.buffer != nullptr &&
                 tw_q->sb.buffer == q_view.planes[1].buffer &&
                 tw_q->sb.offset == q_view.planes[1].offset,
-            "q8_g64 pre-tiled was NOT zero-copy bound in AffineNaxCache");
+            "q8_g64 pre-tiled binding mismatch in AffineNaxCache");
     require(tw_o != nullptr && tw_o->bits == 8U && tw_o->group_size == 128U,
             "q8_g128 pre-tiled missing from AffineNaxCache");
-    require(tw_o->codes.buffer == o_view.planes[0].buffer &&
-                tw_o->codes.offset == o_view.planes[0].offset &&
+    require((!o_is_v2 || (tw_o->codes.buffer == o_view.planes[0].buffer &&
+                          tw_o->codes.offset == o_view.planes[0].offset)) &&
+                tw_o->codes.buffer != nullptr &&
                 tw_o->sb.buffer == o_view.planes[1].buffer &&
                 tw_o->sb.offset == o_view.planes[1].offset,
-            "q8_g128 pre-tiled was NOT zero-copy bound in AffineNaxCache");
+            "q8_g128 pre-tiled binding mismatch in AffineNaxCache");
     require(tw_a != nullptr && tw_a->bits == 8U && tw_a->group_size == 128U &&
                 tw_a->codes.buffer != a_untiled.planes[0].buffer,
             "untiled q8_g128 fallback pre-tile failed in AffineNaxCache");

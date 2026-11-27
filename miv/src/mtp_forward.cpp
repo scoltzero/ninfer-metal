@@ -153,13 +153,12 @@ public:
             affine_cache ? affine_cache->find(w.object_id) : nullptr;
         if (!(tw_existing && tw_existing->high1.buffer)) {
           Ref src_h2{};
-          if (w.layout == "oq_nax_tiled_g64_v1" ||
-              w.layout == "oq_nax_tiled_g128_v1") {
-            src_h2 = plane(w, "nax_high2");
-          } else if (tw_existing && tw_existing->bits == 5U &&
-                     tw_existing->bn == bn && tw_existing->n == w.row_count &&
-                     tw_existing->k == w.in_features) {
+          if (tw_existing && tw_existing->bits == 5U &&
+              tw_existing->bn == bn && tw_existing->n == w.row_count &&
+              tw_existing->k == w.in_features) {
             src_h2 = tw_existing->high2;
+          } else if (is_oq_nax_pretiled_layout(w.layout)) {
+            src_h2 = plane(w, "nax_high2");
           }
           const U64 h1_bytes = mul(padded_n, U32(w.in_features) / 8U);
           if (src_h2.buffer && src_h2.bytes >= 2ULL * h1_bytes &&
@@ -170,8 +169,7 @@ public:
           }
         }
       }
-      if ((w.layout == "oq_nax_tiled_g64_v1" ||
-           w.layout == "oq_nax_tiled_g128_v1") &&
+      if (is_oq_nax_pretiled_layout(w.layout) &&
           !sb_tiled_entries_.contains(w.object_id)) {
         const auto *tw =
             affine_cache ? affine_cache->find(w.object_id) : nullptr;
@@ -1366,12 +1364,12 @@ public:
       mtp_candidates.push_back(mlp_down);
     }
     bool any_pretiled_mx = (head.layout == "mx_nax_tiled_bk128_v1");
-    bool any_pretiled_oq = (head.layout == "oq_nax_tiled_g64_v1" ||
-                            head.layout == "oq_nax_tiled_g128_v1");
+    bool any_pretiled_oq = is_oq_nax_pretiled_layout(head.layout);
+    bool any_fwht64 = head.has_fwht64() || (moe_layer && moe_down.has_fwht64());
     for (const auto &cw : mtp_candidates) {
       any_pretiled_mx |= (cw.layout == "mx_nax_tiled_bk128_v1");
-      any_pretiled_oq |= (cw.layout == "oq_nax_tiled_g64_v1" ||
-                          cw.layout == "oq_nax_tiled_g128_v1");
+      any_pretiled_oq |= is_oq_nax_pretiled_layout(cw.layout);
+      any_fwht64 |= cw.has_fwht64();
     }
 
     const void *head_buf_ptr =
@@ -1442,8 +1440,7 @@ public:
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
          any_pretiled_oq || kl32_enabled)) {
       if (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-          head.layout == "oq_nax_tiled_g64_v1" ||
-          head.layout == "oq_nax_tiled_g128_v1" || kl32_enabled) {
+          is_oq_nax_pretiled_layout(head.layout) || kl32_enabled) {
         head_affine_cache = AffineNaxCache::acquire(
             head_owner_key, context, libraries, get("zero"), {head},
             mtp_silicon_tuning.linear_split_k_target_slices);
@@ -1467,6 +1464,19 @@ public:
             context.make_private_buffer(xs_bytes));
         affine_nax_xs = Ref{xs_buf.get(), 0, xs_bytes};
         buffers.push_back(std::move(xs_buf));
+      }
+    }
+
+    if (any_fwht64) {
+      if (f16_scratch.buffer != nullptr) {
+        fwht_scratch = f16_scratch;
+      } else {
+        const U32 max_k = std::max({2U * h, f, q, shared_f});
+        const U64 fw_bytes = mul(mul(priming_cap, max_k), 2ULL);
+        auto fw_buf = std::make_unique<MetalBuffer>(
+            context.make_private_buffer(fw_bytes));
+        fwht_scratch = Ref{fw_buf.get(), 0, fw_bytes};
+        buffers.push_back(std::move(fw_buf));
       }
     }
 
@@ -1639,10 +1649,16 @@ public:
     return false;
   }
 
+  static U32 pretiled_k_flags(U32 k, bool lane_v2, bool fwht64) noexcept {
+    return (k & 0x3FFFFFFFU) | (lane_v2 ? 0x40000000U : 0U) |
+           (fwht64 ? 0x80000000U : 0U);
+  }
+
   bool resolve_pretiled_affine_t1(const MaterializedWeightView &w, U32 t,
                                   Ref *out_codes = nullptr,
                                   Ref *out_high = nullptr,
-                                  Ref *out_sb = nullptr) const {
+                                  Ref *out_sb = nullptr,
+                                  bool *out_lane_v2 = nullptr) const {
     const U32 bits = affine_nax_bits(w.format);
     if (!(kl32_enabled && t == 1U && bits != 0U && h >= 512U &&
           w.parent_shape.size() == 2U && w.row_count > 0U &&
@@ -1666,11 +1682,12 @@ public:
                                                              : get("zero"));
         if (out_sb)
           *out_sb = tw->sb_tiled;
+        if (out_lane_v2)
+          *out_lane_v2 = true;
         return true;
       }
     }
-    if (w.layout == "oq_nax_tiled_g64_v1" ||
-        w.layout == "oq_nax_tiled_g128_v1") {
+    if (is_oq_nax_pretiled_layout(w.layout)) {
       const Ref *sb_tl = find_sb_tiled_fallback(w);
       if (!sb_tl || !sb_tl->buffer) {
         return false;
@@ -1681,6 +1698,8 @@ public:
         *out_high = (bits == 5U) ? *q5_h1 : affine_high_plane(w, bits);
       if (out_sb)
         *out_sb = *sb_tl;
+      if (out_lane_v2)
+        *out_lane_v2 = is_oq_nax_lane_v2_layout(w.layout);
       return true;
     }
     return false;
@@ -1701,8 +1720,7 @@ public:
     if (!affine_nax_xs.buffer) {
       return false;
     }
-    if (w.layout == "oq_nax_tiled_g64_v1" ||
-        w.layout == "oq_nax_tiled_g128_v1") {
+    if (is_oq_nax_pretiled_layout(w.layout)) {
       return find_affine_nax(w) != nullptr;
     }
     return linear_policy == LinearNumericPolicy::RowExactPortableV1 &&
@@ -1712,8 +1730,9 @@ public:
   std::vector<std::byte> fused_norm_params(U32 n0, U32 n1, U32 n2, U32 n3,
                                            U32 k_in, U32 bits_packed,
                                            U32 sq_slot, float w_off) const {
+    const U32 k_eff = k_in & 0x3FFFFFFFU;
     return words({n0, n1, n2, n3, k_in, bits_packed, sq_slot,
-                  word(1.0F / float(k_in)), word(float(config.rms_norm_eps)),
+                  word(1.0F / float(k_eff)), word(float(config.rms_norm_eps)),
                   word(w_off)});
   }
 
@@ -1752,14 +1771,18 @@ public:
       auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                        {.width = 64U},
                        {x, mx_c, mx_s, hidden_io, get("rms_sq")});
-      e.dynamic(d, 5, fused_norm_params(n, 0U, 0U, 0U, k, 0U, sq_slot, 0.0F));
+      e.dynamic(d, 5,
+                fused_norm_params(n, 0U, 0U, 0U,
+                                  pretiled_k_flags(k, false, w.has_fwht64()),
+                                  0U, sq_slot, 0.0F));
       e.record_weight(w, n, k, "pretiled_qmv_t1",
                       "pretiled_mxfp4_qmv_add_sq_t1_v4", {}, "legacy_route_v1",
                       {}, false, 1U);
       return true;
     }
     Ref aff_c{}, aff_h{}, aff_sb{};
-    if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb)) {
+    bool lane_v2 = false;
+    if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb, &lane_v2)) {
       const U32 bits = affine_nax_bits(w.format);
       const U32 rows_per_tg = (n >= 2048U) ? 8U : 4U;
       const U32 tgs = (n + rows_per_tg - 1U) / rows_per_tg;
@@ -1777,7 +1800,10 @@ public:
       auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                        {.width = 64U},
                        {x, aff_c, aff_h, aff_sb, hidden_io, get("rms_sq")});
-      e.dynamic(d, 6, fused_norm_params(n, 0U, 0U, 0U, k, bits, sq_slot, 0.0F));
+      e.dynamic(d, 6,
+                fused_norm_params(n, 0U, 0U, 0U,
+                                  pretiled_k_flags(k, lane_v2, w.has_fwht64()),
+                                  bits, sq_slot, 0.0F));
       e.record_weight(w, n, k, "pretiled_qmv_t1",
                       "pretiled_affine_qmv_add_sq_t1_v4", {}, "legacy_route_v1",
                       {}, false, 1U);
@@ -1804,14 +1830,18 @@ public:
       auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                        {.width = 64U},
                        {hidden_in, nw_ref, get("rms_sq"), mx_c, mx_s, y});
-      e.dynamic(d, 6, fused_norm_params(n, 0U, 0U, 0U, k, 0U, sq_slot, w_off));
+      e.dynamic(d, 6,
+                fused_norm_params(n, 0U, 0U, 0U,
+                                  pretiled_k_flags(k, false, w.has_fwht64()),
+                                  0U, sq_slot, w_off));
       e.record_weight(w, n, k, "pretiled_qmv_t1",
                       "pretiled_mxfp4_qmv_norm_t1_v4", {}, "legacy_route_v1",
                       {}, false, 1U);
       return true;
     }
     Ref aff_c{}, aff_h{}, aff_sb{};
-    if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb)) {
+    bool lane_v2 = false;
+    if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb, &lane_v2)) {
       const Ref nw_ref = direct(norm_w, k);
       const U32 bits = affine_nax_bits(w.format);
       const U32 rows_per_tg = (n >= 2048U) ? 8U : 4U;
@@ -1840,7 +1870,9 @@ public:
           "row_exact", fn, {.width = U64(tgs) * 64U}, {.width = 64U},
           {hidden_in, nw_ref, get("rms_sq"), aff_c, aff_h, aff_sb, y});
       e.dynamic(d, 7,
-                fused_norm_params(n, 0U, 0U, 0U, k, bits, sq_slot, w_off));
+                fused_norm_params(n, 0U, 0U, 0U,
+                                  pretiled_k_flags(k, lane_v2, w.has_fwht64()),
+                                  bits, sq_slot, w_off));
       e.record_weight(w, n, k, "pretiled_qmv_t1",
                       "pretiled_affine_qmv_norm_t1_v4", {}, "legacy_route_v1",
                       {}, false, 1U);
@@ -1882,8 +1914,10 @@ public:
       return true;
     }
     Ref agc{}, agh{}, agsb{}, auc{}, auh{}, ausb{};
-    if (resolve_pretiled_affine_t1(gate_w, 1U, &agc, &agh, &agsb) &&
-        resolve_pretiled_affine_t1(up_w, 1U, &auc, &auh, &ausb)) {
+    bool g_v2 = false, u_v2 = false;
+    if (resolve_pretiled_affine_t1(gate_w, 1U, &agc, &agh, &agsb, &g_v2) &&
+        resolve_pretiled_affine_t1(up_w, 1U, &auc, &auh, &ausb, &u_v2) &&
+        g_v2 == u_v2 && gate_w.has_fwht64() == up_w.has_fwht64()) {
       const Ref nw_ref = direct(norm_w, k);
       const U32 g_bits = affine_nax_bits(gate_w.format);
       const U32 u_bits = affine_nax_bits(up_w.format);
@@ -1905,8 +1939,11 @@ public:
                        {.width = 64U},
                        {hidden_in, nw_ref, get("rms_sq"), agc, agh, agsb, auc,
                         auh, ausb, y});
-      e.dynamic(d, 10,
-                fused_norm_params(n, 0U, 0U, 0U, k, packed_bits, sq_slot, w_off));
+      e.dynamic(
+          d, 10,
+          fused_norm_params(n, 0U, 0U, 0U,
+                            pretiled_k_flags(k, g_v2, gate_w.has_fwht64()),
+                            packed_bits, sq_slot, w_off));
       e.record_weight(gate_w, n, k, "pretiled_qmv_t1",
                       "pretiled_affine_qmv_swiglu_norm_t1_v4", {},
                       "legacy_route_v1", {}, false, 1U);
@@ -1949,8 +1986,10 @@ public:
         return true;
       }
       Ref agc{}, agh{}, agsb{}, auc{}, auh{}, ausb{};
-      if (resolve_pretiled_affine_t1(gate_w, 1U, &agc, &agh, &agsb) &&
-          resolve_pretiled_affine_t1(up_w, 1U, &auc, &auh, &ausb)) {
+      bool g_v2 = false, u_v2 = false;
+      if (resolve_pretiled_affine_t1(gate_w, 1U, &agc, &agh, &agsb, &g_v2) &&
+          resolve_pretiled_affine_t1(up_w, 1U, &auc, &auh, &ausb, &u_v2) &&
+          g_v2 == u_v2 && gate_w.has_fwht64() == up_w.has_fwht64()) {
         const U32 g_bits = affine_nax_bits(gate_w.format);
         const U32 u_bits = affine_nax_bits(up_w.format);
         const U32 rows_per_tg = (n >= 2048U) ? 8U : 4U;
@@ -1974,7 +2013,10 @@ public:
         }
         auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                          {.width = 64U}, {x, agc, agh, agsb, auc, auh, ausb, y});
-        e.dynamic(d, 8, words({n, 1U, 0U, k, packed_bits}));
+        e.dynamic(d, 8,
+                  words({n, 1U, 0U,
+                         pretiled_k_flags(k, g_v2, gate_w.has_fwht64()),
+                         packed_bits}));
         e.record_weight(gate_w, n, k, "pretiled_qmv_t1",
                         "pretiled_affine_qmv_swiglu_t1_v3", {},
                         "legacy_route_v1", {}, false, 1U);
@@ -2064,9 +2106,11 @@ public:
       return true;
     }
     Ref h0{}, h1{}, h2{};
-    if (resolve_pretiled_affine_t1(q_proj, 1U, &d0, &h0, &s0) &&
-        resolve_pretiled_affine_t1(k_proj, 1U, &d1, &h1, &s1) &&
-        resolve_pretiled_affine_t1(v_proj, 1U, &d2, &h2, &s2)) {
+    bool lv0 = false, lv1 = false, lv2 = false;
+    if (resolve_pretiled_affine_t1(q_proj, 1U, &d0, &h0, &s0, &lv0) &&
+        resolve_pretiled_affine_t1(k_proj, 1U, &d1, &h1, &s1, &lv1) &&
+        resolve_pretiled_affine_t1(v_proj, 1U, &d2, &h2, &s2, &lv2) &&
+        lv0 == lv1 && lv1 == lv2) {
       const U32 b0 = affine_nax_bits(q_proj.format);
       const U32 b1 = affine_nax_bits(k_proj.format);
       const U32 b2 = affine_nax_bits(v_proj.format);
@@ -2091,7 +2135,9 @@ public:
                        {.width = 64U},
                        {get("norm"), d0, h0, s0, d1, h1, s1, d2, h2, s2,
                         get("query"), get("key"), get("value")});
-      e.dynamic(d, 13, words({2U * q, kv, kv, h, packed_bits}));
+      e.dynamic(d, 13,
+                words({2U * q, kv, kv, pretiled_k_flags(h, lv0, false),
+                       packed_bits}));
       for (std::size_t i = 0; i < 3; ++i) {
         e.record_weight(parts[i], part_ns[i], h, "pretiled_qmv_t1",
                         "pretiled_affine_qmv_concat3_t1_v3", {},
@@ -2164,13 +2210,16 @@ public:
                            : "omlx_m5_pretiled_qmv_mxfp4_bn16_r2_t1";
         auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                          {.width = 64U}, {x, mx_c, mx_s, y});
-        e.dynamic(d, 4, words({n, k, U32(w.padded_k), 1U}));
+        e.dynamic(d, 4,
+                  words({n, pretiled_k_flags(k, false, w.has_fwht64()),
+                         U32(w.padded_k), 1U}));
         e.record_weight(w, n, k, "pretiled_qmv_t1", "pretiled_mxfp4_qmv_t1_v3",
                         {}, "legacy_route_v1", {}, false, explicit_t);
         return;
       }
       Ref aff_c{}, aff_h{}, aff_sb{};
-      if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb)) {
+      bool lane_v2 = false;
+      if (resolve_pretiled_affine_t1(w, 1U, &aff_c, &aff_h, &aff_sb, &lane_v2)) {
         const U32 bits = affine_nax_bits(w.format);
         const U32 rows_per_tg = (n >= 2048U) ? 8U : 4U;
         const U32 tgs = (n + rows_per_tg - 1U) / rows_per_tg;
@@ -2194,7 +2243,9 @@ public:
         }
         auto &d = e.emit("row_exact", fn, {.width = U64(tgs) * 64U},
                          {.width = 64U}, {x, aff_c, aff_h, aff_sb, y});
-        e.dynamic(d, 5, words({n, 1U, 0U, k, bits}));
+        e.dynamic(d, 5,
+                  words({n, 1U, 0U, pretiled_k_flags(k, lane_v2, w.has_fwht64()),
+                         bits}));
         e.record_weight(w, n, k, "pretiled_qmv_t1", "pretiled_affine_qmv_t1_v3",
                         {}, "legacy_route_v1", {}, false, explicit_t);
         return;
@@ -2203,7 +2254,7 @@ public:
     if (use_mxfp4_nax(w)) {
       if (const auto *tw = find_mxfp4_nax(w); tw && tw->n == n && tw->k == k) {
         linear_mxfp4_nax(e, *tw, x, y, f16_scratch, f16_row_scale, explicit_t,
-                         gpu_cores);
+                         gpu_cores, 0u, 0u, 0u, w.has_fwht64());
         e.record_weight(
             w, n, k, "mxfp4_nax_m5_v1", "mxfp4_nax_m5_v1", {},
             "linear_row_exact_portable_v1",
@@ -2215,7 +2266,12 @@ public:
     }
     if (use_affine_nax(w)) {
       if (const auto *tw = find_affine_nax(w); tw && tw->n == n && tw->k == k) {
-        linear_affine_nax(e, *tw, x, affine_nax_xs, y, explicit_t, gpu_cores);
+        if (w.has_fwht64()) {
+          linear_affine_nax_fwht64(e, *tw, x, fwht_scratch, affine_nax_xs, y,
+                                   explicit_t, gpu_cores);
+        } else {
+          linear_affine_nax(e, *tw, x, affine_nax_xs, y, explicit_t, gpu_cores);
+        }
         e.record_weight(
             w, n, k, "affine_nax_m5_v1", "affine_nax_m5_v1", {},
             "linear_row_exact_portable_v1",
@@ -2225,13 +2281,23 @@ public:
       }
     }
     if (bf16_nax_enabled && bf16_nax_weight_eligible(w, n, k)) {
-      linear_bf16_nax(e, w, x, y, n, k, explicit_t, gpu_cores);
+      Ref x_in = x;
+      if (w.has_fwht64()) {
+        detail::forward::emit_fwht64_bf16(e, x, fwht_scratch, k, explicit_t);
+        x_in = fwht_scratch;
+      }
+      linear_bf16_nax(e, w, x_in, y, n, k, explicit_t, gpu_cores);
       return;
     }
     const auto decision = resolve_linear_route(
         w, n, k, t, context.capabilities().device_name, m4_short_routes, {},
         linear_policy, context.capabilities().profile.probe.apple_gpu_family);
-    detail::forward::linear(e, w, x, y, n, k, get("sums"), get("zero"),
+    Ref x_leg = x;
+    if (w.has_fwht64()) {
+      detail::forward::emit_fwht64_bf16(e, x, fwht_scratch, k, explicit_t);
+      x_leg = fwht_scratch;
+    }
+    detail::forward::linear(e, w, x_leg, y, n, k, get("sums"), get("zero"),
                             decision.route, explicit_t);
     e.record_weight(w, n, k, decision.route.family, decision.source,
                     decision.fallback_reason, decision.route.numeric_contract_id,
@@ -2574,6 +2640,10 @@ public:
                          plane(moe_gate, "scale"), plane(moe_up, "data"),
                          plane(moe_up, "scale"), get("product")});
       e.dynamic(d1, 7, up_params, tok_w5);
+      if (moe_down.has_fwht64()) {
+        detail::forward::emit_fwht64_bf16(e, get("product"), get("product"), f,
+                                          explicit_t, 8U);
+      }
       auto &d2 = e.emit("moe", "omlx_m5_mxfp4_moe_w4a16_down_reduce",
                         {.width = U64(rows) * ((h + 7U) / 8U) * 256U},
                         {.width = 256U},
@@ -2623,6 +2693,10 @@ public:
              get("product")});
         e.dynamic(d1, 12, up_params, tok_w5);
 
+        if (moe_down.has_fwht64()) {
+          detail::forward::emit_fwht64_bf16(e, get("product"), get("product"),
+                                            f, explicit_t, 8U);
+        }
         auto &s2 =
             e.emit("moe", "omlx_m5_moe_group_sum_g" + std::to_string(d_group),
                    {.width = U64(rows) * 8U * (f / d_group) * 32U},
@@ -3492,7 +3566,7 @@ public:
   std::shared_ptr<Mxfp4NaxCache> head_mxfp4_cache, mtp_mxfp4_cache;
   std::shared_ptr<AffineNaxCache> head_affine_cache, mtp_affine_cache;
   std::shared_ptr<MtpQ5High1Cache> head_q5_cache, mtp_q5_cache;
-  Ref f16_scratch{}, f16_row_scale{}, affine_nax_xs{};
+  Ref f16_scratch{}, f16_row_scale{}, affine_nax_xs{}, fwht_scratch{};
 
   SaveTrunkProfile save_local_trunk;
   std::optional<SaveTrunkProfile> save_delegated_trunk;

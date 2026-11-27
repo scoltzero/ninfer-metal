@@ -26,6 +26,7 @@ struct ResolvedKl32Mxfp4Planes {
   std::uint32_t n = 0;
   std::uint32_t k = 0;
   std::uint32_t bn = 16;
+  bool has_fwht64 = false;
 };
 
 struct ResolvedKl32AffinePlanes {
@@ -36,6 +37,8 @@ struct ResolvedKl32AffinePlanes {
   std::uint32_t k = 0;
   std::uint32_t bn = 16;
   std::uint32_t bits = 4;
+  bool is_lane_v2 = false;
+  bool has_fwht64 = false;
 };
 
 class Q5High1Cache {

@@ -92,13 +92,25 @@ inline U64 affine_nax_high_bytes(U32 padded_n, U32 k, U32 bits) {
   return 0ULL;
 }
 
+inline bool is_oq_nax_tiled_v1_layout(std::string_view layout) noexcept {
+  return layout == "oq_nax_tiled_g64_v1" || layout == "oq_nax_tiled_g128_v1";
+}
+
+inline bool is_oq_nax_lane_v2_layout(std::string_view layout) noexcept {
+  return layout == "oq_nax_lane_g64_v2" || layout == "oq_nax_lane_g128_v2";
+}
+
+inline bool is_oq_nax_pretiled_layout(std::string_view layout) noexcept {
+  return is_oq_nax_tiled_v1_layout(layout) ||
+         is_oq_nax_lane_v2_layout(layout);
+}
+
 inline bool affine_nax_weight_eligible(const MaterializedWeightView &w) {
   const U32 bits = affine_nax_bits(w.format);
   const U32 gs = affine_nax_group_size(w.format);
   return bits != 0u && gs != 0u &&
          (w.layout == "oq_rowsplit_k128_v1" ||
-          w.layout == "oq_nax_tiled_g64_v1" ||
-          w.layout == "oq_nax_tiled_g128_v1") &&
+          is_oq_nax_pretiled_layout(w.layout)) &&
          w.parent_shape.size() == 2 && w.row_count > 0 &&
          w.in_features >= 512 && (w.in_features % gs) == 0 &&
          (w.in_features % 64u) == 0 && w.padded_k >= w.in_features &&
@@ -153,8 +165,7 @@ public:
     if (has_entry(w.object_id) || !seen_.insert(w.object_id).second) {
       return;
     }
-    if (w.layout == "oq_nax_tiled_g64_v1" ||
-        w.layout == "oq_nax_tiled_g128_v1") {
+    if (is_oq_nax_lane_v2_layout(w.layout)) {
       const U32 n = U32(w.row_count);
       const U32 k = U32(w.in_features);
       const U32 bn = affine_nax_bn(n);
@@ -185,6 +196,33 @@ public:
       if (bits == 5u && high.buffer != nullptr) {
         pending_h1_compacts_.push_back(
             {w.object_id, high, mul(padded_n, k / 8u)});
+      }
+      return;
+    }
+    if (is_oq_nax_tiled_v1_layout(w.layout)) {
+      const U32 n = U32(w.row_count);
+      const U32 k = U32(w.in_features);
+      const U32 bn = affine_nax_bn(n);
+      const U32 padded_n = ((n + bn - 1u) / bn) * bn;
+      const U32 bits = affine_nax_bits(w.format);
+      const U32 gs = affine_nax_group_size(w.format);
+      Ref high = bits == 3u                     ? plane(w, "nax_high1")
+                 : (bits == 5u || bits == 6u)   ? plane(w, "nax_high2")
+                                                : zero;
+      const Ref src_sb = plane(w, "nax_sb");
+      Ref pre_sb_tiled{};
+      for (const auto &pl : w.planes) {
+        if (pl.kind == "nax_sb_tiled" && pl.buffer != nullptr && pl.bytes > 0) {
+          pre_sb_tiled = Ref{pl.buffer, pl.offset, pl.bytes};
+          break;
+        }
+      }
+      pending_v1_repacks_.push_back(
+          {w.object_id, plane(w, "nax_codes"), high, src_sb, pre_sb_tiled, n, k,
+           bn, padded_n, affine_nax_split_k(n, k, target_split_k_), bits, gs});
+      if (pre_sb_tiled.buffer == nullptr) {
+        pending_sb_transposes_.push_back(
+            {w.object_id, src_sb, padded_n, k / 64u, bn});
       }
       return;
     }
@@ -232,6 +270,7 @@ public:
       ~PendingResetGuard() {
         self->pending_.clear();
         self->pending_pretiled_.clear();
+        self->pending_v1_repacks_.clear();
         self->pending_concats_.clear();
         self->pending_sb_transposes_.clear();
         self->pending_h1_compacts_.clear();
@@ -245,8 +284,9 @@ public:
       pending_sb_transposes_.clear();
       pending_h1_compacts_.clear();
     }
-    if (pending_.empty() && pending_concats_.empty() &&
-        pending_sb_transposes_.empty() && pending_h1_compacts_.empty()) {
+    if (pending_.empty() && pending_v1_repacks_.empty() &&
+        pending_concats_.empty() && pending_sb_transposes_.empty() &&
+        pending_h1_compacts_.empty()) {
       if (!pending_pretiled_.empty()) {
         std::lock_guard<std::mutex> elk(entries_mutex_);
         for (auto &pp : pending_pretiled_) {
@@ -258,6 +298,44 @@ public:
       return;
     }
     NaxSegmentArena arena;
+
+    struct V1RepackPlan {
+      U32 object_id = 0;
+      Ref src_codes{};
+      Ref src_high{};
+      Ref src_sb{};
+      Ref pre_sb_tiled{};
+      U32 n = 0;
+      U32 k = 0;
+      U32 bn = 16;
+      U32 padded_n = 0;
+      U32 sk = 1;
+      U32 bits = 4;
+      U32 gs = 64;
+      NaxSegmentArena::Placement codes;
+      NaxSegmentArena::Placement high;
+      NaxSegmentArena::Placement high1;
+    };
+    std::vector<V1RepackPlan> v1_plans;
+    v1_plans.reserve(pending_v1_repacks_.size());
+    for (const auto &pv : pending_v1_repacks_) {
+      const U64 code_bytes = affine_nax_code_bytes(pv.padded_n, pv.k, pv.bits);
+      NaxSegmentArena::Placement high_p{};
+      if (affine_nax_has_high_plane(pv.bits)) {
+        high_p = arena.plan_alloc(affine_nax_high_bytes(pv.padded_n, pv.k, pv.bits),
+                                  "Affine NAX v1->lane_v2 high");
+      }
+      NaxSegmentArena::Placement high1_p{};
+      if (has_row_exact && pv.bits == 5u) {
+        high1_p = arena.plan_alloc(mul(pv.padded_n, pv.k / 8u),
+                                   "Affine NAX v1->lane_v2 q5_high1");
+      }
+      v1_plans.push_back(
+          {pv.object_id, pv.src_codes, pv.src_high, pv.src_sb, pv.pre_sb_tiled,
+           pv.n, pv.k, pv.bn, pv.padded_n, pv.sk, pv.bits, pv.gs,
+           arena.plan_alloc(code_bytes, "Affine NAX v1->lane_v2 codes"),
+           high_p, high1_p});
+    }
 
     struct PendingPlan {
       MaterializedWeightView weight;
@@ -409,8 +487,34 @@ public:
     static std::atomic<U64> repack_id{0};
     Encoder enc(ctx, libs, 1,
                 "affine.nax.repack." + std::to_string(++repack_id));
-    if (!plans.empty() || !cplans.empty()) {
+    if (!plans.empty() || !v1_plans.empty() || !cplans.empty()) {
       enc.begin_stage("repack_affine_g64");
+      for (const auto &vp : v1_plans) {
+        const Ref dst_codes =
+            NaxSegmentArena::resolve(segments_, vp.codes, base_seg);
+        const Ref dst_high =
+            affine_nax_has_high_plane(vp.bits)
+                ? NaxSegmentArena::resolve(segments_, vp.high, base_seg)
+                : zero;
+        const Ref dst_high1 =
+            (has_row_exact && vp.bits == 5u)
+                ? NaxSegmentArena::resolve(segments_, vp.high1, base_seg)
+                : Ref{};
+        const U32 groups = vp.k / 64u;
+        const U64 row_groups = mul(U64(vp.padded_n), U64(groups));
+        auto &d = enc.emit(
+            "affine_nax", "omlx_m5_repack_oq_v1_to_lane_v2",
+            {.width = ((row_groups + 255ULL) / 256ULL) * 256ULL},
+            {.width = 256u},
+            {vp.src_codes, affine_nax_has_high_plane(vp.bits) ? vp.src_high : zero,
+             dst_codes, dst_high});
+        enc.dynamic(d, 4, words({U32(row_groups), vp.bits}));
+        staged.emplace(
+            vp.object_id,
+            std::make_unique<TiledAffineWeight>(TiledAffineWeight{
+                dst_codes, dst_high, vp.src_sb, vp.n, vp.k, vp.bn, vp.padded_n,
+                vp.sk, vp.bits, vp.gs, vp.pre_sb_tiled, dst_high1}));
+      }
       for (const auto &pp : plans) {
         const Ref dst_codes =
             NaxSegmentArena::resolve(segments_, pp.codes, base_seg);
@@ -460,8 +564,7 @@ public:
           const U32 wn = U32(w.row_count);
           const U32 wpadded_n = ((wn + 15u) / 16u) * 16u;
           const U32 wgs = affine_nax_group_size(w.format);
-          if (w.layout == "oq_nax_tiled_g64_v1" ||
-              w.layout == "oq_nax_tiled_g128_v1") {
+          if (is_oq_nax_lane_v2_layout(w.layout)) {
             const U64 c_off = affine_nax_code_bytes(row_off, cp.k, cp.bits);
             const U64 c_len = affine_nax_code_bytes(wpadded_n, cp.k, cp.bits);
             const U32 c_words = U32(c_len / 4u);
@@ -483,6 +586,35 @@ public:
                   {wh, Ref{dst_high.buffer, dst_high.offset + h_off, h_len}});
               enc.dynamic(dh, 2, words({h_words}));
             }
+            auto &dsb = enc.emit(
+                "affine_nax", "omlx_m5_copy_affine_sb_slice",
+                {.width = groups, .height = wpadded_n},
+                {.width = std::min(groups, 16u), .height = 16u},
+                {plane(w, "nax_sb"), dst_sb});
+            enc.dynamic(dsb, 2,
+                        words({groups, wpadded_n, wn, cp.padded_n, row_off}));
+          } else if (is_oq_nax_tiled_v1_layout(w.layout)) {
+            const U64 c_off = affine_nax_code_bytes(row_off, cp.k, cp.bits);
+            const U64 c_len = affine_nax_code_bytes(wpadded_n, cp.k, cp.bits);
+            const U64 h_off = affine_nax_high_bytes(row_off, cp.k, cp.bits);
+            const U64 h_len = affine_nax_high_bytes(wpadded_n, cp.k, cp.bits);
+            const Ref wh = affine_nax_has_high_plane(cp.bits)
+                               ? (cp.bits == 3u ? plane(w, "nax_high1")
+                                                : plane(w, "nax_high2"))
+                               : zero;
+            const Ref dst_h_slice =
+                affine_nax_has_high_plane(cp.bits)
+                    ? Ref{dst_high.buffer, dst_high.offset + h_off, h_len}
+                    : zero;
+            const U64 row_groups = mul(U64(wpadded_n), U64(groups));
+            auto &dr = enc.emit(
+                "affine_nax", "omlx_m5_repack_oq_v1_to_lane_v2",
+                {.width = ((row_groups + 255ULL) / 256ULL) * 256ULL},
+                {.width = 256u},
+                {plane(w, "nax_codes"), wh,
+                 Ref{dst_codes.buffer, dst_codes.offset + c_off, c_len},
+                 dst_h_slice});
+            enc.dynamic(dr, 4, words({U32(row_groups), cp.bits}));
             auto &dsb = enc.emit(
                 "affine_nax", "omlx_m5_copy_affine_sb_slice",
                 {.width = groups, .height = wpadded_n},
@@ -520,9 +652,21 @@ public:
       }
     }
     if (has_row_exact &&
-        (!plans.empty() || !cplans.empty() || !sb_plans.empty() ||
-         !h1_plans.empty())) {
+        (!plans.empty() || !v1_plans.empty() || !cplans.empty() ||
+         !sb_plans.empty() || !h1_plans.empty())) {
       enc.begin_stage("transpose_affine_sb_tiled");
+      for (const auto &vp : v1_plans) {
+        if (vp.bits == 5u && vp.high1.bytes > 0ULL) {
+          const Ref src_h2 = NaxSegmentArena::resolve(segments_, vp.high, base_seg);
+          const Ref dst_h1 = NaxSegmentArena::resolve(segments_, vp.high1, base_seg);
+          const U32 words_out = U32(vp.high1.bytes / 4ULL);
+          auto &dc = enc.emit(
+              "row_exact", "omlx_m5_compact_q5_high2_to_high1",
+              {.width = ((U64(words_out) + 255ULL) / 256ULL) * 256ULL},
+              {.width = 256u}, {src_h2, dst_h1});
+          enc.dynamic(dc, 2, words({words_out}));
+        }
+      }
       for (const auto &pp : plans) {
         const Ref src_sb = NaxSegmentArena::resolve(segments_, pp.sb, base_seg);
         const Ref dst_sb_tiled =
@@ -645,6 +789,20 @@ private:
     U32 object_id = 0;
     TiledAffineWeight weight{};
   };
+  struct PendingV1Repack {
+    U32 object_id = 0;
+    Ref src_codes{};
+    Ref src_high{};
+    Ref src_sb{};
+    Ref pre_sb_tiled{};
+    U32 n = 0;
+    U32 k = 0;
+    U32 bn = 16;
+    U32 padded_n = 0;
+    U32 sk = 1;
+    U32 bits = 4;
+    U32 gs = 64;
+  };
   struct PendingSbTranspose {
     U32 object_id = 0;
     Ref src_sb{};
@@ -671,6 +829,7 @@ private:
   std::unordered_set<U32> seen_;
   std::vector<MaterializedWeightView> pending_;
   std::vector<PendingPretiled> pending_pretiled_;
+  std::vector<PendingV1Repack> pending_v1_repacks_;
   std::vector<PendingSbTranspose> pending_sb_transposes_;
   std::vector<PendingH1Compact> pending_h1_compacts_;
   std::vector<PendingConcat> pending_concats_;
@@ -756,6 +915,34 @@ inline void ensure_affine_nax_xsum(Encoder &e, Ref x, Ref xs, U32 k,
   e.set_group_sum(key);
 }
 
+// Single-pass FWHT-64 BF16 rotation + GS64 xsum (writes x_rot = x @ H_64 and xs).
+inline void ensure_affine_fwht64_xsum(Encoder &e, Ref x, Ref x_rot_dst, Ref xs,
+                                      U32 k,
+                                      std::optional<U32> explicit_t = {}) {
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 mp = affine_nax_mp(t);
+  const bool dyn_rows = !explicit_t.has_value() && t != 1u;
+  const Encoder::GroupSumKey key{xs.buffer, xs.offset, x.buffer, x.offset,
+                                 k,         64u,       t,        dyn_rows,
+                                 2u,        true};
+  const Encoder::GroupSumKey rot_key{xs.buffer,        xs.offset,
+                                     x_rot_dst.buffer, x_rot_dst.offset,
+                                     k,                64u,
+                                     t,                dyn_rows,
+                                     2u,               false};
+  if (e.has_group_sum(key) && e.has_group_sum(rot_key)) {
+    return;
+  }
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  auto &d = e.emit("affine_nax", "omlx_m5_affine_fwht64_xsum_g64",
+                   {.width = U64(k / 64u) * 32u, .height = mp}, {.width = 32u},
+                   {x, x_rot_dst, xs});
+  e.dynamic(d, 3, words({k, mp, 0u, t}), tokens_patch);
+  e.set_group_sum(key);
+  e.set_group_sum(rot_key);
+}
+
 inline NaxWidePrefillTile
 affine_nax_select_wide(const TiledAffineWeight &tw, U32 t,
                        std::optional<U32> explicit_t = {},
@@ -784,9 +971,8 @@ inline bool affine_nax_q5_h1_bm16_eligible(const TiledAffineWeight &tw) {
 
 inline U32 affine_nax_q5_h1_bm16_linear_sk(const TiledAffineWeight &tw) {
   const U32 groups = tw.k / 64u;
-  U32 sk = (tw.n >= 65536u)             ? 2u
-           : (tw.bn == 32u || tw.n >= 8192u) ? 4u
-                                        : 8u;
+  // WP3.1: Cap SK <= 4 (<= 16.0 KiB TG SRAM on Apple10).
+  U32 sk = (tw.n >= 65536u) ? 2u : 4u;
   while (sk > 2u && sk > groups) {
     sk /= 2u;
   }
@@ -832,18 +1018,23 @@ inline std::string affine_nax_group(const Encoder &e,
 }
 
 inline bool affine_nax_swiglu_out64_enabled() noexcept {
-  // Real Apple10 M5 Ultra calibration: out64's 27 KiB SRAM caps occupancy to
-  // 1 TG/core vs bm64_bn64_sk1. Keep out64 for Dual-ANE row-slice calls
-  // (is_slice), mixed q4/q56 pairs, and opt-in via OMLX_M5_ENABLE_SWIGLU_OUT64=1.
+  // WP3.1 Apple10 M5 Ultra verified: 1-pass BN_out=32 out64 (9,216 B SRAM, 0 spills,
+  // 128 threads, 3 TGs/core) beats HEAD out64 (27,648 B) by 1.10-1.16x and beats/matches
+  // Split (2x Linear + SwiGLU) & bm64_bn64 across M=512..4096 (default ON).
   if (const char *dis = std::getenv("OMLX_M5_DISABLE_SWIGLU_OUT64");
       dis != nullptr && std::string_view(dis) == "1") {
     return false;
   }
   if (const char *en = std::getenv("OMLX_M5_ENABLE_SWIGLU_OUT64");
-      en != nullptr && std::string_view(en) == "1") {
-    return true;
+      en != nullptr) {
+    if (std::string_view(en) == "0") {
+      return false;
+    }
+    if (std::string_view(en) == "1") {
+      return true;
+    }
   }
-  return false;
+  return true;
 }
 
 inline void linear_affine_nax(Encoder &e, const TiledAffineWeight &tw, Ref x,
@@ -1048,7 +1239,7 @@ inline void linear_affine_nax_swiglu(Encoder &e, const TiledAffineWeight &gw,
       throw std::invalid_argument("linear_affine_nax_swiglu slice exceeds weight n");
     }
     const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
-    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 x_tiles = (eff_n + 31u) / 32u;
     const U32 y_tiles = (t + 63u) / 64u;
     const U32 eff_gs = (gw.group_size == 128u && uw.group_size == 128u &&
                         (gw.k % 128u) == 0u)
@@ -1059,9 +1250,9 @@ inline void linear_affine_nax_swiglu(Encoder &e, const TiledAffineWeight &gw,
     const std::string fn = "omlx_m5_affine_nax_" + mode_tag + "_g" +
                            std::to_string(eff_gs) +
                            "_swiglu_bm64_bn64_out64_sk1";
-    const MetalDispatchSize grid{.width = U64(x_tiles) * 256u,
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 128u,
                                  .height = y_tiles};
-    const MetalDispatchSize threads{.width = 256u};
+    const MetalDispatchSize threads{.width = 128u};
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
     if (!affine_nax_has_high_plane(gw.bits) &&
         !affine_nax_has_high_plane(uw.bits)) {
@@ -1144,24 +1335,26 @@ inline void linear_affine_nax_swiglu(Encoder &e, const TiledAffineWeight &gw,
   const Ref u_sb_ref = use_sb_tiled ? uw.sb_tiled : uw.sb;
   const U32 sb_stride_n = use_sb_tiled ? 0u : gw.padded_n;
   if (bm > 8u) {
+    // WP3.1: Cap SwiGLU bm32_n16 at SK <= 4 (12.0 KiB <= 16.0 KiB TG SRAM).
+    const U32 eff_sk = (bm == 32u) ? std::min<U32>(gw.split_k, 4u) : gw.split_k;
     const U32 y_tiles = (mp + bm - 1u) / bm;
     const std::string fn = "omlx_m5_affine_nax_" + tag + "_swiglu_bm" +
                            std::to_string(bm) + "_n16_sk" +
-                           std::to_string(gw.split_k);
-    const MetalDispatchSize grid{.width = U64(gw.padded_n / 16u) * 32u * gw.split_k,
+                           std::to_string(eff_sk);
+    const MetalDispatchSize grid{.width = U64(gw.padded_n / 16u) * 32u * eff_sk,
                                  .height = y_tiles};
-    const MetalDispatchSize threads{.width = 32u * gw.split_k};
+    const MetalDispatchSize threads{.width = 32u * eff_sk};
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
     if (!affine_nax_has_high_plane(gw.bits)) {
       auto &d = e.emit("affine_nax", fn, grid, threads,
                        {x, gw.codes, g_sb_ref, uw.codes, u_sb_ref, xs, y});
-      e.dynamic(d, 7, words({gw.n, gw.k, mp, t, sb_stride_n, gw.split_k}),
+      e.dynamic(d, 7, words({gw.n, gw.k, mp, t, sb_stride_n, eff_sk}),
                 tokens_patch);
     } else {
       auto &d = e.emit("affine_nax", fn, grid, threads,
                        {x, gw.codes, gw.high2, g_sb_ref, uw.codes, uw.high2,
                         u_sb_ref, xs, y});
-      e.dynamic(d, 9, words({gw.n, gw.k, mp, t, sb_stride_n, gw.split_k}),
+      e.dynamic(d, 9, words({gw.n, gw.k, mp, t, sb_stride_n, eff_sk}),
                 tokens_patch);
     }
     return;
@@ -1187,6 +1380,95 @@ inline void linear_affine_nax_swiglu(Encoder &e, const TiledAffineWeight &gw,
                      {x, gw.codes, gw.high2, g_sb_ref, uw.codes, uw.high2,
                       u_sb_ref, xs, y});
     e.dynamic(d, 9, words({gw.n, gw.k, mp, t, sb_stride_n, gw.split_k}),
+              tokens_patch);
+  }
+}
+
+// FWHT-64 wrapper for W4A16 affine_nax linear (rotates x -> x_rot_scratch).
+inline void linear_affine_nax_fwht64(Encoder &e, const TiledAffineWeight &tw,
+                                     Ref x, Ref x_rot_scratch, Ref xs, Ref y,
+                                     std::optional<U32> explicit_t = {},
+                                     U32 gpu_cores = 64u,
+                                     U32 row_offset = 0u,
+                                     U32 out_stride = 0u,
+                                     U32 slice_n = 0u) {
+  const U32 sel_t = nax_effective_select_t(e, explicit_t);
+  const auto sel_exp = nax_effective_select_explicit_t(e, explicit_t);
+  const bool is_slice = (row_offset > 0u) ||
+                        (out_stride > 0u && out_stride != tw.n) ||
+                        (slice_n > 0u && slice_n != tw.n);
+  const bool uses_bf16_only =
+      is_slice ||
+      (affine_nax_select_wide(tw, sel_t, sel_exp, gpu_cores) !=
+       NaxWidePrefillTile::none) ||
+      affine_nax_q5_h1_bm16_eligible(tw);
+  if (uses_bf16_only) {
+    emit_fwht64_bf16(e, x, x_rot_scratch, tw.k, explicit_t);
+  } else {
+    ensure_affine_fwht64_xsum(e, x, x_rot_scratch, xs, tw.k, explicit_t);
+  }
+  linear_affine_nax(e, tw, x_rot_scratch, xs, y, explicit_t, gpu_cores,
+                    row_offset, out_stride, slice_n);
+}
+
+// WP3.1 Mode B: Zero-Ws W4A16 out64 Gate + Up + SwiGLU + fused FWHT-64 + GS64 INT8 epilogue.
+// Directly produces (qa_out, sa_out, ra_out) for a W4A8 fwht64 down_proj with 0 extra dispatches.
+// If also_write_bf16 == true (Bypass LoRA / tensor inspection), also writes unrotated SwiGLU to y_bf16.
+inline void linear_affine_nax_swiglu_fwht64_a8(
+    Encoder &e, const TiledAffineWeight &gw, const TiledAffineWeight &uw, Ref x,
+    Ref qa_out, Ref sa_out, Ref ra_out, Ref opt_y_bf16, bool also_write_bf16,
+    U32 a8_mp, std::optional<U32> explicit_t = {}, U32 row_offset = 0u,
+    U32 out_stride = 0u, U32 slice_n = 0u) {
+  if (gw.n != uw.n || gw.k != uw.k || gw.bn != 16u || uw.bn != 16u ||
+      (gw.k % 64u) != 0u || (gw.n % 64u) != 0u || (row_offset % 64u) != 0u ||
+      row_offset >= gw.n) {
+    throw std::invalid_argument(
+        "linear_affine_nax_swiglu_fwht64_a8 requires bn=16, k%64==0, n%64==0, row_offset%64==0");
+  }
+  const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+  if (row_offset + eff_n > gw.n || (eff_n % 64u) != 0u) {
+    throw std::invalid_argument(
+        "linear_affine_nax_swiglu_fwht64_a8 slice must be 64-aligned within n");
+  }
+  const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 x_tiles = eff_n / 64u;
+  const U32 y_tiles = (t + 63u) / 64u;
+  const U32 eff_gs = (gw.group_size == 128u && uw.group_size == 128u &&
+                      (gw.k % 128u) == 0u)
+                         ? 128u
+                         : 64u;
+  const std::string tag_g = affine_nax_mode_tag(gw.bits);
+  const std::string tag_u = affine_nax_mode_tag(uw.bits);
+  const std::string mode_tag =
+      (tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u);
+  const std::string fn = "omlx_m5_affine_nax_" + mode_tag + "_g" +
+                         std::to_string(eff_gs) +
+                         "_swiglu_bm64_bn64_out64_sk1_fwht64_a8";
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 256u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 256u};
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  const U32 epi_flags = also_write_bf16 ? 1u : 0u;
+  e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+  if (!affine_nax_has_high_plane(gw.bits) &&
+      !affine_nax_has_high_plane(uw.bits)) {
+    auto &d = e.emit("affine_nax", fn, grid, threads,
+                     {x, gw.codes, gw.sb, uw.codes, uw.sb, qa_out, sa_out,
+                      ra_out, opt_y_bf16});
+    e.dynamic(d, 9,
+              words({eff_n, gw.k, a8_mp, t, gw.padded_n, epi_flags, row_offset,
+                     eff_stride}),
+              tokens_patch);
+  } else {
+    const Ref g_hi = gw.high2.buffer != nullptr ? gw.high2 : gw.codes;
+    const Ref u_hi = uw.high2.buffer != nullptr ? uw.high2 : uw.codes;
+    auto &d = e.emit("affine_nax", fn, grid, threads,
+                     {x, gw.codes, g_hi, gw.sb, uw.codes, u_hi, uw.sb, qa_out,
+                      sa_out, ra_out, opt_y_bf16});
+    e.dynamic(d, 11,
+              words({eff_n, gw.k, a8_mp, t, gw.padded_n, epi_flags, row_offset,
+                     eff_stride}),
               tokens_patch);
   }
 }

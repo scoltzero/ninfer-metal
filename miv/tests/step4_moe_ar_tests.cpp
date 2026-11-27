@@ -1541,9 +1541,12 @@ Json test_moe_bm64_and_2048_async_prefill(
                   tag + " cap=128 must emit 4-dispatch zero-gather BM=32");
         } else {
           // Zero-gather BM=64: exactly 4 dispatches (sched_bm64 + swiglu + down + reduce)!
+          const std::string expect_bm64 =
+              moe_nax_swiglu_out64_env_enabled() ? "_bm64_out64_sk1"
+                                                 : "_bm64_bn64_sk1";
           require(prof.plan.dispatch_count() == 4U &&
-                      prof.weight_routes.front().function.find(
-                          "_bm64_bn64_sk1") != std::string::npos,
+                      prof.weight_routes.front().function.find(expect_bm64) !=
+                          std::string::npos,
                   tag + " cap>=256 must emit 4-dispatch zero-gather BM=64");
           if (cap == 2048U) {
             require(prof.weight_routes.front().grid.width == 32ULL * 128ULL,
@@ -1562,8 +1565,11 @@ Json test_moe_bm64_and_2048_async_prefill(
                                64U, 300U, r_logits, true),
               "delegated_prefill emit_moe_nax_ffn failed for " + tag);
       auto p_del = e_del.finish();
+      const std::string expect_del =
+          moe_nax_swiglu_out64_env_enabled() ? "_bm64_out64_sk1"
+                                             : "_bm64_bn64_sk1";
       require(p_del.plan.dispatch_count() == 4U &&
-                  p_del.weight_routes.front().function.find("_bm64_bn64_sk1") !=
+                  p_del.weight_routes.front().function.find(expect_del) !=
                       std::string::npos,
               tag + " delegated_prefill T=300@cap=512 did not match solo BM=64 route");
     };

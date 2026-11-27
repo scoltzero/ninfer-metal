@@ -35,6 +35,11 @@ struct ArtifactObject {
   std::string object_sha256;
   std::vector<ArtifactPlane> planes;
   std::vector<std::string> source_tensors;
+  std::string input_transform = "none";
+
+  [[nodiscard]] bool has_fwht64() const noexcept {
+    return input_transform == "fwht64";
+  }
 };
 
 struct ArtifactBinding {

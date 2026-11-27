@@ -91,6 +91,32 @@ std::uint8_t encode_e2m1_ref(float v) {
 }
 
 // Build synthetic oQ affine weight (q4/q5/q6, g64/g128) in either untiled or NAX pre-tiled layout.
+static std::uint32_t pi64_test(std::uint32_t off) {
+  return ((off & 12u) << 2u) | ((off >> 2u) & 12u) | (off & 3u);
+}
+
+static void fwht64_test_rows(std::vector<float> &mat, std::uint32_t rows,
+                             std::uint32_t cols) {
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t c = 0; c < cols; c += 64u) {
+      float *v = mat.data() + static_cast<std::size_t>(r) * cols + c;
+      for (std::uint32_t len = 1u; len < 64u; len <<= 1u) {
+        for (std::uint32_t i = 0u; i < 64u; i += len * 2u) {
+          for (std::uint32_t j = 0u; j < len; ++j) {
+            const float a = v[i + j];
+            const float b = v[i + j + len];
+            v[i + j] = a + b;
+            v[i + j + len] = a - b;
+          }
+        }
+      }
+      for (std::uint32_t i = 0u; i < 64u; ++i) {
+        v[i] *= 0.125f;
+      }
+    }
+  }
+}
+
 SyntheticWeightFixture make_affine_fixture(
     const MetalContext &ctx,
     std::string name,
@@ -100,7 +126,9 @@ SyntheticWeightFixture make_affine_fixture(
     std::uint32_t bits,
     std::uint32_t gs,
     bool nax_pretiled,
-    std::uint32_t seed) {
+    std::uint32_t seed,
+    bool lane_v2 = false,
+    bool fwht64_weight = false) {
   SyntheticWeightFixture fix;
   const std::uint32_t padded_k = ((k + 127u) / 128u) * 128u;
   const std::uint32_t max_code = (1u << bits) - 1u;
@@ -149,6 +177,10 @@ SyntheticWeightFixture make_affine_fixture(
   fix.view.row_start = 0;
   fix.view.row_count = rows;
   fix.view.in_features = k;
+  fix.view.input_transform = fwht64_weight ? "fwht64" : "none";
+  if (fwht64_weight) {
+    fwht64_test_rows(fix.exact_f32, rows, k);
+  }
 
   auto upload_vec = [&](const void *ptr, std::size_t bytes, std::string kind) {
     fix.owned_buffers.push_back(ctx.upload(std::span<const std::byte>(
@@ -205,7 +237,11 @@ SyntheticWeightFixture make_affine_fixture(
     upload_vec(sc_buf.data(), sc_buf.size() * 2u, "scale");
     upload_vec(bi_buf.data(), bi_buf.size() * 2u, "bias");
   } else {
-    fix.view.layout = (gs == 128u) ? "oq_nax_tiled_g128_v1" : "oq_nax_tiled_g64_v1";
+    fix.view.layout = lane_v2
+                          ? ((gs == 128u) ? "oq_nax_lane_g128_v2"
+                                          : "oq_nax_lane_g64_v2")
+                          : ((gs == 128u) ? "oq_nax_tiled_g128_v1"
+                                          : "oq_nax_tiled_g64_v1");
     const std::uint32_t bn = rows >= 65536u ? 32u : 16u;
     const std::uint32_t padded_n = ((rows + bn - 1u) / bn) * bn;
     const std::uint32_t groups64 = k / 64u;
@@ -230,14 +266,15 @@ SyntheticWeightFixture make_affine_fixture(
 
         const std::size_t tile_idx = static_cast<std::size_t>(r / bn) * groups64 + g;
         for (std::uint32_t i = 0; i < 64u; ++i) {
+          const std::uint32_t slot = lane_v2 ? pi64_test(i) : i;
           const std::uint8_t code =
               codes_raw[static_cast<std::size_t>(r) * k + g * 64u + i];
-          nax_codes[tile_idx * (bn * 32u) + rn * 32u + i / 2u] |=
-              static_cast<std::uint8_t>((code & 0x0Fu) << ((i & 1u) * 4u));
+          nax_codes[tile_idx * (bn * 32u) + rn * 32u + slot / 2u] |=
+              static_cast<std::uint8_t>((code & 0x0Fu) << ((slot & 1u) * 4u));
           if (bits == 5u || bits == 6u) {
             const std::uint8_t h = (bits == 5u) ? ((code >> 4u) & 1u) : ((code >> 4u) & 3u);
-            nax_high2[tile_idx * (bn * 16u) + rn * 16u + i / 4u] |=
-                static_cast<std::uint8_t>(h << ((i & 3u) * 2u));
+            nax_high2[tile_idx * (bn * 16u) + rn * 16u + slot / 4u] |=
+                static_cast<std::uint8_t>(h << ((slot & 3u) * 2u));
           }
         }
       }
@@ -263,7 +300,8 @@ SyntheticWeightFixture make_mxfp4_fixture(
     std::uint32_t rows,
     std::uint32_t k,
     bool nax_pretiled,
-    std::uint32_t seed) {
+    std::uint32_t seed,
+    bool fwht64_weight = false) {
   SyntheticWeightFixture fix;
   const std::uint32_t padded_k = ((k + 127u) / 128u) * 128u;
   const std::uint32_t num_g32 = k / 32u;
@@ -306,6 +344,10 @@ SyntheticWeightFixture make_mxfp4_fixture(
   fix.view.row_start = 0;
   fix.view.row_count = rows;
   fix.view.in_features = k;
+  fix.view.input_transform = fwht64_weight ? "fwht64" : "none";
+  if (fwht64_weight) {
+    fwht64_test_rows(fix.exact_f32, rows, k);
+  }
 
   auto upload_vec = [&](const void *ptr, std::size_t bytes, std::string kind) {
     fix.owned_buffers.push_back(ctx.upload(std::span<const std::byte>(
@@ -553,16 +595,22 @@ int test_miv_extraction_accuracy(const MetalContext &ctx) {
     std::uint32_t bits;
     std::uint32_t gs;
     bool pretiled;
+    bool lane_v2;
+    bool fwht64;
   };
-  const std::array<Case, 8> cases = {{
-      {"oQ4_g64_untiled", false, 4u, 64u, false},
-      {"oQ4_g64_nax_pretiled", false, 4u, 64u, true},
-      {"oQ5_g64_untiled", false, 5u, 64u, false},
-      {"oQ5_g64_nax_pretiled", false, 5u, 64u, true},
-      {"oQ6_g128_untiled", false, 6u, 128u, false},
-      {"oQ6_g128_nax_pretiled", false, 6u, 128u, true},
-      {"MXFP4_untiled", true, 4u, 32u, false},
-      {"MXFP4_nax_pretiled", true, 4u, 32u, true},
+  const std::array<Case, 12> cases = {{
+      {"oQ4_g64_untiled", false, 4u, 64u, false, false, false},
+      {"oQ4_g64_nax_pretiled", false, 4u, 64u, true, false, false},
+      {"oQ4_g64_lane_v2_fwht", false, 4u, 64u, true, true, true},
+      {"oQ5_g64_untiled", false, 5u, 64u, false, false, false},
+      {"oQ5_g64_nax_pretiled", false, 5u, 64u, true, false, false},
+      {"oQ5_g64_lane_v2_fwht", false, 5u, 64u, true, true, true},
+      {"oQ6_g128_untiled", false, 6u, 128u, false, false, false},
+      {"oQ6_g128_nax_pretiled", false, 6u, 128u, true, false, false},
+      {"oQ6_g128_lane_v2_fwht", false, 6u, 128u, true, true, true},
+      {"MXFP4_untiled", true, 4u, 32u, false, false, false},
+      {"MXFP4_nax_pretiled", true, 4u, 32u, true, false, false},
+      {"MXFP4_pretiled_fwht", true, 4u, 32u, true, false, true},
   }};
 
   const std::uint32_t rows = 256u;
@@ -574,11 +622,13 @@ int test_miv_extraction_accuracy(const MetalContext &ctx) {
         tc.is_mxfp4
             ? make_mxfp4_fixture(ctx, "model.layers.0.mlp.down_proj",
                                  static_cast<std::uint32_t>(idx), rows, k,
-                                 tc.pretiled, 100u + static_cast<std::uint32_t>(idx))
+                                 tc.pretiled, 100u + static_cast<std::uint32_t>(idx),
+                                 tc.fwht64)
             : make_affine_fixture(ctx, "model.layers.0.mlp.down_proj",
                                   static_cast<std::uint32_t>(idx), rows, k,
                                   tc.bits, tc.gs, tc.pretiled,
-                                  200u + static_cast<std::uint32_t>(idx));
+                                  200u + static_cast<std::uint32_t>(idx),
+                                  tc.lane_v2, tc.fwht64);
 
     // Extract middle slice [64, 192) to verify non-zero row_start indexing on BOTH untiled & NAX tiled!
     const std::uint64_t r0 = 64u;
@@ -588,7 +638,7 @@ int test_miv_extraction_accuracy(const MetalContext &ctx) {
         fix.exact_f32.data() + static_cast<std::size_t>(r0 * k),
         static_cast<std::size_t>(rc * k));
     const float exact_err = max_abs_diff(dec, ref_slice);
-    REQUIRE(exact_err == 0.0f);
+    REQUIRE(exact_err <= (tc.fwht64 ? 1e-5f : 0.0f));
 
     const auto q = extract_miv_weight_slice_g64_int8(fix.view, r0, rc);
     const auto deq = dequantize_g64_int8_to_f32(q);
@@ -597,7 +647,7 @@ int test_miv_extraction_accuracy(const MetalContext &ctx) {
                 tc.label, exact_err, cos);
     REQUIRE(cos >= 0.9995);
   }
-  std::cout << "[PASS] test_miv_extraction_accuracy (all 8 formats/layouts >= 0.9995)\n";
+  std::cout << "[PASS] test_miv_extraction_accuracy (all 12 formats/layouts including lane_v2+fwht64 >= 0.9995)\n";
   return 0;
 }
 

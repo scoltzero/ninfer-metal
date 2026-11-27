@@ -917,9 +917,8 @@ inline void bf16_nax_wide_sk1_linear_impl(
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      #pragma clang loop unroll(full)
+      #pragma clang loop unroll(disable)
       for (uint kk = 0u; kk < kBK; kk += 32u) {
-        volatile int cbar;
         vec<bfloat, 8> a00, a01, a10, a11, b00, b01, b10, b11;
         #pragma clang loop unroll(full)
         for (uint r = 0u; r < 2u; ++r) {
@@ -943,7 +942,6 @@ inline void bf16_nax_wide_sk1_linear_impl(
         bf16_mma_16x32x16(D[0][0], D[0][1], a01, b01, b11);
         bf16_mma_16x32x16(D[1][0], D[1][1], a10, b00, b10);
         bf16_mma_16x32x16(D[1][0], D[1][1], a11, b01, b11);
-        (void)cbar;
       }
     }
   } else {
@@ -977,9 +975,8 @@ inline void bf16_nax_wide_sk1_linear_impl(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
-        #pragma clang loop unroll(full)
+        #pragma clang loop unroll(disable)
         for (uint kk = 0u; kk < kBK; kk += 32u) {
-          volatile int cbar;
           vec<bfloat, 8> b00, b01, b10, b11;
           #pragma clang loop unroll(full)
           for (uint r = 0u; r < 2u; ++r) {
@@ -1016,8 +1013,7 @@ inline void bf16_nax_wide_sk1_linear_impl(
               bf16_mma_16x32x16(D[mm][0], D[mm][1], a1, b01, b11);
             }
           }
-          (void)cbar;
-        }
+          }
       }
     }
   }
@@ -1147,9 +1143,8 @@ inline void bf16_nax_wide_sk1_swiglu_impl(
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      #pragma clang loop unroll(full)
+      #pragma clang loop unroll(disable)
       for (uint kk = 0u; kk < kBK; kk += 32u) {
-        volatile int cbar;
         vec<bfloat, 8> a00, a01, a10, a11, b00, b01, b10, b11;
         #pragma clang loop unroll(full)
         for (uint r = 0u; r < 2u; ++r) {
@@ -1173,7 +1168,6 @@ inline void bf16_nax_wide_sk1_swiglu_impl(
         bf16_mma_16x32x16(D[0][0], D[0][1], a01, b01, b11);
         bf16_mma_16x32x16(D[1][0], D[1][1], a10, b00, b10);
         bf16_mma_16x32x16(D[1][0], D[1][1], a11, b01, b11);
-        (void)cbar;
       }
     }
   } else {
@@ -1210,9 +1204,8 @@ inline void bf16_nax_wide_sk1_swiglu_impl(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
-        #pragma clang loop unroll(full)
+        #pragma clang loop unroll(disable)
         for (uint kk = 0u; kk < kBK; kk += 32u) {
-          volatile int cbar;
           vec<bfloat, 8> b00, b01, b10, b11;
           #pragma clang loop unroll(full)
           for (uint r = 0u; r < 2u; ++r) {
@@ -1249,8 +1242,7 @@ inline void bf16_nax_wide_sk1_swiglu_impl(
               bf16_mma_16x32x16(D[mm][0], D[mm][1], a1, b01, b11);
             }
           }
-          (void)cbar;
-        }
+          }
       }
     }
   }
@@ -1512,8 +1504,7 @@ inline void bf16_nax_swiglu_bm_impl(
   OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 16, 16, 4)                                    \
   OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 16, 16, 8)                                    \
   OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 32, 16, 2)                                    \
-  OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 32, 16, 4)                                    \
-  OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 32, 16, 8)
+  OMLX_M5_BF16_NAX_SWIGLU_BM(BK, 32, 16, 4)
 
 OMLX_M5_BF16_NAX_BM_SUITE(128)
 OMLX_M5_BF16_NAX_BM_SUITE(64)

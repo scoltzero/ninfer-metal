@@ -433,8 +433,7 @@ public:
       }
     }
     if ((linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         head.layout == "oq_nax_tiled_g64_v1" ||
-         head.layout == "oq_nax_tiled_g128_v1") &&
+         is_oq_nax_pretiled_layout(head.layout)) &&
         affine_nax_runtime_eligible(context, directory) &&
         affine_nax_weight_eligible(head)) {
       const void *head_key =
@@ -1012,8 +1011,7 @@ public:
     }
     if (!did_nax_head &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         head.layout == "oq_nax_tiled_g64_v1" ||
-         head.layout == "oq_nax_tiled_g128_v1") &&
+         is_oq_nax_pretiled_layout(head.layout)) &&
         affine_nax_head_cache && affine_nax_head_cache->active()) {
       if (const auto *tw = affine_nax_head_cache->find(head.object_id);
           tw && tw->n == config.vocabulary_size && tw->k == h) {
@@ -1687,8 +1685,7 @@ public:
     }
     if (!did_nax_head &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         head.layout == "oq_nax_tiled_g64_v1" ||
-         head.layout == "oq_nax_tiled_g128_v1") &&
+         is_oq_nax_pretiled_layout(head.layout)) &&
         affine_nax_head_cache && affine_nax_head_cache->active()) {
       if (const auto *tw = affine_nax_head_cache->find(head.object_id);
           tw && tw->n == config.vocabulary_size && tw->k == h) {
