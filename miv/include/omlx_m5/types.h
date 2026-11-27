@@ -18,7 +18,7 @@ inline constexpr std::int32_t kMaxRepetitionContextSize = 4096;
 enum class PrefillLinearMode : std::uint8_t {
   BFloat16 = 0, // "bf16"
   W4A8 = 1,     // "w4a8"
-  W4A4 = 2,     // "w4a4"
+  W4A4 = 2,     // "w4a4" (MXFP4-only)
 };
 
 enum class PrefillAttentionMode : std::uint8_t {
@@ -177,6 +177,15 @@ parse_prefill_ane_mode(std::string_view value) {
       "prefill_ane_mode must be 'off', 'auto', 'compact_int8', or "
       "'ultra_fp16_swiglu', got: " +
       std::string(value));
+}
+
+[[nodiscard]] constexpr PrefillAneMode
+effective_requested_prefill_ane_mode(PrefillAneMode mode,
+                                     bool legacy_ane_offload) noexcept {
+  if (mode != PrefillAneMode::Off) {
+    return mode;
+  }
+  return legacy_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
 }
 
 [[nodiscard]] constexpr bool
@@ -425,13 +434,8 @@ using RuntimeStats = StatsReport;
 
 [[nodiscard]] constexpr PrefillAneMode
 effective_load_prefill_ane_mode(const LoadOptions &options) noexcept {
-  if (options.prefill_ane_mode != PrefillAneMode::Off) {
-    return options.prefill_ane_mode;
-  }
-  if (options.prefill_ane_offload) {
-    return PrefillAneMode::Auto;
-  }
-  return PrefillAneMode::Off;
+  return effective_requested_prefill_ane_mode(options.prefill_ane_mode,
+                                              options.prefill_ane_offload);
 }
 
 inline void append_prefill_execution_identity_fields(

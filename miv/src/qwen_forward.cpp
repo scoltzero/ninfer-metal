@@ -1152,85 +1152,217 @@ public:
         context.capabilities().profile.probe.metal4_compiler &&
         context.capabilities().profile.probe.tensor_api;
 
-    // Module 4b: Initialize Native Dual-ANE Co-Execution Engine on primary Dense slot.
-    // Calibrated for 80-core Apple M5 Ultra NAX GPU + Dual-ANE:
-    //   - On full-scale dense models (intermediate >= 8192, workspace >= 2048), match
-    //     T_chunk = 2048 (avoids 2x attention KV traffic penalty), use direct FP16 weights
-    //     (13.8 TFLOPS dual-die vs 8.1 TFLOPS G=64 INT8), offload fused MlpGateUpSwiGlu
-    //     only (avoids mlp.down_proj K=17408 6.4x ANE SRAM cliff & small-op dispatch lag),
-    //     and split at alpha_bf16=0.08 / alpha_w4a8=0.06 so Dual-ANE finishes inside GPU.
-    //   - Small synthetic models keep alpha_bf16=0.25 / alpha_w4a8=0.15 / T=1024 for tests.
-    if (!shared_primary_ && prefill_options_.ane_offload && c.num_experts == 0) {
-      const bool large_m5_dense =
-          (c.intermediate_size >= 8192 && workspace_rows_ >= 2048U);
-      ane::AneDualOffloadConfig ane_cfg;
-      ane_cfg.chunk_tokens =
-          prefill_options_.ane_chunk_tokens
-              ? prefill_options_.ane_chunk_tokens
-              : (large_m5_dense ? 2048U : ane::kAneDefaultChunkTokens);
-      ane_cfg.linear_route =
-          (prefill_options_.linear_mode == PrefillLinearMode::W4A8)
-              ? ane::AneLinearRoute::W4A8
-              : ane::AneLinearRoute::BF16;
-      ane_cfg.alpha_bf16 = large_m5_dense ? 0.045 : ane::kAneDefaultAlphaBf16;
-      ane_cfg.alpha_w4a8 = large_m5_dense ? 0.03 : ane::kAneDefaultAlphaW4A8;
-      ane_cfg.use_fp16_weights = large_m5_dense;
-      ane_cfg.mlp_swiglu_only = large_m5_dense;
-      ane_cfg.max_in_features = large_m5_dense ? 8192U : 0U;
-      ane_cfg.artifact_digest = prefill_options_.artifact_digest;
-      ane_cfg.metallib_path = libraries / "omlx_m5_ane_pack_unpack.metallib";
-      ane_cfg.external_mtl_device = context.native_mtl_device();
-      ane_cfg.external_mtl_command_queue = context.native_mtl_command_queue();
-      if (const char *env_chunk = std::getenv("OMLX_M5_ANE_CHUNK_TOKENS")) {
-        const auto parsed = std::strtoul(env_chunk, nullptr, 10);
-        if (parsed >= 64UL && parsed <= workspace_rows_) {
-          ane_cfg.chunk_tokens = static_cast<U32>(parsed);
+    // Module 4b / WP 3C: Graded Dual-ANE Collaboration (`compact_int8` + `ultra_fp16_swiglu`).
+    // Mode resolution & legacy precedence:
+    //   1. Explicit prefill_options_.ane_mode (or OMLX_M5_ANE_MODE diagnostic override)
+    //   2. Legacy prefill_options_.ane_offload == true -> PrefillAneMode::Auto
+    //   3. Auto grading:
+    //      - MoE (num_experts > 0) -> off ("moe_unsupported")
+    //      - ANE unavailable -> off ("ane_unavailable")
+    //      - gpu_cores >= 64 && intermediate_size >= 4096 && workspace_rows >= 2048
+    //        -> ultra_fp16_swiglu + 1-layer canary auto-guard (<= 0.98 * GPU-solo)
+    //      - Else (gpu_cores < 64 or tiny synthetic fixtures) -> compact_int8
+    {
+      PrefillAneMode req_ane_mode = effective_requested_prefill_ane_mode(
+          prefill_options_.ane_mode, prefill_options_.ane_offload);
+      if (const char *env_mode = std::getenv("OMLX_M5_ANE_MODE");
+          env_mode != nullptr && *env_mode != '\0') {
+        if (const auto parsed = try_parse_prefill_ane_mode(env_mode)) {
+          req_ane_mode = *parsed;
         }
       }
-      if (const char *env_alpha = std::getenv("OMLX_M5_ANE_ALPHA")) {
-        const double parsed = std::strtod(env_alpha, nullptr);
-        if (std::isfinite(parsed) && parsed > 0.0 && parsed <= ane::kAneMaxAlpha) {
-          ane_cfg.alpha_override = parsed;
+
+      U32 effective_gpu_cores = silicon_tuning.gpu_cores;
+      if (const char *fake_gc = std::getenv("OMLX_M5_FAKE_GPU_CORES");
+          fake_gc != nullptr && *fake_gc != '\0') {
+        const auto parsed = std::strtoul(fake_gc, nullptr, 10);
+        if (parsed > 0UL && parsed <= 512UL) {
+          effective_gpu_cores = static_cast<U32>(parsed);
         }
       }
-      if (const char *env_fp16 = std::getenv("OMLX_M5_ANE_FP16")) {
-        ane_cfg.use_fp16_weights = (std::string_view(env_fp16) == "1");
-      }
-      if (const char *env_swiglu = std::getenv("OMLX_M5_ANE_SWIGLU_ONLY")) {
-        ane_cfg.mlp_swiglu_only = (std::string_view(env_swiglu) == "1");
-      }
-      if (const char *env_maxk = std::getenv("OMLX_M5_ANE_MAX_IN_FEATURES")) {
-        ane_cfg.max_in_features = static_cast<U32>(std::strtoul(env_maxk, nullptr, 10));
-      }
-      if (const char *env_procs = std::getenv("OMLX_M5_ANE_MAX_PROCS_PER_BANK")) {
-        const auto parsed = std::strtoul(env_procs, nullptr, 10);
-        if (parsed >= 1UL && parsed <= 250UL) {
-          ane_cfg.max_procedures_per_bank = static_cast<U32>(parsed);
-        }
-      }
-      if (const char *env_mib = std::getenv("OMLX_M5_ANE_MAX_BANK_MIB")) {
-        const auto parsed = std::strtoul(env_mib, nullptr, 10);
-        if (parsed >= 32UL && parsed <= 2560UL) {
-          ane_cfg.max_bank_bytes_per_die =
-              static_cast<U64>(parsed) * 1024ULL * 1024ULL;
-        }
-      }
-      if (ane_cfg.chunk_tokens <= workspace_rows_ &&
-          std::filesystem::is_regular_file(ane_cfg.metallib_path)) {
-        try {
-          ane_engine_ =
-              ane::AneDualOffloadEngine::build_from_model(weights, layers, ane_cfg);
-        } catch (...) {
-          ane_engine_.reset();
-        }
-        if (ane_engine_ && ane_engine_->is_active()) {
-          ane_active_ = true;
-          ane_chunk_tokens_ = ane_engine_->stats().chunk_tokens;
-          ane_split_alpha_ = ane_engine_->stats().target_alpha;
+
+      if (!shared_primary_ && req_ane_mode != PrefillAneMode::Off) {
+        const auto metallib_path = libraries / "omlx_m5_ane_pack_unpack.metallib";
+        if (c.num_experts > 0) {
+          ane_mode_effective_ = PrefillAneMode::Off;
+          ane_inactive_reason_ = "moe_unsupported";
+        } else {
+          const auto ane_hw = ane::probe_ane_hardware();
+          if (!ane_hw.is_available() ||
+              !std::filesystem::is_regular_file(metallib_path)) {
+            ane_mode_effective_ = PrefillAneMode::Off;
+            ane_inactive_reason_ = "ane_unavailable";
+          } else {
+            PrefillAneMode target_mode = req_ane_mode;
+            if (target_mode == PrefillAneMode::Auto) {
+              const bool ultra_eligible =
+                  (effective_gpu_cores >= 64U && c.intermediate_size >= 4096 &&
+                   workspace_rows_ >= ane::kAneUltraDefaultChunkTokens);
+              target_mode = ultra_eligible ? PrefillAneMode::UltraFp16SwiGlu
+                                           : PrefillAneMode::CompactInt8;
+            }
+
+            ane::AneDualOffloadConfig ane_cfg;
+            ane_cfg.linear_route =
+                (prefill_options_.linear_mode == PrefillLinearMode::W4A4)
+                    ? ane::AneLinearRoute::W4A4
+                    : ((prefill_options_.linear_mode == PrefillLinearMode::W4A8)
+                           ? ane::AneLinearRoute::W4A8
+                           : ane::AneLinearRoute::BF16);
+            ane_cfg.artifact_digest = prefill_options_.artifact_digest;
+            ane_cfg.metallib_path = metallib_path;
+            ane_cfg.external_mtl_device = context.native_mtl_device();
+            ane_cfg.external_mtl_command_queue =
+                context.native_mtl_command_queue();
+            ane_cfg.share_input_surface = true;
+
+            if (target_mode == PrefillAneMode::UltraFp16SwiGlu) {
+              ane_cfg.chunk_tokens =
+                  prefill_options_.ane_chunk_tokens
+                      ? prefill_options_.ane_chunk_tokens
+                      : std::min<U32>(ane::kAneUltraDefaultChunkTokens,
+                                      workspace_rows_);
+              ane_cfg.alpha_bf16 = ane::kAneUltraDefaultAlphaBf16;
+              ane_cfg.alpha_w4a8 = ane::kAneUltraDefaultAlphaW4A8;
+              ane_cfg.alpha_w4a4 = ane::kAneUltraDefaultAlphaW4A4;
+              ane_cfg.use_fp16_weights = true;
+              ane_cfg.mlp_swiglu_only = true;
+              ane_cfg.max_in_features = 8192U;
+              ane_cfg.max_bank_bytes_per_die = ane::kAneUltraMaxBankBytesPerDie;
+              ane_cfg.max_procedures_per_bank =
+                  ane::kAneUltraMaxProceduresPerBank;
+              ane_cfg.calibration_bypass_ratio =
+                  ane::kAneDefaultCalibrationBypassRatio;
+            } else {
+              // CompactInt8 (G=64 INT8 multi-projection offload for gpu_cores < 64
+              // and explicit compact_int8).
+              ane_cfg.chunk_tokens =
+                  prefill_options_.ane_chunk_tokens
+                      ? prefill_options_.ane_chunk_tokens
+                      : std::min<U32>(ane::kAneDefaultChunkTokens,
+                                      workspace_rows_);
+              ane_cfg.alpha_bf16 = ane::kAneDefaultAlphaBf16;
+              ane_cfg.alpha_w4a8 = ane::kAneDefaultAlphaW4A8;
+              ane_cfg.alpha_w4a4 = ane::kAneDefaultAlphaW4A8;
+              ane_cfg.use_fp16_weights = false;
+              ane_cfg.mlp_swiglu_only = false;
+              ane_cfg.max_in_features = 0U;
+            }
+
+            if (const char *env_chunk = std::getenv("OMLX_M5_ANE_CHUNK_TOKENS")) {
+              const auto parsed = std::strtoul(env_chunk, nullptr, 10);
+              if (parsed >= 64UL && parsed <= workspace_rows_) {
+                ane_cfg.chunk_tokens = static_cast<U32>(parsed);
+              }
+            }
+            if (const char *env_alpha = std::getenv("OMLX_M5_ANE_ALPHA")) {
+              const double parsed = std::strtod(env_alpha, nullptr);
+              if (std::isfinite(parsed) && parsed > 0.0 &&
+                  parsed <= ane::kAneMaxAlpha) {
+                ane_cfg.alpha_override = parsed;
+              }
+            }
+            if (const char *env_fp16 = std::getenv("OMLX_M5_ANE_FP16")) {
+              ane_cfg.use_fp16_weights = (std::string_view(env_fp16) == "1");
+            }
+            if (const char *env_swiglu = std::getenv("OMLX_M5_ANE_SWIGLU_ONLY")) {
+              ane_cfg.mlp_swiglu_only = (std::string_view(env_swiglu) == "1");
+            }
+            if (const char *env_maxk = std::getenv("OMLX_M5_ANE_MAX_IN_FEATURES")) {
+              ane_cfg.max_in_features =
+                  static_cast<U32>(std::strtoul(env_maxk, nullptr, 10));
+            }
+            if (const char *env_procs =
+                    std::getenv("OMLX_M5_ANE_MAX_PROCS_PER_BANK")) {
+              const auto parsed = std::strtoul(env_procs, nullptr, 10);
+              if (parsed >= 1UL && parsed <= 250UL) {
+                ane_cfg.max_procedures_per_bank = static_cast<U32>(parsed);
+              }
+            }
+            if (const char *env_mib = std::getenv("OMLX_M5_ANE_MAX_BANK_MIB")) {
+              const auto parsed = std::strtoul(env_mib, nullptr, 10);
+              if (parsed >= 32UL && parsed <= 2560UL) {
+                ane_cfg.max_bank_bytes_per_die =
+                    static_cast<U64>(parsed) * 1024ULL * 1024ULL;
+              }
+            }
+            if (const char *env_share =
+                    std::getenv("OMLX_M5_ANE_SHARE_INPUT_SURFACE")) {
+              ane_cfg.share_input_surface = (std::string_view(env_share) != "0");
+            }
+            if (const char *env_ratio = std::getenv("OMLX_M5_ANE_CAL_RATIO")) {
+              const double parsed = std::strtod(env_ratio, nullptr);
+              if (std::isfinite(parsed) && parsed > 0.0 && parsed <= 2.0) {
+                ane_cfg.calibration_bypass_ratio = parsed;
+              }
+            }
+
+            if (ane_cfg.chunk_tokens >= 32U &&
+                (ane_cfg.chunk_tokens % 32U) == 0U &&
+                ane_cfg.chunk_tokens <= workspace_rows_) {
+              bool allow_full_build = true;
+              if (target_mode == PrefillAneMode::UltraFp16SwiGlu) {
+                const U32 active_dies =
+                    (!ane_cfg.force_single_die && ane_hw.physical_die_count >= 2U)
+                        ? 2U
+                        : 1U;
+                double calibrated_alpha = ane_cfg.alpha_bf16;
+                std::string cal_reason;
+                const bool cal_ok = calibrate_ultra_fp16_swiglu_canary(
+                    ane_cfg, effective_gpu_cores, active_dies, ane_hw.os_build,
+                    calibrated_alpha, cal_reason);
+                if (cal_ok) {
+                  ane_cfg.alpha_override = calibrated_alpha;
+                } else {
+                  allow_full_build = false;
+                  ane_mode_effective_ = PrefillAneMode::Off;
+                  ane_inactive_reason_ =
+                      cal_reason.empty() ? "calibration_bypassed" : cal_reason;
+                }
+              }
+
+              if (allow_full_build) {
+                try {
+                  ane_engine_ = ane::AneDualOffloadEngine::build_from_model(
+                      weights, layers, ane_cfg);
+                } catch (...) {
+                  ane_engine_.reset();
+                }
+                if (ane_engine_ && ane_engine_->is_active()) {
+                  ane_active_ = true;
+                  ane_mode_effective_ = target_mode;
+                  ane_inactive_reason_.clear();
+                  ane_chunk_tokens_ = ane_engine_->stats().chunk_tokens;
+                  ane_split_alpha_ = ane_engine_->stats().target_alpha;
+                  if (ane_mode_effective_ == PrefillAneMode::UltraFp16SwiGlu) {
+                    const auto default_route =
+                        select_chunk_attention_route(ane_chunk_tokens_, 0U);
+                    const U32 default_env =
+                        (default_route == ChunkAttentionRoute::Sage2MInference ||
+                         (default_route == ChunkAttentionRoute::Sage2Dense &&
+                          max_context > 4096U))
+                            ? select_long_ctx_envelope(ane_chunk_tokens_)
+                            : 0U;
+                    static_cast<void>(get_or_build_ultra_swiglu_chunk_plan(
+                        default_env, default_route, false));
+                  }
+                } else if (ane_inactive_reason_.empty()) {
+                  ane_mode_effective_ = PrefillAneMode::Off;
+                  ane_inactive_reason_ = "ane_unavailable";
+                }
+              }
+            } else {
+              ane_mode_effective_ = PrefillAneMode::Off;
+              ane_inactive_reason_ = "chunk_tokens_unavailable";
+            }
+          }
         }
       }
     }
     prefill_telemetry_.prefill_ane_active = ane_active_;
+    prefill_telemetry_.prefill_ane_mode_effective =
+        std::string(prefill_ane_mode_to_string(ane_mode_effective_));
+    prefill_telemetry_.prefill_ane_inactive_reason = ane_inactive_reason_;
     prefill_telemetry_.prefill_ane_split_alpha = ane_split_alpha_;
 
     reset();
@@ -1330,8 +1462,12 @@ public:
     if (prefill_options_.cache_blend) {
       base_fields.emplace("prefill_cache_blend", "1");
     }
-    if (prefill_options_.ane_offload) {
-      base_fields.emplace("prefill_ane_offload", "1");
+    const PrefillAneMode req_ane_identity = effective_requested_prefill_ane_mode(
+        prefill_options_.ane_mode, prefill_options_.ane_offload);
+    if (req_ane_identity != PrefillAneMode::Off) {
+      base_fields.emplace(
+          "prefill_ane_mode",
+          std::string(prefill_ane_mode_to_string(req_ane_identity)));
     }
     base_fields.emplace("owner", std::to_string(owner_id));
     base_execution_identity_ = execution_identity_digest(base_fields);
@@ -1390,6 +1526,7 @@ public:
     split_verify_profiles.clear();
     long_ctx_profiles_.clear();
     ane_layer_plans_.clear();
+    ane_ultra_plans_.clear();
     packed_cache_.clear();
     verify_async_profile_ = nullptr;
     for (auto &ap : ar_pipe_)
@@ -2374,15 +2511,25 @@ public:
                                         const MaterializedWeightView &up_w,
                                         Ref x, Ref y_bf16, U32 n, U32 k,
                                         bool also_write_bf16,
-                                        std::optional<U32> explicit_t = {}) {
+                                        std::optional<U32> explicit_t = {},
+                                        U32 row_offset = 0U,
+                                        U32 out_stride = 0U,
+                                        U32 slice_n = 0U) {
     if (!w4a8_nax_enabled_ || is_overridden(gate_w) || is_overridden(up_w) ||
         has_bypass_lora(gate_w) || has_bypass_lora(up_w) ||
         gate_w.has_fwht64() || up_w.has_fwht64() || (k % 64U) != 0U ||
-        (n % 64U) != 0U || a8_qa.buffer == nullptr ||
-        a8_mid_qa.buffer == nullptr || a8_mid_sa.buffer == nullptr ||
-        a8_mid_ra.buffer == nullptr) {
+        (n % 64U) != 0U || (row_offset % 64U) != 0U || row_offset >= n ||
+        a8_qa.buffer == nullptr || a8_mid_qa.buffer == nullptr ||
+        a8_mid_sa.buffer == nullptr || a8_mid_ra.buffer == nullptr) {
       return false;
     }
+    const U32 eff_n = (slice_n > 0U) ? slice_n : (n - row_offset);
+    if (row_offset + eff_n > n || (eff_n % 64U) != 0U) {
+      return false;
+    }
+    const bool is_slice = (row_offset > 0U) ||
+                          (out_stride > 0U && out_stride != n) ||
+                          (slice_n > 0U && slice_n != n);
     if (mxfp4_nax_active() && (k % 128U) == 0U) {
       const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
       const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
@@ -2393,9 +2540,12 @@ public:
         }
         linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
             e, *gw, *uw, a8_qa, a8_sa, a8_mid_qa, a8_mid_sa, a8_mid_ra, y_bf16,
-            also_write_bf16, explicit_t);
-        e.set_a8_quant(make_a8_key_for(e, y_bf16, n, a8_mid_qa, a8_mid_sa,
-                                       a8_mid_ra, explicit_t, /*fwht64=*/true));
+            also_write_bf16, explicit_t, row_offset, out_stride, slice_n);
+        if (!is_slice) {
+          e.set_a8_quant(make_a8_key_for(e, y_bf16, n, a8_mid_qa, a8_mid_sa,
+                                         a8_mid_ra, explicit_t,
+                                         /*fwht64=*/true));
+        }
         e.record_weight(gate_w, n, k, "mxfp4_w4a8_nax_m5_v1",
                         "mxfp4_w4a8_swiglu_out64_fwht64_a8_v2", {},
                         "w4a8_prefill_v1", "mxfp4.w4a8.swiglu_out64.fwht64.v2",
@@ -2421,10 +2571,13 @@ public:
             ensure_a8_quant(e, x, k, explicit_t, /*fwht64=*/false)) {
           linear_affine_w4a8_nax_swiglu_fwht64_a8(
               e, *gw, *uw, a8_qa, a8_sa, a8_ra, a8_mid_qa, a8_mid_sa, a8_mid_ra,
-              y_bf16, also_write_bf16, explicit_t);
-          e.set_a8_quant(make_a8_key_for(e, y_bf16, n, a8_mid_qa, a8_mid_sa,
-                                         a8_mid_ra, explicit_t,
-                                         /*fwht64=*/true));
+              y_bf16, also_write_bf16, explicit_t, row_offset, out_stride,
+              slice_n);
+          if (!is_slice) {
+            e.set_a8_quant(make_a8_key_for(e, y_bf16, n, a8_mid_qa, a8_mid_sa,
+                                           a8_mid_ra, explicit_t,
+                                           /*fwht64=*/true));
+          }
           const std::string grp = "oq.w4a8." + tag_g + "_" + tag_u +
                                   ".swiglu_out64.fwht64.v2";
           e.record_weight(gate_w, n, k, "affine_w4a8_nax_m5_v1",
@@ -2808,6 +2961,21 @@ public:
       }
     }
     return false;
+  }
+
+  bool can_gpu_suffix_swiglu_fwht64_a8(const MaterializedWeightView &gate_w,
+                                       const MaterializedWeightView &up_w,
+                                       const MaterializedWeightView &down_w,
+                                       U32 n, U32 k, bool use_w4a8) const {
+    if (!use_w4a8 || !w4a8_nax_enabled_ || !down_w.has_fwht64() ||
+        gate_w.has_fwht64() || up_w.has_fwht64() || (n % 64U) != 0U ||
+        (k % 64U) != 0U || a8_qa.buffer == nullptr ||
+        a8_mid_qa.buffer == nullptr || a8_mid_sa.buffer == nullptr ||
+        a8_mid_ra.buffer == nullptr || has_bypass_lora(down_w) ||
+        inspect_tensors_workspace || !can_w4a8_weight(down_w, h, n)) {
+      return false;
+    }
+    return can_gpu_suffix_swiglu(gate_w, up_w, n, k, /*use_w4a8=*/true);
   }
 
   bool emit_gpu_suffix_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
@@ -9282,6 +9450,27 @@ public:
     std::optional<Profile> head_sample;
   };
 
+  struct UltraSwiGluLayerSubPlan {
+    std::optional<Profile> pre_mlp;    // attn/gdn (full concat + GDN Stage-3) + post_norm
+    std::optional<U32> mlp_gu_op_id;   // MlpGateUpSwiGlu ANE op_id
+    ane::AneUnpackTarget unpack_target{};
+    std::optional<Profile> mlp_gu_gpu; // GPU suffix [N_ane, f) in BF16 or W4A8 Mode B
+    std::optional<Profile> post_mlp;   // mlp_down + add + next input_norm (or final add)
+  };
+
+  struct UltraSwiGluChunkPlan {
+    U32 chunk_t = 0;
+    U32 context_envelope = 0;
+    ChunkAttentionRoute attn_route = ChunkAttentionRoute::ExactNax;
+    bool trunk_only = false;
+    bool used_w4a8 = false;
+    bool used_sage2 = false;
+    bool used_minference = false;
+    std::optional<Profile> embed_norm0;
+    std::vector<UltraSwiGluLayerSubPlan> layers;
+    std::optional<Profile> head_sample;
+  };
+
   template <typename T>
   static std::vector<std::byte> pod_bytes(const T &v) {
     const auto raw = std::as_bytes(std::span<const T, 1>(&v, 1));
@@ -9406,6 +9595,9 @@ public:
                                 bool used_w4a4 = false) {
     QwenPrefillTelemetry delta;
     delta.prefill_ane_active = ane_active_;
+    delta.prefill_ane_mode_effective =
+        std::string(prefill_ane_mode_to_string(ane_mode_effective_));
+    delta.prefill_ane_inactive_reason = ane_inactive_reason_;
     delta.prefill_ane_split_alpha = ane_split_alpha_;
     if (used_w4a8) {
       prefill_telemetry_.prefill_w4a8_tokens += count;
@@ -9486,6 +9678,917 @@ public:
            ane_engine_->can_offload_chunk(count) && bypass_lora_ == nullptr &&
            !inspect_routes_enabled && !inspect_tensors_workspace &&
            feature_layers.empty();
+  }
+
+  // WP 3C Startup 1-Layer Canary Micro-Calibration Auto-Guard:
+  // Benchmarks Layer-0 (post_norm + mlp_gu + mlp_down) GPU-solo (ICB) vs
+  // concurrent collapsed GPU+Dual-ANE across candidate alphas BEFORE compiling
+  // all 64 layers, caching the result on disk and requiring
+  // t_Hybrid(alpha*) <= bypass_ratio * t_GPU_solo (default 0.98) for zero regression.
+  bool calibrate_ultra_fp16_swiglu_canary(
+      const ane::AneDualOffloadConfig &base_cfg,
+      U32 effective_gpu_cores,
+      U32 active_dies,
+      const std::string &os_build,
+      double &out_best_alpha,
+      std::string &out_reason) {
+    out_best_alpha = base_cfg.alpha_override.value_or(
+        base_cfg.linear_route == ane::AneLinearRoute::W4A4
+            ? base_cfg.alpha_w4a4
+            : (base_cfg.linear_route == ane::AneLinearRoute::W4A8
+                   ? base_cfg.alpha_w4a8
+                   : base_cfg.alpha_bf16));
+    out_reason.clear();
+    if (blocks.empty()) {
+      out_reason = "no_layers";
+      return false;
+    }
+
+    const auto &blk0 = blocks[0];
+    const auto &gw = blk0.get("mlp_gate");
+    const auto &uw = blk0.get("mlp_up");
+    const auto &dw = blk0.get("mlp_down");
+    const U32 chunk_t = base_cfg.chunk_tokens;
+    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
+    if (!can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8)) {
+      out_reason = "gpu_suffix_unsupported";
+      return false;
+    }
+
+    const bool force_active =
+        detail::forward::env_flag_enabled("OMLX_M5_ANE_FORCE_ACTIVE");
+    const bool recalibrate =
+        detail::forward::env_flag_enabled("OMLX_M5_ANE_RECALIBRATE");
+    const bool verbose =
+        detail::forward::env_flag_enabled("OMLX_M5_ANE_CAL_VERBOSE");
+    const double bypass_ratio = base_cfg.calibration_bypass_ratio;
+
+    std::vector<double> raw_candidates;
+    if (base_cfg.alpha_override.has_value()) {
+      raw_candidates.push_back(*base_cfg.alpha_override);
+    } else if (base_cfg.linear_route == ane::AneLinearRoute::W4A4) {
+      raw_candidates = {0.10, 0.09, 0.08, 0.06};
+    } else {
+      raw_candidates = {0.12, 0.10, 0.09, 0.08, 0.06};
+    }
+
+    std::vector<double> candidates;
+    std::vector<U32> seen_die_rows;
+    for (double a : raw_candidates) {
+      const auto sp = ane::compute_ane_channel_split(
+          f, a, active_dies, base_cfg.max_alpha);
+      if (!sp.enabled()) {
+        continue;
+      }
+      if (std::find(seen_die_rows.begin(), seen_die_rows.end(), sp.die_rows) ==
+          seen_die_rows.end()) {
+        seen_die_rows.push_back(sp.die_rows);
+        candidates.push_back(a);
+      }
+    }
+    if (candidates.empty()) {
+      out_reason = "no_valid_split";
+      return false;
+    }
+
+    std::string cal_key;
+    const bool use_disk_cache =
+        base_cfg.enable_disk_cache && !base_cfg.artifact_digest.empty();
+    if (use_disk_cache) {
+      cal_key = ane::compute_calibration_cache_key(
+          os_build, effective_gpu_cores, active_dies, base_cfg.artifact_digest,
+          base_cfg.linear_route, chunk_t, h, f, bypass_ratio,
+          base_cfg.alpha_override);
+      if (!recalibrate && !force_active) {
+        const auto cached =
+            ane::load_cached_calibration(base_cfg.cache_root, cal_key);
+        if (cached.valid) {
+          out_best_alpha = cached.best_alpha;
+          out_reason = cached.reason;
+          if (verbose) {
+            std::fprintf(
+                stderr,
+                "[ane-cal] cache hit key=%s active=%d alpha=%.4f gpu_solo=%.3fms hybrid=%.3fms reason=%s\n",
+                cal_key.substr(0, 12).c_str(), cached.active ? 1 : 0,
+                cached.best_alpha, cached.gpu_solo_ms, cached.best_hybrid_ms,
+                cached.reason.c_str());
+          }
+          return cached.active;
+        }
+      }
+    }
+
+    // Seed hidden & delta with real finite activations via embedding lookup on token IDs.
+    {
+      std::vector<U32> seed_ids(chunk_t, 0U);
+      const U32 mod_v = std::max<U32>(1U, std::min<U32>(v, 64U));
+      for (U32 i = 0U; i < chunk_t; ++i) {
+        seed_ids[i] = i % mod_v;
+      }
+      const_cast<MetalBuffer *>(token_ids.buffer)
+          ->write(std::as_bytes(std::span(seed_ids)));
+      Encoder e(context, libraries, chunk_t,
+                "qwen.ane.cal.seed.c" + std::to_string(chunk_t) +
+                    plan_key_suffix());
+      e.begin_stage("cal_seed");
+      embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
+      copy(e, hidden, delta, mul(mul(chunk_t, h), 2ULL));
+      Profile seed_prof = e.finish();
+      const std::array calls{MetalCommandInvocation{
+          .plan = &seed_prof.plan,
+          .bindings = seed_prof.bindings,
+          .parameters = &seed_prof.parameters}};
+      static_cast<void>(context.execute_batch(calls));
+    }
+
+    constexpr U32 kBurst = 4U;
+    constexpr U32 kWarmups = 2U;
+    constexpr U32 kSamples = 5U;
+    const bool mode_b_a8 =
+        can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h, use_w4a8);
+    const bool down_w4a8 = use_w4a8 && (dw.has_fwht64() || w4a8_down_proj_);
+    const bool affine_xs_eligible =
+        (!use_w4a8 && affine_nax_active() && affine_nax_xs.buffer != nullptr &&
+         (h % 64U) == 0U);
+    const bool mlp_f16 = !use_w4a8 && block_mlp_input_nax(blk0, chunk_t);
+
+    auto median_of = [](std::vector<double> vals) -> double {
+      if (vals.empty()) {
+        return 0.0;
+      }
+      std::sort(vals.begin(), vals.end());
+      return vals[vals.size() / 2U];
+    };
+
+    // 1. Measure GPU-solo steady-state Layer-0 MLP (kBurst reps in 1 ICB profile).
+    double gpu_solo_ms = 0.0;
+    {
+      Encoder e(context, libraries, chunk_t,
+                "qwen.ane.cal.gpu_solo.c" + std::to_string(chunk_t) +
+                    plan_key_suffix());
+      e.begin_stage("cal_gpu_solo");
+      for (U32 bi = 0U; bi < kBurst; ++bi) {
+        if (use_w4a8) {
+          emit_add_rmsnorm_a8_g64(
+              e, hidden, delta, direct(blk0.get("post_attention_norm"), h),
+              norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/false);
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (mlp_f16) {
+          add_normalize_f16(e, blk0.get("post_attention_norm"), hidden, delta,
+                            f16_norm);
+        } else if (affine_xs_eligible) {
+          emit_affine_add_rmsnorm_xsum(
+              e, hidden, delta, direct(blk0.get("post_attention_norm"), h),
+              norm, affine_nax_xs, h, float(config.rms_norm_eps),
+              normalization_weight_offset);
+          e.set_group_sum(Encoder::GroupSumKey{
+              affine_nax_xs.buffer, affine_nax_xs.offset, norm.buffer,
+              norm.offset, h, 64U, chunk_t, true, 2U});
+        } else {
+          add_normalize(e, blk0.get("post_attention_norm"), hidden, delta, norm);
+        }
+        mlp(e, blk0, 0U, mlp_f16, {}, nullptr, std::nullopt, false, use_w4a8,
+            false);
+      }
+      Profile solo_prof = e.finish();
+      ensure_profile_icb(context, solo_prof);
+      auto run_solo = [&]() -> double {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (solo_prof.icb) {
+          static_cast<void>(context.replay_icb(*solo_prof.icb));
+        } else {
+          const std::array calls{MetalCommandInvocation{
+              .plan = &solo_prof.plan,
+              .bindings = solo_prof.bindings,
+              .parameters = &solo_prof.parameters}};
+          static_cast<void>(context.execute_batch(calls));
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+               double(kBurst);
+      };
+      for (U32 w = 0U; w < kWarmups; ++w) {
+        (void)run_solo();
+      }
+      std::vector<double> samples;
+      samples.reserve(kSamples);
+      for (U32 s = 0U; s < kSamples; ++s) {
+        samples.push_back(run_solo());
+      }
+      gpu_solo_ms = median_of(std::move(samples));
+    }
+
+    // 2. Sweep candidate alphas using a 1-layer canary engine on the active MTLCommandQueue.
+    const std::array<ane::AneOffloadOpSpec, 1> layer0_specs{{
+        ane::AneOffloadOpSpec{
+            .layer_index = 0U,
+            .role = ane::AneProjectionRole::MlpGateUpSwiGlu,
+            .name = "mlp_gate_up_swiglu",
+            .weight = gw,
+            .up_weight = uw,
+        },
+    }};
+
+    // Shared Layer-0 post_norm and mlp_down sub-profiles across alpha candidates.
+    Profile p_post_norm = [&] {
+      Encoder e(context, libraries, chunk_t,
+                "qwen.ane.cal.post_norm.c" + std::to_string(chunk_t) +
+                    plan_key_suffix());
+      e.begin_stage("cal_post_norm");
+      if (use_w4a8) {
+        emit_add_rmsnorm_a8_g64(
+            e, hidden, delta, direct(blk0.get("post_attention_norm"), h), norm,
+            a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+            normalization_weight_offset, /*write_bf16=*/true);
+      } else if (affine_xs_eligible) {
+        emit_affine_add_rmsnorm_xsum(
+            e, hidden, delta, direct(blk0.get("post_attention_norm"), h), norm,
+            affine_nax_xs, h, float(config.rms_norm_eps),
+            normalization_weight_offset);
+      } else {
+        add_normalize(e, blk0.get("post_attention_norm"), hidden, delta, norm);
+      }
+      return e.finish();
+    }();
+
+    Profile p_mlp_down = [&] {
+      Encoder e(context, libraries, chunk_t,
+                "qwen.ane.cal.mlp_dn.c" + std::to_string(chunk_t) +
+                    (mode_b_a8 ? ".mb" : ".ma") + plan_key_suffix());
+      e.begin_stage("cal_mlp_dn");
+      if (mode_b_a8) {
+        e.set_a8_quant(make_a8_key_for(e, product, f, a8_mid_qa, a8_mid_sa,
+                                       a8_mid_ra, std::nullopt,
+                                       /*fwht64=*/true));
+      }
+      if (down_w4a8 && try_linear_w4a8_base(e, dw, product, delta, h, f)) {
+      } else {
+        linear(e, dw, product, delta, h, f);
+      }
+      return e.finish();
+    }();
+
+    auto encode_prof = [&](void *mtl_cb, Profile &pr) {
+      const std::array calls{MetalCommandInvocation{
+          .plan = &pr.plan, .bindings = pr.bindings, .parameters = &pr.parameters}};
+      context.encode_into_command_buffer(mtl_cb, calls);
+    };
+
+    double best_alpha = candidates.front();
+    double best_hybrid_ms = std::numeric_limits<double>::infinity();
+    std::vector<std::pair<double, double>> cand_timings;
+    cand_timings.reserve(candidates.size());
+
+    for (double cand_alpha : candidates) {
+      ane::AneDualOffloadConfig c_cfg = base_cfg;
+      c_cfg.alpha_override = cand_alpha;
+      c_cfg.enable_disk_cache = use_disk_cache;
+      std::unique_ptr<ane::AneDualOffloadEngine> canary;
+      try {
+        canary = ane::AneDualOffloadEngine::build(layer0_specs, c_cfg);
+      } catch (...) {
+        continue;
+      }
+      if (!canary || !canary->is_active()) {
+        continue;
+      }
+      const auto *op0 =
+          canary->find_op(0U, ane::AneProjectionRole::MlpGateUpSwiGlu);
+      if (op0 == nullptr || !op0->split.enabled()) {
+        continue;
+      }
+
+      Profile p_mlp_gu_gpu = [&] {
+        Encoder e(context, libraries, chunk_t,
+                  "qwen.ane.cal.mlp_gu.c" + std::to_string(chunk_t) + ".off" +
+                      std::to_string(op0->split.gpu_row_offset) +
+                      (mode_b_a8 ? ".mb" : ".ma") + plan_key_suffix());
+        e.begin_stage("cal_mlp_gu");
+        if (use_w4a8) {
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (affine_xs_eligible) {
+          e.set_group_sum(Encoder::GroupSumKey{
+              affine_nax_xs.buffer, affine_nax_xs.offset, norm.buffer,
+              norm.offset, h, 64U, chunk_t, true, 2U});
+        }
+        if (mode_b_a8) {
+          (void)try_linear_w4a8_swiglu_fwht64_a8(
+              e, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
+              std::nullopt, op0->split.gpu_row_offset, f, op0->split.gpu_rows);
+        } else {
+          (void)emit_gpu_suffix_swiglu(
+              e, gw, uw, norm, product, f, h, use_w4a8,
+              op0->split.gpu_row_offset, f, op0->split.gpu_rows);
+        }
+        return e.finish();
+      }();
+
+      ane::AneUnpackTarget unpack_target{};
+      if (mode_b_a8) {
+        unpack_target.mode = ane::AneUnpackMode::Fwht64A8;
+        unpack_target.primary_buf = a8_mid_qa.buffer->native_mtl_buffer();
+        unpack_target.primary_offset = a8_mid_qa.offset;
+        unpack_target.aux0_buf = a8_mid_sa.buffer->native_mtl_buffer();
+        unpack_target.aux0_offset = a8_mid_sa.offset;
+        unpack_target.aux1_buf = a8_mid_ra.buffer->native_mtl_buffer();
+        unpack_target.aux1_offset = a8_mid_ra.offset;
+        unpack_target.out_stride = f;
+        unpack_target.dst_col_offset = 0U;
+        unpack_target.mp = w4a8_nax_mp(chunk_t);
+      } else {
+        unpack_target.mode = ane::AneUnpackMode::BF16;
+        unpack_target.primary_buf = product.buffer->native_mtl_buffer();
+        unpack_target.primary_offset = product.offset;
+        unpack_target.out_stride = f;
+        unpack_target.dst_col_offset = 0U;
+        unpack_target.mp = chunk_t;
+      }
+
+      auto run_hybrid = [&]() -> double {
+        const auto t0 = std::chrono::steady_clock::now();
+        void *cb = canary->begin_collapsed_cb();
+        for (U32 bi = 0U; bi < kBurst; ++bi) {
+          encode_prof(cb, p_post_norm);
+          const U64 seq = canary->encode_pack_and_commit(
+              cb, op0->op_id, norm.buffer->native_mtl_buffer(), norm.offset, h);
+          canary->submit_gpu_suffix_cb(
+              [&](void *cb_b1) { encode_prof(cb_b1, p_mlp_gu_gpu); });
+          cb = canary->begin_unpack_cb(seq, op0->op_id, unpack_target);
+          encode_prof(cb, p_mlp_down);
+        }
+        canary->commit_collapsed_cb(cb);
+        canary->flush_and_wait();
+        static_cast<void>(context.submit_classic_barrier());
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+               double(kBurst);
+      };
+
+      try {
+        for (U32 w = 0U; w < kWarmups; ++w) {
+          (void)run_hybrid();
+        }
+        std::vector<double> samples;
+        samples.reserve(kSamples);
+        for (U32 s = 0U; s < kSamples; ++s) {
+          samples.push_back(run_hybrid());
+        }
+        const double med_ms = median_of(std::move(samples));
+        cand_timings.emplace_back(cand_alpha, med_ms);
+        if (verbose) {
+          auto measure_prof_ms = [&](Profile &pr) -> double {
+            const auto s0 = std::chrono::steady_clock::now();
+            void *mcb = canary->begin_collapsed_cb();
+            for (U32 bi = 0U; bi < kBurst; ++bi) {
+              encode_prof(mcb, pr);
+            }
+            canary->commit_collapsed_cb(mcb);
+            canary->flush_and_wait();
+            const auto s1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(s1 - s0).count() /
+                   double(kBurst);
+          };
+          const double gu_ms = measure_prof_ms(p_mlp_gu_gpu);
+          const double dn_ms = measure_prof_ms(p_mlp_down);
+          const auto a0 = std::chrono::steady_clock::now();
+          void *acb = canary->begin_collapsed_cb();
+          for (U32 bi = 0U; bi < kBurst; ++bi) {
+            const U64 seq = canary->encode_pack_and_commit(
+                acb, op0->op_id, norm.buffer->native_mtl_buffer(), norm.offset,
+                h);
+            acb = canary->begin_unpack_cb(seq, op0->op_id, unpack_target);
+          }
+          canary->commit_collapsed_cb(acb);
+          canary->flush_and_wait();
+          const auto a1 = std::chrono::steady_clock::now();
+          const double ane_ms =
+              std::chrono::duration<double, std::milli>(a1 - a0).count() /
+              double(kBurst);
+          std::fprintf(
+              stderr,
+              "[ane-cal] route=%s T=%u alpha=%.3f (ane=%u/%u shared_in=%d modeB=%d) "
+              "gpu_solo=%.3fms hybrid=%.3fms ratio=%.4f "
+              "[gu_sfx=%.3fms dn=%.3fms ane_solo=%.3fms]\n",
+              std::string(ane::to_string(base_cfg.linear_route)).c_str(),
+              chunk_t, cand_alpha, op0->split.ane_total_rows, f,
+              canary->stats().shared_input_surface_active ? 1 : 0,
+              mode_b_a8 ? 1 : 0, gpu_solo_ms, med_ms,
+              gpu_solo_ms > 0.0 ? (med_ms / gpu_solo_ms) : 0.0,
+              gu_ms, dn_ms, ane_ms);
+        }
+        if (med_ms < best_hybrid_ms) {
+          best_hybrid_ms = med_ms;
+          best_alpha = cand_alpha;
+        }
+      } catch (...) {
+        // Skip failed candidate cleanly.
+      }
+      canary.reset();
+    }
+
+    const bool has_valid_timing = std::isfinite(best_hybrid_ms);
+    const bool active =
+        force_active ||
+        (has_valid_timing && gpu_solo_ms > 0.0 &&
+         best_hybrid_ms <= bypass_ratio * gpu_solo_ms);
+    out_best_alpha = best_alpha;
+    out_reason = active ? std::string{} : std::string("calibration_bypassed");
+
+    if (use_disk_cache && !force_active && has_valid_timing) {
+      ane::AneCachedCalibrationRecord rec{};
+      rec.valid = true;
+      rec.active = active;
+      rec.best_alpha = best_alpha;
+      rec.gpu_solo_ms = gpu_solo_ms;
+      rec.best_hybrid_ms = best_hybrid_ms;
+      rec.reason = out_reason;
+      rec.candidate_timings_ms = cand_timings;
+      ane::save_cached_calibration(base_cfg.cache_root, cal_key, rec);
+    }
+    return active;
+  }
+
+  UltraSwiGluChunkPlan &get_or_build_ultra_swiglu_chunk_plan(
+      U32 context_envelope,
+      ChunkAttentionRoute attn_route,
+      bool /*trunk_only*/) {
+    // Share the 64-layer plan across trunk_only=true and trunk_only=false;
+    // head_sample is built once and only executed when !trunk_only.
+    const AneChunkPlanKey plan_key{context_envelope, attn_route, false};
+    if (auto it = ane_ultra_plans_.find(plan_key);
+        it != ane_ultra_plans_.end()) {
+      return it->second;
+    }
+    const U32 chunk_t = ane_chunk_tokens_;
+    const bool use_w4a8 = use_w4a8_for_t(chunk_t, false);
+    const bool affine_xs_eligible =
+        (!use_w4a8 && affine_nax_active() && affine_nax_xs.buffer != nullptr &&
+         (h % 64U) == 0U);
+    const std::string pkey_sfx = ".ane_ultra.c" + std::to_string(chunk_t) +
+                                 ".e" + std::to_string(context_envelope) +
+                                 ".ar" + std::to_string(U32(attn_route)) +
+                                 plan_key_suffix();
+
+    auto block_input_needs_bf16 = [&](const Block &blk) -> bool {
+      if (inspect_tensors_workspace)
+        return true;
+      if (blk.type == LayerType::full_attention) {
+        return block_has_any_bypass(
+                   blk, {"attention_q", "attention_k", "attention_v"}) ||
+               !can_w4a8_weight(blk.get("attention_q"), 2 * q, h) ||
+               !can_w4a8_weight(blk.get("attention_k"), kv, h) ||
+               !can_w4a8_weight(blk.get("attention_v"), kv, h);
+      }
+      const U32 hv = U32(config.linear_num_value_heads);
+      return block_has_any_bypass(blk, {"gdn_qkv", "gdn_z", "gdn_a", "gdn_b"}) ||
+             !can_w4a8_weight(blk.get("gdn_qkv"), conv, h) ||
+             !can_w4a8_weight(blk.get("gdn_z"), gv, h) ||
+             !can_w4a8_weight(blk.get("gdn_a"), hv, h) ||
+             !can_w4a8_weight(blk.get("gdn_b"), hv, h);
+    };
+
+    UltraSwiGluChunkPlan plan;
+    plan.chunk_t = chunk_t;
+    plan.context_envelope = context_envelope;
+    plan.attn_route = attn_route;
+    plan.trunk_only = false;
+    plan.used_w4a8 = use_w4a8;
+
+    // 1. Embedding + Layer-0 input RMSNorm.
+    {
+      Encoder e(context, libraries, chunk_t, "qwen.ultra.emb0" + pkey_sfx);
+      e.begin_stage("embedding");
+      embedding_lookup(e, embedding, token_ids, hidden, zero, v, h);
+      const bool in0_f16 = !use_w4a8 && block_input_nax(blocks[0], chunk_t);
+      if (use_w4a8) {
+        emit_rmsnorm_a8_g64(e, hidden, direct(blocks[0].get("input_norm"), h),
+                            norm, a8_qa, a8_sa, a8_ra, h,
+                            float(config.rms_norm_eps),
+                            normalization_weight_offset,
+                            block_input_needs_bf16(blocks[0]));
+      } else if (in0_f16) {
+        normalize_f16(e, blocks[0].get("input_norm"), hidden, f16_norm);
+      } else if (affine_xs_eligible) {
+        emit_affine_rmsnorm_xsum(e, hidden,
+                                 direct(blocks[0].get("input_norm"), h), norm,
+                                 affine_nax_xs, h, float(config.rms_norm_eps),
+                                 normalization_weight_offset);
+      } else {
+        normalize(e, blocks[0].get("input_norm"), hidden, norm);
+      }
+      plan.embed_norm0 = e.finish();
+    }
+
+    plan.layers.resize(blocks.size());
+    for (U32 li = 0U; li < blocks.size(); ++li) {
+      const auto &block = blocks[li];
+      auto &lp = plan.layers[li];
+      const std::string ltag = ".L" + std::to_string(li) + pkey_sfx;
+      const bool in_f16 = !use_w4a8 && block_input_nax(block, chunk_t);
+      const bool in_affine_xs = (!use_w4a8 && !in_f16 && affine_xs_eligible);
+
+      // 2. Unbroken per-layer pre-MLP GPU trunk:
+      //    Full-Attn (QKV concat + Sage2/MInf/Exact + o_proj) OR
+      //    GDN (QKVZ concat + AB concat + GDN Mega Stage-3 fusion + gdn_out)
+      //    + post_attention_norm (always writes BF16 norm for ANE pack).
+      {
+        Encoder e(context, libraries, chunk_t, "qwen.ultra.pre_mlp" + ltag);
+        e.begin_stage("pre_mlp");
+        if (use_w4a8) {
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (in_affine_xs) {
+          e.set_group_sum(Encoder::GroupSumKey{
+              affine_nax_xs.buffer, affine_nax_xs.offset, norm.buffer,
+              norm.offset, h, 64U, chunk_t, true, 2U});
+        }
+        if (block.type == LayerType::full_attention) {
+          attention(e, block, /*split=*/false, context_envelope, in_f16, {},
+                    nullptr, std::nullopt, use_w4a8, attn_route);
+        } else {
+          gdn(e, block, /*verify=*/false, in_f16, nullptr, std::nullopt,
+              use_w4a8);
+        }
+        plan.used_sage2 |= e.profile.used_sage2;
+        plan.used_minference |= e.profile.used_minference;
+
+        if (use_w4a8) {
+          emit_add_rmsnorm_a8_g64(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+        } else if (affine_xs_eligible) {
+          emit_affine_add_rmsnorm_xsum(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, affine_nax_xs, h, float(config.rms_norm_eps),
+              normalization_weight_offset);
+        } else {
+          add_normalize(e, block.get("post_attention_norm"), hidden, delta,
+                        norm);
+        }
+        lp.pre_mlp = e.finish();
+      }
+
+      // 3. CB_B1: MLP Gate+Up+SwiGLU GPU suffix [N_ane, f) overlapping Dual-ANE [0, N_ane),
+      //    with Mode B (also_write_bf16=false) FWHT-64 + A8 splice when down_proj uses FWHT-64!
+      const auto &gw = block.get("mlp_gate");
+      const auto &uw = block.get("mlp_up");
+      const auto &dw = block.get("mlp_down");
+      const auto *op =
+          ane_engine_->find_op(li, ane::AneProjectionRole::MlpGateUpSwiGlu);
+      const bool offload_gu =
+          (op != nullptr && op->split.enabled() &&
+           can_gpu_suffix_swiglu(gw, uw, f, h, use_w4a8));
+      const bool down_w4a8 = use_w4a8 && (dw.has_fwht64() || w4a8_down_proj_);
+      bool used_mode_b_a8 = false;
+      {
+        Encoder e(context, libraries, chunk_t, "qwen.ultra.mlp_gu" + ltag);
+        e.begin_stage("mlp_gu");
+        if (use_w4a8) {
+          e.set_a8_quant(make_a8_key(e, norm, h));
+        } else if (affine_xs_eligible) {
+          e.set_group_sum(Encoder::GroupSumKey{
+              affine_nax_xs.buffer, affine_nax_xs.offset, norm.buffer,
+              norm.offset, h, 64U, chunk_t, true, 2U});
+        }
+        if (offload_gu) {
+          lp.mlp_gu_op_id = op->op_id;
+          if (can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h, use_w4a8) &&
+              try_linear_w4a8_swiglu_fwht64_a8(
+                  e, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
+                  std::nullopt, op->split.gpu_row_offset, f,
+                  op->split.gpu_rows)) {
+            used_mode_b_a8 = true;
+            lp.unpack_target.mode = ane::AneUnpackMode::Fwht64A8;
+            lp.unpack_target.primary_buf =
+                a8_mid_qa.buffer->native_mtl_buffer();
+            lp.unpack_target.primary_offset = a8_mid_qa.offset;
+            lp.unpack_target.aux0_buf = a8_mid_sa.buffer->native_mtl_buffer();
+            lp.unpack_target.aux0_offset = a8_mid_sa.offset;
+            lp.unpack_target.aux1_buf = a8_mid_ra.buffer->native_mtl_buffer();
+            lp.unpack_target.aux1_offset = a8_mid_ra.offset;
+            lp.unpack_target.out_stride = f;
+            lp.unpack_target.dst_col_offset = 0U;
+            lp.unpack_target.mp = w4a8_nax_mp(chunk_t);
+          } else {
+            (void)emit_gpu_suffix_swiglu(e, gw, uw, norm, product, f, h,
+                                         use_w4a8, op->split.gpu_row_offset, f,
+                                         op->split.gpu_rows);
+            lp.unpack_target.mode = ane::AneUnpackMode::BF16;
+            lp.unpack_target.primary_buf = product.buffer->native_mtl_buffer();
+            lp.unpack_target.primary_offset = product.offset;
+            lp.unpack_target.out_stride = f;
+            lp.unpack_target.dst_col_offset = 0U;
+            lp.unpack_target.mp = chunk_t;
+          }
+        } else if (down_w4a8 && dw.has_fwht64() && can_w4a8_weight(dw, h, f) &&
+                   try_linear_w4a8_swiglu_fwht64_a8(
+                       e, gw, uw, norm, product, f, h,
+                       /*also_write_bf16=*/false)) {
+          used_mode_b_a8 = true;
+        } else if (use_w4a8 &&
+                   try_linear_w4a8_swiglu(e, gw, uw, norm, product, f, h)) {
+        } else if (!try_linear_swiglu(e, gw, uw, norm, product, f, h)) {
+          linear_base(e, gw, norm, gate, f, h);
+          linear_base(e, uw, norm, up, f, h);
+          swiglu(e, chunk_t, f);
+        }
+        lp.mlp_gu_gpu = e.finish();
+      }
+
+      // 4. Post-MLP GPU work fused into the unpack CB:
+      //    mlp_down (consuming Mode B a8_mid directly!) + residual add + next layer input_norm.
+      {
+        Encoder e(context, libraries, chunk_t, "qwen.ultra.post_mlp" + ltag);
+        e.begin_stage("post_mlp");
+        if (used_mode_b_a8) {
+          e.set_a8_quant(make_a8_key_for(e, product, f, a8_mid_qa, a8_mid_sa,
+                                         a8_mid_ra, std::nullopt,
+                                         /*fwht64=*/true));
+        }
+        if (down_w4a8 && try_linear_w4a8_base(e, dw, product, delta, h, f)) {
+        } else {
+          linear(e, dw, product, delta, h, f);
+        }
+        if (li + 1U < blocks.size()) {
+          const auto &next_blk = blocks[li + 1U];
+          const bool next_in_f16 = !use_w4a8 && block_input_nax(next_blk, chunk_t);
+          if (use_w4a8) {
+            emit_add_rmsnorm_a8_g64(
+                e, hidden, delta, direct(next_blk.get("input_norm"), h), norm,
+                a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
+                normalization_weight_offset, block_input_needs_bf16(next_blk));
+          } else if (next_in_f16) {
+            add_normalize_f16(e, next_blk.get("input_norm"), hidden, delta,
+                              f16_norm);
+          } else if (affine_xs_eligible) {
+            emit_affine_add_rmsnorm_xsum(
+                e, hidden, delta, direct(next_blk.get("input_norm"), h), norm,
+                affine_nax_xs, h, float(config.rms_norm_eps),
+                normalization_weight_offset);
+          } else {
+            add_normalize(e, next_blk.get("input_norm"), hidden, delta, norm);
+          }
+        } else {
+          add(e);
+        }
+        lp.post_mlp = e.finish();
+      }
+    }
+
+    // 5. Final head + sample (built once, executed only when !trunk_only).
+    {
+      Encoder e(context, libraries, chunk_t, "qwen.ultra.head" + pkey_sfx);
+      e.begin_stage("head");
+      Ref last_hidden{delta.buffer, 0, mul(h, 2)};
+      Ref last_norm{norm.buffer, 0, mul(h, 2)};
+      Ref row0_logits{logits.buffer, 0, mul(v, 2)};
+      auto &extract =
+          e.emit("qwen_forward", "omlx_m5_forward_last_row", {.width = h},
+                 {.width = 256}, {hidden, last_hidden});
+      e.dynamic(extract, 2, words({chunk_t, h}));
+      normalize(e, final_norm, last_hidden, last_norm, 1U);
+      linear(e, head, last_norm, row0_logits, v, h, 1U);
+      e.begin_stage("sample");
+      const bool use_64tg_argmax =
+          (v >= 256U) && (argmax_scratch.buffer != nullptr) &&
+          !detail::forward::env_flag_enabled("OMLX_M5_DISABLE_64TG_ARGMAX");
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        if (use_64tg_argmax) {
+          auto &st1 = e.emit("position_sampling",
+                             "omlx_m5_position_argmax_stage1_64tg",
+                             {.width = 64U * 256U, .height = 1U},
+                             {.width = 256U}, {row0_logits, argmax_scratch});
+          e.constant(st1, 2, words({v, 1, 1, 0}));
+          auto &sample = e.emit(
+              "position_sampling", "omlx_m5_position_sample_logits_stage2",
+              {.width = 256U}, {.width = 256U},
+              {row0_logits, argmax_scratch, sampled, position_ids,
+               position_scores});
+          e.profile.sampling_offset = e.dynamic(
+              sample, 5, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+          e.constant(sample, 6, words({v, 1, 1, 0}));
+        } else {
+          auto &sample =
+              e.emit("position_sampling", "omlx_m5_position_sample_logits",
+                     {.width = 256}, {.width = 256},
+                     {row0_logits, sampled, position_ids, position_scores});
+          e.profile.sampling_offset = e.dynamic(
+              sample, 4, std::vector<std::byte>(sizeof(PositionSamplingRow)));
+          e.constant(sample, 5, words({v, 1, 1, 0}));
+        }
+      } else if (use_64tg_argmax) {
+        Ref vocab_parts{argmax_scratch.buffer, 0, 512U};
+        auto &st1 =
+            e.emit("vocab", "omlx_m5_vocab_argmax_stage1_64tg",
+                   {.width = 64U * 256U}, {.width = 256U},
+                   {row0_logits, vocab_parts});
+        e.constant(st1, 2, words({v}));
+        auto &sample =
+            e.emit("vocab", "omlx_m5_sample_logits_stage2", {.width = 256U},
+                   {.width = 256U}, {row0_logits, vocab_parts, sampled});
+        e.profile.sampling_offset =
+            e.dynamic(sample, 3, std::vector<std::byte>(sizeof(SampleParams)));
+      } else {
+        auto &sample = e.emit("vocab", "omlx_m5_sample_logits", {.width = 256},
+                              {.width = 256}, {row0_logits, sampled});
+        e.profile.sampling_offset =
+            e.dynamic(sample, 2, std::vector<std::byte>(sizeof(SampleParams)));
+      }
+      plan.head_sample = e.finish();
+    }
+
+    auto [it, _] = ane_ultra_plans_.emplace(plan_key, std::move(plan));
+    return it->second;
+  }
+
+  QwenForwardResult execute_ultra_swiglu_chunk(
+      std::span<const U32> tokens,
+      const GpuSamplingOptions &sampling,
+      bool trunk_only) {
+    const U32 count = U32(tokens.size());
+    const U32 start_pos = next_position;
+    const U32 end_pos = start_pos + count;
+    const auto route = select_chunk_attention_route(count, start_pos);
+    const U32 env =
+        (route == ChunkAttentionRoute::Sage2MInference ||
+         (route == ChunkAttentionRoute::Sage2Dense && max_context > 4096U))
+            ? select_long_ctx_envelope(end_pos)
+            : 0U;
+    auto &plan = get_or_build_ultra_swiglu_chunk_plan(env, route, trunk_only);
+
+    std::fill_n(token_staging.begin(), count, 0U);
+    std::copy(tokens.begin(), tokens.end(), token_staging.begin());
+    const_cast<MetalBuffer *>(token_ids.buffer)
+        ->write(std::as_bytes(std::span(token_staging).first(count)));
+    if (attention_positions.buffer) {
+      std::vector<U32> positions(count);
+      for (U32 i = 0U; i < count; ++i)
+        positions[i] = start_pos + i;
+      const_cast<MetalBuffer *>(attention_positions.buffer)
+          ->write(std::as_bytes(std::span(positions)));
+    }
+
+    auto patch_prof = [&](std::optional<Profile> &opt_prof) {
+      if (!opt_prof.has_value() || opt_prof->patches.empty()) {
+        return;
+      }
+      auto &prof = *opt_prof;
+      for (const auto &patch : prof.patches) {
+        const U32 val =
+            patch.position ? start_pos : count * patch.multiplier;
+        std::memcpy(prof.parameter_data.data() + patch.offset + patch.word * 4,
+                    &val, 4);
+      }
+      prof.parameters.write("step", prof.parameter_data);
+    };
+    patch_prof(plan.embed_norm0);
+    for (auto &lp : plan.layers) {
+      patch_prof(lp.pre_mlp);
+      patch_prof(lp.mlp_gu_gpu);
+      patch_prof(lp.post_mlp);
+    }
+    if (!trunk_only && plan.head_sample.has_value()) {
+      auto &hp = *plan.head_sample;
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        const PositionSamplingRow row{.seed = sampling.seed,
+                                      .position = start_pos + count,
+                                      .top_k = sampling.top_k,
+                                      .temperature = sampling.temperature,
+                                      .top_p = sampling.top_p};
+        std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &row,
+                    sizeof(row));
+      } else {
+        const SampleParams sp{v,
+                              sampling.top_k,
+                              sampling.temperature,
+                              sampling.top_p,
+                              sampling.seed,
+                              sampling.stream,
+                              start_pos + count - 1U};
+        std::memcpy(hp.parameter_data.data() + hp.sampling_offset, &sp,
+                    sizeof(sp));
+      }
+      hp.parameters.write("step", hp.parameter_data);
+    }
+
+    auto *pool = page_pool.get();
+    if (pool && pool->tokens() != start_pos)
+      throw std::logic_error("Qwen ANE KV page frontier disagrees with model");
+    const auto page_copies =
+        pool ? pool->begin_append(count) : std::vector<KvPageCopy>{};
+    struct PageGuard {
+      KvPagePool *pool;
+      bool active;
+      ~PageGuard() {
+        if (active)
+          try {
+            pool->abort();
+          } catch (...) {
+          }
+      }
+    } page_guard{pool, pool != nullptr};
+    execute_cow_copies(page_copies);
+
+    auto encode_one = [&](void *mtl_cb, Profile &pr) {
+      const std::array calls{MetalCommandInvocation{
+          .plan = &pr.plan, .bindings = pr.bindings, .parameters = &pr.parameters}};
+      context.encode_into_command_buffer(mtl_cb, calls);
+    };
+    auto encode_two = [&](void *mtl_cb, Profile &p0, Profile &p1) {
+      const std::array calls{
+          MetalCommandInvocation{
+              .plan = &p0.plan, .bindings = p0.bindings, .parameters = &p0.parameters},
+          MetalCommandInvocation{
+              .plan = &p1.plan, .bindings = p1.bindings, .parameters = &p1.parameters}};
+      context.encode_into_command_buffer(mtl_cb, calls);
+    };
+
+    // Collapsed minimal-CB overlap schedule (~65 trunk CBs/chunk):
+    //   CB_0:   embed_norm0 + pre_mlp[0] + ane_pack[0] + signal(ane_ready, 1)
+    //   CB_B1:  mlp_gu_gpu[li] [N_ane, f) (overlaps Dual-ANE [0, N_ane)!)
+    //   CB_k:   wait(ane_done, seq) + fused_unpack[li] + signal(unpack_done, seq)
+    //           + post_mlp[li] + pre_mlp[li+1] + ane_pack[li+1] + signal(ane_ready, seq+1)
+    void *cb = ane_engine_->begin_collapsed_cb();
+    if (!plan.layers.empty()) {
+      encode_two(cb, *plan.embed_norm0, *plan.layers[0].pre_mlp);
+    } else {
+      encode_one(cb, *plan.embed_norm0);
+    }
+
+    for (U32 li = 0U; li < plan.layers.size(); ++li) {
+      auto &lp = plan.layers[li];
+      if (lp.mlp_gu_op_id.has_value()) {
+        const U64 seq = ane_engine_->encode_pack_and_commit(
+            cb, *lp.mlp_gu_op_id, norm.buffer->native_mtl_buffer(), norm.offset,
+            h);
+        ane_engine_->submit_gpu_suffix_cb(
+            [&](void *cb_b1) { encode_one(cb_b1, *lp.mlp_gu_gpu); });
+        cb = ane_engine_->begin_unpack_cb(seq, *lp.mlp_gu_op_id,
+                                          lp.unpack_target);
+      } else {
+        encode_one(cb, *lp.mlp_gu_gpu);
+      }
+      if (li + 1U < plan.layers.size()) {
+        encode_two(cb, *lp.post_mlp, *plan.layers[li + 1U].pre_mlp);
+      } else if (!trunk_only && plan.head_sample.has_value()) {
+        encode_two(cb, *lp.post_mlp, *plan.head_sample);
+      } else {
+        encode_one(cb, *lp.post_mlp);
+      }
+    }
+    ane_engine_->commit_collapsed_cb(cb);
+
+    ane_engine_->flush_and_wait();
+    MetalSubmission sub{.timing = context.submit_classic_barrier()};
+
+    QwenForwardResult result{
+        .tokens = count,
+        .executed_layers = U32(blocks.size()),
+        .submission = std::move(sub),
+    };
+    if (!trunk_only) {
+      const auto tok_bytes = sampled.buffer->read(
+          0, sampling_contract == SamplingContract::PositionCoupledV1 ? 8 : 4);
+      std::memcpy(&result.token, tok_bytes.data(), 4);
+      result.host_read_bytes = tok_bytes.size();
+      if (sampling_contract == SamplingContract::PositionCoupledV1) {
+        U32 flag = 0;
+        std::memcpy(&flag, tok_bytes.data() + 4, 4);
+        if (flag & 2U)
+          throw std::runtime_error("nonfinite position target logits");
+        if (flag & 1U) {
+          auto ib = position_ids.buffer->read(0, U64(sampling.top_k) * 4);
+          auto sb = position_scores.buffer->read(0, U64(sampling.top_k) * 4);
+          std::vector<U32> ids(sampling.top_k);
+          std::vector<float> scores(sampling.top_k);
+          std::memcpy(ids.data(), ib.data(), ib.size());
+          std::memcpy(scores.data(), sb.data(), sb.size());
+          result.token = position_sample_candidates(
+              ids, scores,
+              {.seed = sampling.seed,
+               .position = start_pos + count,
+               .top_k = sampling.top_k,
+               .temperature = sampling.temperature,
+               .top_p = sampling.top_p});
+          result.host_read_bytes += ib.size() + sb.size();
+        }
+      } else if (result.token >= v) {
+        throw std::runtime_error("nonfinite or invalid legacy sampled token");
+      }
+    }
+
+    if (pool)
+      pool->commit(count);
+    page_guard.active = false;
+    next_position += count;
+    last_logits_row = 0U;
+    has_last_logits = !trunk_only;
+    record_prefill_telemetry(count, start_pos, plan.used_w4a8, plan.used_sage2,
+                             plan.used_minference, plan.chunk_t,
+                             plan.context_envelope, /*used_ane=*/true,
+                             &result.prefill_delta);
+    return result;
   }
 
   AneChunkPlan &get_or_build_ane_chunk_plan(U32 context_envelope,
@@ -9872,6 +10975,9 @@ public:
   QwenForwardResult execute_ane_chunk(std::span<const U32> tokens,
                                       const GpuSamplingOptions &sampling,
                                       bool trunk_only) {
+    if (ane_mode_effective_ == PrefillAneMode::UltraFp16SwiGlu) {
+      return execute_ultra_swiglu_chunk(tokens, sampling, trunk_only);
+    }
     const U32 count = U32(tokens.size());
     const U32 start_pos = next_position;
     const U32 end_pos = start_pos + count;
@@ -10727,6 +11833,9 @@ public:
     if (!cache_blend_eligible() || !blend_cache.enabled()) {
       QwenPrefillTelemetry accum;
       accum.prefill_ane_active = ane_active_;
+      accum.prefill_ane_mode_effective =
+          std::string(prefill_ane_mode_to_string(ane_mode_effective_));
+      accum.prefill_ane_inactive_reason = ane_inactive_reason_;
       accum.prefill_ane_split_alpha = ane_split_alpha_;
       auto res = run_standard_chunked(prefix_tokens, total_tokens, true, accum);
       res.tokens = suffix_len;
@@ -11688,15 +12797,76 @@ public:
             }
             submit_stage2_prof(e.finish());
           }
-          run_stage2_ane_swiglu(li, blk.get("mlp_gate"), blk.get("mlp_up"),
-                                norm, product, f, h, use_w4a8_active,
-                                use_w4a8_active, ltag + ".mlp_gu");
+          const auto &gw = blk.get("mlp_gate");
+          const auto &uw = blk.get("mlp_up");
+          const auto &dw = blk.get("mlp_down");
+          const auto *op_gu = ane_engine_->find_op(
+              li, ane::AneProjectionRole::MlpGateUpSwiGlu);
+          const auto *op_dn =
+              ane_engine_->find_op(li, ane::AneProjectionRole::MlpDown);
+          const bool stage2_mode_b_a8 =
+              (n_ane_blks == 1U && tail_rows == 0U && op_gu != nullptr &&
+               op_gu->split.enabled() && op_dn == nullptr &&
+               can_gpu_suffix_swiglu_fwht64_a8(gw, uw, dw, f, h,
+                                               use_w4a8_active));
+          if (stage2_mode_b_a8) {
+            // Mode B W4A8 splice for CacheBlend Stage 2: GPU suffix [N_ane, f)
+            // + fused ANE unpack [0, N_ane) directly into a8_mid_{qa,sa,ra}.
+            Encoder e_gu(context, libraries, ane_blk_t,
+                         base_tag + ltag + ".mlp_gu.mb");
+            e_gu.begin_stage("blend_ane_gu_sfx_mb");
+            e_gu.set_a8_quant(make_a8_key(e_gu, norm, h));
+            (void)try_linear_w4a8_swiglu_fwht64_a8(
+                e_gu, gw, uw, norm, product, f, h, /*also_write_bf16=*/false,
+                std::nullopt, op_gu->split.gpu_row_offset, f,
+                op_gu->split.gpu_rows);
+            stage2_profiles.push_back(e_gu.finish());
+            auto &stored_gu = stage2_profiles.back();
+            if (stored_gu.used_w4a8)
+              stage2_used_w4a8 = true;
+            stored_gu.parameters.write("step", stored_gu.parameter_data);
+
+            ane::AneUnpackTarget mb_target{};
+            mb_target.mode = ane::AneUnpackMode::Fwht64A8;
+            mb_target.primary_buf = a8_mid_qa.buffer->native_mtl_buffer();
+            mb_target.primary_offset = a8_mid_qa.offset;
+            mb_target.aux0_buf = a8_mid_sa.buffer->native_mtl_buffer();
+            mb_target.aux0_offset = a8_mid_sa.offset;
+            mb_target.aux1_buf = a8_mid_ra.buffer->native_mtl_buffer();
+            mb_target.aux1_offset = a8_mid_ra.offset;
+            mb_target.out_stride = f;
+            mb_target.dst_col_offset = 0U;
+            mb_target.mp = w4a8_nax_mp(ane_blk_t);
+            ane_engine_->enqueue_op_ex(
+                op_gu->op_id, norm.buffer->native_mtl_buffer(), norm.offset, h,
+                mb_target, [&](void *mtl_cb) {
+                  const std::array calls{MetalCommandInvocation{
+                      .plan = &stored_gu.plan,
+                      .bindings = stored_gu.bindings,
+                      .parameters = &stored_gu.parameters}};
+                  context.encode_into_command_buffer(mtl_cb, calls);
+                });
+
+            Encoder e_dn(context, libraries, ane_blk_t,
+                         base_tag + ltag + ".mlp_dn.mb");
+            e_dn.begin_stage("blend_ane_dn_mb");
+            e_dn.set_a8_quant(make_a8_key_for(e_dn, product, f, a8_mid_qa,
+                                              a8_mid_sa, a8_mid_ra,
+                                              std::nullopt, /*fwht64=*/true));
+            if (!try_linear_w4a8_base(e_dn, dw, product, delta, h, f)) {
+              linear(e_dn, dw, product, delta, h, f);
+            }
+            add(e_dn);
+            submit_stage2_prof(e_dn.finish());
+            return;
+          }
+          run_stage2_ane_swiglu(li, gw, uw, norm, product, f, h,
+                                use_w4a8_active, use_w4a8_active,
+                                ltag + ".mlp_gu");
           run_stage2_ane_linear(
-              li, ane::AneProjectionRole::MlpDown, blk.get("mlp_down"), product,
-              delta, h, f,
-              use_w4a8_active &&
-                  (blk.get("mlp_down").has_fwht64() || w4a8_down_proj_),
-              false, ltag + ".mlp_dn");
+              li, ane::AneProjectionRole::MlpDown, dw, product, delta, h, f,
+              use_w4a8_active && (dw.has_fwht64() || w4a8_down_proj_), false,
+              ltag + ".mlp_dn");
           {
             Encoder e(context, libraries, m_active, base_tag + ltag + ".add");
             e.begin_stage("add");
@@ -12300,6 +13470,9 @@ public:
     QwenPrefillTelemetry accum;
     accum.prefill_ane_active = ane_active_;
     accum.prefill_ane_split_alpha = ane_split_alpha_;
+    accum.prefill_ane_mode_effective =
+        std::string(prefill_ane_mode_to_string(ane_mode_effective_));
+    accum.prefill_ane_inactive_reason = ane_inactive_reason_;
     QwenForwardResult final_res{};
 
     std::size_t si = 0U;
@@ -12489,10 +13662,13 @@ public:
   std::unique_ptr<ane::AneDualOffloadEngine> ane_engine_;
   U32 ane_chunk_tokens_ = 0U;
   bool ane_active_ = false;
+  PrefillAneMode ane_mode_effective_ = PrefillAneMode::Off;
+  std::string ane_inactive_reason_;
   double ane_split_alpha_ = 0.0;
   bool cache_blend_kernels_ready_ = false;
   std::map<LongCtxProfileKey, Profile> long_ctx_profiles_;
   std::map<AneChunkPlanKey, AneChunkPlan> ane_layer_plans_;
+  std::map<AneChunkPlanKey, UltraSwiGluChunkPlan> ane_ultra_plans_;
   QwenPrefillTelemetry prefill_telemetry_{};
   std::atomic<U64> blend_plan_seq_{1ULL};
   std::shared_ptr<const QwenMergedLoraOverrides> merged_lora_;
@@ -13155,6 +14331,10 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
           sub_res.prefill_delta.prefill_minference_blocks_total;
       total_res.prefill_delta.prefill_ane_active =
           sub_res.prefill_delta.prefill_ane_active;
+      total_res.prefill_delta.prefill_ane_mode_effective =
+          sub_res.prefill_delta.prefill_ane_mode_effective;
+      total_res.prefill_delta.prefill_ane_inactive_reason =
+          sub_res.prefill_delta.prefill_ane_inactive_reason;
       total_res.prefill_delta.prefill_ane_split_alpha =
           sub_res.prefill_delta.prefill_ane_split_alpha;
       total_res.prefill_delta.prefill_ane_offload_tokens +=
@@ -13267,6 +14447,14 @@ QwenPrefillTelemetry QwenForward::prefill_telemetry() const noexcept {
 
 bool QwenForward::ane_offload_active() const noexcept {
   return impl_->ane_active_;
+}
+
+PrefillAneMode QwenForward::ane_mode_effective() const noexcept {
+  return impl_->ane_mode_effective_;
+}
+
+std::string_view QwenForward::ane_inactive_reason() const noexcept {
+  return impl_->ane_inactive_reason_;
 }
 
 double QwenForward::ane_split_alpha() const noexcept {
@@ -13706,6 +14894,10 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
           sub_res.prefill_delta.prefill_minference_blocks_total;
       total_res.prefill_delta.prefill_ane_active =
           sub_res.prefill_delta.prefill_ane_active;
+      total_res.prefill_delta.prefill_ane_mode_effective =
+          sub_res.prefill_delta.prefill_ane_mode_effective;
+      total_res.prefill_delta.prefill_ane_inactive_reason =
+          sub_res.prefill_delta.prefill_ane_inactive_reason;
       total_res.prefill_delta.prefill_ane_split_alpha =
           sub_res.prefill_delta.prefill_ane_split_alpha;
       total_res.prefill_delta.prefill_ane_offload_tokens +=

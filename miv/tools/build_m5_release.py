@@ -68,6 +68,8 @@ REQUIRED_NAX_METALLIBS = (
     "omlx_m5_gdn_chunk_nax.metallib",
     "omlx_m5_w4a8_nax.metallib",
     "omlx_m5_w4a8_moe_nax.metallib",
+    "omlx_m5_w4a4_nax.metallib",
+    "omlx_m5_w4a4_moe_nax.metallib",
     "omlx_m5_attention_sage2.metallib",
     "omlx_m5_attention_minference.metallib",
     "omlx_m5_cache_blend.metallib",

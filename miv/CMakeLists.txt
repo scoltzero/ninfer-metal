@@ -2935,7 +2935,10 @@ omlx_m5_compile_metallib(
   omlx_m5_ane_pack_unpack_metallib
   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ane_pack_unpack.metal"
   "omlx_m5_ane_pack_unpack.metallib"
-  "15.0")
+  "15.0"
+  EXTRA_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
 add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_ane_pack_unpack_metallib)
 
 target_sources(
@@ -2981,7 +2984,8 @@ target_link_libraries(
   omlx_m5_core_runtime)
 add_dependencies(
   omlx_m5_ane_dual_offload_tests
-  omlx_m5_ane_pack_unpack_metallib)
+  omlx_m5_ane_pack_unpack_metallib
+  omlx_m5_qwen_forward_resources)
 add_test(
   NAME omlx_m5_ane_dual_offload
   COMMAND
@@ -3096,7 +3100,7 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       $<TARGET_FILE:omlx_m5_prefill_all_modes_e2e_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
 
-  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate (all 14 prefill metallibs)
+  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate (all 15 prefill metallibs)
   if(TARGET omlx_m5_affine_nax_metallib AND
      TARGET omlx_m5_mxfp4_nax_metallib AND
      TARGET omlx_m5_moe_nax_metallib AND
@@ -3110,7 +3114,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
      TARGET omlx_m5_attention_sage2_metallib AND
      TARGET omlx_m5_attention_minference_metallib AND
      TARGET omlx_m5_gdn_chunk_nax_metallib AND
-     TARGET omlx_m5_cache_blend_metallib)
+     TARGET omlx_m5_cache_blend_metallib AND
+     TARGET omlx_m5_ane_pack_unpack_metallib)
     add_executable(
       omlx_m5_prefill_sram_spill_audit_tests
       tests/prefill_sram_spill_audit_tests.mm)
@@ -3147,7 +3152,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       omlx_m5_attention_sage2_metallib
       omlx_m5_attention_minference_metallib
       omlx_m5_gdn_chunk_nax_metallib
-      omlx_m5_cache_blend_metallib)
+      omlx_m5_cache_blend_metallib
+      omlx_m5_ane_pack_unpack_metallib)
     add_test(
       NAME omlx_m5_prefill_sram_spill_audit
       COMMAND
