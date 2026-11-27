@@ -243,6 +243,9 @@ inline void linear_bf16_nax_swiglu(Encoder &e,
        (sk == 2u || sk == 4u || sk == 8u))
           ? ((sel_t >= 17u) ? 32u : 16u)
           : 8u;
+  if (bm == 32u && sk > 4u) {
+    sk = 4u;
+  }
   const U32 sw_y_tiles = (bm > 8u) ? ((t + bm - 1u) / bm) : y_tiles;
   std::string fn = "omlx_m5_bf16_nax_swiglu_bk" + std::to_string(bk) +
                    (bm > 8u ? ("_bm" + std::to_string(bm)) : std::string{}) +

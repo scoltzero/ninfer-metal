@@ -360,19 +360,22 @@ inline U32 mxfp4_nax_mp(U32 t) { return ((t + 7u) / 8u) * 8u; }
 
 inline void ensure_f16_cast(Encoder &e, Ref x, Ref f16_scratch,
                             Ref f16_row_scale, U32 k,
-                            std::optional<U32> explicit_t = {}) {
+                            std::optional<U32> explicit_t = {},
+                            bool fwht64 = false) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_nax_mp(t);
   const bool dyn_rows = !explicit_t.has_value() && t != 1u;
   const Encoder::F16CastKey key{f16_scratch.buffer, f16_scratch.offset,
                                 f16_row_scale.buffer, f16_row_scale.offset,
-                                x.buffer, x.offset, k, t, dyn_rows};
+                                x.buffer, x.offset, k, t, dyn_rows, fwht64};
   if (e.has_f16_cast(key)) {
     return;
   }
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
-  auto &d = e.emit("mxfp4_nax", "omlx_m5_bf16_to_f16_rowscale",
+  const char *fn = fwht64 ? "omlx_m5_bf16_fwht64_to_f16_rowscale"
+                          : "omlx_m5_bf16_to_f16_rowscale";
+  auto &d = e.emit("mxfp4_nax", fn,
                    {.width = 256u, .height = mp}, {.width = 256u},
                    {x, f16_scratch, f16_row_scale});
   e.dynamic(d, 3, words({k, mp, 0u, t}), tokens_patch);
@@ -503,19 +506,23 @@ inline void linear_mxfp4_nax_direct_f16(Encoder &e, const TiledMxfp4Weight &tw,
 }
 
 inline bool mxfp4_nax_swiglu_out64_enabled() noexcept {
-  // Real Apple10 M5 Ultra calibration: out64 stages As+Ws (27 KiB SRAM -> 1 TG/core
-  // + 2 barriers/K-block), regressing 64K prefill by +1.83s vs bm64_bn64_sk1
-  // (9 KiB SRAM, direct L1 x loads). Keep out64 for Dual-ANE row-slice calls
-  // (is_slice) and opt-in via OMLX_M5_ENABLE_SWIGLU_OUT64=1.
+  // WP3.1 Apple10 M5 Ultra verified: 1-pass BN_out=32 out64 (9,216 B SRAM, 0 spills,
+  // 128 threads, 3 TGs/core) beats HEAD out64 (27,648 B) by 1.12-1.14x and beats/matches
+  // Split (2x Linear + SwiGLU) across M=512..4096 (default ON).
   if (const char *dis = std::getenv("OMLX_M5_DISABLE_SWIGLU_OUT64");
       dis != nullptr && std::string_view(dis) == "1") {
     return false;
   }
   if (const char *en = std::getenv("OMLX_M5_ENABLE_SWIGLU_OUT64");
-      en != nullptr && std::string_view(en) == "1") {
-    return true;
+      en != nullptr) {
+    if (std::string_view(en) == "0") {
+      return false;
+    }
+    if (std::string_view(en) == "1") {
+      return true;
+    }
   }
-  return false;
+  return true;
 }
 
 inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
@@ -524,7 +531,8 @@ inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
                              U32 gpu_cores = 64u,
                              U32 row_offset = 0u,
                              U32 out_stride = 0u,
-                             U32 slice_n = 0u) {
+                             U32 slice_n = 0u,
+                             bool fwht64 = false) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_nax_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
@@ -549,9 +557,14 @@ inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
     const MetalDispatchSize threads{.width = 128u};
     const std::optional<U32> tokens_patch =
         explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+    Ref x_in = x;
+    if (fwht64) {
+      emit_fwht64_bf16(e, x, f16_scratch, tw.k, explicit_t);
+      x_in = f16_scratch;
+    }
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
     auto &d = e.emit("mxfp4_nax", fn, grid, threads,
-                     {x, tw.codes, tw.scales, y});
+                     {x_in, tw.codes, tw.scales, y});
     e.dynamic(d, 4, words({eff_n, tw.k, mp, t, row_offset, eff_stride}),
               tokens_patch);
     return;
@@ -572,13 +585,18 @@ inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
     const MetalDispatchSize threads{.width = tptg};
     const std::optional<U32> tokens_patch =
         explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+    Ref x_in = x;
+    if (fwht64) {
+      emit_fwht64_bf16(e, x, f16_scratch, tw.k, explicit_t);
+      x_in = f16_scratch;
+    }
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
     auto &d = e.emit("mxfp4_nax", fn, grid, threads,
-                     {x, tw.codes, tw.scales, y});
+                     {x_in, tw.codes, tw.scales, y});
     e.dynamic(d, 4, words({tw.n, tw.k, mp, t}), tokens_patch);
     return;
   }
-  ensure_f16_cast(e, x, f16_scratch, f16_row_scale, tw.k, explicit_t);
+  ensure_f16_cast(e, x, f16_scratch, f16_row_scale, tw.k, explicit_t, fwht64);
   linear_mxfp4_nax_direct_f16(e, tw, f16_scratch, f16_row_scale, y, explicit_t,
                               gpu_cores);
 }
@@ -634,14 +652,16 @@ inline void linear_mxfp4_nax_swiglu_direct_f16(
   }
   const U32 bm = mxfp4_nax_bm(sel_t, rf, 16u, sk);
   if (bm > 8u) {
+    // WP3.1: Cap SwiGLU bm32_n16 at SK <= 4 (12.0 KiB <= 16.0 KiB TG SRAM).
+    const U32 eff_sk = (bm == 32u) ? std::min<U32>(sk, 4u) : sk;
     const U32 y_tiles = (mp + bm - 1u) / bm;
     const std::string fn =
         std::string(out_f16 ? "omlx_m5_mxfp4_nax_swiglu_f16_bm"
                             : "omlx_m5_mxfp4_nax_swiglu_bm") +
-        std::to_string(bm) + "_n16_sk" + std::to_string(sk);
-    const MetalDispatchSize grid{.width = U64(gw.padded_n / 16u) * 32u * sk,
+        std::to_string(bm) + "_n16_sk" + std::to_string(eff_sk);
+    const MetalDispatchSize grid{.width = U64(gw.padded_n / 16u) * 32u * eff_sk,
                                  .height = y_tiles};
-    const MetalDispatchSize threads{.width = 32u * sk};
+    const MetalDispatchSize threads{.width = 32u * eff_sk};
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
     auto &d = e.emit("mxfp4_nax", fn, grid, threads,
                      {x_f16, row_scale, gw.codes, gw.scales, uw.codes, uw.scales,
@@ -694,11 +714,11 @@ inline void linear_mxfp4_nax_swiglu(
       throw std::invalid_argument("linear_mxfp4_nax_swiglu slice exceeds weight n");
     }
     const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
-    const U32 x_tiles = (eff_n + 63u) / 64u;
+    const U32 x_tiles = (eff_n + 31u) / 32u;
     const U32 y_tiles = (t + 63u) / 64u;
-    const MetalDispatchSize grid{.width = U64(x_tiles) * 256u,
+    const MetalDispatchSize grid{.width = U64(x_tiles) * 128u,
                                  .height = y_tiles};
-    const MetalDispatchSize threads{.width = 256u};
+    const MetalDispatchSize threads{.width = 128u};
     const std::optional<U32> tokens_patch =
         explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
     e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
@@ -735,6 +755,43 @@ inline void linear_mxfp4_nax_swiglu(
                                      y_out, false, gpu_cores, explicit_t);
 }
 
+// WP3.1 Mode B: Zero-Ws W4A16 MXFP4 out64 Gate + Up + SwiGLU + fused FWHT-64 + GS64 INT8 epilogue.
+inline void linear_mxfp4_nax_swiglu_fwht64_a8(
+    Encoder &e, const TiledMxfp4Weight &gw, const TiledMxfp4Weight &uw, Ref x,
+    Ref qa_out, Ref sa_out, Ref ra_out, Ref opt_y_bf16, bool also_write_bf16,
+    U32 a8_mp, std::optional<U32> explicit_t = {}, U32 row_offset = 0u,
+    U32 out_stride = 0u, U32 slice_n = 0u) {
+  if (gw.n != uw.n || gw.k != uw.k || gw.bn != 16u || uw.bn != 16u ||
+      (gw.k % 128u) != 0u || (gw.n % 64u) != 0u || (row_offset % 64u) != 0u ||
+      row_offset >= gw.n) {
+    throw std::invalid_argument(
+        "linear_mxfp4_nax_swiglu_fwht64_a8 requires bn=16, k%128==0, n%64==0, row_offset%64==0");
+  }
+  const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+  if (row_offset + eff_n > gw.n || (eff_n % 64u) != 0u) {
+    throw std::invalid_argument(
+        "linear_mxfp4_nax_swiglu_fwht64_a8 slice must be 64-aligned within n");
+  }
+  const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 x_tiles = eff_n / 64u;
+  const U32 y_tiles = (t + 63u) / 64u;
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 256u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 256u};
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  const U32 epi_flags = also_write_bf16 ? 1u : 0u;
+  e.profile.numeric_contract_id = "linear_row_exact_portable_v1";
+  auto &d = e.emit("mxfp4_nax",
+                   "omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1_fwht64_a8",
+                   grid, threads,
+                   {x, gw.codes, gw.scales, uw.codes, uw.scales, qa_out, sa_out,
+                    ra_out, opt_y_bf16});
+  e.dynamic(d, 9,
+            words({eff_n, gw.k, a8_mp, t, row_offset, eff_stride, epi_flags}),
+            tokens_patch);
+}
+
 inline U32 mxfp4_w4a4_mp(U32 t) { return ((t + 15u) / 16u) * 16u; }
 
 inline std::string mxfp4_w4a4_group(const Encoder &e,
@@ -767,20 +824,24 @@ inline U32 mxfp4_w4a4_rf(U32 t) {
 }
 
 inline void ensure_a4_quant(Encoder &e, Ref x, Ref a4_codes, Ref a4_scales,
-                            U32 k, std::optional<U32> explicit_t = {}) {
+                            U32 k, std::optional<U32> explicit_t = {},
+                            bool fwht64 = false) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_w4a4_mp(t);
   const bool dyn_rows = !explicit_t.has_value() && t != 1u;
   const Encoder::F16CastKey key{a4_codes.buffer, a4_codes.offset,
                                 a4_scales.buffer, a4_scales.offset,
-                                x.buffer, x.offset, k, t, dyn_rows};
+                                x.buffer, x.offset, k, t, dyn_rows, fwht64};
   if (e.has_f16_cast(key)) {
     return;
   }
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
-  auto &d = e.emit("mxfp4_nax", "omlx_m5_bf16_to_mxfp4_a4_bm16_bk128",
-                   {.width = U64(k / 32u) * 32u, .height = mp}, {.width = 32u},
+  const char *fn = fwht64 ? "omlx_m5_bf16_fwht64_to_mxfp4_a4_bm16_bk128"
+                          : "omlx_m5_bf16_to_mxfp4_a4_bm16_bk128";
+  const U32 groups_x = fwht64 ? (k / 64u) : (k / 32u);
+  auto &d = e.emit("mxfp4_nax", fn,
+                   {.width = U64(groups_x) * 32u, .height = mp}, {.width = 32u},
                    {x, a4_codes, a4_scales});
   e.dynamic(d, 3, words({k, mp, 0u, t}), tokens_patch);
   e.set_f16_cast(key);
@@ -789,12 +850,13 @@ inline void ensure_a4_quant(Encoder &e, Ref x, Ref a4_codes, Ref a4_scales,
 inline void linear_mxfp4_w4a4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,
                                   Ref y, Ref a4_codes, Ref a4_scales,
                                   std::optional<U32> explicit_t = {},
-                                  U32 gpu_cores = 64u) {
+                                  U32 gpu_cores = 64u,
+                                  bool fwht64 = false) {
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mxfp4_w4a4_mp(t);
   const U32 sel_t = nax_effective_select_t(e, explicit_t);
   const auto sel_exp = nax_effective_select_explicit_t(e, explicit_t);
-  ensure_a4_quant(e, x, a4_codes, a4_scales, tw.k, explicit_t);
+  ensure_a4_quant(e, x, a4_codes, a4_scales, tw.k, explicit_t, fwht64);
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
 

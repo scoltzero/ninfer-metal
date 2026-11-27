@@ -5,6 +5,7 @@
 // input rows and folds up to 8 32-lane pairwise SIMD reductions simultaneously
 // while preserving 100% bit-for-bit identical per-lane FMA and simd_sum order.
 #include "qmv_t1.metal"
+#include "fwht64.h"
 #include <metal_atomic>
 
 constexpr constant uint kRowExactTileM = 8;
@@ -1036,7 +1037,9 @@ inline void pretiled_qmv_mxfp4_kl32_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint k_blocks = k / 128u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint k_blocks = k_eff / 128u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong tile_code_bytes = ulong(BN) * 64ul;
@@ -1056,19 +1059,27 @@ inline void pretiled_qmv_mxfp4_kl32_impl(
   const ulong tile_base = ulong(tile_n) * k_blocks;
   for (uint blk = 0u; blk < k_blocks; blk += 2u) {
     const uint cur_blk = blk + b_sub;
+    float4 f0 = float4(0.0f);
+    float4 f1 = float4(0.0f);
     if (cur_blk < k_blocks) {
       const ulong x_off = ulong(cur_blk) * 128ul + ulong(k_l) * 8ul;
       device const bfloat4 *xb = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      half4 h0, h1;
       if constexpr (PROLOGUE_NORM) {
         device const bfloat4 *wb = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
-        h0 = half4(float4(bfloat4(float4(xb[0]) * inv_rms * (float4(wb[0]) + off4))));
-        h1 = half4(float4(bfloat4(float4(xb[1]) * inv_rms * (float4(wb[1]) + off4))));
+        f0 = float4(bfloat4(float4(xb[0]) * inv_rms * (float4(wb[0]) + off4)));
+        f1 = float4(bfloat4(float4(xb[1]) * inv_rms * (float4(wb[1]) + off4)));
       } else {
         (void)rms_w; (void)inv_rms; (void)off4;
-        h0 = half4(float4(xb[0]));
-        h1 = half4(float4(xb[1]));
+        f0 = float4(xb[0]);
+        f1 = float4(xb[1]);
       }
+    }
+    if (do_fwht) {
+      omlx_m5_fwht64_sub8(f0, f1, lane);
+    }
+    if (cur_blk < k_blocks) {
+      const half4 h0 = half4(f0);
+      const half4 h1 = half4(f1);
       const ulong idx = tile_base + cur_blk;
       device const uchar *d_tile = nax_data + idx * tile_code_bytes;
       device const uchar *s_tile = nax_scale + idx * tile_scale_bytes;
@@ -1161,7 +1172,9 @@ inline void pretiled_qmv_mxfp4_swiglu_kl32_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint k_blocks = k / 128u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint k_blocks = k_eff / 128u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong tile_code_bytes = ulong(BN) * 64ul;
@@ -1183,19 +1196,27 @@ inline void pretiled_qmv_mxfp4_swiglu_kl32_impl(
   const ulong tile_base = ulong(tile_n) * k_blocks;
   for (uint blk = 0u; blk < k_blocks; blk += 2u) {
     const uint cur_blk = blk + b_sub;
+    float4 f0 = float4(0.0f);
+    float4 f1 = float4(0.0f);
     if (cur_blk < k_blocks) {
       const ulong x_off = ulong(cur_blk) * 128ul + ulong(k_l) * 8ul;
       device const bfloat4 *xb = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      half4 h0, h1;
       if constexpr (PROLOGUE_NORM) {
         device const bfloat4 *wb = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
-        h0 = half4(float4(bfloat4(float4(xb[0]) * inv_rms * (float4(wb[0]) + off4))));
-        h1 = half4(float4(bfloat4(float4(xb[1]) * inv_rms * (float4(wb[1]) + off4))));
+        f0 = float4(bfloat4(float4(xb[0]) * inv_rms * (float4(wb[0]) + off4)));
+        f1 = float4(bfloat4(float4(xb[1]) * inv_rms * (float4(wb[1]) + off4)));
       } else {
         (void)rms_w; (void)inv_rms; (void)off4;
-        h0 = half4(float4(xb[0]));
-        h1 = half4(float4(xb[1]));
+        f0 = float4(xb[0]);
+        f1 = float4(xb[1]);
       }
+    }
+    if (do_fwht) {
+      omlx_m5_fwht64_sub8(f0, f1, lane);
+    }
+    if (cur_blk < k_blocks) {
+      const half4 h0 = half4(f0);
+      const half4 h1 = half4(f1);
       const ulong idx = tile_base + cur_blk;
       device const uchar *gd_tile = g_data + idx * tile_code_bytes;
       device const uchar *gs_tile = g_scale + idx * tile_scale_bytes;
@@ -1613,6 +1634,74 @@ inline float pretiled_affine_dot16_f32_dyn(
   return pretiled_affine_dot16_f32<3u>(c_tile, h_tile, rn, k_l, xf);
 }
 
+template <bool PROLOGUE_NORM>
+__attribute__((always_inline)) inline void pretiled_affine_load16_t1(
+    device const bfloat *x,
+    device const bfloat *rms_w,
+    ulong group_base,
+    uint k_l,
+    uint lane,
+    bool valid_g,
+    bool is_lane_v2,
+    bool do_fwht,
+    float inv_rms,
+    float4 off4,
+    thread float (&xf)[16],
+    thread float &local_sum) {
+  float4 v[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+  if (valid_g) {
+    if (is_lane_v2) {
+      device const bfloat4 *xb4 = reinterpret_cast<device const bfloat4 *>(x + group_base);
+      if constexpr (PROLOGUE_NORM) {
+        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + group_base);
+#pragma clang loop unroll(full)
+        for (uint s = 0u; s < 4u; ++s) {
+          const uint idx4 = s * 4u + k_l;
+          v[s] = float4(bfloat4(float4(xb4[idx4]) * inv_rms * (float4(wb4[idx4]) + off4)));
+        }
+      } else {
+        (void)rms_w; (void)inv_rms; (void)off4;
+#pragma clang loop unroll(full)
+        for (uint s = 0u; s < 4u; ++s) {
+          v[s] = float4(xb4[s * 4u + k_l]);
+        }
+      }
+    } else {
+      const ulong x_off = group_base + ulong(k_l) * 16ul;
+      device const bfloat4 *xb4 = reinterpret_cast<device const bfloat4 *>(x + x_off);
+      if constexpr (PROLOGUE_NORM) {
+        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i) {
+          v[i] = float4(bfloat4(float4(xb4[i]) * inv_rms * (float4(wb4[i]) + off4)));
+        }
+      } else {
+        (void)rms_w; (void)inv_rms; (void)off4;
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i) {
+          v[i] = float4(xb4[i]);
+        }
+      }
+    }
+  }
+  if (do_fwht) {
+    if (is_lane_v2) {
+      omlx_m5_fwht64_sub4_pi64(v, lane);
+    } else {
+      omlx_m5_fwht64_sub4_linear(v, lane);
+    }
+  }
+  local_sum = 0.0f;
+#pragma clang loop unroll(full)
+  for (uint i = 0u; i < 4u; ++i) {
+    xf[4u * i + 0u] = v[i].x;
+    xf[4u * i + 1u] = v[i].y;
+    xf[4u * i + 2u] = v[i].z;
+    xf[4u * i + 3u] = v[i].w;
+    local_sum += (v[i].x + v[i].y) + (v[i].z + v[i].w);
+  }
+}
+
 template <uint ROWS_SG, uint BITS, uint BN, bool PROLOGUE_NORM = false, bool EPILOGUE_ADD_SQ = false>
 inline void pretiled_qmv_affine_kl32_impl(
     device const bfloat *x,
@@ -1636,7 +1725,10 @@ inline void pretiled_qmv_affine_kl32_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong code_tile_bytes =
@@ -1656,34 +1748,12 @@ inline void pretiled_qmv_affine_kl32_impl(
   const ulong tile_base = ulong(tile_n) * groups;
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float xf[16];
+    float local_sum = 0.0f;
+    pretiled_affine_load16_t1<PROLOGUE_NORM>(
+        x, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms, off4, xf, local_sum);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb4 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      float xf[16];
-      float local_sum = 0.0f;
-      if constexpr (PROLOGUE_NORM) {
-        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(bfloat4(float4(xb4[i]) * inv_rms * (float4(wb4[i]) + off4)));
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      } else {
-        (void)rms_w; (void)inv_rms; (void)off4;
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(xb4[i]);
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      }
       const ulong idx = tile_base + cur_g;
       device const uchar *c_tile = nax_codes + idx * code_tile_bytes;
       device const uchar *h_tile = nax_high + idx * high_tile_bytes;
@@ -1764,7 +1834,10 @@ inline void pretiled_qmv_affine_swiglu_kl32_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong c_tile_bytes =
@@ -1785,34 +1858,12 @@ inline void pretiled_qmv_affine_swiglu_kl32_impl(
   const ulong tile_base = ulong(tile_n) * groups;
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float xf[16];
+    float local_sum = 0.0f;
+    pretiled_affine_load16_t1<PROLOGUE_NORM>(
+        x, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms, off4, xf, local_sum);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb4 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      float xf[16];
-      float local_sum = 0.0f;
-      if constexpr (PROLOGUE_NORM) {
-        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(bfloat4(float4(xb4[i]) * inv_rms * (float4(wb4[i]) + off4)));
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      } else {
-        (void)rms_w; (void)inv_rms; (void)off4;
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(xb4[i]);
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      }
       const ulong idx = tile_base + cur_g;
       device const uchar *gc_t = g_codes + idx * c_tile_bytes;
       device const uchar *gh_t = g_high + idx * h_tile_bytes;
@@ -1894,7 +1945,10 @@ inline void pretiled_qmv_affine_swiglu_kl32_mixed_fallback(
   if (row_sg >= n) {
     return;
   }
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / bn;
   const uint rn0 = row_sg % bn;
   const ulong gc_tile_bytes =
@@ -1919,34 +1973,12 @@ inline void pretiled_qmv_affine_swiglu_kl32_mixed_fallback(
   const ulong tile_base = ulong(tile_n) * groups;
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float xf[16];
+    float local_sum = 0.0f;
+    pretiled_affine_load16_t1<PROLOGUE_NORM>(
+        x, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms, off4, xf, local_sum);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb4 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      float xf[16];
-      float local_sum = 0.0f;
-      if constexpr (PROLOGUE_NORM) {
-        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(bfloat4(float4(xb4[i]) * inv_rms * (float4(wb4[i]) + off4)));
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      } else {
-        (void)rms_w; (void)inv_rms; (void)off4;
-#pragma clang loop unroll(full)
-        for (uint i = 0u; i < 4u; ++i) {
-          const float4 fv = float4(xb4[i]);
-          xf[4u * i + 0u] = fv.x;
-          xf[4u * i + 1u] = fv.y;
-          xf[4u * i + 2u] = fv.z;
-          xf[4u * i + 3u] = fv.w;
-          local_sum += (fv.x + fv.y) + (fv.z + fv.w);
-        }
-      }
       const ulong idx = tile_base + cur_g;
       device const uchar *gc_t = g_codes + idx * gc_tile_bytes;
       device const uchar *gh_t = g_high + idx * gh_tile_bytes;
@@ -3152,7 +3184,9 @@ inline void pretiled_qmv_mxfp4_kl32_m2_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint k_blocks = k / 128u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint k_blocks = k_eff / 128u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong tile_code_bytes = ulong(BN) * 64ul;
@@ -3167,29 +3201,40 @@ inline void pretiled_qmv_mxfp4_kl32_m2_impl(
 
   const float4 off4 = float4(w_off);
   const ulong tile_base = ulong(tile_n) * k_blocks;
-  device const bfloat *x1 = x + ulong(k);
+  device const bfloat *x1 = x + ulong(k_eff);
   for (uint blk = 0u; blk < k_blocks; blk += 2u) {
     const uint cur_blk = blk + b_sub;
+    float4 f0_0 = float4(0.0f), f0_1 = float4(0.0f);
+    float4 f1_0 = float4(0.0f), f1_1 = float4(0.0f);
     if (cur_blk < k_blocks) {
       const ulong x_off = ulong(cur_blk) * 128ul + ulong(k_l) * 8ul;
       device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x + x_off);
       device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
-      half4 h0_0, h0_1, h1_0, h1_1;
       if constexpr (PROLOGUE_NORM) {
         device const bfloat4 *wb = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
         const float4 w0 = float4(wb[0]) + off4;
         const float4 w1 = float4(wb[1]) + off4;
-        h0_0 = half4(float4(bfloat4(float4(xb0[0]) * inv_rms0 * w0)));
-        h0_1 = half4(float4(bfloat4(float4(xb0[1]) * inv_rms0 * w1)));
-        h1_0 = half4(float4(bfloat4(float4(xb1[0]) * inv_rms1 * w0)));
-        h1_1 = half4(float4(bfloat4(float4(xb1[1]) * inv_rms1 * w1)));
+        f0_0 = float4(bfloat4(float4(xb0[0]) * inv_rms0 * w0));
+        f0_1 = float4(bfloat4(float4(xb0[1]) * inv_rms0 * w1));
+        f1_0 = float4(bfloat4(float4(xb1[0]) * inv_rms1 * w0));
+        f1_1 = float4(bfloat4(float4(xb1[1]) * inv_rms1 * w1));
       } else {
         (void)rms_w; (void)inv_rms0; (void)inv_rms1; (void)off4;
-        h0_0 = half4(float4(xb0[0]));
-        h0_1 = half4(float4(xb0[1]));
-        h1_0 = half4(float4(xb1[0]));
-        h1_1 = half4(float4(xb1[1]));
+        f0_0 = float4(xb0[0]);
+        f0_1 = float4(xb0[1]);
+        f1_0 = float4(xb1[0]);
+        f1_1 = float4(xb1[1]);
       }
+    }
+    if (do_fwht) {
+      omlx_m5_fwht64_sub8(f0_0, f0_1, lane);
+      omlx_m5_fwht64_sub8(f1_0, f1_1, lane);
+    }
+    if (cur_blk < k_blocks) {
+      const half4 h0_0 = half4(f0_0);
+      const half4 h0_1 = half4(f0_1);
+      const half4 h1_0 = half4(f1_0);
+      const half4 h1_1 = half4(f1_1);
       const ulong idx = tile_base + cur_blk;
       device const uchar *d_tile = nax_data + idx * tile_code_bytes;
       device const uchar *s_tile = nax_scale + idx * tile_scale_bytes;
@@ -3249,7 +3294,9 @@ inline void pretiled_qmv_mxfp4_swiglu_kl32_m2_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint k_blocks = k / 128u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint k_blocks = k_eff / 128u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong tile_code_bytes = ulong(BN) * 64ul;
@@ -3266,29 +3313,40 @@ inline void pretiled_qmv_mxfp4_swiglu_kl32_m2_impl(
 
   const float4 off4 = float4(w_off);
   const ulong tile_base = ulong(tile_n) * k_blocks;
-  device const bfloat *x1 = x + ulong(k);
+  device const bfloat *x1 = x + ulong(k_eff);
   for (uint blk = 0u; blk < k_blocks; blk += 2u) {
     const uint cur_blk = blk + b_sub;
+    float4 f0_0 = float4(0.0f), f0_1 = float4(0.0f);
+    float4 f1_0 = float4(0.0f), f1_1 = float4(0.0f);
     if (cur_blk < k_blocks) {
       const ulong x_off = ulong(cur_blk) * 128ul + ulong(k_l) * 8ul;
       device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x + x_off);
       device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
-      half4 h0_0, h0_1, h1_0, h1_1;
       if constexpr (PROLOGUE_NORM) {
         device const bfloat4 *wb = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
         const float4 w0 = float4(wb[0]) + off4;
         const float4 w1 = float4(wb[1]) + off4;
-        h0_0 = half4(float4(bfloat4(float4(xb0[0]) * inv_rms0 * w0)));
-        h0_1 = half4(float4(bfloat4(float4(xb0[1]) * inv_rms0 * w1)));
-        h1_0 = half4(float4(bfloat4(float4(xb1[0]) * inv_rms1 * w0)));
-        h1_1 = half4(float4(bfloat4(float4(xb1[1]) * inv_rms1 * w1)));
+        f0_0 = float4(bfloat4(float4(xb0[0]) * inv_rms0 * w0));
+        f0_1 = float4(bfloat4(float4(xb0[1]) * inv_rms0 * w1));
+        f1_0 = float4(bfloat4(float4(xb1[0]) * inv_rms1 * w0));
+        f1_1 = float4(bfloat4(float4(xb1[1]) * inv_rms1 * w1));
       } else {
         (void)rms_w; (void)inv_rms0; (void)inv_rms1; (void)off4;
-        h0_0 = half4(float4(xb0[0]));
-        h0_1 = half4(float4(xb0[1]));
-        h1_0 = half4(float4(xb1[0]));
-        h1_1 = half4(float4(xb1[1]));
+        f0_0 = float4(xb0[0]);
+        f0_1 = float4(xb0[1]);
+        f1_0 = float4(xb1[0]);
+        f1_1 = float4(xb1[1]);
       }
+    }
+    if (do_fwht) {
+      omlx_m5_fwht64_sub8(f0_0, f0_1, lane);
+      omlx_m5_fwht64_sub8(f1_0, f1_1, lane);
+    }
+    if (cur_blk < k_blocks) {
+      const half4 h0_0 = half4(f0_0);
+      const half4 h0_1 = half4(f0_1);
+      const half4 h1_0 = half4(f1_0);
+      const half4 h1_1 = half4(f1_1);
       const ulong idx = tile_base + cur_blk;
       device const uchar *gd_tile = g_data + idx * tile_code_bytes;
       device const uchar *gs_tile = g_scale + idx * tile_scale_bytes;
@@ -3721,33 +3779,78 @@ __attribute__((always_inline)) inline float2 pretiled_affine_dot16_f32_m2_dyn(
 
 template <bool PROLOGUE_NORM>
 __attribute__((always_inline)) inline void pretiled_affine_load16_m2(
-    device const bfloat4 *xb0,
-    device const bfloat4 *xb1,
-    device const bfloat4 *wb4,
+    device const bfloat *x0,
+    device const bfloat *x1,
+    device const bfloat *rms_w,
+    ulong group_base,
+    uint k_l,
+    uint lane,
+    bool valid_g,
+    bool is_lane_v2,
+    bool do_fwht,
     float inv_rms0,
     float inv_rms1,
     float4 off4,
     thread float4 &x0_0, thread float4 &x0_1, thread float4 &x0_2, thread float4 &x0_3,
     thread float4 &x1_0, thread float4 &x1_1, thread float4 &x1_2, thread float4 &x1_3,
     thread float &lsum0, thread float &lsum1) {
-  if constexpr (PROLOGUE_NORM) {
-    const float4 w0 = float4(wb4[0]) + off4;
-    const float4 w1 = float4(wb4[1]) + off4;
-    const float4 w2 = float4(wb4[2]) + off4;
-    const float4 w3 = float4(wb4[3]) + off4;
-    x0_0 = float4(bfloat4(float4(xb0[0]) * inv_rms0 * w0));
-    x0_1 = float4(bfloat4(float4(xb0[1]) * inv_rms0 * w1));
-    x0_2 = float4(bfloat4(float4(xb0[2]) * inv_rms0 * w2));
-    x0_3 = float4(bfloat4(float4(xb0[3]) * inv_rms0 * w3));
-    x1_0 = float4(bfloat4(float4(xb1[0]) * inv_rms1 * w0));
-    x1_1 = float4(bfloat4(float4(xb1[1]) * inv_rms1 * w1));
-    x1_2 = float4(bfloat4(float4(xb1[2]) * inv_rms1 * w2));
-    x1_3 = float4(bfloat4(float4(xb1[3]) * inv_rms1 * w3));
-  } else {
-    (void)wb4; (void)inv_rms0; (void)inv_rms1; (void)off4;
-    x0_0 = float4(xb0[0]); x0_1 = float4(xb0[1]); x0_2 = float4(xb0[2]); x0_3 = float4(xb0[3]);
-    x1_0 = float4(xb1[0]); x1_1 = float4(xb1[1]); x1_2 = float4(xb1[2]); x1_3 = float4(xb1[3]);
+  float4 v0[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+  float4 v1[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+  if (valid_g) {
+    if (is_lane_v2) {
+      device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x0 + group_base);
+      device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + group_base);
+      if constexpr (PROLOGUE_NORM) {
+        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + group_base);
+#pragma clang loop unroll(full)
+        for (uint s = 0u; s < 4u; ++s) {
+          const uint idx4 = s * 4u + k_l;
+          const float4 w = float4(wb4[idx4]) + off4;
+          v0[s] = float4(bfloat4(float4(xb0[idx4]) * inv_rms0 * w));
+          v1[s] = float4(bfloat4(float4(xb1[idx4]) * inv_rms1 * w));
+        }
+      } else {
+        (void)rms_w; (void)inv_rms0; (void)inv_rms1; (void)off4;
+#pragma clang loop unroll(full)
+        for (uint s = 0u; s < 4u; ++s) {
+          const uint idx4 = s * 4u + k_l;
+          v0[s] = float4(xb0[idx4]);
+          v1[s] = float4(xb1[idx4]);
+        }
+      }
+    } else {
+      const ulong x_off = group_base + ulong(k_l) * 16ul;
+      device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x0 + x_off);
+      device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
+      if constexpr (PROLOGUE_NORM) {
+        device const bfloat4 *wb4 = reinterpret_cast<device const bfloat4 *>(rms_w + x_off);
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i) {
+          const float4 w = float4(wb4[i]) + off4;
+          v0[i] = float4(bfloat4(float4(xb0[i]) * inv_rms0 * w));
+          v1[i] = float4(bfloat4(float4(xb1[i]) * inv_rms1 * w));
+        }
+      } else {
+        (void)rms_w; (void)inv_rms0; (void)inv_rms1; (void)off4;
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i) {
+          v0[i] = float4(xb0[i]);
+          v1[i] = float4(xb1[i]);
+        }
+      }
+    }
   }
+  if (do_fwht) {
+    if (is_lane_v2) {
+      omlx_m5_fwht64_sub4_pi64(v0, lane);
+      omlx_m5_fwht64_sub4_pi64(v1, lane);
+    } else {
+      omlx_m5_fwht64_sub4_linear(v0, lane);
+      omlx_m5_fwht64_sub4_linear(v1, lane);
+    }
+  }
+  x0_0 = v0[0]; x0_1 = v0[1]; x0_2 = v0[2]; x0_3 = v0[3];
+  x1_0 = v1[0]; x1_1 = v1[1]; x1_2 = v1[2]; x1_3 = v1[3];
   lsum0 = ((x0_0.x + x0_0.y) + (x0_0.z + x0_0.w)) +
           ((x0_1.x + x0_1.y) + (x0_1.z + x0_1.w)) +
           ((x0_2.x + x0_2.y) + (x0_2.z + x0_2.w)) +
@@ -3781,7 +3884,10 @@ inline void pretiled_qmv_affine_kl32_m2_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong code_tile_bytes =
@@ -3796,20 +3902,16 @@ inline void pretiled_qmv_affine_kl32_m2_impl(
 
   const float4 off4 = float4(w_off);
   const ulong tile_base = ulong(tile_n) * groups;
-  device const bfloat *x1 = x + ulong(k);
+  device const bfloat *x1 = x + ulong(k_eff);
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
+    float lsum0, lsum1;
+    pretiled_affine_load16_m2<PROLOGUE_NORM>(
+        x, x1, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms0, inv_rms1, off4,
+        x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
-      device const bfloat4 *wb4 = PROLOGUE_NORM
-          ? reinterpret_cast<device const bfloat4 *>(rms_w + x_off) : nullptr;
-      float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
-      float lsum0, lsum1;
-      pretiled_affine_load16_m2<PROLOGUE_NORM>(
-          xb0, xb1, wb4, inv_rms0, inv_rms1, off4,
-          x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
       const ulong idx = tile_base + cur_g;
       device const uchar *c_tile = nax_codes + idx * code_tile_bytes;
       device const uchar *h_tile = nax_high + idx * high_tile_bytes;
@@ -3871,7 +3973,10 @@ inline void pretiled_qmv_affine_swiglu_kl32_m2_impl(
   if (row_sg >= n) {
     return;
   }
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / BN;
   const uint rn0 = row_sg % BN;
   constexpr ulong c_tile_bytes =
@@ -3886,20 +3991,16 @@ inline void pretiled_qmv_affine_swiglu_kl32_m2_impl(
 
   const float4 off4 = float4(w_off);
   const ulong tile_base = ulong(tile_n) * groups;
-  device const bfloat *x1 = x + ulong(k);
+  device const bfloat *x1 = x + ulong(k_eff);
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
+    float lsum0, lsum1;
+    pretiled_affine_load16_m2<PROLOGUE_NORM>(
+        x, x1, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms0, inv_rms1, off4,
+        x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
-      device const bfloat4 *wb4 = PROLOGUE_NORM
-          ? reinterpret_cast<device const bfloat4 *>(rms_w + x_off) : nullptr;
-      float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
-      float lsum0, lsum1;
-      pretiled_affine_load16_m2<PROLOGUE_NORM>(
-          xb0, xb1, wb4, inv_rms0, inv_rms1, off4,
-          x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
       const ulong idx = tile_base + cur_g;
       device const uchar *gc_t = g_codes + idx * c_tile_bytes;
       device const uchar *gh_t = g_high + idx * h_tile_bytes;
@@ -3961,7 +4062,10 @@ inline void pretiled_qmv_affine_swiglu_kl32_m2_mixed_fallback(
   const uint bn = (n >= 65536u) ? 32u : 16u;
   const uint row_sg = (tg_local * 2u + sg) * 2u;
   if (row_sg >= n) return;
-  const uint groups = k / 64u;
+  const bool is_lane_v2 = (k & 0x40000000u) != 0u;
+  const bool do_fwht = (k & 0x80000000u) != 0u;
+  const uint k_eff = k & 0x3FFFFFFFu;
+  const uint groups = k_eff / 64u;
   const uint tile_n = row_sg / bn;
   const uint rn0 = row_sg % bn;
   const ulong gc_tile_bytes = ulong(bn) * ((g_bits == 3u) ? 16ul : ((g_bits == 8u) ? 64ul : 32ul));
@@ -3976,20 +4080,16 @@ inline void pretiled_qmv_affine_swiglu_kl32_m2_mixed_fallback(
 
   const float4 off4 = float4(w_off);
   const ulong tile_base = ulong(tile_n) * groups;
-  device const bfloat *x1 = x + ulong(k);
+  device const bfloat *x1 = x + ulong(k_eff);
   for (uint g = 0u; g < groups; g += 8u) {
     const uint cur_g = g + g_sub;
+    float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
+    float lsum0, lsum1;
+    pretiled_affine_load16_m2<PROLOGUE_NORM>(
+        x, x1, rms_w, ulong(cur_g) * 64ul, k_l, lane, cur_g < groups,
+        is_lane_v2, do_fwht, inv_rms0, inv_rms1, off4,
+        x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
     if (cur_g < groups) {
-      const ulong x_off = ulong(cur_g) * 64ul + ulong(k_l) * 16ul;
-      device const bfloat4 *xb0 = reinterpret_cast<device const bfloat4 *>(x + x_off);
-      device const bfloat4 *xb1 = reinterpret_cast<device const bfloat4 *>(x1 + x_off);
-      device const bfloat4 *wb4 = PROLOGUE_NORM
-          ? reinterpret_cast<device const bfloat4 *>(rms_w + x_off) : nullptr;
-      float4 x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3;
-      float lsum0, lsum1;
-      pretiled_affine_load16_m2<PROLOGUE_NORM>(
-          xb0, xb1, wb4, inv_rms0, inv_rms1, off4,
-          x0_0, x0_1, x0_2, x0_3, x1_0, x1_1, x1_2, x1_3, lsum0, lsum1);
       const ulong idx = tile_base + cur_g;
       device const uchar *gc_t = g_codes + idx * gc_tile_bytes;
       device const uchar *gh_t = g_high + idx * gh_tile_bytes;

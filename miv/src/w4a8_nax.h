@@ -121,7 +121,8 @@ inline void emit_add_rmsnorm_a8_g64(Encoder &e, Ref hidden, Ref delta,
 inline void emit_quantize_a8_g64(Encoder &e, Ref input, Ref qa_out, Ref sa_out,
                                  Ref ra_out, U32 k,
                                  std::optional<U32> explicit_t = {},
-                                 std::optional<U32> mp_override = {}) {
+                                 std::optional<U32> mp_override = {},
+                                 bool fwht64 = false) {
   if ((k % 64u) != 0u || k == 0u) {
     throw std::invalid_argument("emit_quantize_a8_g64 requires k % 64 == 0");
   }
@@ -129,7 +130,9 @@ inline void emit_quantize_a8_g64(Encoder &e, Ref input, Ref qa_out, Ref sa_out,
   const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
-  auto &d = e.emit("w4a8_nax", "omlx_m5_quantize_a8_g64",
+  const char *fn = fwht64 ? "omlx_m5_quantize_a8_g64_fwht64"
+                          : "omlx_m5_quantize_a8_g64";
+  auto &d = e.emit("w4a8_nax", fn,
                    {.width = U64(k / 64u) * 32u, .height = mp}, {.width = 32u},
                    {input, qa_out, sa_out, ra_out});
   e.dynamic(d, 4, words({k, mp, 0u, t}), tokens_patch);
@@ -233,10 +236,10 @@ inline void linear_affine_w4a8_nax_swiglu(Encoder &e,
   const std::string fn = "omlx_m5_affine_w4a8_nax_" + mode_tag + "_g" +
                          std::to_string(eff_gs) +
                          "_swiglu_bm64_bn64_out64_sk1";
-  const U32 x_tiles = (eff_n + 63u) / 64u;
+  const U32 x_tiles = (eff_n + 31u) / 32u;
   const U32 y_tiles = (t + 63u) / 64u;
-  const MetalDispatchSize grid{.width = U64(x_tiles) * 256u, .height = y_tiles};
-  const MetalDispatchSize threads{.width = 256u};
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 128u};
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
   if (!affine_nax_has_high_plane(gw.bits) &&
@@ -254,6 +257,67 @@ inline void linear_affine_w4a8_nax_swiglu(Encoder &e,
                       uw.sb, y});
     e.dynamic(d, 10,
               words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride, 0u}),
+              tokens_patch);
+  }
+}
+
+// Mode B Dense Affine W4A8 Fused Gate + Up + SwiGLU + FWHT-64 + GS64 INT8 epilogue.
+inline void linear_affine_w4a8_nax_swiglu_fwht64_a8(
+    Encoder &e, const TiledAffineWeight &gw, const TiledAffineWeight &uw,
+    Ref qa, Ref sa, Ref ra, Ref qa_out, Ref sa_out, Ref ra_out, Ref opt_y_bf16,
+    bool also_write_bf16, std::optional<U32> explicit_t = {},
+    U32 row_offset = 0u, U32 out_stride = 0u, U32 slice_n = 0u,
+    std::optional<U32> mp_override = {}) {
+  if (gw.n != uw.n || gw.k != uw.k || gw.bn != 16u || uw.bn != 16u ||
+      (gw.k % 64u) != 0u || (gw.n % 64u) != 0u || (row_offset % 64u) != 0u ||
+      row_offset >= gw.n) {
+    throw std::invalid_argument(
+        "linear_affine_w4a8_nax_swiglu_fwht64_a8 requires bn=16, k%64==0, n%64==0, row_offset%64==0");
+  }
+  const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+  if (row_offset + eff_n > gw.n || (eff_n % 64u) != 0u) {
+    throw std::invalid_argument(
+        "linear_affine_w4a8_nax_swiglu_fwht64_a8 slice must be 64-aligned within n");
+  }
+  const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
+  const U32 eff_gs = (gw.group_size == 128u && uw.group_size == 128u &&
+                      (gw.k % 128u) == 0u)
+                         ? 128u
+                         : 64u;
+  const std::string tag_g = affine_nax_mode_tag(gw.bits);
+  const std::string tag_u = affine_nax_mode_tag(uw.bits);
+  const std::string mode_tag =
+      (tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u);
+  const std::string fn = "omlx_m5_affine_w4a8_nax_" + mode_tag + "_g" +
+                         std::to_string(eff_gs) +
+                         "_swiglu_bm64_bn64_out64_sk1_fwht64_a8";
+  const U32 x_tiles = eff_n / 64u;
+  const U32 y_tiles = (t + 63u) / 64u;
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 128u};
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  const U32 flags = also_write_bf16 ? 1u : 0u;
+  if (!affine_nax_has_high_plane(gw.bits) &&
+      !affine_nax_has_high_plane(uw.bits)) {
+    auto &d = e.emit("w4a8_nax", fn, grid, threads,
+                     {qa, sa, ra, gw.codes, gw.sb, uw.codes, uw.sb, qa_out,
+                      sa_out, ra_out, opt_y_bf16});
+    e.dynamic(d, 11,
+              words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
+                     flags}),
+              tokens_patch);
+  } else {
+    const Ref g_hi = gw.high2.buffer != nullptr ? gw.high2 : gw.codes;
+    const Ref u_hi = uw.high2.buffer != nullptr ? uw.high2 : uw.codes;
+    auto &d = e.emit("w4a8_nax", fn, grid, threads,
+                     {qa, sa, ra, gw.codes, g_hi, gw.sb, uw.codes, u_hi, uw.sb,
+                      qa_out, sa_out, ra_out, opt_y_bf16});
+    e.dynamic(d, 13,
+              words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
+                     flags}),
               tokens_patch);
   }
 }
@@ -313,10 +377,10 @@ inline void linear_mxfp4_w4a8_nax_swiglu(Encoder &e,
   const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
-  const U32 x_tiles = (eff_n + 63u) / 64u;
+  const U32 x_tiles = (eff_n + 31u) / 32u;
   const U32 y_tiles = (t + 63u) / 64u;
-  const MetalDispatchSize grid{.width = U64(x_tiles) * 256u, .height = y_tiles};
-  const MetalDispatchSize threads{.width = 256u};
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 128u};
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
   auto &d = e.emit("w4a8_nax",
@@ -325,6 +389,46 @@ inline void linear_mxfp4_w4a8_nax_swiglu(Encoder &e,
                    {qa, sa, gw.codes, gw.scales, uw.codes, uw.scales, y});
   e.dynamic(d, 7,
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride, 0u}),
+            tokens_patch);
+}
+
+// Mode B Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU + FWHT-64 + GS64 INT8 epilogue.
+inline void linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
+    Encoder &e, const TiledMxfp4Weight &gw, const TiledMxfp4Weight &uw,
+    Ref qa, Ref sa, Ref qa_out, Ref sa_out, Ref ra_out, Ref opt_y_bf16,
+    bool also_write_bf16, std::optional<U32> explicit_t = {},
+    U32 row_offset = 0u, U32 out_stride = 0u, U32 slice_n = 0u,
+    std::optional<U32> mp_override = {}) {
+  if (gw.n != uw.n || gw.k != uw.k || gw.bn != 16u || uw.bn != 16u ||
+      (gw.k % 128u) != 0u || (gw.n % 64u) != 0u || (row_offset % 64u) != 0u ||
+      row_offset >= gw.n) {
+    throw std::invalid_argument(
+        "linear_mxfp4_w4a8_nax_swiglu_fwht64_a8 requires bn=16, k%128==0, n%64==0, row_offset%64==0");
+  }
+  const U32 eff_n = (slice_n > 0u) ? slice_n : (gw.n - row_offset);
+  if (row_offset + eff_n > gw.n || (eff_n % 64u) != 0u) {
+    throw std::invalid_argument(
+        "linear_mxfp4_w4a8_nax_swiglu_fwht64_a8 slice must be 64-aligned within n");
+  }
+  const U32 eff_stride = (out_stride > 0u) ? out_stride : gw.n;
+  const U32 t = explicit_t.value_or(e.profile.capacity);
+  const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
+  const U32 x_tiles = eff_n / 64u;
+  const U32 y_tiles = (t + 63u) / 64u;
+  const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
+  const MetalDispatchSize threads{.width = 128u};
+  const std::optional<U32> tokens_patch =
+      explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
+  const U32 flags = also_write_bf16 ? 1u : 0u;
+  auto &d = e.emit(
+      "w4a8_nax",
+      "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
+      grid, threads,
+      {qa, sa, gw.codes, gw.scales, uw.codes, uw.scales, qa_out, sa_out, ra_out,
+       opt_y_bf16});
+  e.dynamic(d, 10,
+            words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
+                   flags}),
             tokens_patch);
 }
 

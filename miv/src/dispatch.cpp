@@ -100,7 +100,9 @@ void validate_layout(std::string_view format, std::string_view layout,
     }
   } else if (layout != "oq_rowsplit_k128_v1" &&
              layout != "oq_nax_tiled_g64_v1" &&
-             layout != "oq_nax_tiled_g128_v1") {
+             layout != "oq_nax_tiled_g128_v1" &&
+             layout != "oq_nax_lane_g64_v2" &&
+             layout != "oq_nax_lane_g128_v2") {
     throw std::invalid_argument("kernel layout is unsupported");
   }
 }

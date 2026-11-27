@@ -4,6 +4,7 @@
 #include "mxfp4_nax_cache.h"
 #include "omlx_m5/metal.h"
 #include "omlx_m5/quantization.h"
+#include "omlx_m5/row_exact.h"
 #include "w4a8_nax.h"
 
 #include <algorithm>
@@ -143,9 +144,38 @@ std::uint8_t expand_1_to_2bit_cpu(std::uint32_t nibble) {
   return std::uint8_t(out);
 }
 
+std::uint32_t pi16_cpu(std::uint32_t c4) {
+  return ((c4 & 3u) << 2u) | ((c4 >> 2u) & 3u);
+}
+
+void fwht64_cpu_inplace(float *v) {
+  for (U32 len = 1u; len < 64u; len <<= 1u) {
+    for (U32 i = 0u; i < 64u; i += len * 2u) {
+      for (U32 j = 0u; j < len; ++j) {
+        const float a = v[i + j];
+        const float b = v[i + j + len];
+        v[i + j] = a + b;
+        v[i + j + len] = a - b;
+      }
+    }
+  }
+  for (U32 i = 0u; i < 64u; ++i) {
+    v[i] *= 0.125f;
+  }
+}
+
+void fwht64_rows_cpu(std::vector<float> &mat, U32 rows, U32 cols) {
+  for (U32 r = 0u; r < rows; ++r) {
+    for (U32 c = 0u; c < cols; c += 64u) {
+      fwht64_cpu_inplace(mat.data() + U64(r) * cols + c);
+    }
+  }
+}
+
 OwnedWeight make_mxfp4_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
                               U32 seed, bool pretiled, U32 bn_override = 0u,
-                              bool moe_expert = false) {
+                              bool moe_expert = false,
+                              bool fwht64_weight = false) {
   OwnedWeight w;
   const U32 bn = bn_override ? bn_override : mxfp4_nax_bn(n);
   const U32 padded_n = ((n + bn - 1u) / bn) * bn;
@@ -158,7 +188,8 @@ OwnedWeight make_mxfp4_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
             .parent_shape = {n, k},
             .padded_k = k,
             .row_count = n,
-            .in_features = k};
+            .in_features = k,
+            .input_transform = fwht64_weight ? "fwht64" : "none"};
   std::vector<std::uint8_t> raw_codes(U64(n) * (k / 2u), 0);
   std::vector<std::uint8_t> raw_scales(U64(n) * (k / 32u), 127);
   w.ref_w.resize(U64(n) * k, 0.0f);
@@ -174,6 +205,9 @@ OwnedWeight make_mxfp4_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
       const float sc = decode_e8m0(raw_scales[U64(r) * (k / 32u) + c / 32u]);
       w.ref_w[U64(r) * k + c] = decode_e2m1(code) * sc;
     }
+  }
+  if (fwht64_weight) {
+    fwht64_rows_cpu(w.ref_w, n, k);
   }
   if (!pretiled) {
     w.add_plane(ctx, "data", raw_codes.data(), raw_codes.size(), k / 2u);
@@ -203,7 +237,9 @@ OwnedWeight make_mxfp4_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
 
 OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k,
                                U32 bits, U32 gs, U32 seed, bool pretiled,
-                               U32 bn_override = 0u, bool moe_expert = false) {
+                               U32 bn_override = 0u, bool moe_expert = false,
+                               bool lane_v2 = false,
+                               bool fwht64_weight = false) {
   OwnedWeight w;
   const U32 bn = bn_override ? bn_override : affine_nax_bn(n);
   const U32 padded_n = ((n + bn - 1u) / bn) * bn;
@@ -212,14 +248,17 @@ OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k
                     std::to_string(gs) + "." + std::to_string(obj_id),
             .format = "oq_affine_q" + std::to_string(bits) + "_g" +
                       std::to_string(gs) + "_bf16_v1",
-            .layout = pretiled ? (gs == 128u ? "oq_nax_tiled_g128_v1"
-                                             : "oq_nax_tiled_g64_v1")
+            .layout = pretiled ? (lane_v2 ? (gs == 128u ? "oq_nax_lane_g128_v2"
+                                                        : "oq_nax_lane_g64_v2")
+                                          : (gs == 128u ? "oq_nax_tiled_g128_v1"
+                                                        : "oq_nax_tiled_g64_v1"))
                                : (moe_expert ? "oq_expert_rowsplit_k128_v1"
                                              : "oq_rowsplit_k128_v1"),
             .parent_shape = {n, k},
             .padded_k = k,
             .row_count = n,
-            .in_features = k};
+            .in_features = k,
+            .input_transform = fwht64_weight ? "fwht64" : "none"};
 
   const U32 code_stride = (bits == 3u) ? (k / 4u) : (bits == 8u) ? k : (k / 2u);
   const U32 high_stride =
@@ -266,6 +305,9 @@ OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k
           std::fma(bf16_val(raw_scale[gi]), float(q), bf16_val(raw_bias[gi]));
     }
   }
+  if (fwht64_weight) {
+    fwht64_rows_cpu(w.ref_w, n, k);
+  }
 
   if (!pretiled) {
     const char *ckind =
@@ -293,17 +335,51 @@ OwnedWeight make_affine_weight(const MetalContext &ctx, U32 obj_id, U32 n, U32 k
     const U32 rn = r % bn;
     for (U32 g = 0; g < groups; ++g) {
       const U64 idx = U64(tn) * groups + g;
-      std::memcpy(nax_codes.data() + idx * bn * c64 + rn * c64,
-                  raw_code.data() + U64(r) * code_stride + g * c64, c64);
-      if (bits == 3u || bits == 6u) {
-        std::memcpy(nax_high.data() + idx * bn * h64 + rn * h64,
-                    raw_high.data() + U64(r) * high_stride + g * h64, h64);
-      } else if (bits == 5u) {
-        const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
-        auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
-        for (U32 bi = 0; bi < 8u; ++bi) {
-          dh[bi * 2u] = expand_1_to_2bit_cpu(sh[bi] & 0x0Fu);
-          dh[bi * 2u + 1u] = expand_1_to_2bit_cpu(sh[bi] >> 4u);
+      auto *dc = nax_codes.data() + idx * bn * c64 + rn * c64;
+      const auto *sc = raw_code.data() + U64(r) * code_stride + g * c64;
+      if (!lane_v2) {
+        std::memcpy(dc, sc, c64);
+        if (bits == 3u || bits == 6u) {
+          std::memcpy(nax_high.data() + idx * bn * h64 + rn * h64,
+                      raw_high.data() + U64(r) * high_stride + g * h64, h64);
+        } else if (bits == 5u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 bi = 0; bi < 8u; ++bi) {
+            dh[bi * 2u] = expand_1_to_2bit_cpu(sh[bi] & 0x0Fu);
+            dh[bi * 2u + 1u] = expand_1_to_2bit_cpu(sh[bi] >> 4u);
+          }
+        }
+      } else {
+        const U32 chunk_bytes = c64 / 16u;
+        for (U32 cs = 0; cs < 16u; ++cs) {
+          std::memcpy(dc + cs * chunk_bytes, sc + pi16_cpu(cs) * chunk_bytes,
+                      chunk_bytes);
+        }
+        if (bits == 3u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 8u + rn * 8u;
+          for (U32 b = 0; b < 8u; ++b) {
+            const U32 s0 = pi16_cpu(b * 2u + 0u);
+            const U32 s1 = pi16_cpu(b * 2u + 1u);
+            const U32 n0 = (U32(sh[s0 >> 1u]) >> ((s0 & 1u) * 4u)) & 0x0Fu;
+            const U32 n1 = (U32(sh[s1 >> 1u]) >> ((s1 & 1u) * 4u)) & 0x0Fu;
+            dh[b] = std::uint8_t(n0 | (n1 << 4u));
+          }
+        } else if (bits == 5u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 8u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 cs = 0; cs < 16u; ++cs) {
+            const U32 s = pi16_cpu(cs);
+            const U32 nib = (U32(sh[s >> 1u]) >> ((s & 1u) * 4u)) & 0x0Fu;
+            dh[cs] = expand_1_to_2bit_cpu(nib);
+          }
+        } else if (bits == 6u) {
+          const auto *sh = raw_high.data() + U64(r) * high_stride + g * 16u;
+          auto *dh = nax_high.data() + idx * bn * 16u + rn * 16u;
+          for (U32 cs = 0; cs < 16u; ++cs) {
+            dh[cs] = sh[pi16_cpu(cs)];
+          }
         }
       }
       const U32 sg_idx = (gs == 128u) ? (g >> 1u) : g;
@@ -412,43 +488,51 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
   const auto affine_path = libs / "omlx_m5_affine_nax.metallib";
   const auto mxfp4_path = libs / "omlx_m5_mxfp4_nax.metallib";
   const auto moe_path = libs / "omlx_m5_moe_nax.metallib";
+  const auto bf16_path = libs / "omlx_m5_bf16_nax.metallib";
   const auto w4a8_path = libs / "omlx_m5_w4a8_nax.metallib";
   const auto w4a8_moe_path = libs / "omlx_m5_w4a8_moe_nax.metallib";
   require(std::filesystem::is_regular_file(affine_path), "missing affine_nax metallib");
   require(std::filesystem::is_regular_file(mxfp4_path), "missing mxfp4_nax metallib");
   require(std::filesystem::is_regular_file(moe_path), "missing moe_nax metallib");
+  require(std::filesystem::is_regular_file(bf16_path), "missing bf16_nax metallib");
   require(std::filesystem::is_regular_file(w4a8_path), "missing w4a8_nax metallib");
   require(std::filesystem::is_regular_file(w4a8_moe_path), "missing w4a8_moe_nax metallib");
 
   ctx.register_library({.key = "w4a8.audit.affine", .path = affine_path});
   ctx.register_library({.key = "w4a8.audit.mxfp4", .path = mxfp4_path});
   ctx.register_library({.key = "w4a8.audit.moe", .path = moe_path});
+  ctx.register_library({.key = "w4a8.audit.bf16", .path = bf16_path});
   ctx.register_library({.key = "w4a8.audit.w4a8", .path = w4a8_path});
   ctx.register_library({.key = "w4a8.audit.w4a8_moe", .path = w4a8_moe_path});
 
   const bool shader_val =
       std::getenv("MTL_SHADER_VALIDATION") != nullptr &&
       std::string_view(std::getenv("MTL_SHADER_VALIDATION")) == "1";
-  const U64 max_tg_ceil = shader_val ? 65536ULL : 32768ULL;
+  const U64 high_occ_cap = shader_val ? 65536ULL : 10240ULL; // <= 10.0 KiB (3-4 TGs/core)
+  const U64 max_16k_cap = shader_val ? 65536ULL : 16384ULL;  // <= 16.0 KiB global ceiling
 
   U32 compiled = 0;
   U64 max_out64_bf16_tg = 0, max_w4a8_lin_tg = 0, max_w4a8_swi_tg = 0,
-      max_w4a8_moe_tg = 0;
+      max_w4a8_moe_tg = 0, max_16k_cleanup_tg = 0;
 
-  // Base 1.2 Dense Affine out64 SwiGLU & slice linear
+  // WP3.1 Zero-Ws Dense Affine out64 SwiGLU (Mode A + Mode B) & slice linear
   for (const char *gs : {"g64", "g128"}) {
     for (const char *tag : {"q4", "q56", "q3", "q8", "q4_q56", "q56_q4"}) {
-      const std::string fn = std::string("omlx_m5_affine_nax_") + tag + "_" +
-                             gs + "_swiglu_bm64_bn64_out64_sk1";
-      const auto info = ctx.warmup_pipeline(
-          {.key = "w4a8.pso." + fn,
-           .library_key = "w4a8.audit.affine",
-           .function_name = fn,
-           .support_indirect_command_buffers = true});
-      require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 28672ULL),
-              fn + " exceeded 28 KiB SRAM budget");
-      max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
-      ++compiled;
+      for (const char *sfx : {"_swiglu_bm64_bn64_out64_sk1",
+                              "_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
+        const std::string fn =
+            std::string("omlx_m5_affine_nax_") + tag + "_" + gs + sfx;
+        const auto info = ctx.warmup_pipeline(
+            {.key = "w4a8.pso." + fn,
+             .library_key = "w4a8.audit.affine",
+             .function_name = fn,
+             .support_indirect_command_buffers = true});
+        require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+                fn + " exceeded 10.0 KiB WP3.1 out64 SRAM budget (got " +
+                    std::to_string(info.static_threadgroup_memory_bytes) + ")");
+        max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
+        ++compiled;
+      }
     }
     for (const char *tag : {"q4", "q56", "q3", "q8"}) {
       for (const char *bns : {"bns16", "bns32"}) {
@@ -459,15 +543,17 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
              .library_key = "w4a8.audit.affine",
              .function_name = fn,
              .support_indirect_command_buffers = true});
-        require(info.static_threadgroup_memory_bytes <= max_tg_ceil,
-                fn + " exceeded 32 KiB SRAM");
+        require(info.static_threadgroup_memory_bytes <= max_16k_cap,
+                fn + " exceeded 16.0 KiB SRAM");
+        max_16k_cleanup_tg = std::max(max_16k_cleanup_tg, info.static_threadgroup_memory_bytes);
         ++compiled;
       }
     }
   }
 
-  // Base 1.2 Dense MXFP4 out64 SwiGLU & slice linear
+  // WP3.1 Zero-Ws Dense MXFP4 out64 SwiGLU (Mode A + Mode B) & slice linear
   for (const char *fn : {"omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1",
+                         "omlx_m5_mxfp4_nax_swiglu_bf16_bm64_bn64_out64_sk1_fwht64_a8",
                          "omlx_m5_mxfp4_nax_bf16_bm64_bn64_bns16_slice_sk1",
                          "omlx_m5_mxfp4_nax_bf16_bm64_bn64_bns32_slice_sk1"}) {
     const auto info = ctx.warmup_pipeline(
@@ -475,13 +561,18 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
          .library_key = "w4a8.audit.mxfp4",
          .function_name = fn,
          .support_indirect_command_buffers = true});
-    require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 28672ULL),
-            std::string(fn) + " exceeded 28 KiB SRAM budget");
-    max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
+    const bool is_out64 = std::string_view(fn).find("_out64_") != std::string_view::npos;
+    require(info.static_threadgroup_memory_bytes <= (is_out64 ? high_occ_cap : max_16k_cap),
+            std::string(fn) + " exceeded WP3.1 SRAM budget");
+    if (is_out64) {
+      max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
+    } else {
+      max_16k_cleanup_tg = std::max(max_16k_cleanup_tg, info.static_threadgroup_memory_bytes);
+    }
     ++compiled;
   }
 
-  // Base 1.2 MoE out64 SwiGLU
+  // WP3.1 Zero-Ws MoE out64 SwiGLU (<= 10.0 KiB)
   {
     const std::string fn = "omlx_m5_moe_mxfp4_nax_swiglu_bm64_out64_sk1";
     const auto info = ctx.warmup_pipeline(
@@ -489,8 +580,9 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
          .library_key = "w4a8.audit.moe",
          .function_name = fn,
          .support_indirect_command_buffers = true});
-    require(info.static_threadgroup_memory_bytes <= max_tg_ceil,
-            fn + " exceeded 32 KiB SRAM");
+    require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+            fn + " exceeded 10.0 KiB MoE out64 SRAM");
+    max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
     ++compiled;
   }
   for (const char *bits : {"3", "4", "5", "6", "8"}) {
@@ -502,15 +594,43 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
            .library_key = "w4a8.audit.moe",
            .function_name = fn,
            .support_indirect_command_buffers = true});
-      require(info.static_threadgroup_memory_bytes <= max_tg_ceil,
-              fn + " exceeded 32 KiB SRAM");
+      require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+              fn + " exceeded 10.0 KiB MoE out64 SRAM");
+      max_out64_bf16_tg = std::max(max_out64_bf16_tg, info.static_threadgroup_memory_bytes);
       ++compiled;
     }
   }
 
-  // Route A Dense W4A8 norm/quant/GDN Stage 3 + Linear + SwiGLU
+  // WP3.1 Global <= 16.0 KiB Cleanup Audit (q3 sk8 union, bm32_n16 sk4 cap, q5_h1 sk4, bf16 sk4)
+  for (const auto &[lib_key, fn] : std::array<std::pair<const char *, const char *>, 11>{{
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q3_n16_sk8"},
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q3_swiglu_n16_sk8"},
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q4_swiglu_bm32_n16_sk4"},
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q3_swiglu_bm32_n16_sk4"},
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q5_h1_bm16_bns16_sk4"},
+           {"w4a8.audit.affine", "omlx_m5_affine_nax_q5_h1_swiglu_bm32_sk4"},
+           {"w4a8.audit.affine", "omlx_m5_repack_oq_v1_to_lane_v2"},
+           {"w4a8.audit.affine", "omlx_m5_affine_fwht64_xsum_g64"},
+           {"w4a8.audit.mxfp4", "omlx_m5_mxfp4_nax_swiglu_bm32_n16_sk4"},
+           {"w4a8.audit.mxfp4", "omlx_m5_bf16_fwht64_to_f16_rowscale"},
+           {"w4a8.audit.bf16", "omlx_m5_bf16_nax_swiglu_bk128_bm32_n16_sk4"},
+       }}) {
+    const auto info = ctx.warmup_pipeline(
+        {.key = std::string("w4a8.pso.") + fn,
+         .library_key = lib_key,
+         .function_name = fn,
+         .support_indirect_command_buffers = true});
+    require(info.static_threadgroup_memory_bytes <= max_16k_cap,
+            std::string(fn) + " exceeded 16.0 KiB WP3.1 ceiling (got " +
+                std::to_string(info.static_threadgroup_memory_bytes) + ")");
+    max_16k_cleanup_tg = std::max(max_16k_cleanup_tg, info.static_threadgroup_memory_bytes);
+    ++compiled;
+  }
+
+  // WP1 Part B Zero-Ws Dense W4A8 norm/quant/fwht64/GDN Stage 3 + Linear + SwiGLU Mode A & Mode B (<= 10.0 KiB)
   for (const char *fn : {"omlx_m5_rmsnorm_a8_g64", "omlx_m5_add_rmsnorm_a8_g64",
                          "omlx_m5_quantize_a8_g64",
+                         "omlx_m5_quantize_a8_g64_fwht64",
                          "omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64"}) {
     const auto info = ctx.warmup_pipeline(
         {.key = std::string("w4a8.pso.") + fn,
@@ -531,38 +651,41 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
              .library_key = "w4a8.audit.w4a8",
              .function_name = fn,
              .support_indirect_command_buffers = true});
-        require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 16384ULL),
-                fn + " exceeded 16 KiB linear W4A8 SRAM budget");
+        require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+                fn + " exceeded 10.0 KiB linear W4A8 SRAM budget");
         max_w4a8_lin_tg = std::max(max_w4a8_lin_tg, info.static_threadgroup_memory_bytes);
         ++compiled;
       }
     }
     for (const char *tag : {"q4", "q56", "q3", "q8", "q4_q56", "q56_q4"}) {
-      const std::string fn = std::string("omlx_m5_affine_w4a8_nax_") + tag +
-                             "_" + gs + "_swiglu_bm64_bn64_out64_sk1";
-      const auto info = ctx.warmup_pipeline(
-          {.key = "w4a8.pso." + fn,
-           .library_key = "w4a8.audit.w4a8",
-           .function_name = fn,
-           .support_indirect_command_buffers = true});
-      require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 20480ULL),
-              fn + " exceeded 20 KiB SwiGLU W4A8 SRAM budget");
-      max_w4a8_swi_tg = std::max(max_w4a8_swi_tg, info.static_threadgroup_memory_bytes);
-      ++compiled;
+      for (const char *sfx : {"_swiglu_bm64_bn64_out64_sk1",
+                              "_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
+        const std::string fn =
+            std::string("omlx_m5_affine_w4a8_nax_") + tag + "_" + gs + sfx;
+        const auto info = ctx.warmup_pipeline(
+            {.key = "w4a8.pso." + fn,
+             .library_key = "w4a8.audit.w4a8",
+             .function_name = fn,
+             .support_indirect_command_buffers = true});
+        require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+                fn + " exceeded 10.0 KiB SwiGLU W4A8 SRAM budget");
+        max_w4a8_swi_tg = std::max(max_w4a8_swi_tg, info.static_threadgroup_memory_bytes);
+        ++compiled;
+      }
     }
   }
   for (const char *fn : {"omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1",
                          "omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns32_sk1",
-                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1"}) {
+                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1",
+                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
     const auto info = ctx.warmup_pipeline(
         {.key = std::string("w4a8.pso.") + fn,
          .library_key = "w4a8.audit.w4a8",
          .function_name = fn,
          .support_indirect_command_buffers = true});
     const bool is_swi = std::string_view(fn).find("_swiglu_") != std::string_view::npos;
-    const U64 cap = shader_val ? 65536ULL : (is_swi ? 20480ULL : 16384ULL);
-    require(info.static_threadgroup_memory_bytes <= cap,
-            std::string(fn) + " exceeded MXFP4 W4A8 SRAM budget");
+    require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+            std::string(fn) + " exceeded 10.0 KiB MXFP4 W4A8 SRAM budget");
     if (is_swi) {
       max_w4a8_swi_tg = std::max(max_w4a8_swi_tg, info.static_threadgroup_memory_bytes);
     } else {
@@ -571,33 +694,40 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
     ++compiled;
   }
 
-  // Route A MoE W4A8
-  {
-    const std::string fn = "omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1";
+  // WP1 Part B Zero-Ws MoE W4A8 (SwiGLU Mode A + Mode B + NEW down_scatter_bm64_bn64_sk1, <= 10.0 KiB)
+  for (const char *fn : {"omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1",
+                         "omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1_fwht64_a8",
+                         "omlx_m5_moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_sk1"}) {
     const auto info = ctx.warmup_pipeline(
-        {.key = "w4a8.pso." + fn,
+        {.key = std::string("w4a8.pso.") + fn,
          .library_key = "w4a8.audit.w4a8_moe",
          .function_name = fn,
          .support_indirect_command_buffers = true});
-    require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 20480ULL),
-            fn + " exceeded 20 KiB MoE W4A8 SRAM budget");
+    require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+            std::string(fn) + " exceeded 10.0 KiB MoE W4A8 SRAM budget");
     max_w4a8_moe_tg = std::max(max_w4a8_moe_tg, info.static_threadgroup_memory_bytes);
     ++compiled;
   }
   for (const char *bits : {"3", "4", "5", "6", "8"}) {
     for (const char *gs : {"64", "128"}) {
-      const std::string fn =
-          std::string("omlx_m5_moe_affine_w4a8_nax_swiglu_q") + bits + "_g" +
-          gs + "_bm64_out64_sk1";
-      const auto info = ctx.warmup_pipeline(
-          {.key = "w4a8.pso." + fn,
-           .library_key = "w4a8.audit.w4a8_moe",
-           .function_name = fn,
-           .support_indirect_command_buffers = true});
-      require(info.static_threadgroup_memory_bytes <= (shader_val ? 65536ULL : 20480ULL),
-              fn + " exceeded 20 KiB MoE W4A8 SRAM budget");
-      max_w4a8_moe_tg = std::max(max_w4a8_moe_tg, info.static_threadgroup_memory_bytes);
-      ++compiled;
+      for (const std::string &fn : {
+               std::string("omlx_m5_moe_affine_w4a8_nax_swiglu_q") + bits +
+                   "_g" + gs + "_bm64_out64_sk1",
+               std::string("omlx_m5_moe_affine_w4a8_nax_swiglu_q") + bits +
+                   "_g" + gs + "_bm64_out64_sk1_fwht64_a8",
+               std::string("omlx_m5_moe_affine_w4a8_nax_down_scatter_q") +
+                   bits + "_g" + gs + "_bm64_bn64_sk1",
+           }) {
+        const auto info = ctx.warmup_pipeline(
+            {.key = "w4a8.pso." + fn,
+             .library_key = "w4a8.audit.w4a8_moe",
+             .function_name = fn,
+             .support_indirect_command_buffers = true});
+        require(info.static_threadgroup_memory_bytes <= high_occ_cap,
+                fn + " exceeded 10.0 KiB MoE W4A8 SRAM budget");
+        max_w4a8_moe_tg = std::max(max_w4a8_moe_tg, info.static_threadgroup_memory_bytes);
+        ++compiled;
+      }
     }
   }
 
@@ -606,6 +736,7 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
           {"max_w4a8_lin_tg_bytes", max_w4a8_lin_tg},
           {"max_w4a8_swi_tg_bytes", max_w4a8_swi_tg},
           {"max_w4a8_moe_tg_bytes", max_w4a8_moe_tg},
+          {"max_16k_cleanup_tg_bytes", max_16k_cleanup_tg},
           {"passed", true}};
 }
 
@@ -886,6 +1017,7 @@ Json test_base12_out64_and_slicing_zero_ulp(const MetalContext &ctx,
         for (U32 live : {33u, 64u, 127u}) {
           {
             ScopedEnv en("OMLX_M5_DISABLE_SWIGLU_OUT64", nullptr);
+            ScopedEnv opt("OMLX_M5_ENABLE_SWIGLU_OUT64", "1");
             Encoder e(ctx, libs, kMaxM, "base12.aff.out64");
             e.begin_stage("swi64");
             linear_affine_nax_swiglu(e, *tw_g, *tw_u, x_ref, xs_ref, y64_ref, 1u);
@@ -1060,6 +1192,7 @@ Json test_base12_out64_and_slicing_zero_ulp(const MetalContext &ctx,
     for (U32 live : {33u, 64u, 127u}) {
       {
         ScopedEnv en("OMLX_M5_DISABLE_SWIGLU_OUT64", nullptr);
+        ScopedEnv opt("OMLX_M5_ENABLE_SWIGLU_OUT64", "1");
         Encoder e(ctx, libs, kMaxM, "base12.mx.out64");
         e.begin_stage("swi64");
         linear_mxfp4_nax_swiglu(e, *tw_g, *tw_u, x_ref, f16_sc, f16_rs, y64_ref, 1u);
@@ -1200,7 +1333,7 @@ Json test_dense_w4a8_accuracy_and_slicing(const MetalContext &ctx,
       for (U32 gs : {64u, 128u}) {
         auto wg = make_affine_weight(ctx, wid++, kNCheck, kK, bits, gs, bits * 13u + gs, true, 16u);
         auto wu = make_affine_weight(ctx, wid++, kNCheck, kK, bits, gs, bits * 29u + gs, true, 16u);
-        auto w32 = make_affine_weight(ctx, wid++, kNCheck, kK, bits, gs, bits * 13u + gs, true, 32u);
+        auto w32 = make_affine_weight(ctx, wid++, kNCheck, kK, bits, gs, bits * 13u + gs, true, 32u, false, true);
         AffineNaxCache cache;
         cache.register_weight(wg.view, zero_ref);
         cache.register_weight(wu.view, zero_ref);
@@ -1238,7 +1371,8 @@ Json test_dense_w4a8_accuracy_and_slicing(const MetalContext &ctx,
             require(cs >= kMinCos,
                     "W4A8 Affine linear cos_sim=" + std::to_string(cs) +
                         " < 0.9995 (q" + std::to_string(bits) + "_g" +
-                        std::to_string(gs) + ")");
+                        std::to_string(gs) + "_bns" + std::to_string(tw->bn) +
+                        ")");
             ++checks;
           }
         }
@@ -1999,6 +2133,915 @@ Json test_moe_out64_and_w4a8(const MetalContext &ctx,
   return {{"checks", checks}, {"min_cos_sim", min_cos_seen}, {"passed", true}};
 }
 
+// ============================================================================
+// Test 6: .miv v2 lane_v2 + All FWHT-64 Runtime Consumers Parity
+//         (T=1, B=2, T=4, T=33, T=65, T=128, T=256)
+// ============================================================================
+Json test_miv2_fwht64_and_all_runtime_consumers(const MetalContext &ctx,
+                                                const std::filesystem::path &libs) {
+  constexpr U32 kK = 512u;
+  constexpr U32 kN = 128u;
+  constexpr U32 kMaxM = 128u;
+  constexpr double kMinCosW4A8 = 0.9995;
+  constexpr double kMinCosW4A4 = 0.9850;
+  U32 checks = 0;
+  double min_w4a8_cos = 1.0;
+
+  auto zero_buf = ctx.make_buffer(256);
+  zero_buf.write(std::vector<std::byte>(256));
+  Ref zero_ref{&zero_buf, 0, zero_buf.size()};
+
+  std::vector<std::uint16_t> x_u16;
+  const auto x_f32 = make_activations(kMaxM, kK, 1301u, x_u16);
+  auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+  Ref x_ref{&x_buf, 0, x_buf.size()};
+
+  auto x_rot_buf = ctx.make_buffer(U64(kMaxM) * kK * 2ULL);
+  Ref x_rot_ref{&x_rot_buf, 0, x_rot_buf.size()};
+  auto xs_buf = ctx.make_private_buffer(U64(kMaxM + 16u) * (kK / 64u) * 4ULL);
+  Ref xs_ref{&xs_buf, 0, xs_buf.size()};
+  auto f16_sc_buf = ctx.make_private_buffer(U64(kMaxM + 16u) * kK * 2ULL);
+  auto f16_rs_buf = ctx.make_private_buffer(U64(kMaxM + 16u) * 4ULL);
+  Ref f16_sc{&f16_sc_buf, 0, f16_sc_buf.size()};
+  Ref f16_rs{&f16_rs_buf, 0, f16_rs_buf.size()};
+  auto a4_c_buf = ctx.make_private_buffer(U64(kMaxM + 16u) * (kK / 2u));
+  auto a4_s_buf = ctx.make_private_buffer(U64(kMaxM + 16u) * (kK / 32u));
+  Ref a4_c{&a4_c_buf, 0, a4_c_buf.size()};
+  Ref a4_s{&a4_s_buf, 0, a4_s_buf.size()};
+
+  const auto a8_in_lay = w4a8_nax_workspace_layout(kMaxM, kK);
+  auto qa_in = ctx.make_buffer(a8_in_lay.qa_bytes);
+  auto sa_in = ctx.make_buffer(a8_in_lay.sa_bytes);
+  auto ra_in = ctx.make_buffer(a8_in_lay.ra_bytes);
+  Ref qa_in_ref{&qa_in, 0, qa_in.size()};
+  Ref sa_in_ref{&sa_in, 0, sa_in.size()};
+  Ref ra_in_ref{&ra_in, 0, ra_in.size()};
+
+  const auto a8_mid_lay = w4a8_nax_workspace_layout(kMaxM, kK);
+  auto qa_mid = ctx.make_buffer(a8_mid_lay.qa_bytes);
+  auto sa_mid = ctx.make_buffer(a8_mid_lay.sa_bytes);
+  auto ra_mid = ctx.make_buffer(a8_mid_lay.ra_bytes);
+  Ref qa_mid_ref{&qa_mid, 0, qa_mid.size()};
+  Ref sa_mid_ref{&sa_mid, 0, sa_mid.size()};
+  Ref ra_mid_ref{&ra_mid, 0, ra_mid.size()};
+
+  auto y_a_buf = ctx.make_buffer(U64(kMaxM) * kK * 2ULL);
+  auto y_b_buf = ctx.make_buffer(U64(kMaxM) * kK * 2ULL);
+  Ref y_a_ref{&y_a_buf, 0, y_a_buf.size()};
+  Ref y_b_ref{&y_b_buf, 0, y_b_buf.size()};
+
+  U32 wid = 6000u;
+
+  // 6a. Load-time repack_oq_v1_to_lane_v2 vs native oq_nax_lane_v2 0-ULP parity across all 10 formats
+  for (U32 bits : {3u, 4u, 5u, 6u, 8u}) {
+    for (U32 gs : {64u, 128u}) {
+      auto w_v1 = make_affine_weight(ctx, wid++, kN, kK, bits, gs, bits * 17u + gs, true, 16u, false, false);
+      auto w_v2 = make_affine_weight(ctx, wid++, kN, kK, bits, gs, bits * 17u + gs, true, 16u, false, true);
+      AffineNaxCache cache;
+      cache.register_weight(w_v1.view, zero_ref);
+      cache.register_weight(w_v2.view, zero_ref);
+      cache.build(ctx, libs, zero_ref);
+      const auto *tw1 = cache.find(w_v1.view.object_id);
+      const auto *tw2 = cache.find(w_v2.view.object_id);
+      require(tw1 != nullptr && tw2 != nullptr, "6a cache missing");
+      {
+        Encoder e1(ctx, libs, kMaxM, "miv2.6a.v1");
+        e1.begin_stage("lin");
+        linear_affine_nax(e1, *tw1, x_ref, xs_ref, y_a_ref, std::nullopt, 1u);
+        auto p1 = e1.finish();
+        submit_profile(ctx, p1, 65u);
+      }
+      {
+        Encoder e2(ctx, libs, kMaxM, "miv2.6a.v2");
+        e2.begin_stage("lin");
+        linear_affine_nax(e2, *tw2, x_ref, xs_ref, y_b_ref, std::nullopt, 1u);
+        auto p2 = e2.finish();
+        submit_profile(ctx, p2, 65u);
+      }
+      require(read_u16(y_a_buf, 65ULL * kN) == read_u16(y_b_buf, 65ULL * kN),
+              "6a repack_oq_v1_to_lane_v2 != native lane_v2 0-ULP for q" +
+                  std::to_string(bits) + "_g" + std::to_string(gs));
+      ++checks;
+    }
+  }
+
+  // 6b. omlx_m5_fwht64_bf16 (row_mul=1 & 2) and omlx_m5_quantize_a8_g64_fwht64 vs CPU H_64
+  {
+    std::vector<float> x_rot_cpu = x_f32;
+    fwht64_rows_cpu(x_rot_cpu, kMaxM, kK);
+    for (U32 live : {1u, 4u, 65u}) {
+      Encoder ef(ctx, libs, kMaxM, "miv2.6b.fwht");
+      ef.begin_stage("fwht");
+      emit_fwht64_bf16(ef, x_ref, x_rot_ref, kK);
+      auto pf = ef.finish();
+      submit_profile(ctx, pf, live);
+      const double cs = cosine_similarity_bf16(
+          read_u16(x_rot_buf, U64(live) * kK),
+          std::span(x_rot_cpu).first(U64(live) * kK), "6b fwht64_bf16");
+      require(cs >= 0.99995, "6b omlx_m5_fwht64_bf16 cos_sim < 0.99995");
+      ++checks;
+
+      Encoder eq(ctx, libs, kMaxM, "miv2.6b.qa8_fwht");
+      eq.begin_stage("qa8_fwht");
+      emit_quantize_a8_g64(eq, x_ref, qa_in_ref, sa_in_ref, ra_in_ref, kK,
+                           std::nullopt, std::nullopt, true);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, live);
+      const auto got_qa = read_i8(qa_in, U64(live) * kK);
+      const auto got_sa = read_f32(sa_in, U64(kK / 64u) * a8_in_lay.mp);
+      const auto got_ra = read_f32(ra_in, U64(kK / 64u) * a8_in_lay.mp);
+      std::vector<float> deq(U64(live) * kK);
+      for (U32 r = 0; r < live; ++r) {
+        for (U32 g = 0; g < kK / 64u; ++g) {
+          const float sa = got_sa[U64(g) * a8_in_lay.mp + r];
+          int sum_q = 0;
+          for (U32 j = 0; j < 64u; ++j) {
+            const int q = int(got_qa[U64(r) * kK + g * 64u + j]);
+            sum_q += q;
+            deq[U64(r) * kK + g * 64u + j] = float(q) * sa;
+          }
+          require(got_ra[U64(g) * a8_in_lay.mp + r] == float(sum_q),
+                  "6b quantize_a8_g64_fwht64 ra exact sum mismatch");
+        }
+      }
+      double dot = 0.0, na = 0.0, nb = 0.0;
+      for (std::size_t i = 0; i < deq.size(); ++i) {
+        const double a = deq[i], b = x_rot_cpu[i];
+        dot += a * b; na += a * a; nb += b * b;
+      }
+      const double qcs = dot / (std::sqrt(na) * std::sqrt(nb));
+      require(qcs >= 0.9997, "6b quantize_a8_g64_fwht64 dequant cos_sim < 0.9997");
+      ++checks;
+    }
+    // Verify row_mul = 2 mode
+    {
+      Encoder ef2(ctx, libs, kMaxM, "miv2.6b.fwht_rm2");
+      ef2.begin_stage("fwht2");
+      emit_fwht64_bf16(ef2, x_ref, x_rot_ref, kK, std::nullopt, 2u);
+      auto pf2 = ef2.finish();
+      submit_profile(ctx, pf2, 16u); // 16 * 2 = 32 rows
+      const double cs = cosine_similarity_bf16(
+          read_u16(x_rot_buf, 32ULL * kK),
+          std::span(x_rot_cpu).first(32ULL * kK), "6b fwht64_bf16 row_mul=2");
+      require(cs >= 0.99995, "6b omlx_m5_fwht64_bf16 row_mul=2 failed");
+      ++checks;
+    }
+  }
+
+  // 6c & 6d. Dense Mode B (SwiGLU + FWHT-64 + GS64 A8 -> W4A8 fwht64 down_proj)
+  //          for BOTH W4A8 Mode B AND WP3.1 W4A16 out64 Mode B (Affine + MXFP4, also_write_bf16=false/true)
+  {
+    auto quantize_in = [&](U32 live) {
+      Encoder eq(ctx, libs, kMaxM, "miv2.6cd.qin");
+      eq.begin_stage("q");
+      emit_quantize_a8_g64(eq, x_ref, qa_in_ref, sa_in_ref, ra_in_ref, kK);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, live);
+    };
+
+    // Affine: q4_g64, q5_g64, q3_g64, q8_g128, mixed q4_q56
+    for (const auto &[gb, ub, gs] : std::array<std::tuple<U32, U32, U32>, 5>{{
+             {4u, 4u, 64u}, {5u, 5u, 64u}, {3u, 3u, 64u}, {8u, 8u, 128u}, {4u, 5u, 64u}}}) {
+      auto wg = make_affine_weight(ctx, wid++, kK, kK, gb, gs, gb * 31u + gs, true, 16u, false, true, false);
+      auto wu = make_affine_weight(ctx, wid++, kK, kK, ub, gs, ub * 37u + gs, true, 16u, false, true, false);
+      auto wd = make_affine_weight(ctx, wid++, kN, kK, gb, gs, gb * 43u + gs, true, 16u, false, true, true);
+      AffineNaxCache ac;
+      ac.register_weight(wg.view, zero_ref);
+      ac.register_weight(wu.view, zero_ref);
+      ac.register_weight(wd.view, zero_ref);
+      ac.build(ctx, libs, zero_ref);
+      const auto *twg = ac.find(wg.view.object_id);
+      const auto *twu = ac.find(wu.view.object_id);
+      const auto *twd = ac.find(wd.view.object_id);
+      const auto ref_mid = cpu_swiglu_ref(x_f32, wg.ref_w, wu.ref_w, kMaxM, kK, kK);
+      const auto ref_dn = cpu_linear_ref(ref_mid, wd.ref_w, kMaxM, kN, kK);
+
+      for (U32 live : {33u, 128u}) {
+        quantize_in(live);
+        // W4A8 Mode A reference BF16 mid
+        {
+          Encoder ea(ctx, libs, kMaxM, "miv2.6c.aff.modeA");
+          ea.begin_stage("a");
+          linear_affine_w4a8_nax_swiglu(ea, *twg, *twu, qa_in_ref, sa_in_ref, ra_in_ref, y_a_ref);
+          auto pa = ea.finish();
+          submit_profile(ctx, pa, live);
+        }
+        const auto mode_a_mid = read_u16(y_a_buf, U64(live) * kK);
+
+        // W4A8 Mode B (also_write_bf16=true) -> W4A8 down_proj
+        {
+          Encoder eb(ctx, libs, kMaxM, "miv2.6c.aff.modeB");
+          eb.begin_stage("b");
+          linear_affine_w4a8_nax_swiglu_fwht64_a8(
+              eb, *twg, *twu, qa_in_ref, sa_in_ref, ra_in_ref, qa_mid_ref,
+              sa_mid_ref, ra_mid_ref, y_b_ref, true);
+          linear_affine_w4a8_nax(eb, *twd, qa_mid_ref, sa_mid_ref, ra_mid_ref, y_a_ref);
+          auto pb = eb.finish();
+          submit_profile(ctx, pb, live);
+        }
+        require(read_u16(y_b_buf, U64(live) * kK) == mode_a_mid,
+                "6c W4A8 Affine Mode B also_write_bf16 != Mode A 0-ULP");
+        const double cs_w4a8 = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(live) * kN),
+            std::span(ref_dn).first(U64(live) * kN), "6c w4a8 modeB->down");
+        min_w4a8_cos = std::min(min_w4a8_cos, cs_w4a8);
+        require(cs_w4a8 >= kMinCosW4A8,
+                "6c W4A8 Affine Mode B -> down_proj cos_sim=" + std::to_string(cs_w4a8));
+        ++checks;
+
+        // WP3.1 W4A16 out64 Mode B (also_write_bf16=true) -> W4A8 down_proj
+        {
+          ScopedEnv en_out64("OMLX_M5_ENABLE_SWIGLU_OUT64", "1");
+          ScopedEnv force64("OMLX_M5_WIDE_PREFILL_TILE", "64");
+          Encoder e16a(ctx, libs, kMaxM, "miv2.6d.aff.modeA");
+          e16a.begin_stage("a16");
+          linear_affine_nax_swiglu(e16a, *twg, *twu, x_ref, xs_ref, y_a_ref, 1u);
+          auto p16a = e16a.finish();
+          submit_profile(ctx, p16a, live);
+        }
+        const auto w4a16_mode_a = read_u16(y_a_buf, U64(live) * kK);
+        {
+          Encoder e16b(ctx, libs, kMaxM, "miv2.6d.aff.modeB");
+          e16b.begin_stage("b16");
+          linear_affine_nax_swiglu_fwht64_a8(
+              e16b, *twg, *twu, x_ref, qa_mid_ref, sa_mid_ref, ra_mid_ref,
+              y_b_ref, true, a8_mid_lay.mp);
+          linear_affine_w4a8_nax(e16b, *twd, qa_mid_ref, sa_mid_ref, ra_mid_ref, y_a_ref);
+          auto p16b = e16b.finish();
+          submit_profile(ctx, p16b, live);
+        }
+        {
+          const auto w4a16_mode_b = read_u16(y_b_buf, U64(live) * kK);
+          if (w4a16_mode_b != w4a16_mode_a) {
+            U64 n_diff = 0;
+            U64 first_i = 0;
+            std::string cols_pat;
+            for (U32 c = 0; c < 64u; ++c) {
+              cols_pat.push_back(w4a16_mode_b[c] == w4a16_mode_a[c] ? '.' : 'X');
+            }
+            for (U64 idx = 0; idx < w4a16_mode_a.size(); ++idx) {
+              if (w4a16_mode_b[idx] != w4a16_mode_a[idx]) {
+                if (n_diff == 0) first_i = idx;
+                ++n_diff;
+              }
+            }
+            const double cos_a = cosine_similarity_bf16(
+                w4a16_mode_a, std::span(ref_mid).first(U64(live) * kK), "modeA");
+            const double cos_b = cosine_similarity_bf16(
+                w4a16_mode_b, std::span(ref_mid).first(U64(live) * kK), "modeB");
+            require(false,
+                    "6d WP3.1 Affine out64 Mode B also_write_bf16 != Mode A 0-ULP (gb=" +
+                    std::to_string(gb) + " ub=" + std::to_string(ub) + " gs=" +
+                    std::to_string(gs) + " live=" + std::to_string(live) +
+                    " n_diff=" + std::to_string(n_diff) + "/" +
+                    std::to_string(w4a16_mode_a.size()) + " first=(" +
+                    std::to_string(first_i / kK) + "," + std::to_string(first_i % kK) +
+                    ") row0[0..63]=" + cols_pat +
+                    " cosA=" + std::to_string(cos_a) + " cosB=" + std::to_string(cos_b) + ")");
+          }
+        }
+        const double cs_16 = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(live) * kN),
+            std::span(ref_dn).first(U64(live) * kN), "6d wp31 aff modeB->down");
+        min_w4a8_cos = std::min(min_w4a8_cos, cs_16);
+        require(cs_16 >= kMinCosW4A8,
+                "6d WP3.1 Affine out64 Mode B -> down_proj cos_sim=" + std::to_string(cs_16));
+        ++checks;
+      }
+    }
+
+    // MXFP4 W4A8 Mode B + WP3.1 W4A16 out64 Mode B -> W4A8 MXFP4 down_proj
+    {
+      auto mg = make_mxfp4_weight(ctx, wid++, kK, kK, 141u, true, 16u, false, false);
+      auto mu = make_mxfp4_weight(ctx, wid++, kK, kK, 142u, true, 16u, false, false);
+      auto md = make_mxfp4_weight(ctx, wid++, kN, kK, 143u, true, 16u, false, true);
+      Mxfp4NaxCache mc;
+      mc.register_weight(mg.view);
+      mc.register_weight(mu.view);
+      mc.register_weight(md.view);
+      mc.build(ctx, libs);
+      const auto *twg = mc.find(mg.view.object_id);
+      const auto *twu = mc.find(mu.view.object_id);
+      const auto *twd = mc.find(md.view.object_id);
+      const auto ref_mid = cpu_swiglu_ref(x_f32, mg.ref_w, mu.ref_w, kMaxM, kK, kK);
+      const auto ref_dn = cpu_linear_ref(ref_mid, md.ref_w, kMaxM, kN, kK);
+
+      for (U32 live : {33u, 128u}) {
+        quantize_in(live);
+        {
+          Encoder ea(ctx, libs, kMaxM, "miv2.6c.mx.modeA");
+          ea.begin_stage("a");
+          linear_mxfp4_w4a8_nax_swiglu(ea, *twg, *twu, qa_in_ref, sa_in_ref, y_a_ref);
+          auto pa = ea.finish();
+          submit_profile(ctx, pa, live);
+        }
+        const auto mode_a_mid = read_u16(y_a_buf, U64(live) * kK);
+        {
+          Encoder eb(ctx, libs, kMaxM, "miv2.6c.mx.modeB");
+          eb.begin_stage("b");
+          linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
+              eb, *twg, *twu, qa_in_ref, sa_in_ref, qa_mid_ref, sa_mid_ref,
+              ra_mid_ref, y_b_ref, true);
+          linear_mxfp4_w4a8_nax(eb, *twd, qa_mid_ref, sa_mid_ref, y_a_ref);
+          auto pb = eb.finish();
+          submit_profile(ctx, pb, live);
+        }
+        require(read_u16(y_b_buf, U64(live) * kK) == mode_a_mid,
+                "6c W4A8 MXFP4 Mode B also_write_bf16 != Mode A 0-ULP");
+        const double cs = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(live) * kN),
+            std::span(ref_dn).first(U64(live) * kN), "6c w4a8 mx modeB->down");
+        min_w4a8_cos = std::min(min_w4a8_cos, cs);
+        require(cs >= kMinCosW4A8, "6c W4A8 MXFP4 Mode B -> down_proj failed");
+        ++checks;
+
+        // WP3.1 W4A16 MXFP4 out64 Mode B
+        {
+          ScopedEnv en_out64("OMLX_M5_ENABLE_SWIGLU_OUT64", "1");
+          ScopedEnv force64("OMLX_M5_WIDE_PREFILL_TILE", "64");
+          Encoder e16a(ctx, libs, kMaxM, "miv2.6d.mx.modeA");
+          e16a.begin_stage("a16");
+          linear_mxfp4_nax_swiglu(e16a, *twg, *twu, x_ref, f16_sc, f16_rs, y_a_ref, 1u);
+          auto p16a = e16a.finish();
+          submit_profile(ctx, p16a, live);
+        }
+        const auto w4a16_mode_a = read_u16(y_a_buf, U64(live) * kK);
+        {
+          Encoder e16b(ctx, libs, kMaxM, "miv2.6d.mx.modeB");
+          e16b.begin_stage("b16");
+          linear_mxfp4_nax_swiglu_fwht64_a8(
+              e16b, *twg, *twu, x_ref, qa_mid_ref, sa_mid_ref, ra_mid_ref,
+              y_b_ref, true, a8_mid_lay.mp);
+          linear_mxfp4_w4a8_nax(e16b, *twd, qa_mid_ref, sa_mid_ref, y_a_ref);
+          auto p16b = e16b.finish();
+          submit_profile(ctx, p16b, live);
+        }
+        require(read_u16(y_b_buf, U64(live) * kK) == w4a16_mode_a,
+                "6d WP3.1 MXFP4 out64 Mode B also_write_bf16 != Mode A 0-ULP");
+        const double cs16 = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(live) * kN),
+            std::span(ref_dn).first(U64(live) * kN), "6d wp31 mx modeB->down");
+        min_w4a8_cos = std::min(min_w4a8_cos, cs16);
+        require(cs16 >= kMinCosW4A8, "6d WP3.1 MXFP4 out64 Mode B -> down_proj failed");
+        ++checks;
+      }
+    }
+  }
+
+  // 6e. W4A16 & W4A4 fwht64 linear fallbacks at T=4 (skinny) & T=128 (wide)
+  {
+    for (U32 bits : {3u, 4u, 5u, 6u, 8u}) {
+      auto w = make_affine_weight(ctx, wid++, kN, kK, bits, 64u, bits * 53u, true, 16u, false, true, true);
+      AffineNaxCache ac;
+      ac.register_weight(w.view, zero_ref);
+      ac.build(ctx, libs, zero_ref);
+      const auto *tw = ac.find(w.view.object_id);
+      const auto ref = cpu_linear_ref(x_f32, w.ref_w, kMaxM, kN, kK);
+      for (U32 t_cur : {4u, 128u}) {
+        Encoder e(ctx, libs, t_cur, "miv2.6e.aff.t" + std::to_string(t_cur));
+        e.begin_stage("lin");
+        linear_affine_nax_fwht64(e, *tw, x_ref, x_rot_ref, xs_ref, y_a_ref, std::nullopt, 1u);
+        auto p = e.finish();
+        submit_profile(ctx, p, t_cur);
+        const double cs = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(t_cur) * kN),
+            std::span(ref).first(U64(t_cur) * kN),
+            "6e affine_nax_fwht64 q" + std::to_string(bits) + "_t" + std::to_string(t_cur));
+        require(cs >= 0.9999, "6e linear_affine_nax_fwht64 cos_sim < 0.9999");
+        ++checks;
+      }
+    }
+    {
+      auto mw = make_mxfp4_weight(ctx, wid++, kN, kK, 151u, true, 16u, false, true);
+      Mxfp4NaxCache mc;
+      mc.register_weight(mw.view);
+      mc.build(ctx, libs);
+      const auto *tw = mc.find(mw.view.object_id);
+      const auto ref = cpu_linear_ref(x_f32, mw.ref_w, kMaxM, kN, kK);
+      for (U32 t_cur : {4u, 128u}) {
+        // W4A16 MXFP4 fwht64 (T=4 exercises bf16_fwht64_to_f16_rowscale; T=128 exercises wide fwht64_bf16)
+        Encoder e16(ctx, libs, t_cur, "miv2.6e.mx16.t" + std::to_string(t_cur));
+        e16.begin_stage("lin16");
+        linear_mxfp4_nax(e16, *tw, x_ref, y_a_ref, f16_sc, f16_rs, std::nullopt,
+                         1u, 0u, 0u, 0u, true);
+        auto p16 = e16.finish();
+        submit_profile(ctx, p16, t_cur);
+        const double cs16 = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(t_cur) * kN),
+            std::span(ref).first(U64(t_cur) * kN),
+            "6e mxfp4_w4a16_fwht64_t" + std::to_string(t_cur));
+        require(cs16 >= 0.9998, "6e linear_mxfp4_nax fwht64 cos_sim < 0.9998");
+        ++checks;
+
+        // W4A4 MXFP4 fwht64 (exercises bf16_fwht64_to_mxfp4_a4_bm16_bk128)
+        Encoder e4(ctx, libs, t_cur, "miv2.6e.mx4.t" + std::to_string(t_cur));
+        e4.begin_stage("lin4");
+        linear_mxfp4_w4a4_nax(e4, *tw, x_ref, y_a_ref, a4_c, a4_s, std::nullopt, 1u, true);
+        auto p4 = e4.finish();
+        submit_profile(ctx, p4, t_cur);
+        const double cs4 = cosine_similarity_bf16(
+            read_u16(y_a_buf, U64(t_cur) * kN),
+            std::span(ref).first(U64(t_cur) * kN),
+            "6e mxfp4_w4a4_fwht64_t" + std::to_string(t_cur));
+        require(cs4 >= kMinCosW4A4, "6e linear_mxfp4_w4a4_nax fwht64 cos_sim < 0.985");
+        ++checks;
+      }
+    }
+  }
+
+  // 6f. Decode T=1 & M=2 pretiled_qmv (row_exact.metal) with bit-30 lane_v2 & bit-31 fwht64
+  //     PLUS qwen_forward.metal portable fallback pretiled_{mxfp4,affine}_linear with fwht64!
+  {
+    const RowExactPlaneSlice zero_slice{zero_ref.buffer, zero_ref.offset, zero_ref.bytes};
+    // MXFP4 pretiled_qmv T=1 & M=2 with do_fwht=true
+    {
+      auto mw = make_mxfp4_weight(ctx, wid++, kN, kK, 161u, true, 16u, false, true);
+      const auto pl = resolve_pretiled_kl32_mxfp4_planes(mw.view);
+      require(pl.has_value() && pl->has_fwht64, "6f resolve_pretiled_kl32_mxfp4_planes failed");
+      const auto ref2 = cpu_linear_ref(x_f32, mw.ref_w, 2u, kN, kK);
+      const U32 k_flagged = kK | 0x80000000u;
+      // T=1
+      {
+        Encoder e(ctx, libs, 1u, "miv2.6f.mx.t1");
+        e.begin_stage("qmv_t1");
+        auto &d = e.emit("row_exact", "omlx_m5_pretiled_qmv_mxfp4_bn16_r4_t1",
+                         {.width = U64((kN + 7u) / 8u) * 64u}, {.width = 64u},
+                         {x_ref, Ref{pl->codes.buffer, pl->codes.offset, pl->codes.bytes},
+                          Ref{pl->scales.buffer, pl->scales.offset, pl->scales.bytes}, y_a_ref});
+        e.dynamic(d, 4, words({kN, k_flagged, kK, 1u}));
+        auto p = e.finish();
+        submit_profile(ctx, p, 1u);
+        const double cs = cosine_similarity_bf16(
+            read_u16(y_a_buf, kN), std::span(ref2).first(kN), "6f pretiled_qmv_mx_t1");
+        require(cs >= 0.9999, "6f pretiled_qmv_mxfp4 T=1 fwht64 failed");
+        ++checks;
+      }
+      // M=2
+      {
+        Encoder e(ctx, libs, 2u, "miv2.6f.mx.m2");
+        e.begin_stage("qmv_m2");
+        auto &d = e.emit("row_exact", "omlx_m5_pretiled_qmv_mxfp4_bn16_r4_m2",
+                         {.width = U64((kN + 7u) / 8u) * 64u}, {.width = 64u},
+                         {x_ref, Ref{pl->codes.buffer, pl->codes.offset, pl->codes.bytes},
+                          Ref{pl->scales.buffer, pl->scales.offset, pl->scales.bytes}, y_a_ref});
+        e.dynamic(d, 4, words({kN, k_flagged, kK, 2u}));
+        auto p = e.finish();
+        submit_profile(ctx, p, 2u);
+        const double cs = cosine_similarity_bf16(
+            read_u16(y_a_buf, 2ULL * kN), ref2, "6f pretiled_qmv_mx_m2");
+        require(cs >= 0.9999, "6f pretiled_qmv_mxfp4 M=2 fwht64 failed");
+        ++checks;
+      }
+      // Portable qwen_forward pretiled fallback (T=4)
+      {
+        Encoder e(ctx, libs, 4u, "miv2.6f.mx.port");
+        e.begin_stage("port");
+        linear(e, mw.view, x_ref, y_a_ref, kN, kK, xs_ref, zero_ref);
+        auto p = e.finish();
+        submit_profile(ctx, p, 4u);
+        const auto ref4 = cpu_linear_ref(x_f32, mw.ref_w, 4u, kN, kK);
+        const double cs = cosine_similarity_bf16(
+            read_u16(y_a_buf, 4ULL * kN), ref4, "6f portable pretiled_mx");
+        require(cs >= 0.9999, "6f portable pretiled_mxfp4_linear fwht64 failed");
+        ++checks;
+      }
+    }
+
+    // Affine pretiled_qmv T=1 & M=2 across q3/q4/q5/q6/q8 for BOTH lane_v2=true and lane_v2=false with do_fwht=true
+    for (U32 bits : {3u, 4u, 5u, 6u, 8u}) {
+      for (bool is_v2 : {false, true}) {
+        auto aw = make_affine_weight(ctx, wid++, kN, kK, bits, 64u, bits * 71u + (is_v2 ? 1u : 0u),
+                                     true, 16u, false, is_v2, true);
+        const std::array<MaterializedWeightView, 1> cand{aw.view};
+        const void *owner_tok =
+            reinterpret_cast<const void *>(std::uintptr_t(0x900000u + aw.view.object_id));
+        auto q5_cache = Q5High1Cache::acquire(owner_tok, ctx, libs, cand);
+        const auto pl = resolve_pretiled_kl32_affine_planes(aw.view, q5_cache.get(), zero_slice);
+        require(pl.has_value() && pl->has_fwht64 && pl->is_lane_v2 == is_v2,
+                "6f resolve_pretiled_kl32_affine_planes failed");
+        const auto ref2 = cpu_linear_ref(x_f32, aw.ref_w, 2u, kN, kK);
+        const U32 k_flagged = kK | (is_v2 ? 0x40000000u : 0u) | 0x80000000u;
+        const Ref c_ref{pl->codes.buffer, pl->codes.offset, pl->codes.bytes};
+        const Ref h_ref{pl->high.buffer, pl->high.offset, pl->high.bytes};
+        const Ref sb_ref{pl->sb_tiled.buffer, pl->sb_tiled.offset, pl->sb_tiled.bytes};
+        // T=1
+        {
+          Encoder e(ctx, libs, 1u, "miv2.6f.aff.t1");
+          e.begin_stage("qmv_t1");
+          auto &d = e.emit("row_exact", "omlx_m5_pretiled_qmv_affine_t1",
+                           {.width = U64((kN + 3u) / 4u) * 64u}, {.width = 64u},
+                           {x_ref, c_ref, h_ref, sb_ref, y_a_ref});
+          e.dynamic(d, 5, words({kN, 1u, 0u, k_flagged, bits}));
+          auto p = e.finish();
+          submit_profile(ctx, p, 1u);
+          const double cs = cosine_similarity_bf16(
+              read_u16(y_a_buf, kN), std::span(ref2).first(kN),
+              "6f pretiled_qmv_aff_t1_q" + std::to_string(bits));
+          require(cs >= 0.9999, "6f pretiled_qmv_affine T=1 fwht64 failed");
+          ++checks;
+        }
+        // M=2
+        {
+          Encoder e(ctx, libs, 2u, "miv2.6f.aff.m2");
+          e.begin_stage("qmv_m2");
+          auto &d = e.emit("row_exact", "omlx_m5_pretiled_qmv_affine_r2_m2",
+                           {.width = U64((kN + 3u) / 4u) * 64u}, {.width = 64u},
+                           {x_ref, c_ref, h_ref, sb_ref, y_a_ref});
+          e.dynamic(d, 5, words({kN, 2u, 0u, k_flagged, bits}));
+          auto p = e.finish();
+          submit_profile(ctx, p, 2u);
+          const double cs = cosine_similarity_bf16(
+              read_u16(y_a_buf, 2ULL * kN), ref2,
+              "6f pretiled_qmv_aff_m2_q" + std::to_string(bits));
+          require(cs >= 0.9999, "6f pretiled_qmv_affine M=2 fwht64 failed");
+          ++checks;
+        }
+        // Portable qwen_forward pretiled fallback (T=4)
+        {
+          Encoder e(ctx, libs, 4u, "miv2.6f.aff.port");
+          e.begin_stage("port");
+          linear(e, aw.view, x_ref, y_a_ref, kN, kK, xs_ref, zero_ref);
+          auto p = e.finish();
+          submit_profile(ctx, p, 4u);
+          const auto ref4 = cpu_linear_ref(x_f32, aw.ref_w, 4u, kN, kK);
+          const double cs = cosine_similarity_bf16(
+              read_u16(y_a_buf, 4ULL * kN), ref4,
+              "6f portable pretiled_aff_q" + std::to_string(bits));
+          require(cs >= 0.9999, "6f portable pretiled_affine_linear fwht64 failed");
+          ++checks;
+        }
+      }
+    }
+  }
+
+  // 6g, 6h, 6i: MoE 100% W4A8 (Mode B -> NEW down_scatter_bm64_bn64_sk1),
+  //             MoE W4A16 fwht64 (T=4 narrow + T=256 wide), and MoE9 T=1 & B=2 fwht64!
+  {
+    constexpr U32 kMaxT = 256u;
+    constexpr U32 kH = 256u;
+    constexpr U32 kF = 256u;
+    constexpr U32 kExperts = 256u;
+    constexpr U32 kTopK = 8u;
+
+    std::vector<std::uint16_t> norm_u16;
+    const auto norm_f32 = make_activations(kMaxT, kH, 1701u, norm_u16);
+    auto norm_buf = ctx.upload(std::as_bytes(std::span(norm_u16)));
+    std::vector<std::uint32_t> route_ids(U64(kMaxT) * kTopK);
+    std::vector<std::uint16_t> route_scores(U64(kMaxT) * kTopK);
+    for (U32 tok = 0; tok < kMaxT; ++tok) {
+      for (U32 s = 0; s < kTopK; ++s) {
+        route_ids[U64(tok) * kTopK + s] =
+            (s < 3u) ? ((tok + s * 2u) % 6u)
+                     : (6u + ((tok * 13u + s * 37u) % (kExperts - 6u)));
+        route_scores[U64(tok) * kTopK + s] =
+            float_to_bf16(0.05f + 0.03f * float((tok + s) % 7u));
+      }
+    }
+    auto rids_buf = ctx.upload(std::as_bytes(std::span(route_ids)));
+    auto rsc_buf = ctx.upload(std::as_bytes(std::span(route_scores)));
+    auto exp_out_buf = ctx.make_buffer(U64(kMaxT) * kTopK * kH * 2ULL);
+    auto routed_buf = ctx.make_buffer(U64(kMaxT) * kH * 2ULL);
+
+    std::vector<std::unique_ptr<MetalBuffer>> ws_bufs;
+    MoeNaxWorkspace ws;
+    ws.allocate(ctx, kMaxT, kH, kF, ws_bufs, kExperts, kTopK);
+
+    const auto a8_lay = w4a8_nax_workspace_layout(kMaxT, kH);
+    auto m_qa = ctx.make_buffer(a8_lay.qa_bytes);
+    auto m_sa = ctx.make_buffer(a8_lay.sa_bytes);
+    auto m_ra = ctx.make_buffer(a8_lay.ra_bytes);
+    Ref norm_ref{&norm_buf, 0, norm_buf.size()};
+    Ref rids_ref{&rids_buf, 0, rids_buf.size()};
+    Ref rsc_ref{&rsc_buf, 0, rsc_buf.size()};
+    Ref exp_ref{&exp_out_buf, 0, exp_out_buf.size()};
+    Ref routed_ref{&routed_buf, 0, routed_buf.size()};
+    Ref m_qa_ref{&m_qa, 0, m_qa.size()};
+    Ref m_sa_ref{&m_sa, 0, m_sa.size()};
+    Ref m_ra_ref{&m_ra, 0, m_ra.size()};
+
+    auto q_norm = [&](U32 live_t) {
+      Encoder eq(ctx, libs, kMaxT, "miv2.6g.q");
+      eq.begin_stage("q");
+      emit_quantize_a8_g64(eq, norm_ref, m_qa_ref, m_sa_ref, m_ra_ref, kH);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, live_t);
+    };
+
+    // 6g + 6h MXFP4 with dw.has_fwht64() == true
+    {
+      auto mg = make_mxfp4_weight(ctx, wid++, kExperts * kF, kH, 211u, false, 0u, true, false);
+      auto mu = make_mxfp4_weight(ctx, wid++, kExperts * kF, kH, 212u, false, 0u, true, false);
+      auto md = make_mxfp4_weight(ctx, wid++, kExperts * kH, kF, 213u, false, 0u, true, true);
+
+      // 6g: 100% W4A8 MoE MXFP4 (Mode B -> NEW down_scatter_bm64_bn64_sk1) at T=65, 256
+      for (U32 live : {65u, 256u}) {
+        q_norm(live);
+        Encoder ew(ctx, libs, kMaxT, "miv2.6g.mx");
+        ew.begin_stage("moe_w4a8_v2");
+        require(emit_moe_w4a8_nax_ffn(ew, ws, mg.view, mu.view, md.view,
+                                      m_qa_ref, m_sa_ref, m_ra_ref, a8_lay.mp,
+                                      rids_ref, rsc_ref, exp_ref, routed_ref,
+                                      kMaxT, kH, kF, kTopK, kExperts),
+                "6g emit_moe_w4a8_nax_ffn MXFP4 fwht64 failed");
+        auto pw = ew.finish();
+        require(pw.weight_routes.back().function ==
+                    "omlx_m5_moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_sk1",
+                "6g MoE MXFP4 fwht64 did not select W4A8 down_scatter");
+        submit_profile(ctx, pw, live);
+        const auto ref = cpu_moe_ffn_ref(norm_f32, mg.ref_w, mu.ref_w, md.ref_w,
+                                         route_ids, route_scores, live, kH, kF, kTopK);
+        const double cs = cosine_similarity_bf16(
+            read_u16(routed_buf, U64(live) * kH), ref, "6g moe_mx_w4a8_v2");
+        min_w4a8_cos = std::min(min_w4a8_cos, cs);
+        require(cs >= kMinCosW4A8,
+                "6g MoE MXFP4 100% W4A8 cos_sim=" + std::to_string(cs));
+        ++checks;
+      }
+
+      // 6h: MoE W4A16 MXFP4 with dw.has_fwht64() at T=4 (narrow) and T=256 (wide)
+      for (U32 live : {4u, 256u}) {
+        Encoder e16(ctx, libs, live, "miv2.6h.mx.t" + std::to_string(live));
+        e16.begin_stage("moe_16");
+        require(emit_moe_nax_ffn(e16, ws, mg.view, mu.view, md.view, norm_ref,
+                                 rids_ref, rsc_ref, exp_ref, routed_ref, live,
+                                 kH, kF, kTopK, kExperts, 64u, std::nullopt, {},
+                                 true, true),
+                "6h emit_moe_nax_ffn MXFP4 fwht64 failed");
+        auto p16 = e16.finish();
+        submit_profile(ctx, p16, live);
+        const auto ref = cpu_moe_ffn_ref(norm_f32, mg.ref_w, mu.ref_w, md.ref_w,
+                                         route_ids, route_scores, live, kH, kF, kTopK);
+        const double cs = cosine_similarity_bf16(
+            read_u16(routed_buf, U64(live) * kH), ref, "6h moe_mx_w4a16_fwht64");
+        require(cs >= 0.9998, "6h MoE W4A16 MXFP4 fwht64 cos_sim < 0.9998");
+        ++checks;
+      }
+
+      // 6i: MoE9 T=1 & B=2 with dw.has_fwht64() == true & shared_dw.has_fwht64() == true
+      {
+        auto sgw = make_mxfp4_weight(ctx, wid++, kF, kH, 221u, true, 16u, false, false);
+        auto suw = make_mxfp4_weight(ctx, wid++, kF, kH, 222u, true, 16u, false, false);
+        auto sdw = make_mxfp4_weight(ctx, wid++, kH, kF, 223u, true, 16u, false, true);
+        Mxfp4NaxCache smc;
+        smc.register_weight(sgw.view);
+        smc.register_weight(suw.view);
+        smc.register_weight(sdw.view);
+        smc.build(ctx, libs);
+
+        std::vector<std::uint16_t> sgate_u16 = {float_to_bf16(0.65f), float_to_bf16(-0.45f)};
+        auto sgate_buf = ctx.upload(std::as_bytes(std::span(sgate_u16)));
+        Ref sgate_ref{&sgate_buf, 0, sgate_buf.size()};
+
+        // Reference MoE9 (routed + sigmoid(sgate) * shared_ffn) for T=2
+        auto ref2 = cpu_moe_ffn_ref(norm_f32, mg.ref_w, mu.ref_w, md.ref_w,
+                                    route_ids, route_scores, 2u, kH, kF, kTopK);
+        const auto sh_mid = cpu_swiglu_ref(norm_f32, sgw.ref_w, suw.ref_w, 2u, kF, kH);
+        const auto sh_dn = cpu_linear_ref(sh_mid, sdw.ref_w, 2u, kH, kF);
+        for (U32 tok = 0; tok < 2u; ++tok) {
+          const float g = 1.0f / (1.0f + std::exp(-bf16_val(sgate_u16[tok])));
+          for (U32 c = 0; c < kH; ++c) {
+            ref2[U64(tok) * kH + c] += g * sh_dn[U64(tok) * kH + c];
+          }
+        }
+        // T=1
+        {
+          Encoder e1(ctx, libs, 1u, "miv2.6i.moe9.t1");
+          e1.begin_stage("moe9_t1");
+          require(emit_moe9_mxfp4_t1(e1, ws, mg.view, mu.view, md.view,
+                                     sgw.view, suw.view, sdw.view, &smc,
+                                     norm_ref, rids_ref, rsc_ref, sgate_ref,
+                                     routed_ref, kH, kF),
+                  "6i emit_moe9_mxfp4_t1 fwht64 failed");
+          auto p1 = e1.finish();
+          submit_profile(ctx, p1, 1u);
+          const double cs = cosine_similarity_bf16(
+              read_u16(routed_buf, kH), std::span(ref2).first(kH), "6i moe9_t1_fwht64");
+          require(cs >= 0.9998, "6i MoE9 T=1 fwht64 cos_sim < 0.9998");
+          ++checks;
+        }
+        // B=2
+        {
+          Encoder e2(ctx, libs, 2u, "miv2.6i.moe9.b2");
+          e2.begin_stage("moe9_b2");
+          require(emit_moe9_mxfp4_bt(e2, ws, mg.view, mu.view, md.view,
+                                     sgw.view, suw.view, sdw.view, &smc,
+                                     norm_ref, rids_ref, rsc_ref, sgate_ref,
+                                     routed_ref, 2u, kH, kF),
+                  "6i emit_moe9_mxfp4_bt fwht64 failed");
+          auto p2 = e2.finish();
+          submit_profile(ctx, p2, 2u);
+          const double cs = cosine_similarity_bf16(
+              read_u16(routed_buf, 2ULL * kH), ref2, "6i moe9_b2_fwht64");
+          require(cs >= 0.9998, "6i MoE9 B=2 fwht64 cos_sim < 0.9998");
+          ++checks;
+        }
+      }
+    }
+
+    // 6g + 6h Affine: ALL 10 (q3/q4/q5/q6/q8) x (g64/g128) with dw.has_fwht64() == true -> 100% W4A8!
+    for (U32 bits : {3u, 4u, 5u, 6u, 8u}) {
+      for (U32 gs : {64u, 128u}) {
+        auto ag = make_affine_weight(ctx, wid++, kExperts * kF, kH, bits, gs, bits * 19u + gs, false, 0u, true, false, false);
+        auto au = make_affine_weight(ctx, wid++, kExperts * kF, kH, bits, gs, bits * 23u + gs, false, 0u, true, false, false);
+        auto ad = make_affine_weight(ctx, wid++, kExperts * kH, kF, bits, gs, bits * 29u + gs, false, 0u, true, false, true);
+
+        for (U32 live : {65u, 256u}) {
+          q_norm(live);
+          Encoder ew(ctx, libs, kMaxT, "miv2.6g.aff");
+          ew.begin_stage("moe_w4a8_v2");
+          require(emit_moe_w4a8_nax_ffn(ew, ws, ag.view, au.view, ad.view,
+                                        m_qa_ref, m_sa_ref, m_ra_ref, a8_lay.mp,
+                                        rids_ref, rsc_ref, exp_ref, routed_ref,
+                                        kMaxT, kH, kF, kTopK, kExperts),
+                  "6g emit_moe_w4a8_nax_ffn Affine fwht64 failed");
+          auto pw = ew.finish();
+          require(pw.weight_routes.back().function.find("_w4a8_nax_down_scatter_") !=
+                      std::string::npos,
+                  "6g MoE Affine fwht64 did not select W4A8 down_scatter");
+          submit_profile(ctx, pw, live);
+          const auto ref = cpu_moe_ffn_ref(norm_f32, ag.ref_w, au.ref_w, ad.ref_w,
+                                           route_ids, route_scores, live, kH, kF, kTopK);
+          const double cs = cosine_similarity_bf16(
+              read_u16(routed_buf, U64(live) * kH), ref,
+              "6g moe_aff_w4a8_v2_q" + std::to_string(bits) + "_g" + std::to_string(gs));
+          min_w4a8_cos = std::min(min_w4a8_cos, cs);
+          require(cs >= kMinCosW4A8,
+                  "6g MoE Affine 100% W4A8 q" + std::to_string(bits) + "_g" +
+                      std::to_string(gs) + " cos_sim=" + std::to_string(cs));
+          ++checks;
+        }
+
+        // Also test MoE W4A16 fwht64 narrow (T=4) & wide (T=256) on q4_g64
+        if (bits == 4u && gs == 64u) {
+          for (U32 live : {4u, 256u}) {
+            Encoder e16(ctx, libs, live, "miv2.6h.aff.t" + std::to_string(live));
+            e16.begin_stage("moe_16");
+            require(emit_moe_nax_ffn(e16, ws, ag.view, au.view, ad.view, norm_ref,
+                                     rids_ref, rsc_ref, exp_ref, routed_ref, live,
+                                     kH, kF, kTopK, kExperts, 64u, std::nullopt, {},
+                                     true, true),
+                    "6h emit_moe_nax_ffn Affine fwht64 failed");
+            auto p16 = e16.finish();
+            submit_profile(ctx, p16, live);
+            const auto ref = cpu_moe_ffn_ref(norm_f32, ag.ref_w, au.ref_w, ad.ref_w,
+                                             route_ids, route_scores, live, kH, kF, kTopK);
+            const double cs = cosine_similarity_bf16(
+                read_u16(routed_buf, U64(live) * kH), ref, "6h moe_aff_w4a16_fwht64");
+            require(cs >= 0.9998, "6h MoE W4A16 Affine fwht64 cos_sim < 0.9998");
+            ++checks;
+          }
+        }
+      }
+    }
+  }
+
+  // 6j: LoRA Mode A ("merge") on .miv v2 (oq_nax_lane_g64_v2 + fwht64):
+  //     W'_eff = W' + scale * B @ (A @ H_64) written as q8 oq_nax_lane_g64_v2 + fwht64.
+  {
+    constexpr U32 kLN = 128u;
+    constexpr U32 kLK = 512u;
+    constexpr U32 kLR = 8u;
+    constexpr U32 kLT = 64u;
+    constexpr float kLScale = 0.25f;
+    const U32 bn = 16u;
+    const U32 padded_n = ((kLN + bn - 1u) / bn) * bn;
+    const U32 groups = kLK / 64u;
+
+    auto w_base = make_affine_weight(ctx, wid++, kLN, kLK, 4u, 64u, 777u, true,
+                                     bn, false, true, true);
+
+    std::vector<float> lora_a(U64(kLR) * kLK);
+    std::vector<float> lora_b(U64(kLN) * kLR);
+    for (U64 i = 0; i < lora_a.size(); ++i) {
+      lora_a[i] = std::sin(float(i + 1u) * 0.13f) * 0.35f;
+    }
+    for (U64 i = 0; i < lora_b.size(); ++i) {
+      lora_b[i] = std::cos(float(i + 3u) * 0.17f) * 0.35f;
+    }
+    // Rotate A -> A_rot = A @ H_64 along each 64-element K block (as lora_runtime.h does)
+    std::vector<float> lora_a_rot = lora_a;
+    fwht64_rows_cpu(lora_a_rot, kLR, kLK);
+
+    auto a_buf = ctx.upload(std::as_bytes(std::span(lora_a_rot)));
+    auto b_buf = ctx.upload(std::as_bytes(std::span(lora_b)));
+    auto dst_codes = ctx.make_private_buffer(U64(padded_n) * kLK);
+    auto dst_sb = ctx.make_private_buffer(U64(groups) * padded_n * 4ULL);
+    auto dst_sb_tiled = ctx.make_private_buffer(U64(padded_n) * groups * 4ULL);
+
+    Ref p0 = plane(w_base.view, "nax_codes");
+    Ref p2 = plane(w_base.view, "nax_sb");
+    const U32 scale_bits = std::bit_cast<U32>(kLScale);
+    {
+      Encoder em(ctx, libs, 1u, "miv2.6j.lora_merge");
+      em.begin_stage("lora_merge");
+      auto &d = em.emit(
+          "lora", "omlx_m5_lora_merge_to_q8_g64",
+          {.width = U64(groups) * 32u, .height = padded_n}, {.width = 32u},
+          {p0, zero_ref, p2, zero_ref, Ref{&a_buf, 0, a_buf.size()},
+           Ref{&b_buf, 0, b_buf.size()}, Ref{&dst_codes, 0, dst_codes.size()},
+           Ref{&dst_sb, 0, dst_sb.size()},
+           Ref{&dst_sb_tiled, 0, dst_sb_tiled.size()}});
+      em.dynamic(d, 9,
+                 words({kLN, kLK, kLK, padded_n, bn, 5u, 4u, 64u, kLR,
+                        scale_bits}));
+      auto pm = em.finish();
+      submit_profile(ctx, pm, 1u);
+    }
+
+    MaterializedWeightView w_merged{
+        .object_id = wid++,
+        .component = w_base.view.component,
+        .name = "miv2.6j.merged_q8_lane_v2",
+        .format = "oq_affine_q8_g64_bf16_v1",
+        .layout = "oq_nax_lane_g64_v2",
+        .parent_shape = {kLN, kLK},
+        .padded_k = kLK,
+        .row_start = 0,
+        .row_count = kLN,
+        .in_features = kLK,
+        .planes =
+            {
+                MaterializedPlaneView{"nax_codes", &dst_codes, 0, 0, dst_codes.size(), 0},
+                MaterializedPlaneView{"nax_sb", &dst_sb, 0, 0, dst_sb.size(), 0},
+                MaterializedPlaneView{"nax_sb_tiled", &dst_sb_tiled, 0, 0, dst_sb_tiled.size(), 0},
+            },
+        .input_transform = "fwht64",
+    };
+
+    // Exact FP32 logical reference W_eff = W_base + scale * (B @ A)
+    std::vector<float> w_eff = w_base.ref_w;
+    for (U32 n = 0; n < kLN; ++n) {
+      for (U32 k = 0; k < kLK; ++k) {
+        float delta = 0.0f;
+        for (U32 r = 0; r < kLR; ++r) {
+          delta += lora_b[U64(n) * kLR + r] * lora_a[U64(r) * kLK + k];
+        }
+        w_eff[U64(n) * kLK + k] += kLScale * delta;
+      }
+    }
+
+    std::vector<std::uint16_t> lx_u16;
+    const auto lx_f32 = make_activations(kLT, kLK, 888u, lx_u16);
+    auto lx_buf = ctx.upload(std::as_bytes(std::span(lx_u16)));
+    Ref lx_ref{&lx_buf, 0, lx_buf.size()};
+    auto ly_buf = ctx.make_buffer(U64(kLT) * kLN * 2ULL);
+    Ref ly_ref{&ly_buf, 0, ly_buf.size()};
+
+    AffineNaxCache lac;
+    lac.register_weight(w_merged, zero_ref);
+    lac.build(ctx, libs, zero_ref);
+    const auto *tw_m = lac.find(w_merged.object_id);
+    require(tw_m != nullptr && tw_m->bits == 8u && tw_m->codes.buffer == &dst_codes,
+            "6j merged LoRA weight missing zero-copy lane_v2 registration");
+
+    // Verify via W4A8 + FWHT-64 activation quantization at T=64
+    const auto llay = w4a8_nax_workspace_layout(kLT, kLK);
+    auto lqa = ctx.make_buffer(llay.qa_bytes);
+    auto lsa = ctx.make_buffer(llay.sa_bytes);
+    auto lra = ctx.make_buffer(llay.ra_bytes);
+    Ref lqa_ref{&lqa, 0, lqa.size()};
+    Ref lsa_ref{&lsa, 0, lsa.size()};
+    Ref lra_ref{&lra, 0, lra.size()};
+    {
+      Encoder ew(ctx, libs, kLT, "miv2.6j.w4a8");
+      ew.begin_stage("lora_w4a8");
+      emit_quantize_a8_g64(ew, lx_ref, lqa_ref, lsa_ref, lra_ref, kLK,
+                           kLT, kLT, true);
+      linear_affine_w4a8_nax(ew, *tw_m, lqa_ref, lsa_ref, lra_ref, ly_ref, kLT);
+      auto pw = ew.finish();
+      submit_profile(ctx, pw, kLT);
+      const auto ref = cpu_linear_ref(lx_f32, w_eff, kLT, kLN, kLK);
+      const double cs = cosine_similarity_bf16(read_u16(ly_buf, U64(kLT) * kLN),
+                                               ref, "6j lora_merge_v2_w4a8");
+      min_w4a8_cos = std::min(min_w4a8_cos, cs);
+      require(cs >= kMinCosW4A8,
+              "6j LoRA merge v2 W4A8 cos_sim=" + std::to_string(cs));
+      ++checks;
+    }
+    // Verify via T=1 pretiled_qmv in-register FWHT-64 + lane_v2
+    {
+      Encoder eq(ctx, libs, 1u, "miv2.6j.qmv_t1");
+      eq.begin_stage("lora_qmv");
+      const U32 k_flags = kLK | (1u << 30u) | (1u << 31u);
+      auto &d = eq.emit("row_exact", "omlx_m5_pretiled_qmv_affine_t1",
+                        {.width = U64((kLN + 3u) / 4u) * 64u}, {.width = 64u},
+                        {lx_ref, Ref{&dst_codes, 0, dst_codes.size()}, zero_ref,
+                         Ref{&dst_sb_tiled, 0, dst_sb_tiled.size()}, ly_ref});
+      eq.dynamic(d, 5, words({kLN, 1u, 0u, k_flags, 8u}));
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, 1u);
+      const auto ref = cpu_linear_ref(lx_f32, w_eff, 1u, kLN, kLK);
+      const double cs = cosine_similarity_bf16(read_u16(ly_buf, kLN), ref,
+                                               "6j lora_merge_v2_qmv_t1");
+      require(cs >= 0.9999,
+              "6j LoRA merge v2 pretiled_qmv T=1 cos_sim=" + std::to_string(cs));
+      ++checks;
+    }
+  }
+
+  return {{"checks", checks}, {"min_w4a8_cos_sim", min_w4a8_cos}, {"passed", true}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2028,6 +3071,8 @@ int main(int argc, char **argv) {
     report["dense_w4a8_accuracy_and_slicing"] =
         test_dense_w4a8_accuracy_and_slicing(ctx, libs);
     report["moe_out64_and_w4a8"] = test_moe_out64_and_w4a8(ctx, libs);
+    report["miv2_fwht64_all_consumers"] =
+        test_miv2_fwht64_and_all_runtime_consumers(ctx, libs);
     report["all_passed"] = true;
     std::cout << report.dump(2) << "\n";
     return 0;

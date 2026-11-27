@@ -513,7 +513,8 @@ omlx_m5_compile_metallib(
   omlx_m5_qwen_forward_metallib
   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/qwen_forward.metal"
   "omlx_m5_qwen_forward.metallib"
-  "15.0")
+  "15.0"
+  EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
 
 omlx_m5_compile_metallib(
   omlx_m5_classic_metallib
@@ -771,13 +772,15 @@ if(OMLX_M5_BUILD_NAX_METALLIB)
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/mxfp4_nax.metal"
       "omlx_m5_mxfp4_nax.metallib"
       "27.0"
-      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
     omlx_m5_compile_metallib(
       omlx_m5_affine_nax_metallib
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/affine_nax.metal"
       "omlx_m5_affine_nax.metallib"
       "27.0"
-      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
     omlx_m5_compile_metallib(
       omlx_m5_bf16_nax_metallib
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/bf16_nax.metal"
@@ -789,7 +792,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB)
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe_nax.metal"
       "omlx_m5_moe_nax.metallib"
       "27.0"
-      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_nax_prefill.metal")
       omlx_m5_compile_metallib(
         omlx_m5_attention_nax_prefill_metallib
@@ -887,7 +891,8 @@ omlx_m5_compile_metallib(
   "omlx_m5_row_exact.metallib"
   "${_omlx_m5_row_exact_deployment_target}"
   EXTRA_FLAGS -Wno-c++17-extensions
-  EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/qmv_t1.metal")
+  EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/qmv_t1.metal"
+                "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
 
 set(OMLX_M5_MXFP4_TENSOROPS_METALLIB_TEST_PATH "")
 if(TARGET omlx_m5_mxfp4_tensorops_metallib)
@@ -2124,7 +2129,8 @@ add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_mtp_forward_metallib)
 
 omlx_m5_compile_metallib(omlx_m5_lora_metallib
   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/lora.metal"
-  "omlx_m5_lora.metallib" "15.0")
+  "omlx_m5_lora.metallib" "15.0"
+  EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
 add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_lora_metallib)
 
 add_dependencies(mseries_backendd omlx_m5_qwen_forward_resources)
@@ -2818,7 +2824,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_nax.metal"
       "omlx_m5_w4a8_nax.metallib"
       "27.0"
-      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
     add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a8_nax_metallib)
   endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_moe_nax.metal")
@@ -2827,7 +2834,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a8_moe_nax.metal"
       "omlx_m5_w4a8_moe_nax.metallib"
       "27.0"
-      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
     add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a8_moe_nax_metallib)
   endif()
   if(TARGET omlx_m5_w4a8_nax_metallib AND TARGET omlx_m5_w4a8_moe_nax_metallib)

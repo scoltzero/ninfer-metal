@@ -114,6 +114,30 @@ using detail::forward::words;
 inline U64 align_256(U64 v) noexcept { return (v + 255ULL) & ~255ULL; }
 inline U32 align_16(U32 v) noexcept { return ((v + 15U) / 16U) * 16U; }
 
+// Normalized involutive FWHT-64 (H_64 = (1/8) * H_tilde_64, H_64^2 = I_64) along
+// each 64-element block of rows in a row-major [rows, k] FP32 matrix.
+inline void fwht64_inplace_rows_f32(float *data, U32 rows, U32 k) noexcept {
+  for (U32 r = 0U; r < rows; ++r) {
+    float *row = data + U64(r) * U64(k);
+    for (U32 base = 0U; base + 64U <= k; base += 64U) {
+      float *x = row + base;
+      for (U32 len = 1U; len < 64U; len <<= 1U) {
+        for (U32 i = 0U; i < 64U; i += (len << 1U)) {
+          for (U32 j = 0U; j < len; ++j) {
+            const float a = x[i + j];
+            const float b = x[i + j + len];
+            x[i + j] = a + b;
+            x[i + j + len] = a - b;
+          }
+        }
+      }
+      for (U32 i = 0U; i < 64U; ++i) {
+        x[i] *= 0.125F;
+      }
+    }
+  }
+}
+
 inline std::uint32_t resolve_target_object_id(const QwenLayerCatalog &catalog,
                                               const LoraTargetKey &target) {
   if (target.is_global) {
@@ -284,9 +308,17 @@ inline std::shared_ptr<QwenMergedLoraOverrides> build_merged_lora_overrides(
   MetalBuffer staging = ctx.make_buffer(align_256(staging_bytes));
   staging.zero();
   for (const auto &job : jobs) {
-    ctx.upload_into(staging,
-                    std::as_bytes(std::span<const float>(job.upd->a_f32)),
-                    job.a_off);
+    if (job.base_w.has_fwht64()) {
+      std::vector<float> a_rot = job.upd->a_f32;
+      fwht64_inplace_rows_f32(a_rot.data(), job.upd->rank, job.k);
+      ctx.upload_into(staging,
+                      std::as_bytes(std::span<const float>(a_rot)),
+                      job.a_off);
+    } else {
+      ctx.upload_into(staging,
+                      std::as_bytes(std::span<const float>(job.upd->a_f32)),
+                      job.a_off);
+    }
     ctx.upload_into(staging,
                     std::as_bytes(std::span<const float>(job.upd->b_f32)),
                     job.b_off);
@@ -322,9 +354,9 @@ inline std::shared_ptr<QwenMergedLoraOverrides> build_merged_lora_overrides(
                abits != 0U) {
       base_bits = abits;
       base_gs = detail::forward::affine_nax_group_size(bw.format);
-      if (bw.layout == "oq_nax_tiled_g64_v1" ||
-          bw.layout == "oq_nax_tiled_g128_v1") {
-        base_kind = 4U;
+      if (detail::forward::is_oq_nax_pretiled_layout(bw.layout)) {
+        base_kind =
+            detail::forward::is_oq_nax_lane_v2_layout(bw.layout) ? 5U : 4U;
         p0 = plane(bw, "nax_codes");
         if (abits == 3U) {
           p1 = plane(bw, "nax_high1");
@@ -378,7 +410,7 @@ inline std::shared_ptr<QwenMergedLoraOverrides> build_merged_lora_overrides(
           .component = bw.component,
           .name = bw.name,
           .format = "oq_affine_q8_g64_bf16_v1",
-          .layout = "oq_nax_tiled_g64_v1",
+          .layout = "oq_nax_lane_g64_v2",
           .parent_shape = bw.parent_shape,
           .padded_k = dst_padded_k,
           .row_start = 0,
@@ -414,6 +446,7 @@ inline std::shared_ptr<QwenMergedLoraOverrides> build_merged_lora_overrides(
                       .row_stride = 0,
                   },
               },
+          .input_transform = bw.input_transform,
       };
       out->views_by_object_id.emplace(bw.object_id, std::move(merged_view));
     } else {
@@ -466,6 +499,7 @@ inline std::shared_ptr<QwenMergedLoraOverrides> build_merged_lora_overrides(
                       .row_stride = U64(padded_groups) * 2ULL,
                   },
               },
+          .input_transform = bw.input_transform,
       };
       out->views_by_object_id.emplace(bw.object_id, std::move(merged_view));
     }

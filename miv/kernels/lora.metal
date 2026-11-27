@@ -1,4 +1,5 @@
 #include "fp4_codec.h"
+#include "fwht64.h"
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
@@ -24,7 +25,7 @@ struct LoraMergeParams {
   uint src_padded_k;
   uint padded_n;
   uint bn;        // 16 or 32
-  uint base_kind; // 0 = direct_bf16, 1 = mxfp4_untiled, 2 = mxfp4_tiled, 3 = affine_untiled, 4 = affine_tiled
+  uint base_kind; // 0 = direct_bf16, 1 = mxfp4_untiled, 2 = mxfp4_tiled, 3 = affine_untiled, 4 = affine_tiled_v1, 5 = affine_lane_v2
   uint base_bits; // 3, 4, 5, 6, 8
   uint base_gs;   // 64 or 128 (32 for mxfp4)
   uint rank;
@@ -115,30 +116,31 @@ inline float lora_unpack_base_elem(
     const float bi = lora_bf16_bits_to_float(biases[g_idx]);
     return fma(sc, float(code), bi);
   }
-  // Tiled oq_nax_tiled_g64_v1 / g128_v1
+  // Tiled oq_nax_tiled_g{64,128}_v1 (base_kind == 4) or oq_nax_lane_g{64,128}_v2 (base_kind == 5)
   const uint groups = p.k / 64u;
   const uint g = col / 64u;
   const uint off = col % 64u;
+  const uint slot = (p.base_kind == 5u) ? omlx_m5_pi64(off) : off;
   const uint rn = row % p.bn;
   const ulong tile_idx = ulong(row / p.bn) * groups + g;
   uint code = 0u;
   if (p.base_bits == 3u) {
     const uchar lb =
-        p0[tile_idx * (ulong(p.bn) * 16ul) + ulong(rn) * 16ul + off / 4u];
+        p0[tile_idx * (ulong(p.bn) * 16ul) + ulong(rn) * 16ul + slot / 4u];
     const uchar hb =
-        p1[tile_idx * (ulong(p.bn) * 8ul) + ulong(rn) * 8ul + off / 8u];
-    code = ((uint(lb) >> ((off & 3u) * 2u)) & 3u) |
-           (((uint(hb) >> (off & 7u)) & 1u) << 2u);
+        p1[tile_idx * (ulong(p.bn) * 8ul) + ulong(rn) * 8ul + slot / 8u];
+    code = ((uint(lb) >> ((slot & 3u) * 2u)) & 3u) |
+           (((uint(hb) >> (slot & 7u)) & 1u) << 2u);
   } else if (p.base_bits == 8u) {
-    code = uint(p0[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + off]);
+    code = uint(p0[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + slot]);
   } else {
     const uchar cb =
-        p0[tile_idx * (ulong(p.bn) * 32ul) + ulong(rn) * 32ul + off / 2u];
-    code = (uint(cb) >> ((off & 1u) * 4u)) & 0xFu;
+        p0[tile_idx * (ulong(p.bn) * 32ul) + ulong(rn) * 32ul + slot / 2u];
+    code = (uint(cb) >> ((slot & 1u) * 4u)) & 0xFu;
     if (p.base_bits == 5u || p.base_bits == 6u) {
       const uchar hb =
-          p1[tile_idx * (ulong(p.bn) * 16ul) + ulong(rn) * 16ul + off / 4u];
-      const uint h2 = (uint(hb) >> ((off & 3u) * 2u)) & 3u;
+          p1[tile_idx * (ulong(p.bn) * 16ul) + ulong(rn) * 16ul + slot / 4u];
+      const uint h2 = (uint(hb) >> ((slot & 3u) * 2u)) & 3u;
       code |= (p.base_bits == 5u ? (h2 & 1u) : h2) << 4u;
     }
   }
@@ -150,7 +152,7 @@ inline float lora_unpack_base_elem(
 }
 
 // Mode A ("merge"): Load-time UMA GPU fusion W_eff = W_base + scale * (B @ A)
-// -> direct quantization & NAX pre-tiling into oq_nax_tiled_g64_v1 q8 + sb_tiled.
+// -> direct quantization & NAX pre-tiling into oq_nax_lane_g64_v2 q8 + sb_tiled.
 [[max_total_threads_per_threadgroup(32)]]
 kernel void omlx_m5_lora_merge_to_q8_g64(
     device const uchar *src_p0 [[buffer(0)]],
@@ -176,10 +178,12 @@ kernel void omlx_m5_lora_merge_to_q8_g64(
   const ulong tile_idx = ulong(tile_n) * groups + g;
   const uint off0 = lane * 2u;
   const uint off1 = off0 + 1u;
+  const uint slot0 = omlx_m5_pi64(off0);
+  const uint slot1 = omlx_m5_pi64(off1);
 
   if (row >= p.n) {
-    dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + off0] = 0u;
-    dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + off1] = 0u;
+    dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + slot0] = 0u;
+    dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + slot1] = 0u;
     if (lane == 0u) {
       dst_nax_sb[ulong(g) * p.padded_n + row] = 0u;
       dst_sb_tiled[(ulong(tile_n) * groups + g) * p.bn + rn] = 0u;
@@ -216,9 +220,9 @@ kernel void omlx_m5_lora_merge_to_q8_g64(
   const uint q0 = uint(clamp(rint((w0 - bias_f) * inv_scale), 0.0f, 255.0f));
   const uint q1 = uint(clamp(rint((w1 - bias_f) * inv_scale), 0.0f, 255.0f));
 
-  dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + off0] =
+  dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + slot0] =
       uchar(q0);
-  dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + off1] =
+  dst_nax_codes[tile_idx * (ulong(p.bn) * 64ul) + ulong(rn) * 64ul + slot1] =
       uchar(q1);
   if (lane == 0u) {
     const uint packed_sb = uint(as_type<ushort>(scale_bf)) |
