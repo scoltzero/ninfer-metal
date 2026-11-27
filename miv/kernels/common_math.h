@@ -13,7 +13,10 @@
 
 // Apple10 (M5 Ultra) physical threadgroup SRAM is 32,768 B/core.
 // Staying <= 16,384 B guarantees >= 2 TGs/core; <= 10,922 B enables 3 TGs/core.
+#ifndef OMLX_M5_APPLE10_MAX_PREFILL_TG_SRAM_BYTES_DEFINED
+#define OMLX_M5_APPLE10_MAX_PREFILL_TG_SRAM_BYTES_DEFINED
 constant constexpr ulong kApple10MaxPrefillTgSramBytes = 16384ul;
+#endif
 constant constexpr ulong kApple10MaxGqaPrefillTgSramBytes = 14336ul;
 
 inline float e8m0_to_float(uchar code) {

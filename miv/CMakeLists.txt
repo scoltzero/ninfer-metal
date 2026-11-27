@@ -3026,9 +3026,17 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       $<TARGET_FILE:omlx_m5_prefill_all_modes_e2e_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
 
-  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate
-  if(TARGET omlx_m5_attention_nax_prefill_metallib AND
+  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate (all 12 prefill metallibs)
+  if(TARGET omlx_m5_affine_nax_metallib AND
+     TARGET omlx_m5_mxfp4_nax_metallib AND
+     TARGET omlx_m5_moe_nax_metallib AND
+     TARGET omlx_m5_bf16_nax_metallib AND
+     TARGET omlx_m5_w4a8_nax_metallib AND
+     TARGET omlx_m5_w4a8_moe_nax_metallib AND
+     TARGET omlx_m5_attention_nax_prefill_metallib AND
      TARGET omlx_m5_attention_affine4_metallib AND
+     TARGET omlx_m5_attention_sage2_metallib AND
+     TARGET omlx_m5_attention_minference_metallib AND
      TARGET omlx_m5_gdn_chunk_nax_metallib AND
      TARGET omlx_m5_cache_blend_metallib)
     add_executable(
@@ -3054,8 +3062,16 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       "-framework Metal")
     add_dependencies(
       omlx_m5_prefill_sram_spill_audit_tests
+      omlx_m5_affine_nax_metallib
+      omlx_m5_mxfp4_nax_metallib
+      omlx_m5_moe_nax_metallib
+      omlx_m5_bf16_nax_metallib
+      omlx_m5_w4a8_nax_metallib
+      omlx_m5_w4a8_moe_nax_metallib
       omlx_m5_attention_nax_prefill_metallib
       omlx_m5_attention_affine4_metallib
+      omlx_m5_attention_sage2_metallib
+      omlx_m5_attention_minference_metallib
       omlx_m5_gdn_chunk_nax_metallib
       omlx_m5_cache_blend_metallib)
     add_test(

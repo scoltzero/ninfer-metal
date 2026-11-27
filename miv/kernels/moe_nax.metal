@@ -36,19 +36,21 @@ inline void moe_nax_router_top8_in_tg(
     uint sg) {
   for (uint tok = sg; tok < tokens; tok += 8u) {
     float values[8];
-    bool taken[8];
+    uint taken_mask = 0u;
+#pragma clang loop unroll(full)
     for (uint i = 0u; i < 8u; ++i) {
       values[i] = float(logits[ulong(tok) * 256ul + lane * 8u + i]);
-      taken[i] = false;
     }
     float selected[8];
     uint ids[8];
+#pragma clang loop unroll(full)
     for (uint k = 0u; k < 8u; ++k) {
       int tier = -1;
       float best = -INFINITY;
       uint best_local = 0u;
+#pragma clang loop unroll(full)
       for (uint i = 0u; i < 8u; ++i) {
-        if (taken[i]) {
+        if ((taken_mask & (1u << i)) != 0u) {
           continue;
         }
         const int candidate_tier = isnan(values[i]) ? 0 : 1;
@@ -72,7 +74,7 @@ inline void moe_nax_router_top8_in_tg(
       const uint id = lane * 8u + best_local;
       const uint winner = simd_max(is_best ? id : 0u);
       if (is_best && id == winner) {
-        taken[best_local] = true;
+        taken_mask |= (1u << best_local);
       }
       selected[k] = global_tier == 1 ? maximum : -INFINITY;
       ids[k] = winner;
@@ -4205,19 +4207,21 @@ kernel void omlx_m5_moe9_router_top8_shared_gate_t1(
   // Exact 0-ULP top-8 selection + softmax on SG 0 (matches moe_nax_router_top8_in_tg bit-for-bit)
   if (sg == 0u) {
     float values[8];
-    bool taken[8];
+    uint taken_mask = 0u;
+#pragma clang loop unroll(full)
     for (uint i = 0u; i < 8u; ++i) {
       values[i] = tg_logits[lane * 8u + i];
-      taken[i] = false;
     }
     float selected[8];
     uint ids[8];
+#pragma clang loop unroll(full)
     for (uint k = 0u; k < 8u; ++k) {
       int tier = -1;
       float best = -INFINITY;
       uint best_local = 0u;
+#pragma clang loop unroll(full)
       for (uint i = 0u; i < 8u; ++i) {
-        if (taken[i]) continue;
+        if ((taken_mask & (1u << i)) != 0u) continue;
         const int candidate_tier = isnan(values[i]) ? 0 : 1;
         const float candidate_val = candidate_tier == 1 ? values[i] : -INFINITY;
         if (candidate_tier > tier ||
@@ -4239,7 +4243,7 @@ kernel void omlx_m5_moe9_router_top8_shared_gate_t1(
       const uint id = lane * 8u + best_local;
       const uint winner = simd_max(is_best ? id : 0u);
       if (is_best && id == winner) {
-        taken[best_local] = true;
+        taken_mask |= (1u << best_local);
       }
       selected[k] = global_tier == 1 ? maximum : -INFINITY;
       ids[k] = winner;
@@ -5018,22 +5022,30 @@ inline void moe9_top8_from_atomic_u32(
       selected[k] = as_type<float>(orig_bf << 16u);
       ids[k] = winner;
       if ((winner >> 3u) == lane) {
-        packed[winner & 7u] = 0u;
+        const uint w_slot = winner & 7u;
+#pragma clang loop unroll(full)
+        for (uint i = 0u; i < 8u; ++i) {
+          if (i == w_slot) {
+            packed[i] = 0u;
+          }
+        }
       }
     }
   } else {
     float values[8];
-    bool taken[8];
+    uint taken_mask = 0u;
+#pragma clang loop unroll(full)
     for (uint i = 0u; i < 8u; ++i) {
       values[i] = as_type<float>(uint(raw[i]) << 16u);
-      taken[i] = false;
     }
+#pragma clang loop unroll(full)
     for (uint k = 0u; k < 8u; ++k) {
       int tier = -1;
       float best = -INFINITY;
       uint best_local = 0u;
+#pragma clang loop unroll(full)
       for (uint i = 0u; i < 8u; ++i) {
-        if (taken[i]) continue;
+        if ((taken_mask & (1u << i)) != 0u) continue;
         const int candidate_tier = isnan(values[i]) ? 0 : 1;
         const float candidate_val = candidate_tier == 1 ? values[i] : -INFINITY;
         if (candidate_tier > tier ||
@@ -5055,7 +5067,7 @@ inline void moe9_top8_from_atomic_u32(
       const uint id = lane * 8u + best_local;
       const uint winner = simd_max(is_best ? id : 0u);
       if (is_best && id == winner) {
-        taken[best_local] = true;
+        taken_mask |= (1u << best_local);
       }
       selected[k] = global_tier == 1 ? maximum : -INFINITY;
       ids[k] = winner;

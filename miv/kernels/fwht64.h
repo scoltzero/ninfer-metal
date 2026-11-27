@@ -4,7 +4,10 @@
 
 using namespace metal;
 
+#ifndef OMLX_M5_APPLE10_MAX_PREFILL_TG_SRAM_BYTES_DEFINED
+#define OMLX_M5_APPLE10_MAX_PREFILL_TG_SRAM_BYTES_DEFINED
 constant constexpr ulong kApple10MaxPrefillTgSramBytes = 16384ul;
+#endif
 constant constexpr ulong kApple10HighOccTgSramBytes = 10240ul;
 
 // Involutive intra-row Apple10 NAX quartet permutation on a 64-element group:

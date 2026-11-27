@@ -413,8 +413,8 @@ ma.quantize_source_with_recipe_to_artifact(bf16_dir, recipe, pathlib.Path(sys.ar
           shell_quote(patched_recipe) + " " + shell_quote(qda_art_untiled) +
           " " + shell_quote(qda_art_pretiled));
   run_cmd(shell_quote(python_exe) + " " + shell_quote(tool) +
-          " pretile --input " + shell_quote(mx_art_untiled) + " --output " +
-          shell_quote(mx_art_pretiled) + " >/dev/null");
+          " pretile --artifact-version 1 --input " + shell_quote(mx_art_untiled) +
+          " --output " + shell_quote(mx_art_pretiled) + " >/dev/null");
 
   // 3. Open with parallel SHA-256 verification and verify decode_weight_row 0-ULP match!
   const auto art_u = ArtifactModel::open(qda_art_untiled, true);

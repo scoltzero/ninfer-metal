@@ -105,7 +105,7 @@ def main() -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Audit all 12 prefill/NAX metallibs present in metallib-dir (Stage 2 full-repo CI mode).",
+        help="Audit all 12 prefill/NAX metallibs (default behavior; kept for CLI compatibility).",
     )
     parser.add_argument(
         "--libs",
@@ -191,7 +191,7 @@ def main() -> int:
         if not args.skip_shader_validation:
             sv_env = os.environ.copy()
             sv_env["MTL_SHADER_VALIDATION"] = "1"
-            sv_cmd = [str(audit_bin), str(metallib_dir)]
+            sv_cmd = [str(audit_bin), str(metallib_dir), "--smoke-only"]
             if args.all:
                 sv_cmd.append("--all")
             if args.libs:

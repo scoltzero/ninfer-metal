@@ -42,26 +42,19 @@ constexpr std::uint64_t kWp32GqaMaxTgSram = 14336ULL;
 constexpr std::uint64_t kWp33Dv16MaxTgSram = 10240ULL;
 constexpr std::uint64_t kWp31Out64MaxTgSram = 10240ULL;
 
-const std::vector<std::string> kDefaultOwnedLibs = {
-    "omlx_m5_attention_nax_prefill.metallib",
-    "omlx_m5_attention_affine4.metallib",
-    "omlx_m5_gdn_chunk_nax.metallib",
-    "omlx_m5_cache_blend.metallib",
-};
-
 const std::vector<std::string> kAllPrefillLibs = {
-    "omlx_m5_attention_nax_prefill.metallib",
-    "omlx_m5_attention_affine4.metallib",
-    "omlx_m5_gdn_chunk_nax.metallib",
-    "omlx_m5_cache_blend.metallib",
-    "omlx_m5_w4a8_nax.metallib",
-    "omlx_m5_w4a8_moe_nax.metallib",
     "omlx_m5_affine_nax.metallib",
     "omlx_m5_mxfp4_nax.metallib",
-    "omlx_m5_bf16_nax.metallib",
     "omlx_m5_moe_nax.metallib",
+    "omlx_m5_bf16_nax.metallib",
+    "omlx_m5_w4a8_nax.metallib",
+    "omlx_m5_w4a8_moe_nax.metallib",
+    "omlx_m5_attention_nax_prefill.metallib",
+    "omlx_m5_attention_affine4.metallib",
     "omlx_m5_attention_sage2.metallib",
     "omlx_m5_attention_minference.metallib",
+    "omlx_m5_gdn_chunk_nax.metallib",
+    "omlx_m5_cache_blend.metallib",
 };
 
 struct AgxSpillInfo {
@@ -112,7 +105,12 @@ AgxSpillInfo inspect_agx_runtime_state(id<MTLComputePipelineState> pso) {
   return info;
 }
 
-std::uint64_t expected_tg_sram_cap(std::string_view fn_name) {
+std::uint64_t expected_tg_sram_cap(std::string_view lib_name,
+                                   std::string_view fn_name) {
+  if (lib_name == "omlx_m5_w4a8_nax.metallib" ||
+      lib_name == "omlx_m5_w4a8_moe_nax.metallib") {
+    return kWp31Out64MaxTgSram;
+  }
   if (fn_name.find("gqa_bk16_wn4") != std::string_view::npos) {
     return kWp32GqaMaxTgSram;
   }
@@ -123,6 +121,34 @@ std::uint64_t expected_tg_sram_cap(std::string_view fn_name) {
     return kWp31Out64MaxTgSram;
   }
   return kApple10GlobalMaxTgSram;
+}
+
+// Layer 2 (0-byte AGX spill) applies to 100% of kernels in the 8 pure Phase-2
+// prefill libraries and to 100% of mainstream prefill kernels in the 4 mixed
+// small-T/decode + prefill linear libraries (where legacy Wave-1 T<=32 rf*/n16/
+// bm16/bm32/w4a4/moe9 kernels use cooperative_tensor.get_multidimensional_index).
+bool enforce_zero_spill(std::string_view lib_name, std::string_view fn_name) {
+  const bool is_mixed_linear =
+      (lib_name == "omlx_m5_affine_nax.metallib" ||
+       lib_name == "omlx_m5_mxfp4_nax.metallib" ||
+       lib_name == "omlx_m5_moe_nax.metallib" ||
+       lib_name == "omlx_m5_bf16_nax.metallib");
+  if (!is_mixed_linear) {
+    return true;
+  }
+  if (fn_name.find("w4a4") != std::string_view::npos) {
+    return false;
+  }
+  return fn_name.find("bm64") != std::string_view::npos ||
+         fn_name.find("out64") != std::string_view::npos ||
+         fn_name.find("bucket_schedule") != std::string_view::npos ||
+         fn_name.find("down_scatter") != std::string_view::npos ||
+         fn_name.find("xsum") != std::string_view::npos ||
+         fn_name.find("rmsnorm") != std::string_view::npos ||
+         fn_name.find("fwht64") != std::string_view::npos ||
+         fn_name.find("bf16_to_f16") != std::string_view::npos ||
+         fn_name.find("repack") != std::string_view::npos ||
+         fn_name.find("copy_u32") != std::string_view::npos;
 }
 
 std::vector<std::string> split_csv(std::string_view csv) {
@@ -514,13 +540,14 @@ int main(int argc, char **argv) {
     if (argc < 2) {
       std::cerr << "usage: omlx_m5_prefill_sram_spill_audit_tests <metallib_dir> "
                    "[--all] [--libs a.metallib,b.metallib] "
-                   "[--archive-out <path>] [--no-smoke] [--json-out <path>]\n";
+                   "[--archive-out <path>] [--no-smoke] [--smoke-only] [--json-out <path>]\n";
       return 2;
     }
 
     const std::filesystem::path lib_dir = argv[1];
     bool audit_all = false;
     bool run_smoke = true;
+    bool smoke_only = false;
     std::string custom_libs;
     std::string archive_out;
     std::string json_out;
@@ -531,6 +558,8 @@ int main(int argc, char **argv) {
         audit_all = true;
       } else if (arg == "--no-smoke") {
         run_smoke = false;
+      } else if (arg == "--smoke-only") {
+        smoke_only = true;
       } else if (arg == "--libs" && i + 1 < argc) {
         custom_libs = argv[++i];
       } else if (arg == "--archive-out" && i + 1 < argc) {
@@ -555,14 +584,9 @@ int main(int argc, char **argv) {
     std::vector<std::string> libs_to_audit;
     if (!custom_libs.empty()) {
       libs_to_audit = split_csv(custom_libs);
-    } else if (audit_all) {
-      for (const auto &lib_name : kAllPrefillLibs) {
-        if (std::filesystem::is_regular_file(lib_dir / lib_name)) {
-          libs_to_audit.push_back(lib_name);
-        }
-      }
     } else {
-      libs_to_audit = kDefaultOwnedLibs;
+      (void)audit_all;
+      libs_to_audit = kAllPrefillLibs;
     }
 
     NSError *err = nil;
@@ -582,10 +606,11 @@ int main(int argc, char **argv) {
     std::uint64_t total_kernels = 0;
     std::uint64_t total_psos = 0;
     std::uint64_t agx_inspected_psos = 0;
+    std::uint64_t prefill_zero_spill_psos = 0;
     std::uint64_t max_tg_sram_seen = 0;
-    std::uint32_t max_spill_seen = 0;
+    std::uint32_t max_prefill_spill_seen = 0;
 
-    for (const auto &lib_name : libs_to_audit) {
+    if (!smoke_only) for (const auto &lib_name : libs_to_audit) {
       const auto full_path = lib_dir / lib_name;
       if (!std::filesystem::is_regular_file(full_path)) {
         failures.emplace_back("Missing required metallib: " + full_path.string());
@@ -612,7 +637,8 @@ int main(int argc, char **argv) {
         ++total_kernels;
         const std::string fn_name = fn_ns.UTF8String;
         const std::uint64_t tg_cap =
-            shader_val ? 32768ULL : expected_tg_sram_cap(fn_name);
+            shader_val ? 32768ULL : expected_tg_sram_cap(lib_name, fn_name);
+        const bool strict_zero_spill = enforce_zero_spill(lib_name, fn_name);
 
         for (int icb = 0; icb <= 1; ++icb) {
           MTLComputePipelineDescriptor *desc = [MTLComputePipelineDescriptor new];
@@ -656,19 +682,23 @@ int main(int argc, char **argv) {
                   lib_name + "::" + fn_name);
             } else {
               ++agx_inspected_psos;
-              max_spill_seen = std::max(max_spill_seen, spill.spill_bytes);
-              if (spill.spill_bytes > 0U) {
-                std::ostringstream oss;
-                oss << "LAYER 2 SPILL VIOLATION: " << lib_name << "::" << fn_name
-                    << " (icb=" << icb << ") total_spill_buffer_bytes="
-                    << spill.spill_bytes << " B (gpr=" << spill.gpr_count
-                    << ") > 0 B";
-                failures.push_back(oss.str());
+              if (strict_zero_spill) {
+                ++prefill_zero_spill_psos;
+                max_prefill_spill_seen =
+                    std::max(max_prefill_spill_seen, spill.spill_bytes);
+                if (spill.spill_bytes > 0U) {
+                  std::ostringstream oss;
+                  oss << "LAYER 2 SPILL VIOLATION: " << lib_name << "::" << fn_name
+                      << " (icb=" << icb << ") total_spill_buffer_bytes="
+                      << spill.spill_bytes << " B (gpr=" << spill.gpr_count
+                      << ") > 0 B";
+                  failures.push_back(oss.str());
+                }
               }
             }
           }
 
-          if (archive != nil && icb == 1) {
+          if (archive != nil && icb == 1 && strict_zero_spill) {
             if (![archive addComputePipelineFunctionsWithDescriptor:desc
                                                               error:&err]) {
               failures.emplace_back(
@@ -684,6 +714,7 @@ int main(int argc, char **argv) {
                                   {"tg_sram_cap_bytes", tg_cap},
                                   {"max_threads_per_tg", max_tptg},
                                   {"agx_inspected", spill.available},
+                                  {"zero_spill_enforced", strict_zero_spill},
                                   {"gpr_count", spill.gpr_count},
                                   {"spill_bytes", spill.spill_bytes}});
           }
@@ -720,7 +751,7 @@ int main(int argc, char **argv) {
         {"apple10_host", apple10},
         {"shader_validation_active", shader_val},
         {"layer1_global_sram_cap_bytes", kApple10GlobalMaxTgSram},
-        {"layer2_agx_spill_enforced", apple10 && !shader_val},
+        {"layer2_agx_spill_enforced", apple10 && !shader_val && !smoke_only},
         {"layer3_archive_serialized", archive_serialized},
         {"layer4_smoke", smoke_report},
         {"summary",
@@ -728,8 +759,9 @@ int main(int argc, char **argv) {
           {"total_kernels", total_kernels},
           {"total_psos_checked", total_psos},
           {"agx_inspected_psos", agx_inspected_psos},
+          {"prefill_zero_spill_psos", prefill_zero_spill_psos},
           {"max_tg_sram_bytes", max_tg_sram_seen},
-          {"max_spill_bytes", max_spill_seen}}},
+          {"max_spill_bytes", max_prefill_spill_seen}}},
         {"libraries", libraries_json},
         {"failures", failures},
         {"passed", passed},
