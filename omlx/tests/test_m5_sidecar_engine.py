@@ -3695,11 +3695,29 @@ class TestDFlash2WhitelistAndAutoRepack:
         ok_again, _ = m5_mod.can_convert_to_miv(df27_dir, str(fake_bin))
         assert ok_again is False
 
-        # 3) Reject DFlash v1, non-Qwen Flint-DFlash2, and unsupported 512-expert Flash-Next geometry
-        for bad_name, bad_cfg in (
-            ("Qwen3.5-9B-DFlash-v1", _make_dflash2_cfg(4096, 32, arch="DFlashDraftModel")),
+        # 3) Decoupled DFlash2 accepts non-248320 vocab & custom target geometries structurally,
+        #    while rejecting DFlash v1, causal drafts, unaligned hidden_size, and target mismatches.
+        for valid_custom_name, valid_custom_cfg in (
             ("Flint-DFlash2", _make_dflash2_cfg(2048, 49, vocab_size=150144, model_type="flint")),
             ("Qwen3.8-Flash-Next-DFlash2", _make_dflash2_cfg(2560, 48)),
+        ):
+            cdir = tmp_path / valid_custom_name
+            cdir.mkdir()
+            (cdir / "config.json").write_text(json.dumps(valid_custom_cfg), encoding="utf-8")
+            (cdir / "model.safetensors").write_bytes(orig_st_bytes)
+            c_ok, c_reason = m5_mod.can_convert_to_miv(cdir, str(fake_bin))
+            assert c_ok is True and c_reason == "", f"{valid_custom_name}: {c_reason}"
+            mismatch_ok, mismatch_reason = m5_mod.can_convert_to_miv(
+                cdir,
+                str(fake_bin),
+                target_config={"hidden_size": 4096, "num_hidden_layers": 32, "vocab_size": 248320},
+            )
+            assert mismatch_ok is False and mismatch_reason != ""
+
+        for bad_name, bad_cfg in (
+            ("Qwen3.5-9B-DFlash-v1", _make_dflash2_cfg(4096, 32, arch="DFlashDraftModel")),
+            ("Causal-DFlash2", {**_make_dflash2_cfg(4096, 32), "is_causal": True}),
+            ("Unaligned-DFlash2", _make_dflash2_cfg(2000, 32)),
         ):
             bdir = tmp_path / bad_name
             bdir.mkdir()
