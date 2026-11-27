@@ -11,6 +11,7 @@
 #include "moe_nax.h"
 #include "mxfp4_nax_cache.h"
 #include "silicon_tuning.h"
+#include "w4a4_nax.h"
 #include "w4a8_nax.h"
 #include "omlx_m5/execution_contract.h"
 #include "omlx_m5/kv_page_pool.h"
@@ -493,8 +494,14 @@ public:
     conv = 2 * gk + gv;
 
     const bool affine4_kv = (kv_format_ == KvStorageFormat::Affine4Group128);
+    const bool w4a4_keep_qk_a8 =
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A4 &&
+         w4a4_keep_qk_a8_enabled());
+    const bool enable_w4a4_ws =
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A4);
     const bool enable_w4a8_ws =
-        (prefill_options_.linear_mode == PrefillLinearMode::W4A8);
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A8 ||
+         w4a4_keep_qk_a8);
     const bool enable_minf_ws =
         (shared_primary_ == nullptr &&
          prefill_options_.attention_mode == PrefillAttentionMode::Sage2 &&
@@ -511,7 +518,7 @@ public:
         attention_policy == omlx::m5::AttentionNumericPolicy::RowExactV1,
         inspect_tensors_workspace, 0U, workspace_rows_, affine4_kv, 0U,
         flash_nax_prefill_, enable_w4a8_ws, enable_minf_ws,
-        enable_sage2_kv_ws);
+        enable_sage2_kv_ws, enable_w4a4_ws);
     feature_ring_rows_ = allocation_plan.feature_ring_rows;
 
     if (allocation_plan.largest_buffer_bytes >
@@ -577,6 +584,11 @@ public:
       a8_sa = allocate_private("a8_sa");
       a8_ra = allocate_private("a8_ra");
       a8_workspace_mp_ = w4a8_nax_mp(workspace_rows_);
+    }
+    if (enable_w4a4_ws) {
+      w4a4_codes = allocate_private("w4a4_codes");
+      w4a4_scales = allocate_private("w4a4_scales");
+      w4a4_workspace_mp_ = w4a4_nax_mp(workspace_rows_);
     }
     if (enable_minf_ws) {
       minference_scratch = allocate("minference_scratch");
@@ -827,8 +839,19 @@ public:
         merged_lora_ ? static_cast<const void *>(merged_lora_.get())
                      : static_cast<const void *>(&weights);
 
+    const bool w4a4_requested =
+        (prefill_options_.linear_mode == PrefillLinearMode::W4A4 &&
+         w4a4_codes.buffer != nullptr &&
+         w4a4_nax_runtime_eligible(context, libraries));
+    w4a4_min_tokens_ = w4a4_nax_min_tokens();
+    w4a4_keep_qk_a8_ = w4a4_keep_qk_a8;
+    w4a4_down_proj_ = []() {
+      const char *env = std::getenv("OMLX_M5_W4A4_DOWN_BF16");
+      return !(env != nullptr && std::string_view(env) == "1");
+    }();
     const bool w4a8_requested =
-        (prefill_options_.linear_mode == PrefillLinearMode::W4A8 &&
+        ((prefill_options_.linear_mode == PrefillLinearMode::W4A8 ||
+          w4a4_keep_qk_a8) &&
          a8_qa.buffer != nullptr &&
          w4a8_nax_runtime_eligible(context, libraries));
     w4a8_min_tokens_ = w4a8_nax_min_tokens();
@@ -836,7 +859,8 @@ public:
 
     if (mxfp4_nax_runtime_eligible(context, libraries) &&
         (linear_policy == LinearNumericPolicy::RowExactPortableV1 ||
-         w4a8_requested || mxfp4_w4a4_prefill_enabled() || has_pretiled_mxfp4 ||
+         w4a8_requested || w4a4_requested || mxfp4_w4a4_prefill_enabled() ||
+         has_pretiled_mxfp4 ||
          (t_domain_active() && pretiled_qmv_t1_enabled()))) {
       mxfp4_nax_cache = Mxfp4NaxCache::acquire(
           cache_owner_key, context, libraries, candidates,
@@ -1006,6 +1030,27 @@ public:
         buffers.push_back(std::move(ra_buf));
       }
     }
+    if (w4a4_requested && any_fwht64) {
+      const U32 max_mp = w4a4_nax_mp(workspace_rows_);
+      const U32 max_mid_k =
+          std::max({f, U32(config.shared_expert_intermediate_size)});
+      if (max_mid_k > 0U && (max_mid_k % 128U) == 0U) {
+        const U64 tiles_m = U64(max_mp / 16U);
+        const U64 tiles_k = U64(max_mid_k / 128U);
+        const U64 c_bytes = mul(mul(tiles_m, tiles_k), 1024ULL);
+        const U64 s_bytes = mul(mul(tiles_m, tiles_k), 64ULL);
+        auto c_buf = std::make_unique<MetalBuffer>(
+            context.make_private_buffer(c_bytes));
+        auto s_buf = std::make_unique<MetalBuffer>(
+            context.make_private_buffer(s_bytes));
+        w4a4_mid_codes = Ref{c_buf.get(), 0, c_bytes};
+        w4a4_mid_scales = Ref{s_buf.get(), 0, s_bytes};
+        track_extra_workspace("w4a4_mid_codes", *c_buf);
+        track_extra_workspace("w4a4_mid_scales", *s_buf);
+        buffers.push_back(std::move(c_buf));
+        buffers.push_back(std::move(s_buf));
+      }
+    }
 
     if (!speculative_enabled && h >= 512U &&
         has_row_exact_metallib_ && t_domain_active() &&
@@ -1058,6 +1103,8 @@ public:
     w4a8_nax_enabled_ =
         w4a8_requested &&
         (mxfp4_nax_active() || affine_nax_active() || moe_nax_ws.active);
+    w4a4_nax_enabled_ =
+        w4a4_requested && (mxfp4_nax_active() || moe_nax_ws.active);
 
     const bool affine4_planar_ok =
         (kv_format_ != KvStorageFormat::Affine4Group128) ||
@@ -2442,6 +2489,212 @@ public:
         }
         return true;
       }
+    }
+    return false;
+  }
+
+  bool use_w4a4_for_t(U32 t, bool verify) const noexcept {
+    return w4a4_nax_enabled_ && !verify && t >= w4a4_min_tokens_ &&
+           w4a4_codes.buffer != nullptr && (h % 128U) == 0U &&
+           !diagnostic_override;
+  }
+
+  bool use_w4a4_prefill(const Encoder &e, bool verify,
+                        std::optional<U32> explicit_t = {}) const noexcept {
+    return use_w4a4_for_t(nax_effective_select_t(e, explicit_t), verify);
+  }
+
+  Encoder::A4QuantKey make_a4_key_for(const Encoder &e, Ref input, U32 k,
+                                      Ref codes, Ref scales,
+                                      std::optional<U32> explicit_t = {},
+                                      bool fwht64 = false) const {
+    const U32 t = explicit_t.value_or(e.profile.capacity);
+    const bool dyn_rows = !explicit_t.has_value() && t != 1U;
+    return Encoder::A4QuantKey{
+        .input_buffer = input.buffer,
+        .input_offset = input.offset,
+        .codes_buffer = codes.buffer,
+        .codes_offset = codes.offset,
+        .scales_buffer = scales.buffer,
+        .scales_offset = scales.offset,
+        .k = k,
+        .rows = t,
+        .mp = w4a4_nax_mp(t),
+        .dynamic_tokens = dyn_rows,
+        .fwht64 = fwht64,
+    };
+  }
+
+  Encoder::A4QuantKey make_a4_key(const Encoder &e, Ref input, U32 k,
+                                  std::optional<U32> explicit_t = {},
+                                  bool fwht64 = false) const {
+    return make_a4_key_for(e, input, k, w4a4_codes, w4a4_scales, explicit_t,
+                           fwht64);
+  }
+
+  bool ensure_a4_quant(Encoder &e, Ref input, U32 k,
+                       std::optional<U32> explicit_t = {},
+                       bool fwht64 = false) {
+    if (w4a4_codes.buffer == nullptr || w4a4_scales.buffer == nullptr ||
+        (k % 128U) != 0U || k == 0U) {
+      return false;
+    }
+    const auto key = make_a4_key(e, input, k, explicit_t, fwht64);
+    if (e.has_a4_quant(key)) {
+      return true;
+    }
+    emit_quantize_a4_bm16_bk128(e, input, w4a4_codes, w4a4_scales, k,
+                                explicit_t, std::nullopt, fwht64);
+    e.set_a4_quant(key);
+    return true;
+  }
+
+  bool can_w4a4_weight(const MaterializedWeightView &w, U32 n, U32 k) const {
+    if (!w4a4_nax_enabled_ || is_overridden(w) || (k % 128U) != 0U ||
+        w4a4_codes.buffer == nullptr || !mxfp4_nax_active()) {
+      return false;
+    }
+    if (const auto *tw = mxfp4_nax_cache->find(w.object_id);
+        tw != nullptr && tw->n == n && tw->k == k) {
+      return true;
+    }
+    return false;
+  }
+
+  bool try_linear_w4a4_base(Encoder &e, const MaterializedWeightView &w, Ref x,
+                            Ref y, U32 n, U32 k,
+                            std::optional<U32> explicit_t = {},
+                            U32 row_offset = 0U, U32 out_stride = 0U,
+                            U32 slice_n = 0U) {
+    if (!w4a4_nax_enabled_ || is_overridden(w) || (k % 128U) != 0U ||
+        w4a4_codes.buffer == nullptr || !mxfp4_nax_active()) {
+      return false;
+    }
+    const auto *tw = mxfp4_nax_cache->find(w.object_id);
+    if (tw == nullptr || tw->n != n || tw->k != k) {
+      return false;
+    }
+    const bool use_mid =
+        w.has_fwht64() && w4a4_mid_codes.buffer != nullptr &&
+        e.has_a4_quant(make_a4_key_for(e, x, k, w4a4_mid_codes, w4a4_mid_scales,
+                                       explicit_t, /*fwht64=*/true));
+    const Ref codes_use = use_mid ? w4a4_mid_codes : w4a4_codes;
+    const Ref scales_use = use_mid ? w4a4_mid_scales : w4a4_scales;
+    if (!use_mid && !ensure_a4_quant(e, x, k, explicit_t, w.has_fwht64())) {
+      return false;
+    }
+    emit_mxfp4_w4a4_nax_linear(e, *tw, codes_use, scales_use, y, explicit_t,
+                               row_offset, out_stride, slice_n);
+    e.record_weight(w, n, k, "mxfp4_w4a4_nax_m5_v2", "mxfp4_w4a4_nax_m5_v2", {},
+                    "w4a4_prefill_v1", "mxfp4.w4a4.bm64_bn64.sk1.v2", false,
+                    explicit_t);
+    return true;
+  }
+
+  bool try_linear_w4a4_swiglu(Encoder &e, const MaterializedWeightView &gate_w,
+                              const MaterializedWeightView &up_w, Ref x, Ref y,
+                              U32 n, U32 k, std::optional<U32> explicit_t = {},
+                              U32 row_offset = 0U, U32 out_stride = 0U,
+                              U32 slice_n = 0U) {
+    if (!w4a4_nax_enabled_ || is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) || (k % 128U) != 0U ||
+        w4a4_codes.buffer == nullptr || !mxfp4_nax_active()) {
+      return false;
+    }
+    const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+    const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+    if (!gw || !uw || gw->bn != 16U || uw->bn != 16U || gw->n != n ||
+        gw->k != k || uw->n != n || uw->k != k) {
+      return false;
+    }
+    if (!ensure_a4_quant(e, x, k, explicit_t)) {
+      return false;
+    }
+    emit_mxfp4_w4a4_nax_swiglu(e, *gw, *uw, w4a4_codes, w4a4_scales, y,
+                               explicit_t, row_offset, out_stride, slice_n);
+    e.record_weight(gate_w, n, k, "mxfp4_w4a4_nax_m5_v2",
+                    "mxfp4_w4a4_swiglu_out64_v2", {}, "w4a4_prefill_v1",
+                    "mxfp4.w4a4.swiglu_out64.sk1.v2", false, explicit_t);
+    e.record_weight(up_w, n, k, "mxfp4_w4a4_nax_m5_v2",
+                    "mxfp4_w4a4_swiglu_out64_v2", {}, "w4a4_prefill_v1",
+                    "mxfp4.w4a4.swiglu_out64.sk1.v2", false, explicit_t);
+    return true;
+  }
+
+  bool try_linear_w4a4_swiglu_fwht64_a4(Encoder &e,
+                                        const MaterializedWeightView &gate_w,
+                                        const MaterializedWeightView &up_w,
+                                        Ref x, Ref y_bf16, U32 n, U32 k,
+                                        bool also_write_bf16,
+                                        std::optional<U32> explicit_t = {},
+                                        U32 row_offset = 0U,
+                                        U32 out_stride = 0U, U32 slice_n = 0U) {
+    if (!w4a4_nax_enabled_ || is_overridden(gate_w) || is_overridden(up_w) ||
+        has_bypass_lora(gate_w) || has_bypass_lora(up_w) ||
+        gate_w.has_fwht64() || up_w.has_fwht64() || (k % 128U) != 0U ||
+        (n % 128U) != 0U || (row_offset % 128U) != 0U ||
+        w4a4_codes.buffer == nullptr || w4a4_mid_codes.buffer == nullptr ||
+        w4a4_mid_scales.buffer == nullptr || !mxfp4_nax_active()) {
+      return false;
+    }
+    const auto *gw = mxfp4_nax_cache->find(gate_w.object_id);
+    const auto *uw = mxfp4_nax_cache->find(up_w.object_id);
+    if (!gw || !uw || gw->bn != 16U || uw->bn != 16U || gw->n != n ||
+        gw->k != k || uw->n != n || uw->k != k) {
+      return false;
+    }
+    if (!ensure_a4_quant(e, x, k, explicit_t, /*fwht64=*/false)) {
+      return false;
+    }
+    emit_mxfp4_w4a4_nax_swiglu_fwht64_a4(
+        e, *gw, *uw, w4a4_codes, w4a4_scales, w4a4_mid_codes, w4a4_mid_scales,
+        y_bf16, also_write_bf16, explicit_t, row_offset, out_stride, slice_n);
+    if (row_offset == 0U && slice_n == 0U) {
+      e.set_a4_quant(make_a4_key_for(e, y_bf16, n, w4a4_mid_codes,
+                                     w4a4_mid_scales, explicit_t,
+                                     /*fwht64=*/true));
+    }
+    e.record_weight(gate_w, n, k, "mxfp4_w4a4_nax_m5_v2",
+                    "mxfp4_w4a4_swiglu_out64_fwht64_a4_v2", {},
+                    "w4a4_prefill_v1", "mxfp4.w4a4.swiglu_out64.fwht64.v2",
+                    false, explicit_t);
+    e.record_weight(up_w, n, k, "mxfp4_w4a4_nax_m5_v2",
+                    "mxfp4_w4a4_swiglu_out64_fwht64_a4_v2", {},
+                    "w4a4_prefill_v1", "mxfp4.w4a4.swiglu_out64.fwht64.v2",
+                    false, explicit_t);
+    return true;
+  }
+
+  bool try_concat_w4a4_nax(Encoder &e, U32 concat_id,
+                           std::span<const MaterializedWeightView> parts,
+                           std::span<const U32> part_ns, U32 k, Ref x_bf16,
+                           Ref dst_concat,
+                           std::optional<U32> explicit_t = {}) {
+    if (!w4a4_nax_enabled_ || !concat_id || !dst_concat.buffer ||
+        parts.empty() || (k % 128U) != 0U || w4a4_codes.buffer == nullptr ||
+        !mxfp4_nax_active()) {
+      return false;
+    }
+    U32 total_n = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      if (is_overridden(parts[i])) {
+        return false;
+      }
+      total_n += part_ns[i];
+    }
+    if (const auto *tw = mxfp4_nax_cache->find(concat_id);
+        tw != nullptr && tw->n == total_n && tw->k == k) {
+      if (!ensure_a4_quant(e, x_bf16, k, explicit_t)) {
+        return false;
+      }
+      emit_mxfp4_w4a4_nax_linear(e, *tw, w4a4_codes, w4a4_scales, dst_concat,
+                                 explicit_t);
+      for (std::size_t i = 0; i < parts.size(); ++i) {
+        e.record_weight(parts[i], part_ns[i], k, "mxfp4_w4a4_nax_m5_v2",
+                        "mxfp4_w4a4_nax_m5_v2", {}, "w4a4_prefill_v1",
+                        "mxfp4.w4a4.bm64_bn64.sk1.v2", false, explicit_t);
+      }
+      return true;
     }
     return false;
   }
@@ -4300,7 +4553,8 @@ public:
                  std::optional<U32> out_sq_slot = std::nullopt,
                  bool input_is_a8 = false,
                  std::optional<ChunkAttentionRoute> attn_route_override =
-                     std::nullopt) {
+                     std::nullopt,
+                 bool input_is_a4 = false) {
     const U32 t = e.profile.capacity;
     Ref q_ref = query, k_ref = key, v_ref = value;
     const std::array<MaterializedWeightView, 3> parts{
@@ -4456,6 +4710,33 @@ public:
                         "pretiled_affine_qmv_concat3_t1_v3", {},
                         "legacy_route_v1", {}, false);
       }
+    } else if (!fused_qkv_norm && input_is_a4 && !w4a4_keep_qk_a8_ &&
+               try_concat_w4a4_nax(e, block.concat_qkv_id, parts, part_ns, h,
+                                   norm, concat_out)) {
+      emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+    } else if (!fused_qkv_norm && input_is_a4) {
+      if (w4a4_keep_qk_a8_) {
+        if (!try_linear_w4a8_base(e, block.get("attention_q"), norm, query,
+                                  2 * q, h) &&
+            !try_linear_w4a4_base(e, block.get("attention_q"), norm, query,
+                                  2 * q, h))
+          linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+        if (!try_linear_w4a8_base(e, block.get("attention_k"), norm, key, kv,
+                                  h) &&
+            !try_linear_w4a4_base(e, block.get("attention_k"), norm, key, kv,
+                                  h))
+          linear_base(e, block.get("attention_k"), norm, key, kv, h);
+      } else {
+        if (!try_linear_w4a4_base(e, block.get("attention_q"), norm, query,
+                                  2 * q, h))
+          linear_base(e, block.get("attention_q"), norm, query, 2 * q, h);
+        if (!try_linear_w4a4_base(e, block.get("attention_k"), norm, key, kv,
+                                  h))
+          linear_base(e, block.get("attention_k"), norm, key, kv, h);
+      }
+      if (!try_linear_w4a4_base(e, block.get("attention_v"), norm, value, kv,
+                                h))
+        linear_base(e, block.get("attention_v"), norm, value, kv, h);
     } else if (!fused_qkv_norm && input_is_a8 &&
                try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h,
                                    norm, concat_out)) {
@@ -4508,8 +4789,14 @@ public:
         custom_attn_pos.buffer ? custom_attn_pos : attention_positions, t,
         split, context_envelope, true, std::nullopt, nullptr,
         attn_route_override);
-    if (input_is_a8 &&
-        try_linear_w4a8_base(e, block.get("attention_o"), mixer, delta, h, q)) {
+    if (input_is_a4 &&
+        try_linear_w4a4_base(e, block.get("attention_o"), mixer, delta, h, q)) {
+      emit_bypass_for_weight(e, block.get("attention_o"), mixer, delta, h);
+      if (io_sq_slot != nullptr)
+        *io_sq_slot = std::nullopt;
+    } else if (input_is_a8 &&
+               try_linear_w4a8_base(e, block.get("attention_o"), mixer, delta,
+                                    h, q)) {
       emit_bypass_for_weight(e, block.get("attention_o"), mixer, delta, h);
       if (io_sq_slot != nullptr)
         *io_sq_slot = std::nullopt;
@@ -4546,11 +4833,16 @@ public:
                            bool out_w4a8 = false,
                            bool out_w4a8_write_bf16 = false,
                            bool emit_gdn_out_linear = true,
-                           bool *out_wrote_a8 = nullptr) {
+                           bool *out_wrote_a8 = nullptr,
+                           bool out_w4a4 = false,
+                           bool out_w4a4_write_bf16 = false,
+                           bool *out_wrote_a4 = nullptr) {
     if (out_fused_add_sq)
       *out_fused_add_sq = false;
     if (out_wrote_a8)
       *out_wrote_a8 = false;
+    if (out_wrote_a4)
+      *out_wrote_a4 = false;
     const auto &c = config;
     auto params =
         words({U32(c.linear_num_key_heads), U32(c.linear_num_value_heads),
@@ -4583,20 +4875,28 @@ public:
     const U32 vd = U32(c.linear_value_head_dim);
 
     const auto &out_w = block.get("gdn_out");
+    const bool eff_out_w4a4 =
+        out_w4a4 && !verify && can_w4a4_weight(out_w, h, gv);
     const bool eff_out_w4a8 =
-        out_w4a8 && !verify && can_w4a8_weight(out_w, h, gv);
+        !eff_out_w4a4 && out_w4a8 && !verify && can_w4a8_weight(out_w, h, gv);
     const auto *gdn_out_nax =
-        (!eff_out_w4a8 && allow_f16_out && emit_gdn_out_linear &&
-         !has_bypass_lora(out_w) && use_mxfp4_nax_for_weight(out_w, t))
+        (!eff_out_w4a4 && !eff_out_w4a8 && allow_f16_out &&
+         emit_gdn_out_linear && !has_bypass_lora(out_w) &&
+         use_mxfp4_nax_for_weight(out_w, t))
             ? mxfp4_nax_cache->find(out_w.object_id)
             : nullptr;
     const bool out_f16 =
         (!out_w.has_fwht64() && gdn_out_nax != nullptr &&
          gdn_out_nax->n == h && gdn_out_nax->k == gv);
+    const bool mega_fuse_a4 = eff_out_w4a4 && !out_w.has_fwht64();
     const bool mega_fuse_a8 = eff_out_w4a8 && !out_w.has_fwht64();
     const U32 mp = out_f16 ? mxfp4_nax_mp(t) : 0U;
     auto emit_gdn_out_bf16 = [&]() {
       if (!emit_gdn_out_linear) {
+        return;
+      }
+      if (eff_out_w4a4 && try_linear_w4a4_base(e, out_w, mix_ref, delta, h, gv)) {
+        emit_bypass_for_weight(e, out_w, mix_ref, delta, h);
         return;
       }
       if (eff_out_w4a8 && try_linear_w4a8_base(e, out_w, mix_ref, delta, h, gv)) {
@@ -4633,8 +4933,23 @@ public:
               mega_fuse_a8 ? a8_sa : Ref{}, mega_fuse_a8 ? a8_ra : Ref{},
               mega_fuse_a8 ? w4a8_nax_mp(t) : 0U,
               mega_fuse_a8 && (out_w4a8_write_bf16 || has_bypass_lora(out_w)),
-              float(c.rms_norm_eps))) {
-        if (mega_fuse_a8) {
+              float(c.rms_norm_eps), mega_fuse_a4 ? w4a4_codes : Ref{},
+              mega_fuse_a4 ? w4a4_scales : Ref{},
+              mega_fuse_a4 ? w4a4_nax_mp(t) : 0U,
+              mega_fuse_a4 && (out_w4a4_write_bf16 || has_bypass_lora(out_w)))) {
+        if (mega_fuse_a4) {
+          if (out_wrote_a4)
+            *out_wrote_a4 = true;
+          e.set_a4_quant(make_a4_key(
+              e, mix_ref, gv,
+              dynamic_tokens ? std::nullopt : std::optional<U32>(t)));
+          if (emit_gdn_out_linear) {
+            if (!try_linear_w4a4_base(e, out_w, mix_ref, delta, h, gv)) {
+              linear_base(e, out_w, mix_ref, delta, h, gv);
+            }
+            emit_bypass_for_weight(e, out_w, mix_ref, delta, h);
+          }
+        } else if (mega_fuse_a8) {
           if (out_wrote_a8)
             *out_wrote_a8 = true;
           e.set_a8_quant(make_a8_key(
@@ -4646,7 +4961,7 @@ public:
             }
             emit_bypass_for_weight(e, out_w, mix_ref, delta, h);
           }
-        } else if (eff_out_w4a8) {
+        } else if (eff_out_w4a4 || eff_out_w4a8) {
           emit_gdn_out_bf16();
         } else if (out_f16) {
           linear_from_f16(e, out_w, f16_scratch, f16_ones_scale, delta, h, gv);
@@ -4796,7 +5111,7 @@ public:
   void gdn(Encoder &e, const Block &block, bool verify,
            bool input_is_f16 = false, std::optional<U32> *io_sq_slot = nullptr,
            std::optional<U32> out_sq_slot = std::nullopt,
-           bool input_is_a8 = false) {
+           bool input_is_a8 = false, bool input_is_a4 = false) {
     const auto &c = config;
     const U32 t = e.profile.capacity;
     const U32 hv = U32(c.linear_num_value_heads);
@@ -5044,6 +5359,15 @@ public:
                           "pretiled_affine_qmv_concat2_t1_v3", {},
                           "legacy_route_v1", {}, false);
         }
+      } else if (input_is_a4 &&
+                 try_concat_w4a4_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
+                                     qkvz_ns, h, norm, concat_out)) {
+        emit_split2(e, concat_out, qkv, z, conv, gv);
+      } else if (input_is_a4) {
+        if (!try_linear_w4a4_base(e, block.get("gdn_qkv"), norm, qkv, conv, h))
+          linear_base(e, block.get("gdn_qkv"), norm, qkv, conv, h);
+        if (!try_linear_w4a4_base(e, block.get("gdn_z"), norm, z, gv, h))
+          linear_base(e, block.get("gdn_z"), norm, z, gv, h);
       } else if (input_is_a8 &&
                  try_concat_w4a8_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
                                      qkvz_ns, h, norm, concat_out)) {
@@ -5116,6 +5440,15 @@ public:
                           "pretiled_affine_qmv_concat2_t1_v3", {},
                           "legacy_route_v1", {}, false);
         }
+      } else if (input_is_a4 &&
+                 try_concat_w4a4_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
+                                     h, norm, ab_concat)) {
+        emit_split2(e, ab_concat, a, b, hv, hv);
+      } else if (input_is_a4) {
+        if (!try_linear_w4a4_base(e, block.get("gdn_a"), norm, a, hv, h))
+          linear_base(e, block.get("gdn_a"), norm, a, hv, h);
+        if (!try_linear_w4a4_base(e, block.get("gdn_b"), norm, b, hv, h))
+          linear_base(e, block.get("gdn_b"), norm, b, hv, h);
       } else if (input_is_a8 &&
                  try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns,
                                      h, norm, ab_concat)) {
@@ -5161,7 +5494,8 @@ public:
         e, block, block, qkv_ref, z_ref, a_ref, b_ref, convolved, recurrent,
         mixer, t, verify, true, true, 0U,
         io_sq_slot != nullptr ? out_sq_slot : std::optional<U32>{},
-        &gdn_fused_sq, /*out_w4a8=*/input_is_a8);
+        &gdn_fused_sq, /*out_w4a8=*/input_is_a8, false, true, nullptr,
+        /*out_w4a4=*/input_is_a4);
     if (io_sq_slot != nullptr) {
       *io_sq_slot = gdn_fused_sq ? out_sq_slot : std::nullopt;
     }
@@ -5289,7 +5623,8 @@ public:
                          bool &wrote_expert_output,
                          Ref fused_router_logits = {},
                          std::optional<U32> explicit_t = {},
-                         bool verify = false, bool input_is_a8 = false) {
+                         bool verify = false, bool input_is_a8 = false,
+                         bool input_is_a4 = false) {
     wrote_expert_output = false;
     if (moe_override)
       return false;
@@ -5304,6 +5639,17 @@ public:
     }
     const U32 t = explicit_t.value_or(e.profile.capacity);
     const U32 sel_t = nax_effective_select_t(e, explicit_t);
+    if (input_is_a4 && !verify &&
+        moe_w4a4_nax_runtime_eligible(context, libraries) &&
+        ensure_a4_quant(e, norm, h, explicit_t) &&
+        emit_moe_w4a4_nax_ffn(e, moe_nax_ws, gw, uw, dw, w4a4_codes,
+                              w4a4_scales, w4a4_nax_mp(t), route_ids,
+                              route_scores, expert_output, routed, t, h, f,
+                              8u, 256u, explicit_t, fused_router_logits,
+                              /*emit_reduce=*/false, w4a4_down_proj_)) {
+      wrote_expert_output = true;
+      return true;
+    }
     if (input_is_a8 && !verify &&
         moe_w4a8_nax_runtime_eligible(context, libraries) &&
         ensure_a8_quant(e, norm, h, explicit_t) &&
@@ -5470,9 +5816,51 @@ public:
            std::optional<U32> *io_sq_slot = nullptr,
            std::optional<U32> out_sq_slot = std::nullopt,
            bool allow_moe9_bt = false, bool input_is_a8 = false,
-           bool verify = false) {
+           bool verify = false, bool input_is_a4 = false) {
     const auto t = explicit_t.value_or(e.profile.capacity);
     if (!config.num_experts) {
+      if (input_is_a4) {
+        const auto &dw_v = block.get("mlp_down");
+        const bool down_w4a4 = dw_v.has_fwht64() || w4a4_down_proj_;
+        const bool mode_b_ok =
+            down_w4a4 && dw_v.has_fwht64() && can_w4a4_weight(dw_v, h, f) &&
+            try_linear_w4a4_swiglu_fwht64_a4(
+                e, block.get("mlp_gate"), block.get("mlp_up"), norm, product, f,
+                h, has_bypass_lora(dw_v) || inspect_tensors_workspace,
+                explicit_t);
+        if (!mode_b_ok &&
+            !try_linear_w4a4_swiglu(e, block.get("mlp_gate"),
+                                    block.get("mlp_up"), norm, product, f, h,
+                                    explicit_t)) {
+          if (!try_linear_w4a4_base(e, block.get("mlp_gate"), norm, gate, f, h,
+                                    explicit_t))
+            linear_base(e, block.get("mlp_gate"), norm, gate, f, h, explicit_t);
+          if (!try_linear_w4a4_base(e, block.get("mlp_up"), norm, up, f, h,
+                                    explicit_t))
+            linear_base(e, block.get("mlp_up"), norm, up, f, h, explicit_t);
+          if (const auto *mlp_gu_bypass = find_bypass_group(
+                  layer_index, QwenBypassGroupKind::mlp_gate_up);
+              mlp_gu_bypass != nullptr) {
+            const std::array<detail::lora_rt::BypassPartDest, 2> dests{{
+                {gate, f, 0U},
+                {up, f, 0U},
+            }};
+            detail::lora_rt::emit_bypass_sibling_group(
+                e, *mlp_gu_bypass, norm, dests, lora_bypass_tmp_,
+                bf16_nax_bypass_ok_, silicon_tuning.gpu_cores, explicit_t);
+          }
+          swiglu(e, t, f, explicit_t);
+        }
+        if (down_w4a4 &&
+            try_linear_w4a4_base(e, dw_v, product, delta, h, f, explicit_t)) {
+          emit_bypass_for_weight(e, dw_v, product, delta, h, explicit_t);
+        } else {
+          linear(e, dw_v, product, delta, h, f, explicit_t);
+        }
+        if (io_sq_slot != nullptr)
+          *io_sq_slot = std::nullopt;
+        return;
+      }
       if (input_is_a8) {
         const auto &dw_v = block.get("mlp_down");
         const bool down_w4a8 = dw_v.has_fwht64() || w4a8_down_proj_;
@@ -5793,7 +6181,7 @@ public:
     bool wrote_expert_output = false;
     if (!try_fused_moe_ffn(e, block, wrote_expert_output,
                            fuse_router_nax ? router : Ref{}, explicit_t,
-                           verify, input_is_a8)) {
+                           verify, input_is_a8, input_is_a4)) {
       expert_linear(e, block.get("moe_expert_gate"), norm, gate, f, h, false,
                     explicit_t);
       expert_linear(e, block.get("moe_expert_up"), norm, up, f, h, false,
@@ -5809,32 +6197,51 @@ public:
     }
     U32 shared_f = U32(config.shared_expert_intermediate_size);
     const auto &sdw_v = block.get("moe_shared_mlp_down");
+    const bool shared_down_w4a4 = sdw_v.has_fwht64() || w4a4_down_proj_;
     const bool shared_down_w4a8 = sdw_v.has_fwht64() || w4a8_down_proj_;
-    const bool shared_mode_b =
-        input_is_a8 && shared_down_w4a8 && sdw_v.has_fwht64() &&
-        can_w4a8_weight(sdw_v, h, shared_f) &&
-        try_linear_w4a8_swiglu_fwht64_a8(
+    const bool shared_mode_b_a4 =
+        input_is_a4 && shared_down_w4a4 && sdw_v.has_fwht64() &&
+        can_w4a4_weight(sdw_v, h, shared_f) &&
+        try_linear_w4a4_swiglu_fwht64_a4(
             e, block.get("moe_shared_mlp_gate"), block.get("moe_shared_mlp_up"),
             norm, product, shared_f, h,
             has_bypass_lora(sdw_v) || inspect_tensors_workspace, explicit_t);
+    const bool shared_mode_b =
+        shared_mode_b_a4 ||
+        (input_is_a8 && shared_down_w4a8 && sdw_v.has_fwht64() &&
+         can_w4a8_weight(sdw_v, h, shared_f) &&
+         try_linear_w4a8_swiglu_fwht64_a8(
+             e, block.get("moe_shared_mlp_gate"), block.get("moe_shared_mlp_up"),
+             norm, product, shared_f, h,
+             has_bypass_lora(sdw_v) || inspect_tensors_workspace, explicit_t));
     const bool shared_swiglu_done =
         shared_mode_b ||
+        (input_is_a4 &&
+         try_linear_w4a4_swiglu(e, block.get("moe_shared_mlp_gate"),
+                                block.get("moe_shared_mlp_up"), norm, product,
+                                shared_f, h, explicit_t)) ||
         (input_is_a8 &&
          try_linear_w4a8_swiglu(e, block.get("moe_shared_mlp_gate"),
                                 block.get("moe_shared_mlp_up"), norm, product,
                                 shared_f, h, explicit_t)) ||
-        (!input_is_a8 &&
+        (!input_is_a4 && !input_is_a8 &&
          try_linear_swiglu(e, block.get("moe_shared_mlp_gate"),
                            block.get("moe_shared_mlp_up"), norm, product,
                            shared_f, h, explicit_t));
     if (!shared_swiglu_done) {
-      if (!(input_is_a8 &&
+      if (!(input_is_a4 &&
+            try_linear_w4a4_base(e, block.get("moe_shared_mlp_gate"), norm,
+                                 gate, shared_f, h, explicit_t)) &&
+          !(input_is_a8 &&
             try_linear_w4a8_base(e, block.get("moe_shared_mlp_gate"), norm,
                                  gate, shared_f, h, explicit_t))) {
         linear_base(e, block.get("moe_shared_mlp_gate"), norm, gate, shared_f,
                     h, explicit_t);
       }
-      if (!(input_is_a8 &&
+      if (!(input_is_a4 &&
+            try_linear_w4a4_base(e, block.get("moe_shared_mlp_up"), norm, up,
+                                 shared_f, h, explicit_t)) &&
+          !(input_is_a8 &&
             try_linear_w4a8_base(e, block.get("moe_shared_mlp_up"), norm, up,
                                  shared_f, h, explicit_t))) {
         linear_base(e, block.get("moe_shared_mlp_up"), norm, up, shared_f, h,
@@ -5853,9 +6260,13 @@ public:
       }
       swiglu(e, t, shared_f, explicit_t);
     }
-    if (input_is_a8 && shared_down_w4a8 &&
-        try_linear_w4a8_base(e, sdw_v, product, shared, h, shared_f,
+    if (input_is_a4 && shared_down_w4a4 &&
+        try_linear_w4a4_base(e, sdw_v, product, shared, h, shared_f,
                              explicit_t)) {
+      emit_bypass_for_weight(e, sdw_v, product, shared, h, explicit_t);
+    } else if (input_is_a8 && shared_down_w4a8 &&
+               try_linear_w4a8_base(e, sdw_v, product, shared, h, shared_f,
+                                    explicit_t)) {
       emit_bypass_for_weight(e, sdw_v, product, shared, h, explicit_t);
     } else {
       linear(e, sdw_v, product, shared, h, shared_f, explicit_t);
@@ -5997,6 +6408,15 @@ public:
         key += ".w4dp1";
       }
     }
+    if (w4a4_nax_enabled_) {
+      key += ".plm2.w4a4m" + std::to_string(w4a4_min_tokens_);
+      if (w4a4_keep_qk_a8_) {
+        key += ".qka8";
+      }
+      if (!w4a4_down_proj_) {
+        key += ".d16";
+      }
+    }
     if (sage2_enabled_) {
       key += ".pam1";
       if (resolve_sage2_pv_mode() == Sage2PvMode::Mxfp8) {
@@ -6059,7 +6479,11 @@ public:
           const auto *tw = mxfp4_nax_cache->find(head.object_id);
           return tw && tw->n == v && tw->k == h;
         }();
-    const bool layer_w4a8 = use_w4a8_prefill(e, verify);
+    const bool layer_w4a4 = use_w4a4_prefill(e, verify);
+    const bool layer_w4a8 = !layer_w4a4 && use_w4a8_prefill(e, verify);
+    if (layer_w4a4) {
+      e.profile.used_w4a4 = true;
+    }
     if (layer_w4a8) {
       e.profile.used_w4a8 = true;
     }
@@ -6070,14 +6494,16 @@ public:
          rms_sq_buf.buffer != nullptr && moe_tg_done_buf.buffer != nullptr &&
          h < 65536U);
     const bool affine_xs_eligible =
-        (!layer_w4a8 && !allow_t1_fused_norms && t > 1U && affine_nax_active() &&
-         affine_nax_xs.buffer != nullptr && (h % 64U) == 0U);
+        (!layer_w4a4 && !layer_w4a8 && !allow_t1_fused_norms && t > 1U &&
+         affine_nax_active() && affine_nax_xs.buffer != nullptr &&
+         (h % 64U) == 0U);
     const U32 num_sq_words = U32(blocks.size()) * 2U + 4U;
     const U32 num_moe_words =
         config.num_experts ? (U32(blocks.size()) + 4U) : 0U;
     std::optional<U32> pending_sq_slot;
     std::optional<Encoder::GroupSumKey> carried_affine_xs;
     std::optional<Encoder::A8QuantKey> carried_a8_quant;
+    std::optional<Encoder::A4QuantKey> carried_a4_quant;
     auto restore_carried_xs = [&]() {
       if (carried_affine_xs.has_value()) {
         e.set_group_sum(*carried_affine_xs);
@@ -6086,6 +6512,10 @@ public:
       if (carried_a8_quant.has_value()) {
         e.set_a8_quant(*carried_a8_quant);
         carried_a8_quant.reset();
+      }
+      if (carried_a4_quant.has_value()) {
+        e.set_a4_quant(*carried_a4_quant);
+        carried_a4_quant.reset();
       }
     };
     auto block_input_needs_bf16 = [&](const Block &blk) -> bool {
@@ -6112,6 +6542,31 @@ public:
              !can_w4a8_weight(blk.get("mlp_gate"), f, h) ||
              !can_w4a8_weight(blk.get("mlp_up"), f, h);
     };
+    auto block_input_needs_bf16_a4 = [&](const Block &blk) -> bool {
+      if (inspect_tensors_workspace)
+        return true;
+      if (blk.type == LayerType::full_attention) {
+        return w4a4_keep_qk_a8_ ||
+               block_has_any_bypass(
+                   blk, {"attention_q", "attention_k", "attention_v"}) ||
+               !can_w4a4_weight(blk.get("attention_q"), 2 * q, h) ||
+               !can_w4a4_weight(blk.get("attention_k"), kv, h) ||
+               !can_w4a4_weight(blk.get("attention_v"), kv, h);
+      }
+      const U32 hv = U32(config.linear_num_value_heads);
+      return block_has_any_bypass(blk, {"gdn_qkv", "gdn_z", "gdn_a", "gdn_b"}) ||
+             !can_w4a4_weight(blk.get("gdn_qkv"), conv, h) ||
+             !can_w4a4_weight(blk.get("gdn_z"), gv, h) ||
+             !can_w4a4_weight(blk.get("gdn_a"), hv, h) ||
+             !can_w4a4_weight(blk.get("gdn_b"), hv, h);
+    };
+    auto block_mlp_needs_bf16_a4 = [&](const Block &blk) -> bool {
+      if (inspect_tensors_workspace || config.num_experts > 0)
+        return true;
+      return block_has_any_bypass(blk, {"mlp_gate", "mlp_up"}) ||
+             !can_w4a4_weight(blk.get("mlp_gate"), f, h) ||
+             !can_w4a4_weight(blk.get("mlp_up"), f, h);
+    };
     auto make_norm_xs_key = [&]() -> Encoder::GroupSumKey {
       return Encoder::GroupSumKey{affine_nax_xs.buffer,
                                   affine_nax_xs.offset,
@@ -6125,18 +6580,30 @@ public:
     };
     U32 layer_index = 0;
     for (const auto &block : blocks) {
-      const bool in_f16 = !layer_w4a8 && block_input_nax(block, t);
-      const bool mlp_f16 = !layer_w4a8 && block_mlp_input_nax(block, t);
-      const bool in_affine_xs = (!layer_w4a8 && !in_f16 && affine_xs_eligible);
-      const bool mlp_affine_xs = (!layer_w4a8 && !mlp_f16 && affine_xs_eligible);
-      const bool layer_fuse =
-          allow_t1_fused_norms && !layer_w4a8 && !in_f16 && !mlp_f16;
+      const bool in_f16 =
+          !layer_w4a4 && !layer_w4a8 && block_input_nax(block, t);
+      const bool mlp_f16 =
+          !layer_w4a4 && !layer_w4a8 && block_mlp_input_nax(block, t);
+      const bool in_affine_xs =
+          (!layer_w4a4 && !layer_w4a8 && !in_f16 && affine_xs_eligible);
+      const bool mlp_affine_xs =
+          (!layer_w4a4 && !layer_w4a8 && !mlp_f16 && affine_xs_eligible);
+      const bool layer_fuse = allow_t1_fused_norms && !layer_w4a4 &&
+                              !layer_w4a8 && !in_f16 && !mlp_f16;
       e.begin_stage(
           "layer." + std::to_string(layer_index) +
           (block.type == LayerType::full_attention ? ".attention" : ".gdn"));
       restore_carried_xs();
       if (layer_index == 0) {
-        if (layer_w4a8) {
+        if (layer_w4a4) {
+          emit_rmsnorm_a4_bm16_bk128(e, hidden,
+                                     direct(block.get("input_norm"), h), norm,
+                                     w4a4_codes, w4a4_scales, h,
+                                     float(config.rms_norm_eps),
+                                     normalization_weight_offset,
+                                     block_input_needs_bf16_a4(block));
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (layer_w4a8) {
           emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h),
                               norm, a8_qa, a8_sa, a8_ra, h,
                               float(config.rms_norm_eps),
@@ -6156,7 +6623,15 @@ public:
         else
           normalize(e, block.get("input_norm"), hidden, norm);
       } else if (!layer_fuse && pending_sq_slot.has_value()) {
-        if (layer_w4a8) {
+        if (layer_w4a4) {
+          emit_rmsnorm_a4_bm16_bk128(e, hidden,
+                                     direct(block.get("input_norm"), h), norm,
+                                     w4a4_codes, w4a4_scales, h,
+                                     float(config.rms_norm_eps),
+                                     normalization_weight_offset,
+                                     block_input_needs_bf16_a4(block));
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (layer_w4a8) {
           emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h),
                               norm, a8_qa, a8_sa, a8_ra, h,
                               float(config.rms_norm_eps),
@@ -6179,15 +6654,21 @@ public:
                   layer_fuse ? &pending_sq_slot : nullptr,
                   layer_fuse ? std::optional<U32>{2U * layer_index}
                              : std::optional<U32>{},
-                  layer_w4a8, attn_route_override);
+                  layer_w4a8, attn_route_override, layer_w4a4);
       else
         gdn(e, block, verify, in_f16, layer_fuse ? &pending_sq_slot : nullptr,
             layer_fuse ? std::optional<U32>{2U * layer_index}
                        : std::optional<U32>{},
-            layer_w4a8);
+            layer_w4a8, layer_w4a4);
       e.begin_stage("layer." + std::to_string(layer_index) + ".mlp");
       if (!pending_sq_slot.has_value()) {
-        if (layer_w4a8) {
+        if (layer_w4a4) {
+          emit_add_rmsnorm_a4_bm16_bk128(
+              e, hidden, delta, direct(block.get("post_attention_norm"), h),
+              norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+              normalization_weight_offset, block_mlp_needs_bf16_a4(block));
+          e.set_a4_quant(make_a4_key(e, norm, h));
+        } else if (layer_w4a8) {
           emit_add_rmsnorm_a8_g64(
               e, hidden, delta, direct(block.get("post_attention_norm"), h),
               norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -6209,10 +6690,18 @@ public:
           layer_fuse ? &pending_sq_slot : nullptr,
           layer_fuse ? std::optional<U32>{2U * layer_index + 1U}
                      : std::optional<U32>{},
-          false, layer_w4a8, verify);
+          false, layer_w4a8, verify, layer_w4a4);
       if (!pending_sq_slot.has_value()) {
         if (layer_index + 1 < blocks.size()) {
-          if (layer_w4a8) {
+          if (layer_w4a4) {
+            emit_add_rmsnorm_a4_bm16_bk128(
+                e, hidden, delta,
+                direct(blocks[layer_index + 1].get("input_norm"), h), norm,
+                w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                normalization_weight_offset,
+                block_input_needs_bf16_a4(blocks[layer_index + 1]));
+            carried_a4_quant = make_a4_key(e, norm, h);
+          } else if (layer_w4a8) {
             emit_add_rmsnorm_a8_g64(
                 e, hidden, delta,
                 direct(blocks[layer_index + 1].get("input_norm"), h), norm,
@@ -8913,13 +9402,18 @@ public:
                                 bool used_sage2, bool used_minf, U32 minf_cap,
                                 U32 minf_env, bool used_ane,
                                 QwenPrefillTelemetry *out_delta,
-                                std::optional<U32> ane_offload_override = {}) {
+                                std::optional<U32> ane_offload_override = {},
+                                bool used_w4a4 = false) {
     QwenPrefillTelemetry delta;
     delta.prefill_ane_active = ane_active_;
     delta.prefill_ane_split_alpha = ane_split_alpha_;
     if (used_w4a8) {
       prefill_telemetry_.prefill_w4a8_tokens += count;
       delta.prefill_w4a8_tokens += count;
+    }
+    if (used_w4a4) {
+      prefill_telemetry_.prefill_w4a4_tokens += count;
+      delta.prefill_w4a4_tokens += count;
     }
     if (used_sage2) {
       prefill_telemetry_.prefill_sage2_tokens += count;
@@ -9795,10 +10289,14 @@ public:
         (cold_route != ChunkAttentionRoute::ExactNax)
             ? select_long_ctx_envelope(end_pos)
             : end_pos;
-    const bool use_w4a8 = use_w4a8_for_t(lm, false);
+    const bool use_w4a4 = use_w4a4_for_t(lm, false);
+    const bool use_w4a8 = !use_w4a4 && use_w4a8_for_t(lm, false);
     const U64 seq_id = blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
     Encoder e(context, libraries, lm,
               "qwen.blend.cold." + std::to_string(seq_id) + plan_key_suffix());
+    if (use_w4a4) {
+      e.profile.used_w4a4 = true;
+    }
     if (use_w4a8) {
       e.profile.used_w4a8 = true;
     }
@@ -9833,7 +10331,14 @@ public:
         e.dynamic(qh3, 3, pod_bytes(qp));
       }
 
-      if (use_w4a8) {
+      if (use_w4a4) {
+        emit_rmsnorm_a4_bm16_bk128(e, hidden, direct(block.get("input_norm"), h),
+                                   norm, w4a4_codes, w4a4_scales, h,
+                                   float(config.rms_norm_eps),
+                                   normalization_weight_offset,
+                                   /*write_bf16=*/true);
+        e.set_a4_quant(make_a4_key(e, norm, h));
+      } else if (use_w4a8) {
         emit_rmsnorm_a8_g64(e, hidden, direct(block.get("input_norm"), h), norm,
                             a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
                             normalization_weight_offset, /*write_bf16=*/true);
@@ -9847,7 +10352,27 @@ public:
             block.get("attention_q"), block.get("attention_k"),
             block.get("attention_v")};
         const std::array<U32, 3> part_ns{2 * q, kv, kv};
-        if (use_w4a8 &&
+        if (use_w4a4 && !w4a4_keep_qk_a8_ &&
+            try_concat_w4a4_nax(e, block.concat_qkv_id, parts, part_ns, h, norm,
+                                concat_out)) {
+          emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
+        } else if (use_w4a4) {
+          if (w4a4_keep_qk_a8_) {
+            if (!try_linear_w4a8_base(e, parts[0], norm, query, 2 * q, h) &&
+                !try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+              linear_base(e, parts[0], norm, query, 2 * q, h);
+            if (!try_linear_w4a8_base(e, parts[1], norm, key, kv, h) &&
+                !try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+              linear_base(e, parts[1], norm, key, kv, h);
+          } else {
+            if (!try_linear_w4a4_base(e, parts[0], norm, query, 2 * q, h))
+              linear_base(e, parts[0], norm, query, 2 * q, h);
+            if (!try_linear_w4a4_base(e, parts[1], norm, key, kv, h))
+              linear_base(e, parts[1], norm, key, kv, h);
+          }
+          if (!try_linear_w4a4_base(e, parts[2], norm, value, kv, h))
+            linear_base(e, parts[2], norm, value, kv, h);
+        } else if (use_w4a8 &&
             try_concat_w4a8_nax(e, block.concat_qkv_id, parts, part_ns, h, norm,
                                 concat_out)) {
           emit_split3(e, concat_out, query, key, value, 2 * q, kv, kv);
@@ -9913,7 +10438,9 @@ public:
                    geom.mix3_cached_scale_bytes()}});
           e.dynamic(qmix, 3, pod_bytes(qm));
         }
-        if (!(use_w4a8 && try_linear_w4a8_base(e, block.get("attention_o"),
+        if (!(use_w4a4 && try_linear_w4a4_base(e, block.get("attention_o"),
+                                               mixer, delta, h, q)) &&
+            !(use_w4a8 && try_linear_w4a8_base(e, block.get("attention_o"),
                                                mixer, delta, h, q))) {
           linear(e, block.get("attention_o"), mixer, delta, h, q);
         }
@@ -9925,7 +10452,16 @@ public:
         const std::array<MaterializedWeightView, 2> ab_parts{
             block.get("gdn_a"), block.get("gdn_b")};
         const std::array<U32, 2> ab_ns{hv, hv};
-        if (use_w4a8 &&
+        if (use_w4a4 &&
+            try_concat_w4a4_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
+                                qkvz_ns, h, norm, concat_out)) {
+          emit_split2(e, concat_out, qkv, z, conv, gv);
+        } else if (use_w4a4) {
+          if (!try_linear_w4a4_base(e, qkvz_parts[0], norm, qkv, conv, h))
+            linear_base(e, qkvz_parts[0], norm, qkv, conv, h);
+          if (!try_linear_w4a4_base(e, qkvz_parts[1], norm, z, gv, h))
+            linear_base(e, qkvz_parts[1], norm, z, gv, h);
+        } else if (use_w4a8 &&
             try_concat_w4a8_nax(e, block.concat_gdn_qkvz_id, qkvz_parts,
                                 qkvz_ns, h, norm, concat_out)) {
           emit_split2(e, concat_out, qkv, z, conv, gv);
@@ -9941,7 +10477,16 @@ public:
           linear_base(e, qkvz_parts[0], norm, qkv, conv, h);
           linear_base(e, qkvz_parts[1], norm, z, gv, h);
         }
-        if (use_w4a8 &&
+        if (use_w4a4 &&
+            try_concat_w4a4_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
+                                norm, concat_out)) {
+          emit_split2(e, concat_out, a, b, hv, hv);
+        } else if (use_w4a4) {
+          if (!try_linear_w4a4_base(e, ab_parts[0], norm, a, hv, h))
+            linear_base(e, ab_parts[0], norm, a, hv, h);
+          if (!try_linear_w4a4_base(e, ab_parts[1], norm, b, hv, h))
+            linear_base(e, ab_parts[1], norm, b, hv, h);
+        } else if (use_w4a8 &&
             try_concat_w4a8_nax(e, block.concat_gdn_ab_id, ab_parts, ab_ns, h,
                                 norm, concat_out)) {
           emit_split2(e, concat_out, a, b, hv, hv);
@@ -10051,14 +10596,23 @@ public:
           e.dynamic(pb, 3, pod_bytes(pop));
         }
 
-        if (!(use_w4a8 && try_linear_w4a8_base(e, block.get("gdn_out"), mixer,
+        if (!(use_w4a4 && try_linear_w4a4_base(e, block.get("gdn_out"), mixer,
+                                               delta, h, gv)) &&
+            !(use_w4a8 && try_linear_w4a8_base(e, block.get("gdn_out"), mixer,
                                                delta, h, gv))) {
           linear(e, block.get("gdn_out"), mixer, delta, h, gv);
         }
         ++gdn_idx;
       }
 
-      if (use_w4a8) {
+      if (use_w4a4) {
+        emit_add_rmsnorm_a4_bm16_bk128(
+            e, hidden, delta, direct(block.get("post_attention_norm"), h), norm,
+            w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+            normalization_weight_offset,
+            /*write_bf16=*/(config.num_experts > 0));
+        e.set_a4_quant(make_a4_key(e, norm, h));
+      } else if (use_w4a8) {
         emit_add_rmsnorm_a8_g64(
             e, hidden, delta, direct(block.get("post_attention_norm"), h), norm,
             a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10069,7 +10623,7 @@ public:
         add_normalize(e, block.get("post_attention_norm"), hidden, delta, norm);
       }
       mlp(e, block, li, false, {}, nullptr, std::nullopt, false, use_w4a8,
-          /*verify=*/false);
+          /*verify=*/false, use_w4a4);
       add(e);
     }
 
@@ -10090,8 +10644,10 @@ public:
     QwenPrefillTelemetry seg_delta;
     record_prefill_telemetry(lm, start_pos, prof.used_w4a8, prof.used_sage2,
                              prof.used_minference, lm, prof.minf_context_envelope,
-                             /*used_ane=*/false, &seg_delta);
+                             /*used_ane=*/false, &seg_delta, std::nullopt,
+                             prof.used_w4a4);
     accum_delta.prefill_w4a8_tokens += seg_delta.prefill_w4a8_tokens;
+    accum_delta.prefill_w4a4_tokens += seg_delta.prefill_w4a4_tokens;
     accum_delta.prefill_sage2_tokens += seg_delta.prefill_sage2_tokens;
     accum_delta.prefill_minference_blocks_total +=
         seg_delta.prefill_minference_blocks_total;
@@ -10152,6 +10708,7 @@ public:
           last_res = owner.run_trunk(prompt.subspan(cur, chunk), true);
         }
         accum.prefill_w4a8_tokens += last_res.prefill_delta.prefill_w4a8_tokens;
+        accum.prefill_w4a4_tokens += last_res.prefill_delta.prefill_w4a4_tokens;
         accum.prefill_sage2_tokens +=
             last_res.prefill_delta.prefill_sage2_tokens;
         accum.prefill_minference_blocks_total +=
@@ -10356,11 +10913,15 @@ public:
       // ====================================================================
       // Stage 1: KV Instantiation + Pre-Probe + Layer-3 Probe + HKVD Select
       // ====================================================================
-      const bool use_w4a8_win = use_w4a8_for_t(win_len, false);
+      const bool use_w4a4_win = use_w4a4_for_t(win_len, false);
+      const bool use_w4a8_win = !use_w4a4_win && use_w4a8_for_t(win_len, false);
       const U64 seq1 =
           blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
       Encoder e1(context, libraries, win_len,
                  "qwen.blend.warm1." + std::to_string(seq1) + plan_key_suffix());
+      if (use_w4a4_win) {
+        e1.profile.used_w4a4 = true;
+      }
       if (use_w4a8_win) {
         e1.profile.used_w4a8 = true;
       }
@@ -10456,10 +11017,19 @@ public:
                             token_ids.offset + mul(rel_start, 4ULL),
                             mul(run_len, 4ULL)};
           embedding_lookup(e1, embedding, seg_tok, hidden, zero, v, h, run_len);
-          const bool seg_w4a8 = use_w4a8_for_t(run_len, false);
+          const bool seg_w4a4 = use_w4a4_for_t(run_len, false);
+          const bool seg_w4a8 = !seg_w4a4 && use_w4a8_for_t(run_len, false);
           for (U32 li = 0; li < probe_idx; ++li) {
             const auto &blk = blocks[li];
-            if (seg_w4a8) {
+            if (seg_w4a4) {
+              emit_rmsnorm_a4_bm16_bk128(e1, hidden,
+                                         direct(blk.get("input_norm"), h), norm,
+                                         w4a4_codes, w4a4_scales, h,
+                                         float(config.rms_norm_eps),
+                                         normalization_weight_offset, true,
+                                         run_len);
+              e1.set_a4_quant(make_a4_key(e1, norm, h, run_len));
+            } else if (seg_w4a8) {
               emit_rmsnorm_a8_g64(e1, hidden, direct(blk.get("input_norm"), h),
                                   norm, a8_qa, a8_sa, a8_ra, h,
                                   float(config.rms_norm_eps),
@@ -10474,7 +11044,18 @@ public:
             const std::array<MaterializedWeightView, 2> ab_parts{
                 blk.get("gdn_a"), blk.get("gdn_b")};
             const std::array<U32, 2> ab_ns{hv, hv};
-            if (seg_w4a8 &&
+            if (seg_w4a4 &&
+                try_concat_w4a4_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                    qkvz_ns, h, norm, concat_out, run_len)) {
+              emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
+            } else if (seg_w4a4) {
+              if (!try_linear_w4a4_base(e1, qkvz_parts[0], norm, qkv, conv, h,
+                                        run_len))
+                linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
+              if (!try_linear_w4a4_base(e1, qkvz_parts[1], norm, z, gv, h,
+                                        run_len))
+                linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
+            } else if (seg_w4a8 &&
                 try_concat_w4a8_nax(e1, blk.concat_gdn_qkvz_id, qkvz_parts,
                                     qkvz_ns, h, norm, concat_out, run_len)) {
               emit_split2(e1, concat_out, qkv, z, conv, gv, run_len);
@@ -10493,7 +11074,18 @@ public:
               linear_base(e1, qkvz_parts[0], norm, qkv, conv, h, run_len);
               linear_base(e1, qkvz_parts[1], norm, z, gv, h, run_len);
             }
-            if (seg_w4a8 &&
+            if (seg_w4a4 &&
+                try_concat_w4a4_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out, run_len)) {
+              emit_split2(e1, concat_out, a, b, hv, hv, run_len);
+            } else if (seg_w4a4) {
+              if (!try_linear_w4a4_base(e1, ab_parts[0], norm, a, hv, h,
+                                        run_len))
+                linear_base(e1, ab_parts[0], norm, a, hv, h, run_len);
+              if (!try_linear_w4a4_base(e1, ab_parts[1], norm, b, hv, h,
+                                        run_len))
+                linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
+            } else if (seg_w4a8 &&
                 try_concat_w4a8_nax(e1, blk.concat_gdn_ab_id, ab_parts, ab_ns,
                                     h, norm, concat_out, run_len)) {
               emit_split2(e1, concat_out, a, b, hv, hv, run_len);
@@ -10512,12 +11104,22 @@ public:
               linear_base(e1, ab_parts[1], norm, b, hv, h, run_len);
             }
             emit_blend_gdn_slice(e1, blk, blk.state0, blk.state1, 0U, run_len);
-            if (!(seg_w4a8 &&
+            if (!(seg_w4a4 &&
+                  try_linear_w4a4_base(e1, blk.get("gdn_out"), mixer, delta, h,
+                                       gv, run_len)) &&
+                !(seg_w4a8 &&
                   try_linear_w4a8_base(e1, blk.get("gdn_out"), mixer, delta, h,
                                        gv, run_len))) {
               linear(e1, blk.get("gdn_out"), mixer, delta, h, gv, run_len);
             }
-            if (seg_w4a8) {
+            if (seg_w4a4) {
+              emit_add_rmsnorm_a4_bm16_bk128(
+                  e1, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                  norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                  normalization_weight_offset, (config.num_experts > 0),
+                  run_len);
+              e1.set_a4_quant(make_a4_key(e1, norm, h, run_len));
+            } else if (seg_w4a8) {
               emit_add_rmsnorm_a8_g64(
                   e1, hidden, delta, direct(blk.get("post_attention_norm"), h),
                   norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10529,7 +11131,7 @@ public:
                             norm, run_len);
             }
             mlp(e1, blk, li, false, run_len, nullptr, std::nullopt, false,
-                seg_w4a8, /*verify=*/false);
+                seg_w4a8, /*verify=*/false, seg_w4a4);
             add(e1, run_len);
           }
           copy(e1, hidden,
@@ -10554,7 +11156,13 @@ public:
         const auto &pblk = blocks[probe_idx];
         e1.begin_stage("blend_probe_layer");
         e1.delegated_prefill = false;
-        if (use_w4a8_win) {
+        if (use_w4a4_win) {
+          emit_rmsnorm_a4_bm16_bk128(
+              e1, full_hidden_ref, direct(pblk.get("input_norm"), h), norm,
+              w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+              normalization_weight_offset, /*write_bf16=*/true);
+          e1.set_a4_quant(make_a4_key(e1, norm, h));
+        } else if (use_w4a8_win) {
           emit_rmsnorm_a8_g64(
               e1, full_hidden_ref, direct(pblk.get("input_norm"), h), norm,
               a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -10575,13 +11183,20 @@ public:
                              {.width = std::min<U32>(128U, gx)},
                              {norm, mand_idx_ref, zero, delta});
           e1.dynamic(gm, 4, pod_bytes(gp));
-          const bool mand_w4a8 = use_w4a8_for_t(m_mand, false);
-          if (!(mand_w4a8 &&
-                try_linear_w4a8_base(e1, pblk.get("attention_k"), delta, key,
-                                     kv, h, m_mand))) {
+          const bool mand_w4a4 = use_w4a4_for_t(m_mand, false);
+          const bool mand_w4a8 = !mand_w4a4 && use_w4a8_for_t(m_mand, false);
+          const bool mand_k_a8 =
+              (mand_w4a8 || (mand_w4a4 && w4a4_keep_qk_a8_)) &&
+              try_linear_w4a8_base(e1, pblk.get("attention_k"), delta, key, kv,
+                                   h, m_mand);
+          if (!mand_k_a8 &&
+              !(mand_w4a4 && try_linear_w4a4_base(e1, pblk.get("attention_k"),
+                                                  delta, key, kv, h, m_mand))) {
             linear_base(e1, pblk.get("attention_k"), delta, key, kv, h, m_mand);
           }
-          if (!(mand_w4a8 &&
+          if (!(mand_w4a4 && try_linear_w4a4_base(e1, pblk.get("attention_v"),
+                                                  delta, value, kv, h, m_mand)) &&
+              !(mand_w4a8 &&
                 try_linear_w4a8_base(e1, pblk.get("attention_v"), delta, value,
                                      kv, h, m_mand))) {
             linear_base(e1, pblk.get("attention_v"), delta, value, kv, h,
@@ -10615,9 +11230,13 @@ public:
           emit_refresh_pages(e1, pblk);
         }
 
-        if (!(use_w4a8_win &&
-              try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
-                                   2 * q, h))) {
+        const bool probe_q_a8 =
+            (use_w4a8_win || (use_w4a4_win && w4a4_keep_qk_a8_)) &&
+            try_linear_w4a8_base(e1, pblk.get("attention_q"), norm, query,
+                                 2 * q, h);
+        if (!probe_q_a8 &&
+            !(use_w4a4_win && try_linear_w4a4_base(e1, pblk.get("attention_q"),
+                                                   norm, query, 2 * q, h))) {
           linear_base(e1, pblk.get("attention_q"), norm, query, 2 * q, h);
         }
         {
@@ -11291,12 +11910,17 @@ public:
         ane_engine_->flush_and_wait();
         static_cast<void>(context.submit_classic_barrier());
       } else {
+        const bool use_w4a4_active = use_w4a4_for_t(m_active, false);
+        const bool use_w4a8_active_gpu = !use_w4a4_active && use_w4a8_active;
         const U64 seq2 =
             blend_plan_seq_.fetch_add(1ULL, std::memory_order_relaxed);
         Encoder e2(context, libraries, m_active,
                    "qwen.blend.warm2." + std::to_string(seq2) +
                        plan_key_suffix());
-        if (use_w4a8_active) {
+        if (use_w4a4_active) {
+          e2.profile.used_w4a4 = true;
+        }
+        if (use_w4a8_active_gpu) {
           e2.profile.used_w4a8 = true;
         }
 
@@ -11328,12 +11952,21 @@ public:
         {
           const auto &pblk = blocks[probe_idx];
           e2.begin_stage("blend_probe_finish");
-          if (!(use_w4a8_active &&
+          if (!(use_w4a4_active &&
+                try_linear_w4a4_base(e2, pblk.get("attention_o"), mixer, delta,
+                                     h, q)) &&
+              !(use_w4a8_active_gpu &&
                 try_linear_w4a8_base(e2, pblk.get("attention_o"), mixer, delta,
                                      h, q))) {
             linear(e2, pblk.get("attention_o"), mixer, delta, h, q);
           }
-          if (use_w4a8_active) {
+          if (use_w4a4_active) {
+            emit_add_rmsnorm_a4_bm16_bk128(
+                e2, hidden, delta, direct(pblk.get("post_attention_norm"), h),
+                norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                normalization_weight_offset, (config.num_experts > 0));
+            e2.set_a4_quant(make_a4_key(e2, norm, h));
+          } else if (use_w4a8_active_gpu) {
             emit_add_rmsnorm_a8_g64(
                 e2, hidden, delta, direct(pblk.get("post_attention_norm"), h),
                 norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -11344,7 +11977,7 @@ public:
                           norm);
           }
           mlp(e2, pblk, probe_idx, false, {}, nullptr, std::nullopt, false,
-              use_w4a8_active, /*verify=*/false);
+              use_w4a8_active_gpu, /*verify=*/false, use_w4a4_active);
           add(e2);
         }
 
@@ -11352,7 +11985,14 @@ public:
         for (U32 li = probe_idx + 1U; li < blocks.size(); ++li) {
           const auto &blk = blocks[li];
           e2.begin_stage("blend_deep.L" + std::to_string(li));
-          if (use_w4a8_active) {
+          if (use_w4a4_active) {
+            emit_rmsnorm_a4_bm16_bk128(e2, hidden,
+                                       direct(blk.get("input_norm"), h), norm,
+                                       w4a4_codes, w4a4_scales, h,
+                                       float(config.rms_norm_eps),
+                                       normalization_weight_offset, true);
+            e2.set_a4_quant(make_a4_key(e2, norm, h));
+          } else if (use_w4a8_active_gpu) {
             emit_rmsnorm_a8_g64(e2, hidden, direct(blk.get("input_norm"), h),
                                 norm, a8_qa, a8_sa, a8_ra, h,
                                 float(config.rms_norm_eps),
@@ -11367,11 +12007,31 @@ public:
                 blk.get("attention_q"), blk.get("attention_k"),
                 blk.get("attention_v")};
             const std::array<U32, 3> part_ns{2 * q, kv, kv};
-            if (use_w4a8_active &&
+            if (use_w4a4_active && !w4a4_keep_qk_a8_ &&
+                try_concat_w4a4_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
+                                    norm, concat_out)) {
+              emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
+            } else if (use_w4a4_active) {
+              if (w4a4_keep_qk_a8_) {
+                if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h) &&
+                    !try_linear_w4a4_base(e2, parts[0], norm, query, 2 * q, h))
+                  linear_base(e2, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h) &&
+                    !try_linear_w4a4_base(e2, parts[1], norm, key, kv, h))
+                  linear_base(e2, parts[1], norm, key, kv, h);
+              } else {
+                if (!try_linear_w4a4_base(e2, parts[0], norm, query, 2 * q, h))
+                  linear_base(e2, parts[0], norm, query, 2 * q, h);
+                if (!try_linear_w4a4_base(e2, parts[1], norm, key, kv, h))
+                  linear_base(e2, parts[1], norm, key, kv, h);
+              }
+              if (!try_linear_w4a4_base(e2, parts[2], norm, value, kv, h))
+                linear_base(e2, parts[2], norm, value, kv, h);
+            } else if (use_w4a8_active_gpu &&
                 try_concat_w4a8_nax(e2, blk.concat_qkv_id, parts, part_ns, h,
                                     norm, concat_out)) {
               emit_split3(e2, concat_out, query, key, value, 2 * q, kv, kv);
-            } else if (use_w4a8_active) {
+            } else if (use_w4a8_active_gpu) {
               if (!try_linear_w4a8_base(e2, parts[0], norm, query, 2 * q, h))
                 linear_base(e2, parts[0], norm, query, 2 * q, h);
               if (!try_linear_w4a8_base(e2, parts[1], norm, key, kv, h))
@@ -11416,7 +12076,10 @@ public:
 
             emit_blend_attn_route_b(e2, blk, m_active, active_pos_host.front(),
                                     ctx_env, attention_positions);
-            if (!(use_w4a8_active &&
+            if (!(use_w4a4_active &&
+                  try_linear_w4a4_base(e2, blk.get("attention_o"), mixer, delta,
+                                       h, q)) &&
+                !(use_w4a8_active_gpu &&
                   try_linear_w4a8_base(e2, blk.get("attention_o"), mixer, delta,
                                        h, q))) {
               linear(e2, blk.get("attention_o"), mixer, delta, h, q);
@@ -11428,11 +12091,20 @@ public:
             const std::array<MaterializedWeightView, 2> ab_parts{
                 blk.get("gdn_a"), blk.get("gdn_b")};
             const std::array<U32, 2> ab_ns{hv, hv};
-            if (use_w4a8_active &&
+            if (use_w4a4_active &&
+                try_concat_w4a4_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
+                                    qkvz_ns, h, norm, concat_out)) {
+              emit_split2(e2, concat_out, qkv, z, conv, gv);
+            } else if (use_w4a4_active) {
+              if (!try_linear_w4a4_base(e2, qkvz_parts[0], norm, qkv, conv, h))
+                linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
+              if (!try_linear_w4a4_base(e2, qkvz_parts[1], norm, z, gv, h))
+                linear_base(e2, qkvz_parts[1], norm, z, gv, h);
+            } else if (use_w4a8_active_gpu &&
                 try_concat_w4a8_nax(e2, blk.concat_gdn_qkvz_id, qkvz_parts,
                                     qkvz_ns, h, norm, concat_out)) {
               emit_split2(e2, concat_out, qkv, z, conv, gv);
-            } else if (use_w4a8_active) {
+            } else if (use_w4a8_active_gpu) {
               if (!try_linear_w4a8_base(e2, qkvz_parts[0], norm, qkv, conv, h))
                 linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
               if (!try_linear_w4a8_base(e2, qkvz_parts[1], norm, z, gv, h))
@@ -11444,11 +12116,20 @@ public:
               linear_base(e2, qkvz_parts[0], norm, qkv, conv, h);
               linear_base(e2, qkvz_parts[1], norm, z, gv, h);
             }
-            if (use_w4a8_active &&
+            if (use_w4a4_active &&
+                try_concat_w4a4_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns,
+                                    h, norm, concat_out)) {
+              emit_split2(e2, concat_out, a, b, hv, hv);
+            } else if (use_w4a4_active) {
+              if (!try_linear_w4a4_base(e2, ab_parts[0], norm, a, hv, h))
+                linear_base(e2, ab_parts[0], norm, a, hv, h);
+              if (!try_linear_w4a4_base(e2, ab_parts[1], norm, b, hv, h))
+                linear_base(e2, ab_parts[1], norm, b, hv, h);
+            } else if (use_w4a8_active_gpu &&
                 try_concat_w4a8_nax(e2, blk.concat_gdn_ab_id, ab_parts, ab_ns,
                                     h, norm, concat_out)) {
               emit_split2(e2, concat_out, a, b, hv, hv);
-            } else if (use_w4a8_active) {
+            } else if (use_w4a8_active_gpu) {
               if (!try_linear_w4a8_base(e2, ab_parts[0], norm, a, hv, h))
                 linear_base(e2, ab_parts[0], norm, a, hv, h);
               if (!try_linear_w4a8_base(e2, ab_parts[1], norm, b, hv, h))
@@ -11485,7 +12166,10 @@ public:
               }
             }
 
-            if (!(use_w4a8_active &&
+            if (!(use_w4a4_active &&
+                  try_linear_w4a4_base(e2, blk.get("gdn_out"), mixer, delta, h,
+                                       gv)) &&
+                !(use_w4a8_active_gpu &&
                   try_linear_w4a8_base(e2, blk.get("gdn_out"), mixer, delta, h,
                                        gv))) {
               linear(e2, blk.get("gdn_out"), mixer, delta, h, gv);
@@ -11493,7 +12177,13 @@ public:
             ++gdn_idx;
           }
 
-          if (use_w4a8_active) {
+          if (use_w4a4_active) {
+            emit_add_rmsnorm_a4_bm16_bk128(
+                e2, hidden, delta, direct(blk.get("post_attention_norm"), h),
+                norm, w4a4_codes, w4a4_scales, h, float(config.rms_norm_eps),
+                normalization_weight_offset, (config.num_experts > 0));
+            e2.set_a4_quant(make_a4_key(e2, norm, h));
+          } else if (use_w4a8_active_gpu) {
             emit_add_rmsnorm_a8_g64(
                 e2, hidden, delta, direct(blk.get("post_attention_norm"), h),
                 norm, a8_qa, a8_sa, a8_ra, h, float(config.rms_norm_eps),
@@ -11504,7 +12194,7 @@ public:
                           norm);
           }
           mlp(e2, blk, li, false, {}, nullptr, std::nullopt, false,
-              use_w4a8_active, /*verify=*/false);
+              use_w4a8_active_gpu, /*verify=*/false, use_w4a4_active);
           add(e2);
         }
 
@@ -11569,6 +12259,8 @@ public:
       last_logits_row = 0U;
       has_last_logits = is_final_window;
 
+      const bool any_w4a4 =
+          prof1.used_w4a4 || (!stage2_ane && use_w4a4_for_t(m_active, false));
       const bool any_w4a8 = prof1.used_w4a8 || stage2_used_w4a8;
       const bool any_sage2 = prof1.used_sage2 || stage2_used_sage2;
       const bool any_minf = stage2_used_minf || prof1.used_minference;
@@ -11580,11 +12272,13 @@ public:
           m_active, active_pos_host.front(), any_w4a8, any_sage2, any_minf,
           minf_cap, minf_env, /*used_ane=*/stage2_ane, &win_delta,
           stage2_ane ? std::optional<U32>{stage2_ane_offload_rows}
-                     : std::nullopt);
+                     : std::nullopt,
+          any_w4a4);
       prefill_telemetry_.prefill_cache_blend_hit_tokens += win_hit_tokens;
       prefill_telemetry_.prefill_cache_blend_recomputed_tokens +=
           recomputed_hit_tokens;
       accum.prefill_w4a8_tokens += win_delta.prefill_w4a8_tokens;
+      accum.prefill_w4a4_tokens += win_delta.prefill_w4a4_tokens;
       accum.prefill_sage2_tokens += win_delta.prefill_sage2_tokens;
       accum.prefill_minference_blocks_total +=
           win_delta.prefill_minference_blocks_total;
@@ -11772,10 +12466,17 @@ public:
   U32 w4a8_min_tokens_ = kW4A8DefaultMinTokens;
   bool w4a8_nax_enabled_ = false;
   bool w4a8_down_proj_ = false;
+  U32 w4a4_min_tokens_ = kW4A4DefaultMinTokens;
+  bool w4a4_nax_enabled_ = false;
+  bool w4a4_keep_qk_a8_ = false;
+  bool w4a4_down_proj_ = true;
   Ref fwht_scratch;
   Ref a8_qa, a8_sa, a8_ra;
   Ref a8_mid_qa, a8_mid_sa, a8_mid_ra;
   U32 a8_workspace_mp_ = 0U;
+  Ref w4a4_codes, w4a4_scales;
+  Ref w4a4_mid_codes, w4a4_mid_scales;
+  U32 w4a4_workspace_mp_ = 0U;
   static constexpr U32 kDefaultSage2MinEndKv = 0U;
   static constexpr U32 kDefaultMInferenceMinMeanKv = 4096U;
   bool sage2_enabled_ = false;
@@ -12380,7 +13081,8 @@ QwenForward::finish_prefill_step(QwenAsyncPrefillStep &&step) {
                              st.profile->used_w4a8, st.profile->used_sage2,
                              st.profile->used_minference, st.profile->capacity,
                              st.profile->minf_context_envelope,
-                             /*used_ane=*/false, &res.prefill_delta);
+                             /*used_ane=*/false, &res.prefill_delta,
+                             std::nullopt, st.profile->used_w4a4);
   return res;
 }
 
@@ -12443,6 +13145,8 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
           sub_res.submission.shared_event_value;
       total_res.prefill_delta.prefill_w4a8_tokens +=
           sub_res.prefill_delta.prefill_w4a8_tokens;
+      total_res.prefill_delta.prefill_w4a4_tokens +=
+          sub_res.prefill_delta.prefill_w4a4_tokens;
       total_res.prefill_delta.prefill_sage2_tokens +=
           sub_res.prefill_delta.prefill_sage2_tokens;
       total_res.prefill_delta.prefill_minference_blocks_skipped +=
@@ -12542,7 +13246,8 @@ QwenForwardResult QwenForward::run_trunk(std::span<const U32> tokens,
   p.record_prefill_telemetry(count, start_pos, profile.used_w4a8,
                              profile.used_sage2, profile.used_minference,
                              profile.capacity, profile.minf_context_envelope,
-                             /*used_ane=*/false, &res.prefill_delta);
+                             /*used_ane=*/false, &res.prefill_delta,
+                             std::nullopt, profile.used_w4a4);
   return res;
 }
 
@@ -12991,6 +13696,8 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
           sub_res.submission.shared_event_value;
       total_res.prefill_delta.prefill_w4a8_tokens +=
           sub_res.prefill_delta.prefill_w4a8_tokens;
+      total_res.prefill_delta.prefill_w4a4_tokens +=
+          sub_res.prefill_delta.prefill_w4a4_tokens;
       total_res.prefill_delta.prefill_sage2_tokens +=
           sub_res.prefill_delta.prefill_sage2_tokens;
       total_res.prefill_delta.prefill_minference_blocks_skipped +=
@@ -13277,7 +13984,8 @@ QwenForwardResult QwenForward::execute(std::span<const U32> tokens,
     p.record_prefill_telemetry(U32(tokens.size()), start_pos, profile.used_w4a8,
                                profile.used_sage2, profile.used_minference,
                                profile.capacity, profile.minf_context_envelope,
-                               /*used_ane=*/false, &result.prefill_delta);
+                               /*used_ane=*/false, &result.prefill_delta,
+                               std::nullopt, profile.used_w4a4);
   }
   return result;
 }

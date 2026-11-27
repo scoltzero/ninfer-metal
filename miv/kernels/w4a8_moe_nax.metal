@@ -58,14 +58,15 @@ struct W4A8MoeMxfp4SwiTgStorage {
       float Sa_s[64u];                                  //   256 B
       float Sw0_s[64u];                                 //   256 B
       float Sw1_s[64u];                                 //   256 B
+      uint slow_flag[4u];                               //    16 B (per-SG race-free flag)
     } kloop;
     alignas(16) bfloat SwiBuf[64u * kW4A8MoeEpiStride]; // 8,704 B
   };
   uint tg_tok[64u];                                     //   256 B
   uint tg_meta[4u];                                     //    16 B {expert, rb, valid_rows, tg_n0_base}
 };
-static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) == 9232ul,
-              "W4A8MoeMxfp4SwiTgStorage must be 9,232 B (9.02 KiB)");
+static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) == 9248ul,
+              "W4A8MoeMxfp4SwiTgStorage must be 9,248 B (9.03 KiB)");
 static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) <= kApple10HighOccTgSramBytes,
               "W4A8MoeMxfp4SwiTgStorage exceeds 10.0 KiB");
 
@@ -87,9 +88,10 @@ struct W4A8MoeDownMxfp4TgStorage {
   float Sa_s[64u];                                  //   256 B
   float Sw0_s[64u];                                 //   256 B
   float Sw1_s[64u];                                 //   256 B
+  uint slow_flag[4u];                               //    16 B (per-SG race-free flag)
 };
-static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) == 8960ul,
-              "W4A8MoeDownMxfp4TgStorage must be 8,960 B (8.75 KiB)");
+static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) == 8976ul,
+              "W4A8MoeDownMxfp4TgStorage must be 8,976 B (8.77 KiB)");
 static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) <= kApple10HighOccTgSramBytes,
               "W4A8MoeDownMxfp4TgStorage exceeds 10.0 KiB");
 
@@ -108,6 +110,27 @@ inline bool w4a8_moe_has_apple10_i8_layout() {
 inline int8_t w4a8_moe_mxfp4_e2m1_to_i8_x2(uint nib) {
   const int mag2 = int((0xC8643210u >> ((nib & 7u) * 4u)) & 0xFu);
   return int8_t((nib & 8u) ? -mag2 : mag2);
+}
+
+// Constant-buffer 2 KiB pre-shifted byte LUT for lossless MXFP4 (2 * E2M1 << sh, sh in 0..3).
+// Passed via Encoder::dynamic(...) (icb=1 + MTL_SHADER_VALIDATION=1 clean, 0 B extra SRAM).
+inline float w4a8_moe_e8m0_safe(uchar code) {
+  if (code == 255u) return 0.0f;
+  return e8m0_to_float(code);
+}
+
+inline void w4a8_moe_unpack_mxfp4_lut_sh_u4(
+    uint4 raw_w, uint sh, constant ushort *mxfp4_lut,
+    thread uint4 &wu0, thread uint4 &wu1) {
+  constant ushort *lut = mxfp4_lut + (sh << 8u);
+  wu0.x = uint(lut[(raw_w.x >>  0u) & 0xFFu]) | (uint(lut[(raw_w.x >>  8u) & 0xFFu]) << 16u);
+  wu0.y = uint(lut[(raw_w.x >> 16u) & 0xFFu]) | (uint(lut[(raw_w.x >> 24u) & 0xFFu]) << 16u);
+  wu0.z = uint(lut[(raw_w.y >>  0u) & 0xFFu]) | (uint(lut[(raw_w.y >>  8u) & 0xFFu]) << 16u);
+  wu0.w = uint(lut[(raw_w.y >> 16u) & 0xFFu]) | (uint(lut[(raw_w.y >> 24u) & 0xFFu]) << 16u);
+  wu1.x = uint(lut[(raw_w.z >>  0u) & 0xFFu]) | (uint(lut[(raw_w.z >>  8u) & 0xFFu]) << 16u);
+  wu1.y = uint(lut[(raw_w.z >> 16u) & 0xFFu]) | (uint(lut[(raw_w.z >> 24u) & 0xFFu]) << 16u);
+  wu1.z = uint(lut[(raw_w.w >>  0u) & 0xFFu]) | (uint(lut[(raw_w.w >>  8u) & 0xFFu]) << 16u);
+  wu1.w = uint(lut[(raw_w.w >> 16u) & 0xFFu]) | (uint(lut[(raw_w.w >> 24u) & 0xFFu]) << 16u);
 }
 
 inline void w4a8_moe_store_as_mx_u4(threadgroup int8_t *As_i8, uint a_r, uint a_col16, uint4 qa_v) {
@@ -1265,6 +1288,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
     device float *mid_sa,
     device float *mid_ra,
     constant W4A8MoeGemmParams &p,
+    constant ushort *mxfp4_lut,
     threadgroup W4A8MoeMxfp4SwiTgStorage &tg_mem,
     uint lane,
     uint sg,
@@ -1311,10 +1335,22 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (w4a8_moe_has_apple10_i8_layout()) {
-    constexpr auto desc_i8 = matmul2d_descriptor(
+    constexpr auto desc16_m = matmul2d_descriptor(
+        16, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    constexpr auto desc16_a = matmul2d_descriptor(
         16, 32, 32, false, true, false,
         matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc_i8, execution_simdgroup> op_i8;
+    constexpr auto desc32_m = matmul2d_descriptor(
+        32, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    constexpr auto desc32_a = matmul2d_descriptor(
+        32, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc16_m, execution_simdgroup> op16_m;
+    matmul2d<desc16_a, execution_simdgroup> op16_a;
+    matmul2d<desc32_m, execution_simdgroup> op32_m;
+    matmul2d<desc32_a, execution_simdgroup> op32_a;
     tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tA(
         tg_mem.kloop.As_i8, dextents<int32_t, 2>(int(kW4A8MoeMxStride), 64));
     tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tB(
@@ -1323,7 +1359,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
     const bool sg_is_up = ((sg & 1u) != 0u);
     const uint k_blocks = p.k >> 6u;
 
-    // Fast path for valid_rows <= 32: half qa loads, half Sa loads, half NAX MMAs, 16-reg acc0[16]!
+    // Fast path for valid_rows <= 32: half qa loads, half Sa loads, 16x32x32 shift-merge LUT!
     if (tg_mem.tg_meta[2] <= 32u) {
       #pragma clang loop unroll(full)
       for (uint hn = 0u; hn < kPasses; ++hn) {
@@ -1349,16 +1385,16 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
               ? *reinterpret_cast<device const uint4 *>(qa + ulong(t0) * p.k + k0 + a_col16)
               : uint4(0u);
           uint4 raw_w = uint4(0u);
-          float sw_v = 0.0f;
+          uchar2 ep = uchar2(0u, 0u);
           if (w_live) {
             const ulong c_off = w_exp_row * ulong(p.padded_k >> 1u) + ulong(sub32_abs) * 16ul;
-            const ulong s_off = w_exp_row * ulong(p.padded_k >> 5u) + ulong(sub32_abs);
+            const ulong s_off = w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul;
             if (!sg_is_up) {
               raw_w = *reinterpret_cast<device const uint4 *>(g_codes + c_off);
-              sw_v = 0.5f * e8m0_to_float(g_scales[s_off]);
+              ep = *reinterpret_cast<device const uchar2 *>(g_scales + s_off);
             } else {
               raw_w = *reinterpret_cast<device const uint4 *>(u_codes + c_off);
-              sw_v = 0.5f * e8m0_to_float(u_scales[s_off]);
+              ep = *reinterpret_cast<device const uchar2 *>(u_scales + s_off);
             }
           }
           float sa_v = 0.0f;
@@ -1366,12 +1402,31 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
             const uint st = tg_mem.tg_tok[tid];
             if (st != 0xFFFFFFFFu) sa_v = sa[ulong(kb) * p.mp + st];
           }
+          const int de = (w_live && ep.x != 255u && ep.y != 255u)
+              ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+          const bool row_fast = (abs(de) <= 3);
+          const uint sh = row_fast
+              ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
+              : 0u;
+          const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
+          uint4 wu0, wu1;
+          w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
           w4a8_moe_store_as_mx_u4(tg_mem.kloop.As_i8, a_r0, a_col16, qa0);
-          w4a8_moe_unpack_mxfp4_32_i8(
-              raw_w, reinterpret_cast<threadgroup char4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u));
-          if (col32 == 0u) tg_mem.kloop.Sw0_s[w_row] = sw_v; else tg_mem.kloop.Sw1_s[w_row] = sw_v;
+          *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 0u) = wu0;
+          *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
+          if (col32 == 0u) {
+            if (row_fast) {
+              const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+              tg_mem.kloop.Sw0_s[w_row] = sw;
+              tg_mem.kloop.Sw1_s[w_row] = sw;
+            } else {
+              tg_mem.kloop.Sw0_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.x)) : 0.0f;
+              tg_mem.kloop.Sw1_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.y)) : 0.0f;
+            }
+          }
+          if (lane == 0u) tg_mem.kloop.slow_flag[sg] = sg_slow_w;
           if (tid < 32u) tg_mem.kloop.Sa_s[tid] = sa_v;
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1380,36 +1435,43 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
           const uint qid = lane >> 2u;
           const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
           const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
-          auto a0 = tA.slice(0, int(m_off));
-          auto a1 = tA.slice(32, int(m_off));
-          auto b0 = tB.slice(0, int(sg_n * 32u));
-          auto b1 = tB.slice(32, int(sg_n * 32u));
-          auto ci = op_i8.template get_destination_cooperative_tensor<
-              remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
+          const uint sw_base = sg_n * 32u + fn;
           const float sa0 = tg_mem.kloop.Sa_s[m_off + fm];
           const float sa1 = tg_mem.kloop.Sa_s[m_off + 8u + fm];
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a0, b0, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
+          auto a0 = tA.slice(0, int(m_off));
+          auto b0 = tB.slice(0, int(sg_n * 32u));
+          auto ci = op16_m.template get_destination_cooperative_tensor<
+              remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
+          if ((tg_mem.kloop.slow_flag[sg_n * 2u] | tg_mem.kloop.slow_flag[sg_n * 2u + 1u]) == 0u) {
+            auto a1 = tA.slice(32, int(m_off));
+            auto b1 = tB.slice(32, int(sg_n * 32u));
+            op16_m.run(a0, b0, ci);
+            op16_a.run(a1, b1, ci);
             #pragma clang loop unroll(full)
             for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.kloop.Sw0_s[sg_n * 32u + u * 16u + fn + c];
-              acc0[u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc0[u * 8u + c]);
-              acc0[u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc0[u * 8u + 4u + c]);
+              const float sw0 = tg_mem.kloop.Sw0_s[sw_base + c];
+              const float sw1 = tg_mem.kloop.Sw0_s[sw_base + 16u + c];
+              acc0[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc0[ 0u + c]);
+              acc0[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc0[ 4u + c]);
+              acc0[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc0[ 8u + c]);
+              acc0[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc0[12u + c]);
             }
-          }
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a1, b1, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
-            #pragma clang loop unroll(full)
-            for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.kloop.Sw1_s[sg_n * 32u + u * 16u + fn + c];
-              acc0[u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc0[u * 8u + c]);
-              acc0[u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc0[u * 8u + 4u + c]);
+          } else {
+            #pragma clang loop unroll(disable)
+            for (uint hk = 0u; hk < 2u; ++hk) {
+              auto ah = tA.slice(int(hk * 32u), int(m_off));
+              auto bh = tB.slice(int(hk * 32u), int(sg_n * 32u));
+              op16_m.run(ah, bh, ci);
+              threadgroup const float *swp = (hk == 0u) ? tg_mem.kloop.Sw0_s : tg_mem.kloop.Sw1_s;
+              #pragma clang loop unroll(full)
+              for (uint c = 0u; c < 4u; ++c) {
+                const float sw0 = swp[sw_base + c];
+                const float sw1 = swp[sw_base + 16u + c];
+                acc0[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc0[ 0u + c]);
+                acc0[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc0[ 4u + c]);
+                acc0[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc0[ 8u + c]);
+                acc0[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc0[12u + c]);
+              }
             }
           }
         }
@@ -1514,12 +1576,9 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
       const bool w_live = (w_col < p.n);
       const ulong w_exp_row = ulong(tg_mem.tg_meta[0]) * ulong(p.n) + ulong(w_col);
 
-      float acc_f32[2][16];
+      float acc_f32[32];
       #pragma clang loop unroll(full)
-      for (uint mm = 0u; mm < 2u; ++mm) {
-        #pragma clang loop unroll(full)
-        for (ushort i = 0u; i < 16u; ++i) acc_f32[mm][i] = 0.0f;
-      }
+      for (ushort i = 0u; i < 32u; ++i) acc_f32[i] = 0.0f;
 
       for (uint kb = 0u; kb < k_blocks; ++kb) {
         const uint k0 = kb * kW4A8MoeBK;
@@ -1540,16 +1599,16 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
             ? *reinterpret_cast<device const uint4 *>(qa + ulong(t1) * p.k + k0 + a_col16)
             : uint4(0u);
         uint4 raw_w = uint4(0u);
-        float sw_v = 0.0f;
+        uchar2 ep = uchar2(0u, 0u);
         if (w_live) {
           const ulong c_off = w_exp_row * ulong(p.padded_k >> 1u) + ulong(sub32_abs) * 16ul;
-          const ulong s_off = w_exp_row * ulong(p.padded_k >> 5u) + ulong(sub32_abs);
+          const ulong s_off = w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul;
           if (!sg_is_up) {
             raw_w = *reinterpret_cast<device const uint4 *>(g_codes + c_off);
-            sw_v = 0.5f * e8m0_to_float(g_scales[s_off]);
+            ep = *reinterpret_cast<device const uchar2 *>(g_scales + s_off);
           } else {
             raw_w = *reinterpret_cast<device const uint4 *>(u_codes + c_off);
-            sw_v = 0.5f * e8m0_to_float(u_scales[s_off]);
+            ep = *reinterpret_cast<device const uchar2 *>(u_scales + s_off);
           }
         }
         float sa_v = 0.0f;
@@ -1557,53 +1616,86 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
           const uint st = tg_mem.tg_tok[tid];
           if (st != 0xFFFFFFFFu) sa_v = sa[ulong(kb) * p.mp + st];
         }
+        const int de = (w_live && ep.x != 255u && ep.y != 255u)
+            ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+        const bool row_fast = (abs(de) <= 3);
+        const uint sh = row_fast
+            ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
+            : 0u;
+        const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
+        uint4 wu0, wu1;
+        w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         w4a8_moe_store_as_mx_u4(tg_mem.kloop.As_i8, a_r0, a_col16, qa0);
         w4a8_moe_store_as_mx_u4(tg_mem.kloop.As_i8, a_r1, a_col16, qa1);
-        w4a8_moe_unpack_mxfp4_32_i8(
-            raw_w, reinterpret_cast<threadgroup char4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u));
-        if (col32 == 0u) tg_mem.kloop.Sw0_s[w_row] = sw_v; else tg_mem.kloop.Sw1_s[w_row] = sw_v;
+        *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 0u) = wu0;
+        *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
+        if (col32 == 0u) {
+          if (row_fast) {
+            const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+            tg_mem.kloop.Sw0_s[w_row] = sw;
+            tg_mem.kloop.Sw1_s[w_row] = sw;
+          } else {
+            tg_mem.kloop.Sw0_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.x)) : 0.0f;
+            tg_mem.kloop.Sw1_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.y)) : 0.0f;
+          }
+        }
+        if (lane == 0u) tg_mem.kloop.slow_flag[sg] = sg_slow_w;
         if (tid < BM_TG) tg_mem.kloop.Sa_s[tid] = sa_v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const uint m_off = (sg >> 1u) * ((tg_mem.tg_meta[2] <= 32u) ? 16u : 32u);
+        const uint m_off = (sg >> 1u) * 32u;
         const uint sg_n = sg & 1u;
         const uint qid = lane >> 2u;
         const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
         const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
+        const uint sw_base = sg_n * 32u + fn;
+        const float sa0 = tg_mem.kloop.Sa_s[m_off + fm];
+        const float sa1 = tg_mem.kloop.Sa_s[m_off + 8u + fm];
+        const float sa2 = tg_mem.kloop.Sa_s[m_off + 16u + fm];
+        const float sa3 = tg_mem.kloop.Sa_s[m_off + 24u + fm];
+        auto a0 = tA.slice(0, int(m_off));
         auto b0 = tB.slice(0, int(sg_n * 32u));
-        auto b1 = tB.slice(32, int(sg_n * 32u));
-        #pragma clang loop unroll(full)
-        for (uint mm = 0u; mm < 2u; ++mm) {
-          auto a0 = tA.slice(0, int(m_off + mm * 16u));
-          auto a1 = tA.slice(32, int(m_off + mm * 16u));
-          auto ci = op_i8.template get_destination_cooperative_tensor<
-              remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
-          const float sa0 = tg_mem.kloop.Sa_s[m_off + mm * 16u + fm];
-          const float sa1 = tg_mem.kloop.Sa_s[m_off + mm * 16u + 8u + fm];
+        auto ci = op32_m.template get_destination_cooperative_tensor<
+            remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
+        if ((tg_mem.kloop.slow_flag[sg_n * 2u] | tg_mem.kloop.slow_flag[sg_n * 2u + 1u]) == 0u) {
+          auto a1 = tA.slice(32, int(m_off));
+          auto b1 = tB.slice(32, int(sg_n * 32u));
+          op32_m.run(a0, b0, ci);
+          op32_a.run(a1, b1, ci);
           #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a0, b0, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
-            #pragma clang loop unroll(full)
-            for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.kloop.Sw0_s[sg_n * 32u + u * 16u + fn + c];
-              acc_f32[mm][u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc_f32[mm][u * 8u + c]);
-              acc_f32[mm][u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc_f32[mm][u * 8u + 4u + c]);
-            }
+          for (uint c = 0u; c < 4u; ++c) {
+            const float sw0 = tg_mem.kloop.Sw0_s[sw_base + c];
+            const float sw1 = tg_mem.kloop.Sw0_s[sw_base + 16u + c];
+            acc_f32[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc_f32[ 0u + c]);
+            acc_f32[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc_f32[ 4u + c]);
+            acc_f32[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc_f32[ 8u + c]);
+            acc_f32[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc_f32[12u + c]);
+            acc_f32[16u + c] = fma(sa2 * sw0, float(ci[16u + c]), acc_f32[16u + c]);
+            acc_f32[20u + c] = fma(sa3 * sw0, float(ci[20u + c]), acc_f32[20u + c]);
+            acc_f32[24u + c] = fma(sa2 * sw1, float(ci[24u + c]), acc_f32[24u + c]);
+            acc_f32[28u + c] = fma(sa3 * sw1, float(ci[28u + c]), acc_f32[28u + c]);
           }
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a1, b1, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
+        } else {
+          #pragma clang loop unroll(disable)
+          for (uint hk = 0u; hk < 2u; ++hk) {
+            auto ah = tA.slice(int(hk * 32u), int(m_off));
+            auto bh = tB.slice(int(hk * 32u), int(sg_n * 32u));
+            op32_m.run(ah, bh, ci);
+            threadgroup const float *swp = (hk == 0u) ? tg_mem.kloop.Sw0_s : tg_mem.kloop.Sw1_s;
             #pragma clang loop unroll(full)
             for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.kloop.Sw1_s[sg_n * 32u + u * 16u + fn + c];
-              acc_f32[mm][u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc_f32[mm][u * 8u + c]);
-              acc_f32[mm][u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc_f32[mm][u * 8u + 4u + c]);
+              const float sw0 = swp[sw_base + c];
+              const float sw1 = swp[sw_base + 16u + c];
+              acc_f32[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc_f32[ 0u + c]);
+              acc_f32[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc_f32[ 4u + c]);
+              acc_f32[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc_f32[ 8u + c]);
+              acc_f32[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc_f32[12u + c]);
+              acc_f32[16u + c] = fma(sa2 * sw0, float(ci[16u + c]), acc_f32[16u + c]);
+              acc_f32[20u + c] = fma(sa3 * sw0, float(ci[20u + c]), acc_f32[20u + c]);
+              acc_f32[24u + c] = fma(sa2 * sw1, float(ci[24u + c]), acc_f32[24u + c]);
+              acc_f32[28u + c] = fma(sa3 * sw1, float(ci[28u + c]), acc_f32[28u + c]);
             }
           }
         }
@@ -1616,8 +1708,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
       const uint rb_cur = tg_mem.tg_meta[1];
       const uint vr = tg_mem.tg_meta[2];
       const uint n0_base = tg_mem.tg_meta[3];
-      const bool compact32 = (vr <= 32u);
-      const uint m_off = (sg >> 1u) * (compact32 ? 16u : 32u);
+      const uint m_off = (sg >> 1u) * 32u;
       const uint n0_sg = n0_base + hn * 32u + sg_n * 16u;
 
       if constexpr (!OutputA8) {
@@ -1626,17 +1717,17 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
         if (m_off < vr && n0_sg + fn < p.n) {
           #pragma clang loop unroll(full)
           for (uint mm = 0u; mm < 2u; ++mm) {
-            if ((mm == 0u || !compact32) && (m_off + mm * 16u < vr)) {
+            if (m_off + mm * 16u < vr) {
               #pragma clang loop unroll(full)
               for (uint h = 0u; h < 2u; ++h) {
                 const uint rm = m_off + mm * 16u + fm + h * 8u;
                 if (rm < vr) {
-                  const uint e = h * 4u;
+                  const uint e = mm * 16u + h * 4u;
                   bfloat4 out_b;
                   #pragma clang loop unroll(full)
                   for (uint j = 0u; j < 4u; ++j) {
-                    out_b[j] = bfloat(nax_silu_f32(float(bfloat(acc_f32[mm][e + j]))) *
-                                      float(bfloat(acc_f32[mm][8u + e + j])));
+                    out_b[j] = bfloat(nax_silu_f32(float(bfloat(acc_f32[e + j]))) *
+                                      float(bfloat(acc_f32[8u + e + j])));
                   }
                   *reinterpret_cast<device bfloat4 *>(
                       mid_bf16 + ulong(rb_cur + rm) * p.n + n0_sg + fn) = out_b;
@@ -1654,25 +1745,23 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
         if (hn == 0u) {
           #pragma clang loop unroll(full)
           for (uint mm = 0u; mm < 2u; ++mm) {
-            if (mm == 0u || !compact32) {
-              #pragma clang loop unroll(full)
-              for (uint h = 0u; h < 2u; ++h) {
-                const uint rm = m_off + mm * 16u + fm + h * 8u;
-                if (rm < vr) {
-                  bfloat4 out_b = bfloat4(bfloat(0.0f));
-                  if (n0_sg + fn < p.n) {
-                    const uint e = h * 4u;
-                    #pragma clang loop unroll(full)
-                    for (uint j = 0u; j < 4u; ++j) {
-                      out_b[j] = (n0_sg + fn + j < p.n)
-                          ? bfloat(nax_silu_f32(float(bfloat(acc_f32[mm][e + j]))) *
-                                   float(bfloat(acc_f32[mm][8u + e + j])))
-                          : bfloat(0.0f);
-                    }
+            #pragma clang loop unroll(full)
+            for (uint h = 0u; h < 2u; ++h) {
+              const uint rm = m_off + mm * 16u + fm + h * 8u;
+              if (rm < vr) {
+                bfloat4 out_b = bfloat4(bfloat(0.0f));
+                if (n0_sg + fn < p.n) {
+                  const uint e = mm * 16u + h * 4u;
+                  #pragma clang loop unroll(full)
+                  for (uint j = 0u; j < 4u; ++j) {
+                    out_b[j] = (n0_sg + fn + j < p.n)
+                        ? bfloat(nax_silu_f32(float(bfloat(acc_f32[e + j]))) *
+                                 float(bfloat(acc_f32[8u + e + j])))
+                        : bfloat(0.0f);
                   }
-                  *reinterpret_cast<device bfloat4 *>(
-                      mid_qa + ulong(rb_cur + rm) * p.n + stash_col_off) = out_b;
                 }
+                *reinterpret_cast<device bfloat4 *>(
+                    mid_qa + ulong(rb_cur + rm) * p.n + stash_col_off) = out_b;
               }
             }
           }
@@ -1680,31 +1769,29 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
           threadgroup_barrier(mem_flags::mem_threadgroup);
           #pragma clang loop unroll(full)
           for (uint mm = 0u; mm < 2u; ++mm) {
-            if (mm == 0u || !compact32) {
-              #pragma clang loop unroll(full)
-              for (uint h = 0u; h < 2u; ++h) {
-                const uint rm = m_off + mm * 16u + fm + h * 8u;
-                bfloat4 s0 = bfloat4(bfloat(0.0f));
-                bfloat4 s1 = bfloat4(bfloat(0.0f));
-                if (rm < vr) {
-                  s0 = *reinterpret_cast<device const bfloat4 *>(
-                      mid_qa + ulong(rb_cur + rm) * p.n + stash_col_off);
-                  if (n0_sg + fn < p.n) {
-                    const uint e = h * 4u;
-                    #pragma clang loop unroll(full)
-                    for (uint j = 0u; j < 4u; ++j) {
-                      s1[j] = (n0_sg + fn + j < p.n)
-                          ? bfloat(nax_silu_f32(float(bfloat(acc_f32[mm][e + j]))) *
-                                   float(bfloat(acc_f32[mm][8u + e + j])))
-                          : bfloat(0.0f);
-                    }
+            #pragma clang loop unroll(full)
+            for (uint h = 0u; h < 2u; ++h) {
+              const uint rm = m_off + mm * 16u + fm + h * 8u;
+              bfloat4 s0 = bfloat4(bfloat(0.0f));
+              bfloat4 s1 = bfloat4(bfloat(0.0f));
+              if (rm < vr) {
+                s0 = *reinterpret_cast<device const bfloat4 *>(
+                    mid_qa + ulong(rb_cur + rm) * p.n + stash_col_off);
+                if (n0_sg + fn < p.n) {
+                  const uint e = mm * 16u + h * 4u;
+                  #pragma clang loop unroll(full)
+                  for (uint j = 0u; j < 4u; ++j) {
+                    s1[j] = (n0_sg + fn + j < p.n)
+                        ? bfloat(nax_silu_f32(float(bfloat(acc_f32[e + j]))) *
+                                 float(bfloat(acc_f32[8u + e + j])))
+                        : bfloat(0.0f);
                   }
                 }
-                *reinterpret_cast<threadgroup bfloat4 *>(
-                    tg_mem.SwiBuf + rm * kW4A8MoeEpiStride + sg_n * 16u + fn) = s0;
-                *reinterpret_cast<threadgroup bfloat4 *>(
-                    tg_mem.SwiBuf + rm * kW4A8MoeEpiStride + 32u + sg_n * 16u + fn) = s1;
               }
+              *reinterpret_cast<threadgroup bfloat4 *>(
+                  tg_mem.SwiBuf + rm * kW4A8MoeEpiStride + sg_n * 16u + fn) = s0;
+              *reinterpret_cast<threadgroup bfloat4 *>(
+                  tg_mem.SwiBuf + rm * kW4A8MoeEpiStride + 32u + sg_n * 16u + fn) = s1;
             }
           }
         }
@@ -2191,6 +2278,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
     device const uchar *d_scales,
     device bfloat *expert_output,
     constant W4A8MoeGemmParams &p,
+    constant ushort *mxfp4_lut,
     threadgroup W4A8MoeDownMxfp4TgStorage &tg_mem,
     uint lane,
     uint sg,
@@ -2216,10 +2304,22 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
   const uint tid = sg * 32u + lane;
 
   if (w4a8_moe_has_apple10_i8_layout()) {
-    constexpr auto desc_i8 = matmul2d_descriptor(
+    constexpr auto desc16_m = matmul2d_descriptor(
+        16, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    constexpr auto desc16_a = matmul2d_descriptor(
         16, 32, 32, false, true, false,
         matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc_i8, execution_simdgroup> op_i8;
+    constexpr auto desc32_m = matmul2d_descriptor(
+        32, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    constexpr auto desc32_a = matmul2d_descriptor(
+        32, 32, 32, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc16_m, execution_simdgroup> op16_m;
+    matmul2d<desc16_a, execution_simdgroup> op16_a;
+    matmul2d<desc32_m, execution_simdgroup> op32_m;
+    matmul2d<desc32_a, execution_simdgroup> op32_a;
     tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tA(
         tg_mem.As_i8, dextents<int32_t, 2>(int(kW4A8MoeMxStride), 64));
     tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tB(
@@ -2242,6 +2342,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
     const uint qid = lane >> 2u;
     const uint fm = ((qid & 4u) | ((lane >> 1u) & 3u));
     const uint fn = ((qid & 2u) | (lane & 1u)) * 4u;
+    const uint sw_base = sg_n * 32u + fn;
 
     if (compact32) {
       float acc0[16];
@@ -2258,50 +2359,76 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
             ? *reinterpret_cast<device const uint4 *>(
                   d_codes + w_exp_row * ulong(p.padded_k >> 1u) + ulong(sub32_abs) * 16ul)
             : uint4(0u);
-        const float sw_v = w_live
-            ? (0.5f * e8m0_to_float(d_scales[w_exp_row * ulong(p.padded_k >> 5u) + ulong(sub32_abs)]))
-            : 0.0f;
+        const uchar2 ep = w_live
+            ? *reinterpret_cast<device const uchar2 *>(
+                  d_scales + w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul)
+            : uchar2(0u, 0u);
         const float sa_v = (tid < 32u && tid < valid_rows) ? mid_sa[ulong(kb) * p.mp + rb + tid] : 0.0f;
+        const int de = (w_live && ep.x != 255u && ep.y != 255u)
+            ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+        const bool row_fast = (abs(de) <= 3);
+        const uint sh = row_fast
+            ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
+            : 0u;
+        const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
+        uint4 wu0, wu1;
+        w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         w4a8_moe_store_as_mx_u4(tg_mem.As_i8, a_r0, a_col16, qa0);
-        w4a8_moe_unpack_mxfp4_32_i8(
-            raw_w, reinterpret_cast<threadgroup char4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u));
-        if (col32 == 0u) tg_mem.Sw0_s[w_row] = sw_v; else tg_mem.Sw1_s[w_row] = sw_v;
+        *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 0u) = wu0;
+        *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
+        if (col32 == 0u) {
+          if (row_fast) {
+            const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+            tg_mem.Sw0_s[w_row] = sw;
+            tg_mem.Sw1_s[w_row] = sw;
+          } else {
+            tg_mem.Sw0_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.x)) : 0.0f;
+            tg_mem.Sw1_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.y)) : 0.0f;
+          }
+        }
+        if (lane == 0u) tg_mem.slow_flag[sg] = sg_slow_w;
         if (tid < 32u) tg_mem.Sa_s[tid] = sa_v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg_active) {
           auto a0 = tA.slice(0, int(m_off));
-          auto a1 = tA.slice(32, int(m_off));
           auto b0 = tB.slice(0, int(sg_n * 32u));
-          auto b1 = tB.slice(32, int(sg_n * 32u));
-          auto ci = op_i8.template get_destination_cooperative_tensor<
+          auto ci = op16_m.template get_destination_cooperative_tensor<
               remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
           const float sa0 = tg_mem.Sa_s[m_off + fm];
           const float sa1 = tg_mem.Sa_s[m_off + 8u + fm];
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a0, b0, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
+          if ((tg_mem.slow_flag[sg_n * 2u] | tg_mem.slow_flag[sg_n * 2u + 1u]) == 0u) {
+            auto a1 = tA.slice(32, int(m_off));
+            auto b1 = tB.slice(32, int(sg_n * 32u));
+            op16_m.run(a0, b0, ci);
+            op16_a.run(a1, b1, ci);
             #pragma clang loop unroll(full)
             for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.Sw0_s[sg_n * 32u + u * 16u + fn + c];
-              acc0[u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc0[u * 8u + c]);
-              acc0[u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc0[u * 8u + 4u + c]);
+              const float sw0 = tg_mem.Sw0_s[sw_base + c];
+              const float sw1 = tg_mem.Sw0_s[sw_base + 16u + c];
+              acc0[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc0[ 0u + c]);
+              acc0[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc0[ 4u + c]);
+              acc0[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc0[ 8u + c]);
+              acc0[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc0[12u + c]);
             }
-          }
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a1, b1, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
-            #pragma clang loop unroll(full)
-            for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.Sw1_s[sg_n * 32u + u * 16u + fn + c];
-              acc0[u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc0[u * 8u + c]);
-              acc0[u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc0[u * 8u + 4u + c]);
+          } else {
+            #pragma clang loop unroll(disable)
+            for (uint hk = 0u; hk < 2u; ++hk) {
+              auto ah = tA.slice(int(hk * 32u), int(m_off));
+              auto bh = tB.slice(int(hk * 32u), int(sg_n * 32u));
+              op16_m.run(ah, bh, ci);
+              threadgroup const float *swp = (hk == 0u) ? tg_mem.Sw0_s : tg_mem.Sw1_s;
+              #pragma clang loop unroll(full)
+              for (uint c = 0u; c < 4u; ++c) {
+                const float sw0 = swp[sw_base + c];
+                const float sw1 = swp[sw_base + 16u + c];
+                acc0[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc0[ 0u + c]);
+                acc0[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc0[ 4u + c]);
+                acc0[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc0[ 8u + c]);
+                acc0[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc0[12u + c]);
+              }
             }
           }
         }
@@ -2330,12 +2457,9 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
       return;
     }
 
-    float acc_f32[2][16];
+    float acc_f32[32];
     #pragma clang loop unroll(full)
-    for (uint mm = 0u; mm < 2u; ++mm) {
-      #pragma clang loop unroll(full)
-      for (ushort i = 0u; i < 16u; ++i) acc_f32[mm][i] = 0.0f;
-    }
+    for (ushort i = 0u; i < 32u; ++i) acc_f32[i] = 0.0f;
 
     for (uint kb = 0u; kb < k_blocks; ++kb) {
       const uint k0 = kb * kW4A8MoeBK;
@@ -2351,53 +2475,86 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
           ? *reinterpret_cast<device const uint4 *>(
                 d_codes + w_exp_row * ulong(p.padded_k >> 1u) + ulong(sub32_abs) * 16ul)
           : uint4(0u);
-      const float sw_v = w_live
-          ? (0.5f * e8m0_to_float(d_scales[w_exp_row * ulong(p.padded_k >> 5u) + ulong(sub32_abs)]))
-          : 0.0f;
+      const uchar2 ep = w_live
+          ? *reinterpret_cast<device const uchar2 *>(
+                d_scales + w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul)
+          : uchar2(0u, 0u);
       const float sa_v = (tid < BM_TG && tid < valid_rows) ? mid_sa[ulong(kb) * p.mp + rb + tid] : 0.0f;
+      const int de = (w_live && ep.x != 255u && ep.y != 255u)
+          ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+      const bool row_fast = (abs(de) <= 3);
+      const uint sh = row_fast
+          ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
+          : 0u;
+      const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
+      uint4 wu0, wu1;
+      w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       w4a8_moe_store_as_mx_u4(tg_mem.As_i8, a_r0, a_col16, qa0);
       w4a8_moe_store_as_mx_u4(tg_mem.As_i8, a_r1, a_col16, qa1);
-      w4a8_moe_unpack_mxfp4_32_i8(
-          raw_w, reinterpret_cast<threadgroup char4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u));
-      if (col32 == 0u) tg_mem.Sw0_s[w_row] = sw_v; else tg_mem.Sw1_s[w_row] = sw_v;
+      *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 0u) = wu0;
+      *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
+      if (col32 == 0u) {
+        if (row_fast) {
+          const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+          tg_mem.Sw0_s[w_row] = sw;
+          tg_mem.Sw1_s[w_row] = sw;
+        } else {
+          tg_mem.Sw0_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.x)) : 0.0f;
+          tg_mem.Sw1_s[w_row] = w_live ? (0.5f * w4a8_moe_e8m0_safe(ep.y)) : 0.0f;
+        }
+      }
+      if (lane == 0u) tg_mem.slow_flag[sg] = sg_slow_w;
       if (tid < BM_TG) tg_mem.Sa_s[tid] = sa_v;
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
+        auto a0 = tA.slice(0, int(m_off));
         auto b0 = tB.slice(0, int(sg_n * 32u));
-        auto b1 = tB.slice(32, int(sg_n * 32u));
-        #pragma clang loop unroll(full)
-        for (uint mm = 0u; mm < 2u; ++mm) {
-          auto a0 = tA.slice(0, int(m_off + mm * 16u));
-          auto a1 = tA.slice(32, int(m_off + mm * 16u));
-          auto ci = op_i8.template get_destination_cooperative_tensor<
-              remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
-          const float sa0 = tg_mem.Sa_s[m_off + mm * 16u + fm];
-          const float sa1 = tg_mem.Sa_s[m_off + mm * 16u + 8u + fm];
+        auto ci = op32_m.template get_destination_cooperative_tensor<
+            remove_addrspace_t<decltype(a0)>, remove_addrspace_t<decltype(b0)>, int32_t>();
+        const float sa0 = tg_mem.Sa_s[m_off + fm];
+        const float sa1 = tg_mem.Sa_s[m_off + 8u + fm];
+        const float sa2 = tg_mem.Sa_s[m_off + 16u + fm];
+        const float sa3 = tg_mem.Sa_s[m_off + 24u + fm];
+        if ((tg_mem.slow_flag[sg_n * 2u] | tg_mem.slow_flag[sg_n * 2u + 1u]) == 0u) {
+          auto a1 = tA.slice(32, int(m_off));
+          auto b1 = tB.slice(32, int(sg_n * 32u));
+          op32_m.run(a0, b0, ci);
+          op32_a.run(a1, b1, ci);
           #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a0, b0, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
-            #pragma clang loop unroll(full)
-            for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.Sw0_s[sg_n * 32u + u * 16u + fn + c];
-              acc_f32[mm][u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc_f32[mm][u * 8u + c]);
-              acc_f32[mm][u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc_f32[mm][u * 8u + 4u + c]);
-            }
+          for (uint c = 0u; c < 4u; ++c) {
+            const float sw0 = tg_mem.Sw0_s[sw_base + c];
+            const float sw1 = tg_mem.Sw0_s[sw_base + 16u + c];
+            acc_f32[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc_f32[ 0u + c]);
+            acc_f32[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc_f32[ 4u + c]);
+            acc_f32[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc_f32[ 8u + c]);
+            acc_f32[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc_f32[12u + c]);
+            acc_f32[16u + c] = fma(sa2 * sw0, float(ci[16u + c]), acc_f32[16u + c]);
+            acc_f32[20u + c] = fma(sa3 * sw0, float(ci[20u + c]), acc_f32[20u + c]);
+            acc_f32[24u + c] = fma(sa2 * sw1, float(ci[24u + c]), acc_f32[24u + c]);
+            acc_f32[28u + c] = fma(sa3 * sw1, float(ci[28u + c]), acc_f32[28u + c]);
           }
-          #pragma clang loop unroll(full)
-          for (ushort i = 0u; i < 16u; ++i) ci[i] = 0;
-          op_i8.run(a1, b1, ci);
-          #pragma clang loop unroll(full)
-          for (uint u = 0u; u < 2u; ++u) {
+        } else {
+          #pragma clang loop unroll(disable)
+          for (uint hk = 0u; hk < 2u; ++hk) {
+            auto ah = tA.slice(int(hk * 32u), int(m_off));
+            auto bh = tB.slice(int(hk * 32u), int(sg_n * 32u));
+            op32_m.run(ah, bh, ci);
+            threadgroup const float *swp = (hk == 0u) ? tg_mem.Sw0_s : tg_mem.Sw1_s;
             #pragma clang loop unroll(full)
             for (uint c = 0u; c < 4u; ++c) {
-              const float sw = tg_mem.Sw1_s[sg_n * 32u + u * 16u + fn + c];
-              acc_f32[mm][u * 8u + c]      = fma(sa0 * sw, float(ci[u * 8u + c]),      acc_f32[mm][u * 8u + c]);
-              acc_f32[mm][u * 8u + 4u + c] = fma(sa1 * sw, float(ci[u * 8u + 4u + c]), acc_f32[mm][u * 8u + 4u + c]);
+              const float sw0 = swp[sw_base + c];
+              const float sw1 = swp[sw_base + 16u + c];
+              acc_f32[ 0u + c] = fma(sa0 * sw0, float(ci[ 0u + c]), acc_f32[ 0u + c]);
+              acc_f32[ 4u + c] = fma(sa1 * sw0, float(ci[ 4u + c]), acc_f32[ 4u + c]);
+              acc_f32[ 8u + c] = fma(sa0 * sw1, float(ci[ 8u + c]), acc_f32[ 8u + c]);
+              acc_f32[12u + c] = fma(sa1 * sw1, float(ci[12u + c]), acc_f32[12u + c]);
+              acc_f32[16u + c] = fma(sa2 * sw0, float(ci[16u + c]), acc_f32[16u + c]);
+              acc_f32[20u + c] = fma(sa3 * sw0, float(ci[20u + c]), acc_f32[20u + c]);
+              acc_f32[24u + c] = fma(sa2 * sw1, float(ci[24u + c]), acc_f32[24u + c]);
+              acc_f32[28u + c] = fma(sa3 * sw1, float(ci[28u + c]), acc_f32[28u + c]);
             }
           }
         }
@@ -2407,7 +2564,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
     if (sg_active) {
       #pragma clang loop unroll(full)
       for (uint mm = 0u; mm < 2u; ++mm) {
-        if ((mm == 0u || !compact32) && (m_off + mm * 16u < valid_rows)) {
+        if (m_off + mm * 16u < valid_rows) {
           #pragma clang loop unroll(full)
           for (uint h = 0u; h < 2u; ++h) {
             const uint rm = m_off + mm * 16u + fm + h * 8u;
@@ -2418,12 +2575,12 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
               for (uint u = 0u; u < 2u; ++u) {
                 const uint col = n0_sg + u * 16u + fn;
                 if (col < p.n) {
-                  const uint e = u * 8u + h * 4u;
+                  const uint e = mm * 16u + u * 8u + h * 4u;
                   const bfloat4 out_v = bfloat4(
-                      bfloat(acc_f32[mm][e + 0u] * score),
-                      bfloat(acc_f32[mm][e + 1u] * score),
-                      bfloat(acc_f32[mm][e + 2u] * score),
-                      bfloat(acc_f32[mm][e + 3u] * score));
+                      bfloat(acc_f32[e + 0u] * score),
+                      bfloat(acc_f32[e + 1u] * score),
+                      bfloat(acc_f32[e + 2u] * score),
+                      bfloat(acc_f32[e + 3u] * score));
                   *reinterpret_cast<device bfloat4 *>(
                       expert_output + ulong(assign) * p.n + col) = out_v;
                 }
@@ -2533,6 +2690,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1(
     device const uchar *u_scales [[buffer(9)]],
     device bfloat *mid_bf16 [[buffer(10)]],
     constant W4A8MoeGemmParams &p [[buffer(11)]],
+    constant ushort *mxfp4_lut [[buffer(12)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
@@ -2540,7 +2698,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1(
   moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl<false>(
       qa, sa, tile_assign, tile_expert, tile_valid_rows, total_tiles,
       g_codes, g_scales, u_codes, u_scales, mid_bf16, nullptr, nullptr, nullptr,
-      p, tg_mem, lane, sg, tg);
+      p, mxfp4_lut, tg_mem, lane, sg, tg);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2559,6 +2717,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1_fwht64_a8(
     device float *mid_sa [[buffer(11)]],
     device float *mid_ra [[buffer(12)]],
     constant W4A8MoeGemmParams &p [[buffer(13)]],
+    constant ushort *mxfp4_lut [[buffer(14)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
@@ -2566,7 +2725,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1_fwht64_a8(
   moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl<true>(
       qa, sa, tile_assign, tile_expert, tile_valid_rows, total_tiles,
       g_codes, g_scales, u_codes, u_scales, nullptr, mid_qa, mid_sa, mid_ra,
-      p, tg_mem, lane, sg, tg);
+      p, mxfp4_lut, tg_mem, lane, sg, tg);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2582,13 +2741,14 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_sk1(
     device const uchar *d_scales [[buffer(8)]],
     device bfloat *expert_output [[buffer(9)]],
     constant W4A8MoeGemmParams &p [[buffer(10)]],
+    constant ushort *mxfp4_lut [[buffer(11)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup W4A8MoeDownMxfp4TgStorage tg_mem;
   moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
       mid_qa, mid_sa, tile_expert, tile_valid_rows, tile_assign, total_tiles,
-      route_scores, d_codes, d_scales, expert_output, p, tg_mem, lane, sg, tg);
+      route_scores, d_codes, d_scales, expert_output, p, mxfp4_lut, tg_mem, lane, sg, tg);
 }
 
 #define OMLX_M5_MOE_AFFINE_W4A8_NO_HIGH(BITS, GS)                              \

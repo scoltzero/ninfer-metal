@@ -940,10 +940,11 @@ public:
     // auto-fallback BEFORE planning prefill workspaces / execution hashes.
     {
       std::size_t mxfp4_count = 0;
-      std::size_t mxfp4_v2_fwht64_count = 0;
       std::size_t oq_affine_count = 0;
       std::size_t bf16_count = 0;
       std::size_t other_count = 0;
+      bool saw_down_fwht64 =
+          ((artifact->summary().container_flags & kArtifactFlagFwht64) != 0U);
       for (const auto &layer : layers.layers()) {
         for (const auto &st : layer.stages) {
           if (st.kind != LayerStageKind::linear || st.object_id == UINT32_MAX) {
@@ -956,15 +957,17 @@ public:
           const auto &obj = artifact->object(st.object_id);
           if (obj.format == "mxfp4_e2m1_g32_e8m0_v1") {
             ++mxfp4_count;
-            if (obj.layout == "mx_nax_tiled_bk128_v1" && obj.has_fwht64()) {
-              ++mxfp4_v2_fwht64_count;
-            }
           } else if (obj.format.starts_with("oq_affine_")) {
             ++oq_affine_count;
           } else if (obj.format == "direct_bf16_v1") {
             ++bf16_count;
           } else {
             ++other_count;
+          }
+          if (st.role == "mlp_down" || st.role == "moe_expert_down") {
+            if (obj.has_fwht64()) {
+              saw_down_fwht64 = true;
+            }
           }
         }
       }
@@ -983,8 +986,6 @@ public:
         model_quant_format.clear();
       }
 
-      const bool all_mxfp4_v2_fwht64 =
-          (mxfp4_count > 0 && mxfp4_v2_fwht64_count == mxfp4_count);
       const bool has_quantized_trunk =
           (mxfp4_count > 0 || oq_affine_count > 0);
       const bool force_apple10 = [] {
@@ -1000,14 +1001,22 @@ public:
         const char *env = std::getenv("OMLX_M5_DISABLE_W4A8_NAX");
         return env != nullptr && std::string_view(env) == "1";
       }();
+      const bool w4a4_disabled_env = [] {
+        const char *env = std::getenv("OMLX_M5_DISABLE_W4A4_NAX");
+        return env != nullptr && std::string_view(env) == "1";
+      }();
+      const bool allow_no_fwht64 = [] {
+        const char *v = std::getenv("OMLX_M5_W4A4_ALLOW_NO_FWHT64");
+        return v != nullptr && std::string_view(v) == "1";
+      }();
       const bool w4a8_runtime_ok =
           nax_hw_eligible && !w4a8_disabled_env &&
           std::filesystem::is_regular_file(libraries /
                                            "omlx_m5_w4a8_nax.metallib");
       const bool w4a4_runtime_ok =
-          nax_hw_eligible &&
+          nax_hw_eligible && !w4a4_disabled_env &&
           std::filesystem::is_regular_file(libraries /
-                                           "omlx_m5_mxfp4_nax.metallib");
+                                           "omlx_m5_w4a4_nax.metallib");
 
       effective_linear_mode = options.prefill_linear_mode;
       prefill_linear_fallback = false;
@@ -1019,7 +1028,7 @@ public:
                                       : PrefillLinearMode::BFloat16;
           prefill_linear_fallback = true;
           prefill_linear_fallback_reason = "requires_mxfp4_model";
-        } else if (!all_mxfp4_v2_fwht64) {
+        } else if (!saw_down_fwht64 && !allow_no_fwht64) {
           effective_linear_mode = w4a8_runtime_ok
                                       ? PrefillLinearMode::W4A8
                                       : PrefillLinearMode::BFloat16;
@@ -1052,9 +1061,19 @@ public:
           *loaded_lora, effective_lora_mode, primary_ws_rows,
           std::uint32_t(options.max_concurrency));
     }
+    const bool w4a4_keep_qk_a8 = []() {
+      const char *v = std::getenv("OMLX_M5_W4A4_KEEP_QK_A8");
+      if (!v)
+        return false;
+      const std::string_view sv(v);
+      return sv == "1" || sv == "true" || sv == "TRUE" || sv == "on" ||
+             sv == "ON";
+    }();
+    const bool enable_w4a4_ws =
+        (effective_linear_mode == PrefillLinearMode::W4A4);
     const bool enable_w4a8_ws =
         (effective_linear_mode == PrefillLinearMode::W4A8 ||
-         effective_linear_mode == PrefillLinearMode::W4A4);
+         (enable_w4a4_ws && w4a4_keep_qk_a8));
     const bool enable_minf_ws =
         (options.prefill_attention_mode == PrefillAttentionMode::Sage2 &&
          options.prefill_sparse_minference &&
@@ -1064,7 +1083,7 @@ public:
         std::uint32_t(draft_config.target_layer_ids.size()), false,
         any_speculative, enable_attention_split, coupled, coupled, false, 0u,
         primary_ws_rows, affine4_kv, 0u, enable_flash_nax_prefill,
-        enable_w4a8_ws, enable_minf_ws);
+        enable_w4a8_ws, enable_minf_ws, false, enable_w4a4_ws);
     std::uint64_t per_slot_extra_ws = 0;
     std::uint64_t per_slot_extra_state = 0;
     std::uint64_t companion_weights = 0;

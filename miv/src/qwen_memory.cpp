@@ -54,7 +54,8 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
                          U32 kv_pool_pages, bool flash_nax_prefill,
                          bool enable_w4a8_workspace,
                          bool enable_minference_workspace,
-                         bool enable_sage2_kv_workspace) {
+                         bool enable_sage2_kv_workspace,
+                         bool enable_w4a4_workspace) {
   const U32 max_ws_rows = c.num_experts > 1 ? 4096U : 2048U;
   if (max_context == 0 || workspace_rows == 0 || workspace_rows > max_ws_rows ||
       c.num_hidden_layers <= 0 ||
@@ -199,6 +200,15 @@ plan_qwen_forward_memory(const QwenModelConfig &c, U32 max_context,
     append("a8_qa", multiply(a8_mp, a8_k));
     append("a8_sa", multiply(multiply(a8_groups, a8_mp), 4ULL));
     append("a8_ra", multiply(multiply(a8_groups, a8_mp), 4ULL));
+  }
+  if (enable_w4a4_workspace) {
+    const U64 a4_mp = ((U64(workspace_rows) + 63ULL) / 64ULL) * 64ULL;
+    const U64 raw_max_k = std::max({h, q, gv, f, shared_f});
+    const U64 a4_k = ((raw_max_k + 127ULL) / 128ULL) * 128ULL;
+    const U64 a4_tiles_m = a4_mp / 16ULL;
+    const U64 a4_tiles_k = a4_k / 128ULL;
+    append("w4a4_codes", multiply(multiply(a4_tiles_m, a4_tiles_k), 1024ULL));
+    append("w4a4_scales", multiply(multiply(a4_tiles_m, a4_tiles_k), 64ULL));
   }
   if (enable_minference_workspace && c.full_attention_layers() > 0 &&
       c.head_dim == 256) {

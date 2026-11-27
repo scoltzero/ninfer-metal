@@ -104,7 +104,8 @@ plan_qwen_forward_memory(const QwenModelConfig &, std::uint32_t max_context,
                          bool flash_nax_prefill = false,
                          bool enable_w4a8_workspace = false,
                          bool enable_minference_workspace = false,
-                         bool enable_sage2_kv_workspace = false);
+                         bool enable_sage2_kv_workspace = false,
+                         bool enable_w4a4_workspace = false);
 
 struct QwenLoadBudget {
   std::uint64_t required_bytes = 0;

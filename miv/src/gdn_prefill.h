@@ -316,7 +316,9 @@ inline void emit_gdn_recurrent_verify(
     bool allow_chunk_nax, const std::vector<std::byte> &params_8w,
     const std::vector<std::byte> &mega_params_9w, bool dynamic_tokens,
     U32 gpu_cores = 80U, Ref a8_qa = {}, Ref a8_sa = {}, Ref a8_ra = {},
-    U32 a8_mp = 0U, bool a8_write_bf16 = false, float norm_eps = 1.0e-6f) {
+    U32 a8_mp = 0U, bool a8_write_bf16 = false, float norm_eps = 1.0e-6f,
+    Ref a4_codes = {}, Ref a4_scales = {}, U32 a4_mp = 0U,
+    bool a4_write_bf16 = false) {
   if (!allow_chunk_nax || gdn_chunk_ws.buffer == nullptr ||
       !gdn_chunk_nax_enabled() || capacity < gdn_chunk_nax_min_tokens() ||
       key_dim != 128U || value_dim != 128U || key_heads == 0U ||
@@ -360,10 +362,23 @@ inline void emit_gdn_recurrent_verify(
     e.dynamic(rec, 7, std::move(flex_params), tok_word);
   }
 
+  const bool use_w4a4_stage3 =
+      (!out_f16 && a4_codes.buffer != nullptr && a4_scales.buffer != nullptr);
   const bool use_w4a8_stage3 =
-      (!out_f16 && a8_qa.buffer != nullptr && a8_sa.buffer != nullptr &&
-       a8_ra.buffer != nullptr);
-  if (use_w4a8_stage3) {
+      (!out_f16 && !use_w4a4_stage3 && a8_qa.buffer != nullptr &&
+       a8_sa.buffer != nullptr && a8_ra.buffer != nullptr);
+  if (use_w4a4_stage3) {
+    const U32 mp = a4_mp ? a4_mp : (((capacity + 63U) / 64U) * 64U);
+    const U64 ng_heads = U64(mp) * U64(value_heads);
+    auto &ng = e.emit(
+        "w4a4_nax", "omlx_m5_gdn_chunk_norm_gate_inplace_a4_bm16_bk128_c64",
+        {.width = 128U, .height = (ng_heads + 3U) / 4U}, {.width = 128U},
+        {dst_out, z, norm_weight, a4_codes, a4_scales});
+    e.dynamic(ng, 5,
+              words({key_heads, value_heads, 128U, 128U, conv_width, 4U,
+                     capacity, word(norm_eps), mp, a4_write_bf16 ? 1U : 0U}),
+              tok_word);
+  } else if (use_w4a8_stage3) {
     const U32 mp = a8_mp ? a8_mp : (((capacity + 63U) / 64U) * 64U);
     const U64 ng_heads = U64(mp) * U64(value_heads);
     auto &ng = e.emit(
@@ -393,8 +408,9 @@ inline void emit_gdn_recurrent_verify(
   e.dynamic(commit_hist, 2, params_8w, tok_word);
 
   e.profile.gdn_numeric_contract_id =
-      use_w4a8_stage3 ? "gdn.chunk64_bf16_nax.f32_state.mega_a8_v1"
-                      : "gdn.chunk64_bf16_nax.f32_state.mega_v1";
+      use_w4a4_stage3 ? "gdn.chunk64_bf16_nax.f32_state.mega_a4_v1"
+      : use_w4a8_stage3 ? "gdn.chunk64_bf16_nax.f32_state.mega_a8_v1"
+                        : "gdn.chunk64_bf16_nax.f32_state.mega_v1";
   return true;
 }
 
