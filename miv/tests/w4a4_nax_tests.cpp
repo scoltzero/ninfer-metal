@@ -316,7 +316,6 @@ Json test_sram_and_pso_audit(const MetalContext &ctx,
       {.key = "w4a4.audit.moe", .path = libs / "omlx_m5_w4a4_moe_nax.metallib"});
 
   constexpr U64 kHighOccCap = 10240ULL;
-  constexpr U64 kModeBSwiCap = 8704ULL;
   const char *sv_env = std::getenv("MTL_SHADER_VALIDATION");
   const bool shader_val = (sv_env != nullptr && std::string_view(sv_env) == "1");
   U32 compiled = 0;
@@ -339,16 +338,10 @@ Json test_sram_and_pso_audit(const MetalContext &ctx,
          .library_key = "w4a4.audit.dense",
          .function_name = fn,
          .support_indirect_command_buffers = true});
-    const U64 cap =
-        (std::string_view(fn) ==
-         "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a4")
-            ? kModeBSwiCap
-            : kHighOccCap;
     if (!shader_val) {
-      require(info.static_threadgroup_memory_bytes <= cap,
-              std::string(fn) + " exceeded SRAM budget (" +
-                  std::to_string(info.static_threadgroup_memory_bytes) + " > " +
-                  std::to_string(cap) + ")");
+      require(info.static_threadgroup_memory_bytes <= kHighOccCap,
+              std::string(fn) + " exceeded 10,240 B SRAM budget (" +
+                  std::to_string(info.static_threadgroup_memory_bytes) + ")");
     }
     max_dense_tg = std::max(max_dense_tg, info.static_threadgroup_memory_bytes);
     ++compiled;
@@ -750,8 +743,82 @@ Json test_dense_linear_and_swiglu_modes(const MetalContext &ctx,
               std::to_string(mode_b_down_cos) + " < 0.985");
   (void)mp;
 
+  // 3c. STRESS |de| > 3 dual shift-merge fallback (extreme UE8M0 jumps on both A and W!)
+  double stress_cos = 0.0;
+  {
+    auto ow_s = make_mxfp4_weight(ctx, 299u, kN, kK, 99u, 16u, false);
+    // Patch scales of ow_s and a4_s to trigger |de| > 3 across both fast and slow SGs
+    std::vector<std::uint8_t> sc_a = read_u8(a4_s, lo.scales_bytes);
+    for (std::size_t i = 0; i + 1 < sc_a.size(); i += 2) {
+      if ((i & 6u) == 2u) {
+        sc_a[i] = 118u;
+        sc_a[i + 1] = 128u; // |de_a| = 10 > 3!
+      }
+    }
+    auto a4_s_stress = ctx.upload(std::as_bytes(std::span(sc_a)));
+    Ref as_stress{&a4_s_stress, 0, a4_s_stress.size()};
+
+    // Rebuild weight with |de_w| = 9 > 3 on half the rows (both sg_n=0 and sg_n=1!)
+    std::vector<std::uint8_t> raw_codes(U64(kN) * (kK / 2u), 0);
+    std::vector<std::uint8_t> raw_scales(U64(kN) * (kK / 32u), 127);
+    std::vector<float> ref_w_stress(U64(kN) * kK, 0.0f);
+    for (U32 r = 0; r < kN; ++r) {
+      for (U32 g = 0; g < kK / 32u; ++g) {
+        raw_scales[U64(r) * (kK / 32u) + g] =
+            ((r % 32u) >= 16u && (g & 1u) == 1u) ? std::uint8_t(131u)
+            : ((r % 32u) >= 16u)                 ? std::uint8_t(121u)
+                                                 : std::uint8_t(124u + ((r + g) % 3u));
+      }
+      for (U32 c = 0; c < kK; ++c) {
+        const U32 code = (r * 5u + c * 13u + 7u) & 0x0Fu;
+        raw_codes[U64(r) * (kK / 2u) + (c >> 1u)] |= std::uint8_t(code << ((c & 1u) * 4u));
+        ref_w_stress[U64(r) * kK + c] =
+            decode_e2m1(code) * decode_e8m0(raw_scales[U64(r) * (kK / 32u) + c / 32u]);
+      }
+    }
+    const U32 blocks = kK / 128u;
+    std::vector<std::uint8_t> nc(U64(kN / 16u) * blocks * 16u * 64u, 0);
+    std::vector<std::uint8_t> ns(U64(kN / 16u) * blocks * 16u * 4u, 0x7Fu);
+    for (U32 r = 0; r < kN; ++r) {
+      const U32 tn = r / 16u, rn = r % 16u;
+      for (U32 blk = 0; blk < blocks; ++blk) {
+        const U64 idx = U64(tn) * blocks + blk;
+        std::memcpy(nc.data() + idx * 1024u + rn * 64u,
+                    raw_codes.data() + U64(r) * (kK / 2u) + blk * 64u, 64u);
+        std::memcpy(ns.data() + idx * 64u + rn * 4u,
+                    raw_scales.data() + U64(r) * (kK / 32u) + blk * 4u, 4u);
+      }
+    }
+    auto nc_buf = ctx.upload(std::as_bytes(std::span(nc)));
+    auto ns_buf = ctx.upload(std::as_bytes(std::span(ns)));
+    TiledMxfp4Weight tw_s{.codes = Ref{&nc_buf, 0, nc_buf.size()},
+                          .scales = Ref{&ns_buf, 0, ns_buf.size()},
+                          .n = kN, .k = kK, .bn = 16u, .padded_n = kN};
+    y_buf.zero();
+    {
+      Encoder e(ctx, libs, kM, "w4a4.dense.stress");
+      e.begin_stage("stress");
+      emit_mxfp4_w4a4_nax_linear(e, tw_s, ac_ref, as_stress, y_ref, kM);
+      auto prof = e.finish(false);
+      submit_profile(ctx, prof, kM, false);
+    }
+    const auto a4_deq_s = decode_tiled_a4_cpu(read_u8(a4_c, lo.codes_bytes), sc_a, kM, kK);
+    std::vector<float> ref_s(U64(kM) * kN, 0.0f);
+    for (U32 m = 0; m < kM; ++m) {
+      for (U32 n = 0; n < kN; ++n) {
+        float acc = 0.0f;
+        for (U32 k = 0; k < kK; ++k) acc += a4_deq_s[m * kK + k] * ref_w_stress[n * kK + k];
+        ref_s[m * kN + n] = acc;
+      }
+    }
+    stress_cos = cosine_similarity_bf16(read_u16(y_buf, U64(kM) * kN), ref_s, "w4a4_stress_de");
+    require(stress_cos >= 0.9999,
+            "w4a4 STRESS |de|>3 fallback cos_sim=" + std::to_string(stress_cos) + " < 0.9999");
+  }
+
   return {{"lin_bns16_cos", lin16_cos},
           {"lin_bns32_cos", lin32_cos},
+          {"stress_de_cos", stress_cos},
           {"swiglu_mode_a_cos", swi_a_cos},
           {"mode_b_down_cos", mode_b_down_cos},
           {"ane_splice_bit_exact", true},

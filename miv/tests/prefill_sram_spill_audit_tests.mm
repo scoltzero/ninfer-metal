@@ -113,10 +113,6 @@ std::uint64_t expected_tg_sram_cap(std::string_view lib_name,
       lib_name == "omlx_m5_w4a8_moe_nax.metallib" ||
       lib_name == "omlx_m5_w4a4_nax.metallib" ||
       lib_name == "omlx_m5_w4a4_moe_nax.metallib") {
-    if (fn_name ==
-        "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a4") {
-      return 8704ULL;
-    }
     return kWp31Out64MaxTgSram;
   }
   if (fn_name.find("gqa_bk16_wn4") != std::string_view::npos) {
@@ -554,6 +550,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
     id<MTLBuffer> mid_qa = make_zero_buf(std::size_t(kM) * kN);
     id<MTLBuffer> mid_sa = make_zero_buf(std::size_t(kN / 64U) * kM * 4ULL);
     id<MTLBuffer> mid_ra = make_zero_buf(std::size_t(kN / 64U) * kM * 4ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
 
     struct W4A8NormP {
       std::uint32_t k, t, mp;
@@ -597,6 +594,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:ws_buf offset:0 atIndex:3];
       [enc setBuffer:y_buf offset:0 atIndex:4];
       [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:6];
       [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -624,6 +622,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:mid_ra offset:0 atIndex:8];
       [enc setBuffer:y_buf offset:0 atIndex:9];
       [enc setBytes:&gp length:sizeof(gp) atIndex:10];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:11];
       [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -660,6 +659,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
     id<MTLBuffer> mid_c = make_zero_buf(std::size_t(kM / 16U) * (kN / 128U) * 1024ULL);
     id<MTLBuffer> mid_s = make_zero_buf(std::size_t(kM / 16U) * (kN / 128U) * 64ULL);
     id<MTLBuffer> y_buf = make_zero_buf(std::size_t(kM) * kN * 2ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
 
     struct W4A4NormP {
       std::uint32_t k, t, mp;
@@ -782,6 +782,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:std::get<2>(lin) offset:0 atIndex:3];
       [enc setBuffer:y_buf offset:0 atIndex:4];
       [enc setBytes:&gp4 length:sizeof(gp4) atIndex:5];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:6];
       [enc dispatchThreadgroups:MTLSizeMake(kN / 64U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -806,6 +807,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:ws_16 offset:0 atIndex:5];
       [enc setBuffer:y_buf offset:0 atIndex:6];
       [enc setBytes:&gp4 length:sizeof(gp4) atIndex:7];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:8];
       [enc dispatchThreadgroups:MTLSizeMake(kN / 32U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -834,6 +836,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:mid_s offset:0 atIndex:7];
       [enc setBuffer:y_buf offset:0 atIndex:8];
       [enc setBytes:&gp4 length:sizeof(gp4) atIndex:9];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:10];
       [enc dispatchThreadgroups:MTLSizeMake(kN / 64U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -872,11 +875,12 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
     id<MTLBuffer> w_s = make_zero_buf(std::size_t(kF) * (kH / 32U));
     std::memset(w_s.contents, 0x7F, w_s.length);
     id<MTLBuffer> mid_bf16 = make_zero_buf(64ULL * kF * 2ULL);
-    id<MTLBuffer> mid_qa = make_zero_buf(64ULL * (kF / 2U));
+    id<MTLBuffer> mid_qa = make_zero_buf(64ULL * kF);
     id<MTLBuffer> mid_sa = make_zero_buf(64ULL * (kF / 32U));
     std::memset(mid_sa.contents, 0x7F, mid_sa.length);
     id<MTLBuffer> scores = make_zero_buf(128ULL * 2ULL);
     id<MTLBuffer> exp_out = make_zero_buf(128ULL * kH * 2ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
 
     struct W4A4MoeP {
       std::uint32_t n, k, padded_k, max_tiles, mp, reserved;
@@ -899,6 +903,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:w_s offset:0 atIndex:9];
       [enc setBuffer:mid_bf16 offset:0 atIndex:10];
       [enc setBytes:&mp_up length:sizeof(mp_up) atIndex:11];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:12];
       [enc dispatchThreadgroups:MTLSizeMake(kF / 32U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -929,6 +934,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:mid_qa offset:0 atIndex:10];
       [enc setBuffer:mid_sa offset:0 atIndex:11];
       [enc setBytes:&mp_up length:sizeof(mp_up) atIndex:12];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:13];
       [enc dispatchThreadgroups:MTLSizeMake(kF / 64U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];
@@ -958,6 +964,7 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
       [enc setBuffer:w_s offset:0 atIndex:8];
       [enc setBuffer:exp_out offset:0 atIndex:9];
       [enc setBytes:&mp_dn length:sizeof(mp_dn) atIndex:10];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:11];
       [enc dispatchThreadgroups:MTLSizeMake(kH / 64U, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       [enc endEncoding];

@@ -204,6 +204,7 @@ inline void emit_mxfp4_w4a4_nax_linear(Encoder &e, const TiledMxfp4Weight &tw,
   e.dynamic(d, 5,
             words({eff_n, tw.k, mp, t, tw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
+  e.dynamic(d, 6, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 // Mode A Dense Native MXFP4 W4A4 Fused Gate + Up + SwiGLU -> BF16.
@@ -242,6 +243,7 @@ inline void emit_mxfp4_w4a4_nax_swiglu(Encoder &e,
   e.dynamic(d, 7,
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
+  e.dynamic(d, 8, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 // Mode B Dense Native MXFP4 W4A4 Fused Gate + Up + SwiGLU + FWHT-64 + Tiled MXFP4 A4.
@@ -280,6 +282,7 @@ inline void emit_mxfp4_w4a4_nax_swiglu_fwht64_a4(
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
                    flags}),
             tokens_patch);
+  e.dynamic(d, 10, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 } // namespace omlx::m5::detail::forward

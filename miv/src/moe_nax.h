@@ -623,6 +623,7 @@ inline bool emit_moe_w4a8_nax_ffn(
       e.dynamic(up_nax, 13,
                 words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a8_mp,
                        mid_reserved}));
+      e.dynamic(up_nax, 14, nax_mxfp4_byte_lut_sh_bytes());
       e.record_weight(gw, f, h, "moe_w4a8_nax_m5_v2",
                       "moe_w4a8_swiglu_bm64_out64_sk1_fwht64_a8_v2", {},
                       "legacy_route_v1", {}, false, explicit_t);
@@ -640,6 +641,7 @@ inline bool emit_moe_w4a8_nax_ffn(
       e.dynamic(dn_nax, 10,
                 words({h, f, U32(dw.padded_k), gemm_max_tiles_word, ws.max_rows,
                        0u}));
+      e.dynamic(dn_nax, 11, nax_mxfp4_byte_lut_sh_bytes());
       e.record_weight(dw, h, f, "moe_w4a8_nax_m5_v2",
                       "moe_w4a8_down_bm64_bn64_sk1_v2", {}, "legacy_route_v1",
                       {}, false, explicit_t);
@@ -653,6 +655,7 @@ inline bool emit_moe_w4a8_nax_ffn(
       e.dynamic(up_nax, 11,
                 words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a8_mp,
                        0u}));
+      e.dynamic(up_nax, 12, nax_mxfp4_byte_lut_sh_bytes());
       e.record_weight(gw, f, h, "moe_w4a8_nax_m5_v1",
                       "moe_w4a8_swiglu_bm64_out64_sk1_v1", {},
                       "legacy_route_v1", {}, false, explicit_t);
@@ -911,6 +914,7 @@ inline bool emit_moe_w4a4_nax_ffn(
     e.dynamic(up_nax, 12,
               words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a4_mp,
                      mid_reserved}));
+    e.dynamic(up_nax, 13, nax_mxfp4_byte_lut_sh_bytes());
     e.record_weight(gw, f, h, "moe_w4a4_nax_m5_v1",
                     "moe_w4a4_swiglu_bm64_out64_sk1_fwht64_a4_v1", {},
                     "w4a4_prefill_v1", {}, false, explicit_t);
@@ -928,6 +932,7 @@ inline bool emit_moe_w4a4_nax_ffn(
     e.dynamic(dn_nax, 10,
               words({h, f, U32(dw.padded_k), gemm_max_tiles_word, ws.max_rows,
                      0u}));
+    e.dynamic(dn_nax, 11, nax_mxfp4_byte_lut_sh_bytes());
     e.record_weight(dw, h, f, "moe_w4a4_nax_m5_v1",
                     "moe_w4a4_down_bm64_bn64_sk1_v1", {}, "w4a4_prefill_v1",
                     {}, false, explicit_t);
@@ -941,6 +946,7 @@ inline bool emit_moe_w4a4_nax_ffn(
          ws.mid_f16});
     e.dynamic(up_nax, 11,
               words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a4_mp, 0u}));
+    e.dynamic(up_nax, 12, nax_mxfp4_byte_lut_sh_bytes());
     e.record_weight(gw, f, h, "moe_w4a4_nax_m5_v1",
                     "moe_w4a4_swiglu_bm64_out64_sk1_v1", {}, "w4a4_prefill_v1",
                     {}, false, explicit_t);

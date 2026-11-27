@@ -338,4 +338,33 @@ inline std::shared_ptr<CacheT> nax_acquire_owner_cache(const void *owner_key,
       owner_key, 0ULL, std::forward<BuildFn>(build_fn));
 }
 
+// Pre-shifted 2 KiB MXFP4 E2M1 x2 byte LUT (4 shifts x 256 packed byte pairs = 2,048 B).
+// Passed via Encoder::dynamic(...) (deduplicated into one 256B-aligned MTLBuffer slice
+// per compiled plan) so Apple10 kernels avoid program-scope constant arrays (which trigger
+// Metal 4 Shader Validation false-positives under icb=1) while hitting L1/constant-cache peak.
+inline const std::vector<std::byte> &nax_mxfp4_byte_lut_sh_bytes() {
+  static const std::vector<std::byte> table = [] {
+    static constexpr std::int8_t kMag[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+    std::vector<std::byte> out(4u * 256u * sizeof(std::uint16_t));
+    auto *dst = reinterpret_cast<std::uint16_t *>(out.data());
+    for (unsigned sh = 0u; sh < 4u; ++sh) {
+      for (unsigned b = 0u; b < 256u; ++b) {
+        const unsigned n0 = b & 15u;
+        const unsigned n1 = (b >> 4u) & 15u;
+        const int v0 = (n0 & 8u) ? -(int(kMag[n0 & 7u]) << sh)
+                                 : (int(kMag[n0 & 7u]) << sh);
+        const int v1 = (n1 & 8u) ? -(int(kMag[n1 & 7u]) << sh)
+                                 : (int(kMag[n1 & 7u]) << sh);
+        dst[sh * 256u + b] = static_cast<std::uint16_t>(
+            static_cast<std::uint8_t>(static_cast<std::int8_t>(v0)) |
+            (static_cast<std::uint16_t>(
+                 static_cast<std::uint8_t>(static_cast<std::int8_t>(v1)))
+             << 8u));
+      }
+    }
+    return out;
+  }();
+  return table;
+}
+
 } // namespace omlx::m5::detail::forward

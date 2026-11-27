@@ -242,23 +242,40 @@ int main(int argc, char **argv) {
     };
 
     std::vector<Variant> variants = {
-        {"baseline_ws_128t",      "bench_baseline_ws_128t",        64,  64, 128, 0, nil, nil, {}, {}},
-        {"alpha_win_sm_lut2k",    "bench_alpha_win_sm_lut_32x32",  64,  64, 128, 0, nil, nil, {}, {}},
-        {"alpha_win_sm_lut512",   "bench_alpha_win_sm_lut512_32x32",64, 64, 128, 0, nil, nil, {}, {}},
-        {"alpha_256t_cta_s64",    "bench_alpha_256t_cta_s64",      64,  64, 256, 0, nil, nil, {}, {}},
-        {"alpha_256t_ta_s64",     "bench_alpha_256t_ta_s64",       64,  64, 256, 0, nil, nil, {}, {}},
-        {"alpha_256t_cta_s72",    "bench_alpha_256t_cta_s72",      64,  64, 256, 0, nil, nil, {}, {}},
-        {"alpha_512t_n128_cta",   "bench_alpha_512t_n128_cta_s64", 64, 128, 512, 0, nil, nil, {}, {}},
-        {"alpha_512t_m128_cta",   "bench_alpha_512t_m128_cta_s64",128,  64, 512, 0, nil, nil, {}, {}},
-        {"beta_mxfp8_tg_256t",    "bench_beta_mxfp8_tg_256t",      64,  64, 256, 1, nil, nil, {}, {}},
-        {"beta_mxfp8_dva_256t",   "bench_beta_mxfp8_dva_256t",     64,  64, 256, 1, nil, nil, {}, {}},
-        {"ref_w4a4_128t",         "bench_w4a4_zero_spill_128t",    64,  64, 128, 2, nil, nil, {}, {}},
-        {"w4a4_win_tg_128p",      "bench_w4a4_win_tg_128p",        64,  64, 128, 2, nil, nil, {}, {}},
+        {"baseline_ws_128t",      "bench_baseline_ws_128t",              64,  64, 128, 0, nil, nil, {}, {}},
+        {"alpha_256t_cta_s72",    "bench_alpha_256t_cta_s72",            64,  64, 256, 0, nil, nil, {}, {}},
+        {"alpha_win_sm_blk128",   "bench_alpha_win_sm_lut_32x32",        64,  64, 128, 0, nil, nil, {}, {}},
+        {"w4a8_win_128t_bk64_sm", "bench_w4a8_win_128t_bk64_sm",         64,  64, 128, 0, nil, nil, {}, {}},
+        {"beta_mxfp8_tg_16x32",   "bench_beta_mxfp8_tg_256t",            64,  64, 256, 1, nil, nil, {}, {}},
+        {"beta_mxfp8_32x32x64",   "bench_beta_mxfp8_32x32x64_128t",      64,  64, 128, 1, nil, nil, {}, {}},
+        {"beta_mxfp8_256t_64x128","bench_beta_mxfp8_32x32x32_256t_64x128",64,128, 256, 1, nil, nil, {}, {}},
+        {"w4a4_tgfp4_16x32x32",   "bench_w4a4_win_tg_128p",              64,  64, 128, 2, nil, nil, {}, {}},
+        {"w4a4_tgfp4_32x32x128",  "bench_w4a4_32x32x128_128t_pf",        64,  64, 128, 2, nil, nil, {}, {}},
+        {"w4a4_tgfp4_32x32x64",   "bench_w4a4_32x32x64_128t",            64,  64, 128, 2, nil, nil, {}, {}},
+        {"w4a4_tgfp4_256t_64x128","bench_w4a4_32x32x64_256t_64x128",     64, 128, 256, 2, nil, nil, {}, {}},
+        {"w4a4_win_i8_bk64_sm",   "bench_w4a4_win_i8_bk64_sm",           64,  64, 128, 2, nil, nil, {}, {}},
     };
 
     id<MTLComputePipelineState> pso_qa8 = build_pso(dev, lib, "bench_quantize_a8_g64", false);
     id<MTLComputePipelineState> pso_qfp8 = build_pso(dev, lib, "bench_quantize_mxfp8_g32", false);
     id<MTLComputePipelineState> pso_qa4 = build_pso(dev, lib, "bench_quantize_a4_bm16_bk128", false);
+
+    // Pre-shifted 2 KiB MXFP4 E2M1 x2 byte LUT (icb=1 + MTL_SHADER_VALIDATION=1 clean).
+    id<MTLBuffer> lut_buf = [dev newBufferWithLength:4u * 256u * 2u options:MTLResourceStorageModeShared];
+    {
+      static constexpr std::int8_t kMag[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+      auto *dst = reinterpret_cast<std::uint16_t *>(lut_buf.contents);
+      for (unsigned sh = 0u; sh < 4u; ++sh) {
+        for (unsigned b = 0u; b < 256u; ++b) {
+          const unsigned n0 = b & 15u, n1 = (b >> 4u) & 15u;
+          const int v0 = (n0 & 8u) ? -(int(kMag[n0 & 7u]) << sh) : (int(kMag[n0 & 7u]) << sh);
+          const int v1 = (n1 & 8u) ? -(int(kMag[n1 & 7u]) << sh) : (int(kMag[n1 & 7u]) << sh);
+          dst[sh * 256u + b] = static_cast<std::uint16_t>(
+              static_cast<std::uint8_t>(static_cast<std::int8_t>(v0)) |
+              (static_cast<std::uint16_t>(static_cast<std::uint8_t>(static_cast<std::int8_t>(v1))) << 8u));
+        }
+      }
+    }
 
     std::printf("\n=== 1. Apple10 SRAM & Spill Audit (icb=0 / icb=1) ===\n");
     std::printf("%-24s | %8s | %8s | %9s | %11s\n", "Variant", "TG SRAM", "MaxThr", "GPR(0/1)", "Spill(0/1)");
@@ -336,7 +353,7 @@ int main(int argc, char **argv) {
         [enc setBuffer:qa4_buf offset:0 atIndex:1];
         [enc setBuffer:sa4_buf offset:0 atIndex:2];
         [enc setBytes:&qp length:sizeof(qp) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(K / 32u, MP, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake((K / 64u + 3u) / 4u, MP, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -366,6 +383,7 @@ int main(int argc, char **argv) {
         [enc setBuffer:ws_buf offset:0 atIndex:3];
         [enc setBuffer:y_buf offset:0 atIndex:4];
         [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+        [enc setBuffer:lut_buf offset:0 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake((N + v.bn - 1u) / v.bn, (M + v.bm - 1u) / v.bm, 1)
             threadsPerThreadgroup:MTLSizeMake(v.tptg, 1, 1)];
         [enc endEncoding];
@@ -467,14 +485,15 @@ int main(int argc, char **argv) {
 
       const double q_a8_ms = time_quant(pso_qa8, qa8_buf, sa8_buf, MTLSizeMake(K / 64u, MP, 1), MTLSizeMake(32, 1, 1));
       const double q_fp8_ms = time_quant(pso_qfp8, qfp8_buf, sfp8_buf, MTLSizeMake((K / 128u + 3u) / 4u, MP, 1), MTLSizeMake(128, 1, 1));
-      const double q_a4_ms = time_quant(pso_qa4, qa4_buf, sa4_buf, MTLSizeMake(K / 32u, MP, 1), MTLSizeMake(32, 1, 1));
+      const double q_a4_ms = time_quant(pso_qa4, qa4_buf, sa4_buf, MTLSizeMake((K / 64u + 3u) / 4u, MP, 1), MTLSizeMake(128, 1, 1));
 
       std::printf("\nShape: %s (%.2f GFLOP) | Quant ms: A8=%.3f, MXFP8=%.3f, A4=%.3f\n",
                   sh.label, flops * 1e-9, q_a8_ms, q_fp8_ms, q_a4_ms);
-      std::printf("  %-24s | %8s | %10s | %10s | %8s\n",
-                  "Variant", "GEMM ms", "GEMM TF", "Q+GEMM TF", "vs Base");
+      std::printf("  %-24s | %8s | %9s | %9s | %9s | %8s\n",
+                  "Variant", "1CB ms", "1CB TF", "8xCB TF", "Q+8CB TF", "vs Base");
 
       BenchGemmParams gp{N, K, MP, M, N, 0, N, 0};
+      constexpr int kBatch = 8;
       double base_ms = 0.0;
       for (std::size_t vi = 0; vi < variants.size(); ++vi) {
         const auto &v = variants[vi];
@@ -494,12 +513,13 @@ int main(int argc, char **argv) {
           [enc setBuffer:ws_buf offset:0 atIndex:3];
           [enc setBuffer:y_buf offset:0 atIndex:4];
           [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+          [enc setBuffer:lut_buf offset:0 atIndex:6];
           [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
           [enc endEncoding];
           [cb commit];
           [cb waitUntilCompleted];
         }
-        std::vector<double> ms;
+        std::vector<double> ms1, ms8;
         for (int i = 0; i < kIters; ++i) {
           id<MTLCommandBuffer> cb = [q commandBuffer];
           id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -510,19 +530,43 @@ int main(int argc, char **argv) {
           [enc setBuffer:ws_buf offset:0 atIndex:3];
           [enc setBuffer:y_buf offset:0 atIndex:4];
           [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+          [enc setBuffer:lut_buf offset:0 atIndex:6];
           [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
           [enc endEncoding];
           [cb commit];
           [cb waitUntilCompleted];
-          ms.push_back((cb.GPUEndTime - cb.GPUStartTime) * 1e3);
+          ms1.push_back((cb.GPUEndTime - cb.GPUStartTime) * 1e3);
         }
-        std::sort(ms.begin(), ms.end());
-        const double med_ms = ms[ms.size() / 2];
-        if (vi == 0) base_ms = med_ms;
-        const double tf = (flops * 1e-9) / med_ms;
-        const double e2e_tf = (flops * 1e-9) / (med_ms + q_ms);
-        std::printf("  %-24s | %8.3f | %10.2f | %10.2f | %7.2fx\n",
-                    v.name, med_ms, tf, e2e_tf, base_ms / med_ms);
+        const int b_iters = quick ? 3 : 6;
+        for (int i = 0; i < b_iters; ++i) {
+          id<MTLCommandBuffer> cb = [q commandBuffer];
+          id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+          [enc setComputePipelineState:v.pso0];
+          [enc setBuffer:a0 offset:0 atIndex:0];
+          [enc setBuffer:a1 offset:0 atIndex:1];
+          [enc setBuffer:wc_buf offset:0 atIndex:2];
+          [enc setBuffer:ws_buf offset:0 atIndex:3];
+          [enc setBuffer:y_buf offset:0 atIndex:4];
+          [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+          [enc setBuffer:lut_buf offset:0 atIndex:6];
+          for (int b = 0; b < kBatch; ++b) {
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+          }
+          [enc endEncoding];
+          [cb commit];
+          [cb waitUntilCompleted];
+          ms8.push_back(((cb.GPUEndTime - cb.GPUStartTime) * 1e3) / double(kBatch));
+        }
+        std::sort(ms1.begin(), ms1.end());
+        std::sort(ms8.begin(), ms8.end());
+        const double med_ms1 = ms1[ms1.size() / 2];
+        const double med_ms8 = ms8[ms8.size() / 2];
+        if (vi == 0) base_ms = med_ms8;
+        const double tf1 = (flops * 1e-9) / med_ms1;
+        const double tf8 = (flops * 1e-9) / med_ms8;
+        const double e2e_tf = (flops * 1e-9) / (med_ms8 + q_ms);
+        std::printf("  %-24s | %8.3f | %9.2f | %9.2f | %9.2f | %7.2fx\n",
+                    v.name, med_ms1, tf1, tf8, e2e_tf, base_ms / med_ms8);
       }
     }
     return 0;
