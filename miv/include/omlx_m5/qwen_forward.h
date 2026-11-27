@@ -37,17 +37,21 @@ struct QwenPrefillOptions {
   bool sparse_minference = false;
   bool cache_blend = false;
   bool ane_offload = false;
+  PrefillAneMode ane_mode = PrefillAneMode::Off;
   std::string artifact_digest;
-  // Optional override for Dual-ANE fixed chunk tokens (0 => default 1024).
+  // Optional override for Dual-ANE fixed chunk tokens (0 => mode default).
   std::uint32_t ane_chunk_tokens = 0;
 };
 
 struct QwenPrefillTelemetry {
   std::uint64_t prefill_w4a8_tokens = 0;
+  std::uint64_t prefill_w4a4_tokens = 0;
   std::uint64_t prefill_sage2_tokens = 0;
   std::uint64_t prefill_minference_blocks_skipped = 0;
   std::uint64_t prefill_minference_blocks_total = 0;
   bool prefill_ane_active = false;
+  std::string prefill_ane_mode_effective = "off";
+  std::string prefill_ane_inactive_reason;
   double prefill_ane_split_alpha = 0.0;
   std::uint64_t prefill_ane_offload_tokens = 0;
   std::uint64_t prefill_ane_fallback_tokens = 0;
@@ -360,6 +364,8 @@ public:
       const detail::BlendSegmentConfig *seg_cfg = nullptr);
   [[nodiscard]] QwenPrefillTelemetry prefill_telemetry() const noexcept;
   [[nodiscard]] bool ane_offload_active() const noexcept;
+  [[nodiscard]] PrefillAneMode ane_mode_effective() const noexcept;
+  [[nodiscard]] std::string_view ane_inactive_reason() const noexcept;
   [[nodiscard]] double ane_split_alpha() const noexcept;
   [[nodiscard]] std::uint32_t ane_chunk_tokens() const noexcept;
   [[nodiscard]] bool cache_blend_eligible() const noexcept;

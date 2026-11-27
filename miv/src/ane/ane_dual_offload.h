@@ -19,21 +19,58 @@ namespace omlx::m5::ane {
 
 // Fixed-chunk geometry and alignment contracts for Dual-ANE + GPU co-execution.
 inline constexpr std::uint32_t kAneDefaultChunkTokens = 1024u;
+inline constexpr std::uint32_t kAneUltraDefaultChunkTokens = 2048u;
 inline constexpr std::uint32_t kAneRowAlign = 128u;
 inline constexpr std::uint32_t kAneGroupSize = 64u;
 inline constexpr std::uint64_t kAneDefaultMaxBankBytesPerDie =
     320ULL * 1024ULL * 1024ULL; // 320 MiB per shard (~10 fast-compiling shards/die on 27B)
+inline constexpr std::uint64_t kAneUltraMaxBankBytesPerDie =
+    512ULL * 1024ULL * 1024ULL; // 512 MiB per shard (3 shards/die for 64-layer FP16 SwiGLU)
 inline constexpr std::uint64_t kAneDefaultMaxTotalBytesPerDie =
     3584ULL * 1024ULL * 1024ULL; // 3.5 GiB total resident cap per die
 inline constexpr std::uint32_t kAneMaxProceduresPerBank = 24u;
+inline constexpr std::uint32_t kAneUltraMaxProceduresPerBank = 22u;
 inline constexpr double kAneDefaultAlphaBf16 = 0.25;
 inline constexpr double kAneDefaultAlphaW4A8 = 0.15;
+inline constexpr double kAneUltraDefaultAlphaBf16 = 0.10;
+inline constexpr double kAneUltraDefaultAlphaW4A8 = 0.08;
+inline constexpr double kAneUltraDefaultAlphaW4A4 = 0.06;
 inline constexpr double kAneMaxAlpha = 0.30;
+// Empirically tuned on 80-core M5 Ultra (64-layer Qwen3.8-27B .miv v2):
+// hot-SLC Layer-0 canary must beat GPU-solo by >= 4% (ratio <= 0.96) to cover
+// 64-layer cold-DRAM ANE weight streaming + 65-CB vs single-ICB overhead and
+// guarantee strictly zero end-to-end regression across BF16, W4A8, and W4A4.
+inline constexpr double kAneDefaultCalibrationBypassRatio = 0.96;
 
-// Mirrors Module 4a's PrefillLinearMode without touching types.h in Wave 1.
+// Mirrors PrefillLinearMode without coupling ane_dual_offload to serve headers.
 enum class AneLinearRoute : std::uint8_t {
   BF16 = 0,
   W4A8 = 1,
+  W4A4 = 2,
+};
+
+// Destination unpack format written by CB_B2 / collapsed unpack encoder.
+enum class AneUnpackMode : std::uint8_t {
+  BF16 = 0,     // Standard FP16 planar -> BF16 [T, out_stride]
+  Fwht64A8 = 1, // Fused FP16 planar -> FWHT-64 + GS64 INT8 (qa, sa, ra)
+  Fwht64A4 = 2, // Fused FP16 planar -> FWHT-64 + MXFP4 A4 bm16_bk128 (codes, scales)
+};
+
+struct AneUnpackTarget {
+  AneUnpackMode mode = AneUnpackMode::BF16;
+  // BF16:     primary_buf = dst_bf16
+  // Fwht64A8: primary_buf = qa_out, aux0_buf = sa_out, aux1_buf = ra_out
+  // Fwht64A4: primary_buf = a4_codes, aux0_buf = a4_scales
+  void *primary_buf = nullptr;
+  std::uint64_t primary_offset = 0;
+  void *aux0_buf = nullptr;
+  std::uint64_t aux0_offset = 0;
+  void *aux1_buf = nullptr;
+  std::uint64_t aux1_offset = 0;
+  std::uint32_t out_stride = 0;
+  std::uint32_t dst_col_offset = 0;
+  // Padded rows for Fwht64A8 / Fwht64A4 (0 => ((T + 63) / 64) * 64).
+  std::uint32_t mp = 0;
 };
 
 // Strictly allowlisted non-recurrent prefill projections eligible for Dual-ANE
@@ -128,6 +165,10 @@ struct AneGroup64Int8Weight {
     const MaterializedWeightView &weight, std::uint64_t row_start,
     std::uint64_t row_count);
 
+[[nodiscard]] std::vector<std::uint16_t> extract_miv_weight_slice_fp16(
+    const MaterializedWeightView &weight, std::uint64_t row_start,
+    std::uint64_t row_count);
+
 [[nodiscard]] AneGroup64Int8Weight quantize_f32_to_g64_int8(
     std::span<const float> weights, std::uint32_t rows,
     std::uint32_t in_features);
@@ -168,6 +209,7 @@ struct AneDualOffloadConfig {
   AneLinearRoute linear_route = AneLinearRoute::BF16;
   double alpha_bf16 = kAneDefaultAlphaBf16;
   double alpha_w4a8 = kAneDefaultAlphaW4A8;
+  double alpha_w4a4 = kAneUltraDefaultAlphaW4A4;
   std::optional<double> alpha_override;
   double max_alpha = kAneMaxAlpha;
   std::uint64_t max_bank_bytes_per_die = kAneDefaultMaxBankBytesPerDie;
@@ -176,6 +218,9 @@ struct AneDualOffloadConfig {
   // Direct FP16 MIL weight blobs instead of G=64 INT8 blockwise dequant:
   // ~1.7x higher ANE TFLOPS on Apple M5 Ultra with zero weight quantization loss.
   bool use_fp16_weights = false;
+  // Share a single read-only input IOSurfaceRef per ping-pong slot across ane0 & ane1
+  // (automatically falls back to dual input surfaces if rejected by ANE driver).
+  bool share_input_surface = true;
   // Exclude projections with in_features > max_in_features (0 = no cap).
   // Avoids Apple ANE's C_in > 8192 input-SRAM spill cliff (e.g. mlp.down_proj K=17408).
   std::uint32_t max_in_features = 0u;
@@ -210,10 +255,42 @@ struct AneCalibrationResult {
   std::string reason;
 };
 
+struct AneCachedCalibrationRecord {
+  bool valid = false;
+  bool active = false;
+  double best_alpha = 0.0;
+  double gpu_solo_ms = 0.0;
+  double best_hybrid_ms = 0.0;
+  std::string reason;
+  std::vector<std::pair<double, double>> candidate_timings_ms;
+};
+
+[[nodiscard]] std::string compute_calibration_cache_key(
+    std::string_view os_build,
+    std::uint32_t gpu_cores,
+    std::uint32_t ane_dies,
+    std::string_view artifact_digest,
+    AneLinearRoute linear_route,
+    std::uint32_t chunk_tokens,
+    std::uint32_t hidden_size,
+    std::uint32_t intermediate_size,
+    double bypass_ratio,
+    std::optional<double> alpha_override);
+
+[[nodiscard]] AneCachedCalibrationRecord load_cached_calibration(
+    const std::filesystem::path &cache_root,
+    std::string_view cal_key) noexcept;
+
+void save_cached_calibration(
+    const std::filesystem::path &cache_root,
+    std::string_view cal_key,
+    const AneCachedCalibrationRecord &record) noexcept;
+
 struct AneEngineStats {
   bool available = false;
   bool active = false;
   bool auto_bypassed = false;
+  bool shared_input_surface_active = false;
   std::uint32_t physical_die_count = 0;
   std::uint32_t active_die_count = 0;
   bool die_pinned[2] = {false, false};
@@ -351,6 +428,34 @@ public:
       std::uint32_t src_stride = 0,
       std::uint32_t dst_col_offset = 0);
 
+  // Extended async dispatch supporting BF16, Fwht64A8 (Mode B W4A8), and
+  // Fwht64A4 (Mode B W4A4) fused unpack destinations.
+  void enqueue_op_ex(
+      std::uint32_t op_id,
+      void *src_mtl_buffer,
+      std::uint64_t src_offset,
+      std::uint32_t src_stride,
+      const AneUnpackTarget &target,
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix = {});
+
+  // Collapsed-CB overlap pipeline API for `ultra_fp16_swiglu`:
+  // Keeps pre-MLP trunk + ane_pack in one CB and fused ane_unpack + mlp_down +
+  // next-layer pre-MLP in the next CB (reducing ~576 -> 65 trunk CBs/chunk).
+  [[nodiscard]] void *begin_collapsed_cb();
+  std::uint64_t encode_pack_and_commit(
+      void *mtl_command_buffer,
+      std::uint32_t op_id,
+      void *src_mtl_buffer,
+      std::uint64_t src_offset,
+      std::uint32_t src_stride = 0);
+  void submit_gpu_suffix_cb(
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix);
+  [[nodiscard]] void *begin_unpack_cb(
+      std::uint64_t seq,
+      std::uint32_t op_id,
+      const AneUnpackTarget &target);
+  void commit_collapsed_cb(void *mtl_command_buffer);
+
   // Single host wait at the end of a T_chunk pass (drains all in-flight ops
   // and throws std::runtime_error if any ANE or Metal error occurred).
   void flush_and_wait(std::uint32_t timeout_ms = 30000u);
@@ -366,6 +471,14 @@ public:
       std::function<void(void *mtl_command_buffer)> encode_gpu_suffix = {},
       std::uint32_t src_stride = 0,
       std::uint32_t dst_col_offset = 0);
+
+  void run_op_sync_ex(
+      std::uint32_t op_id,
+      void *src_mtl_buffer,
+      std::uint64_t src_offset,
+      std::uint32_t src_stride,
+      const AneUnpackTarget &target,
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix = {});
 
   // Opaque native handles for Wave 2 integration / testing.
   [[nodiscard]] void *native_mtl_device() const noexcept;

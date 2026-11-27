@@ -68,6 +68,32 @@ struct AneUnpackParamsHost {
   std::uint32_t reserved = 0;
 };
 
+struct AneUnpackQuantParamsHost {
+  std::uint32_t T = 0;
+  std::uint32_t mp = 0;
+  std::uint32_t ane0_n = 0;
+  std::uint32_t ane1_n = 0;
+  std::uint32_t out_stride = 0;
+  std::uint32_t dst_col_offset = 0;
+  std::uint32_t reserved0 = 0;
+  std::uint32_t reserved1 = 0;
+};
+
+double select_route_alpha(const AneDualOffloadConfig &config) noexcept {
+  if (config.alpha_override.has_value()) {
+    return *config.alpha_override;
+  }
+  switch (config.linear_route) {
+  case AneLinearRoute::W4A8:
+    return config.alpha_w4a8;
+  case AneLinearRoute::W4A4:
+    return config.alpha_w4a4;
+  case AneLinearRoute::BF16:
+    return config.alpha_bf16;
+  }
+  return config.alpha_bf16;
+}
+
 // Exact IEEE-754 float32 <-> float16 bit conversions (pure C++20, -Wpedantic clean).
 std::uint16_t float_to_f16_bits(float value) noexcept {
   const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
@@ -960,11 +986,8 @@ std::unique_ptr<CompiledAneBank> compile_or_load_bank(
 
         if (use_fp16_weights) {
           auto pack_fp16 = [&](const MaterializedWeightView &w) {
-            const auto f32 = dequantize_miv_weight_slice_f32(w, row_start, row_count);
-            std::vector<std::uint16_t> fp16(f32.size());
-            for (std::size_t k = 0; k < f32.size(); ++k) {
-              fp16[k] = float_to_f16_bits(f32[k]);
-            }
+            const auto fp16 =
+                extract_miv_weight_slice_fp16(w, row_start, row_count);
             return append_mil_blob_chunk(mutable_blob, fp16.data(),
                                          fp16.size() * sizeof(std::uint16_t),
                                          kBlobDtypeFp16);
@@ -1170,6 +1193,8 @@ std::string_view to_string(AneLinearRoute route) noexcept {
     return "bf16";
   case AneLinearRoute::W4A8:
     return "w4a8";
+  case AneLinearRoute::W4A4:
+    return "w4a4";
   }
   return "bf16";
 }
@@ -1367,24 +1392,12 @@ inline void ane_fwht64_inplace_rows_f32(float *data, std::uint64_t rows,
   }
 }
 
-} // namespace
-
-std::vector<float> dequantize_miv_weight_slice_f32(
+void dequantize_miv_weight_rows_f32_into(
     const MaterializedWeightView &w, std::uint64_t row_start,
-    std::uint64_t row_count) {
-  if (!ane_weight_view_supported(w)) {
-    throw std::invalid_argument("unsupported .miv weight view for ANE: " +
-                                w.name + " (" + w.format + "/" + w.layout + ")");
-  }
-  if (row_count == 0 || row_start > w.row_count ||
-      row_count > w.row_count - row_start) {
-    throw std::out_of_range("ANE weight extraction row range out of bounds: " +
-                            w.name);
-  }
+    std::uint64_t row_count, float *out_ptr) {
   const std::uint64_t K = w.in_features;
   const std::uint64_t padded_k = w.padded_k;
   const std::uint64_t total_parent_rows = w.parent_shape[0];
-  std::vector<float> out(static_cast<std::size_t>(row_count * K), 0.0f);
 
   // 1. Direct dense weights (BF16 / FP16 / FP32)
   if (w.format == "direct_bf16_v1" || w.format == "direct_f16_v1" ||
@@ -1392,7 +1405,7 @@ std::vector<float> dequantize_miv_weight_slice_f32(
     const auto data = plane_span(require_view_plane(w, "data"));
     for (std::uint64_t lr = 0; lr < row_count; ++lr) {
       const std::uint64_t r = row_start + lr;
-      float *dst = out.data() + static_cast<std::size_t>(lr * K);
+      float *dst = out_ptr + static_cast<std::size_t>(lr * K);
       if (w.format == "direct_bf16_v1") {
         const auto *src = data.data() + (r * K) * 2;
         for (std::uint64_t c = 0; c < K; ++c) {
@@ -1421,7 +1434,7 @@ std::vector<float> dequantize_miv_weight_slice_f32(
         const std::uint64_t r = w.row_start + row_start + lr;
         const std::uint64_t rn = r % bn;
         const std::uint64_t row_tile_base = (r / bn) * k_blocks;
-        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        float *dst = out_ptr + static_cast<std::size_t>(lr * K);
         for (std::uint64_t blk = 0; blk < k_blocks; ++blk) {
           const std::uint64_t tile_idx = row_tile_base + blk;
           const auto *d_ptr = reinterpret_cast<const std::uint8_t *>(
@@ -1456,7 +1469,7 @@ std::vector<float> dequantize_miv_weight_slice_f32(
             reinterpret_cast<const std::uint8_t *>(data.data() + r * data_row);
         const auto *s_row =
             reinterpret_cast<const std::uint8_t *>(scale.data() + r * scale_row);
-        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        float *dst = out_ptr + static_cast<std::size_t>(lr * K);
         for (std::uint64_t g = 0; g < g32_count; ++g) {
           const float sc = decode_e8m0(s_row[g]);
           if (!std::isfinite(sc)) {
@@ -1501,7 +1514,7 @@ std::vector<float> dequantize_miv_weight_slice_f32(
         const std::uint64_t r = w.row_start + row_start + lr;
         const std::uint64_t rn = r % bn;
         const std::uint64_t row_tile_base = (r / bn) * groups64;
-        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        float *dst = out_ptr + static_cast<std::size_t>(lr * K);
         for (std::uint64_t g = 0; g < groups64; ++g) {
           const std::uint64_t tile_idx = row_tile_base + g;
           const std::uint32_t packed_sb =
@@ -1581,7 +1594,7 @@ std::vector<float> dequantize_miv_weight_slice_f32(
                 : reinterpret_cast<const std::uint8_t *>(high.data() + r * high_row);
         const auto *s_row = scale.data() + r * group_row * 2u;
         const auto *bi_row = bias.data() + r * group_row * 2u;
-        float *dst = out.data() + static_cast<std::size_t>(lr * K);
+        float *dst = out_ptr + static_cast<std::size_t>(lr * K);
 
         const std::uint64_t num_groups = K / gs;
         for (std::uint64_t g = 0; g < num_groups; ++g) {
@@ -1613,9 +1626,241 @@ std::vector<float> dequantize_miv_weight_slice_f32(
 
   // WP1 Part B: Unrotate W' H_64 = W so ANE consumes unrotated FP16/BF16 activations!
   if (w.has_fwht64()) {
-    ane_fwht64_inplace_rows_f32(out.data(), row_count, K);
+    ane_fwht64_inplace_rows_f32(out_ptr, row_count, K);
+  }
+}
+
+} // namespace
+
+std::vector<float> dequantize_miv_weight_slice_f32(
+    const MaterializedWeightView &w, std::uint64_t row_start,
+    std::uint64_t row_count) {
+  if (!ane_weight_view_supported(w)) {
+    throw std::invalid_argument("unsupported .miv weight view for ANE: " +
+                                w.name + " (" + w.format + "/" + w.layout + ")");
+  }
+  if (row_count == 0 || row_start > w.row_count ||
+      row_count > w.row_count - row_start) {
+    throw std::out_of_range("ANE weight extraction row range out of bounds: " +
+                            w.name);
+  }
+  const std::uint64_t K = w.in_features;
+  std::vector<float> out(static_cast<std::size_t>(row_count * K), 0.0f);
+
+  const std::size_t hw =
+      std::max<std::size_t>(1u, std::thread::hardware_concurrency());
+  const std::size_t num_threads =
+      row_count >= 128u
+          ? std::min<std::size_t>({hw, 8u, static_cast<std::size_t>(row_count / 64u)})
+          : 1u;
+
+  if (num_threads <= 1u) {
+    dequantize_miv_weight_rows_f32_into(w, row_start, row_count, out.data());
+    return out;
+  }
+
+  std::mutex err_mu;
+  std::exception_ptr first_err = nullptr;
+  auto work = [&](std::uint64_t lr0, std::uint64_t lr1) {
+    if (lr1 <= lr0) {
+      return;
+    }
+    try {
+      dequantize_miv_weight_rows_f32_into(
+          w, row_start + lr0, lr1 - lr0,
+          out.data() + static_cast<std::size_t>(lr0 * K));
+    } catch (...) {
+      std::lock_guard<std::mutex> lk(err_mu);
+      if (!first_err) {
+        first_err = std::current_exception();
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(num_threads - 1u);
+  for (std::size_t t = 1; t < num_threads; ++t) {
+    const std::uint64_t lr0 = (row_count * t) / num_threads;
+    const std::uint64_t lr1 = (row_count * (t + 1u)) / num_threads;
+    threads.emplace_back(work, lr0, lr1);
+  }
+  work(0u, row_count / num_threads);
+  for (auto &th : threads) {
+    th.join();
+  }
+  if (first_err) {
+    std::rethrow_exception(first_err);
   }
   return out;
+}
+
+std::vector<std::uint16_t> extract_miv_weight_slice_fp16(
+    const MaterializedWeightView &w, std::uint64_t row_start,
+    std::uint64_t row_count) {
+  if (!ane_weight_view_supported(w)) {
+    throw std::invalid_argument("unsupported .miv weight view for ANE FP16: " +
+                                w.name + " (" + w.format + "/" + w.layout + ")");
+  }
+  if (row_count == 0 || row_start > w.row_count ||
+      row_count > w.row_count - row_start) {
+    throw std::out_of_range("ANE FP16 weight extraction row range out of bounds: " +
+                            w.name);
+  }
+  const std::uint64_t K = w.in_features;
+  std::vector<std::uint16_t> out(static_cast<std::size_t>(row_count * K), 0u);
+
+  const std::size_t hw =
+      std::max<std::size_t>(1u, std::thread::hardware_concurrency());
+  const std::size_t num_threads =
+      row_count >= 128u
+          ? std::min<std::size_t>({hw, 8u, static_cast<std::size_t>(row_count / 64u)})
+          : 1u;
+
+  std::mutex err_mu;
+  std::exception_ptr first_err = nullptr;
+  auto work = [&](std::uint64_t lr0, std::uint64_t lr1) {
+    if (lr1 <= lr0) {
+      return;
+    }
+    try {
+      // Process in cache-hot 64-row strips to avoid large temporary FP32 buffers.
+      constexpr std::uint64_t kStripRows = 64u;
+      std::vector<float> tmp(static_cast<std::size_t>(kStripRows * K));
+      for (std::uint64_t pos = lr0; pos < lr1; pos += kStripRows) {
+        const std::uint64_t chunk = std::min<std::uint64_t>(kStripRows, lr1 - pos);
+        dequantize_miv_weight_rows_f32_into(w, row_start + pos, chunk, tmp.data());
+        std::uint16_t *dst = out.data() + static_cast<std::size_t>(pos * K);
+        const std::size_t elems = static_cast<std::size_t>(chunk * K);
+        for (std::size_t i = 0; i < elems; ++i) {
+          dst[i] = float_to_f16_bits(tmp[i]);
+        }
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lk(err_mu);
+      if (!first_err) {
+        first_err = std::current_exception();
+      }
+    }
+  };
+
+  if (num_threads <= 1u) {
+    work(0u, row_count);
+  } else {
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1u);
+    for (std::size_t t = 1; t < num_threads; ++t) {
+      const std::uint64_t lr0 = (row_count * t) / num_threads;
+      const std::uint64_t lr1 = (row_count * (t + 1u)) / num_threads;
+      threads.emplace_back(work, lr0, lr1);
+    }
+    work(0u, row_count / num_threads);
+    for (auto &th : threads) {
+      th.join();
+    }
+  }
+  if (first_err) {
+    std::rethrow_exception(first_err);
+  }
+  return out;
+}
+
+std::string compute_calibration_cache_key(
+    std::string_view os_build,
+    std::uint32_t gpu_cores,
+    std::uint32_t ane_dies,
+    std::string_view artifact_digest,
+    AneLinearRoute linear_route,
+    std::uint32_t chunk_tokens,
+    std::uint32_t hidden_size,
+    std::uint32_t intermediate_size,
+    double bypass_ratio,
+    std::optional<double> alpha_override) {
+  std::ostringstream oss;
+  oss << "ane_cal_v1"
+      << "|os=" << os_build
+      << "|gc=" << gpu_cores
+      << "|dies=" << ane_dies
+      << "|digest=" << artifact_digest
+      << "|route=" << to_string(linear_route)
+      << "|T=" << chunk_tokens
+      << "|h=" << hidden_size
+      << "|f=" << intermediate_size
+      << "|ratio=" << static_cast<std::uint32_t>(std::llround(bypass_ratio * 10000.0));
+  if (alpha_override.has_value()) {
+    oss << "|alpha_ov="
+        << static_cast<std::uint32_t>(std::llround(*alpha_override * 10000.0));
+  }
+  return sha256_hex_string(oss.str());
+}
+
+AneCachedCalibrationRecord load_cached_calibration(
+    const std::filesystem::path &cache_root,
+    std::string_view cal_key) noexcept {
+  AneCachedCalibrationRecord out{};
+  try {
+    const auto root = cache_root.empty()
+                          ? AneDualOffloadEngine::default_cache_root()
+                          : cache_root;
+    const auto path = root / ("cal_" + std::string(cal_key) + ".json");
+    if (!std::filesystem::is_regular_file(path)) {
+      return out;
+    }
+    const auto raw = read_file_bytes(path);
+    const Json j = Json::parse(raw.begin(), raw.end());
+    if (j.value("schema_version", 0u) != 1u ||
+        j.value("cal_key", "") != cal_key) {
+      return out;
+    }
+    out.valid = true;
+    out.active = j.value("active", false);
+    out.best_alpha = j.value("best_alpha", 0.0);
+    out.gpu_solo_ms = j.value("gpu_solo_ms", 0.0);
+    out.best_hybrid_ms = j.value("best_hybrid_ms", 0.0);
+    out.reason = j.value("reason", std::string{});
+    if (j.contains("candidates") && j["candidates"].is_array()) {
+      for (const auto &item : j["candidates"]) {
+        if (item.is_object()) {
+          out.candidate_timings_ms.emplace_back(
+              item.value("alpha", 0.0), item.value("hybrid_ms", 0.0));
+        }
+      }
+    }
+  } catch (...) {
+    return AneCachedCalibrationRecord{};
+  }
+  return out;
+}
+
+void save_cached_calibration(
+    const std::filesystem::path &cache_root,
+    std::string_view cal_key,
+    const AneCachedCalibrationRecord &record) noexcept {
+  try {
+    const auto root = cache_root.empty()
+                          ? AneDualOffloadEngine::default_cache_root()
+                          : cache_root;
+    const auto path = root / ("cal_" + std::string(cal_key) + ".json");
+    const auto lock_path = root / ("cal_" + std::string(cal_key) + ".lock");
+    ScopedFileLock lk(lock_path);
+    Json cands = Json::array();
+    for (const auto &[a, ms] : record.candidate_timings_ms) {
+      cands.push_back({{"alpha", a}, {"hybrid_ms", ms}});
+    }
+    Json j = {
+        {"schema_version", 1u},
+        {"cal_key", std::string(cal_key)},
+        {"active", record.active},
+        {"best_alpha", record.best_alpha},
+        {"gpu_solo_ms", record.gpu_solo_ms},
+        {"best_hybrid_ms", record.best_hybrid_ms},
+        {"reason", record.reason},
+        {"candidates", cands},
+    };
+    const std::string dump = j.dump(2);
+    write_file_atomic(path, dump.data(), dump.size());
+  } catch (...) {
+    // Best-effort persistent calibration cache; never fatal.
+  }
 }
 
 AneGroup64Int8Weight quantize_f32_to_g64_int8(std::span<const float> weights,
@@ -1743,6 +1988,7 @@ public:
   Impl() = default;
 
   ~Impl() {
+    open_collapsed_cb_ = nil;
     // 1. Drain any pending GPU/ANE operations cleanly before shutting down workers.
     try {
       flush_and_wait(5000u);
@@ -1902,6 +2148,14 @@ public:
           make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_bf16_single");
       unpack_dual_pso_ =
           make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_bf16_dual");
+      unpack_a8_single_pso_ =
+          make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_single");
+      unpack_a8_dual_pso_ =
+          make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_dual");
+      unpack_a4_single_pso_ =
+          make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_single");
+      unpack_a4_dual_pso_ =
+          make_pso(@"omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_dual");
 
       ane_ready_event_ = [device_ newSharedEvent];
       ane_done_event_ = [device_ newSharedEvent];
@@ -1925,7 +2179,7 @@ public:
     }
   }
 
-  void bind_op_requests() {
+  void bind_op_requests(bool share_input_surface) {
     @autoreleasepool {
       Class req_cls = NSClassFromString(@"_ANERequest");
       auto get_model_fn = reinterpret_cast<id (*)(id, SEL)>(&objc_msgSend);
@@ -1935,6 +2189,9 @@ public:
           reinterpret_cast<id (*)(Class, SEL, id, id, id, id, id, id, id)>(
               &objc_msgSend);
 
+      const bool use_shared_in =
+          share_input_surface && (stats_.active_die_count == 2u);
+      op_bindings_.clear();
       op_bindings_.resize(ops_.size());
       for (std::size_t op_idx = 0; op_idx < ops_.size(); ++op_idx) {
         const auto &info = ops_[op_idx];
@@ -1964,8 +2221,9 @@ public:
           NSArray *out_indices = @[ @(out_set.firstIndex) ];
 
           for (std::uint32_t slot = 0; slot < 2u; ++slot) {
+            const std::uint32_t in_die = use_shared_in ? 0u : die;
             const auto &in_surf =
-                get_or_create_surface(die, slot, false, in_bytes);
+                get_or_create_surface(in_die, slot, false, in_bytes);
             const auto &out_surf =
                 get_or_create_surface(die, slot, true, out_bytes);
             id req = make_req(
@@ -1975,6 +2233,10 @@ public:
                 @[ in_surf.ane_object ], in_indices, @[ out_surf.ane_object ],
                 out_indices, nil, nil, @(info.procedure_index));
             if (req == nil) {
+              if (use_shared_in) {
+                bind_op_requests(/*share_input_surface=*/false);
+                return;
+              }
               throw std::runtime_error(
                   "Failed to pre-build _ANERequest for op " + info.name);
             }
@@ -1984,6 +2246,52 @@ public:
           }
         }
       }
+      stats_.shared_input_surface_active = use_shared_in;
+    }
+  }
+
+  // Validate that concurrent ane0 || ane1 evaluation accepts a shared read-only
+  // input IOSurfaceRef; automatically falls back to dual input surfaces if rejected.
+  void probe_shared_input_surface() {
+    if (!stats_.shared_input_surface_active || stats_.active_die_count != 2u ||
+        ops_.empty()) {
+      return;
+    }
+    auto eval_fn = reinterpret_cast<BOOL (*)(id, SEL, unsigned int, id, id,
+                                             NSError **)>(&objc_msgSend);
+    const auto &bind0 = op_bindings_[0][0];
+    const auto &bind1 = op_bindings_[0][1];
+    std::atomic<bool> ok0{false};
+    std::atomic<bool> ok1{false};
+    CompiledAneBank *b0 = bind0.bank;
+    CompiledAneBank *b1 = bind1.bank;
+    id r0 = bind0.requests[0];
+    id r1 = bind1.requests[0];
+
+    std::thread t0([&] {
+      @autoreleasepool {
+        NSError *err = nil;
+        ok0.store(eval_fn(b0->model,
+                          @selector(evaluateWithQoS:options:request:error:),
+                          kAneQoS, b0->execution_options, r0, &err) != NO,
+                  std::memory_order_release);
+      }
+    });
+    std::thread t1([&] {
+      @autoreleasepool {
+        NSError *err = nil;
+        ok1.store(eval_fn(b1->model,
+                          @selector(evaluateWithQoS:options:request:error:),
+                          kAneQoS, b1->execution_options, r1, &err) != NO,
+                  std::memory_order_release);
+      }
+    });
+    t0.join();
+    t1.join();
+
+    if (!ok0.load(std::memory_order_acquire) ||
+        !ok1.load(std::memory_order_acquire)) {
+      bind_op_requests(/*share_input_surface=*/false);
     }
   }
 
@@ -1995,16 +2303,181 @@ public:
     }
   }
 
-  void enqueue_op(
-      std::uint32_t op_id,
-      void *src_mtl_buffer,
-      std::uint64_t src_offset,
-      void *dst_mtl_buffer,
-      std::uint64_t dst_offset,
-      std::uint32_t out_stride,
-      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix,
-      std::uint32_t src_stride,
-      std::uint32_t dst_col_offset) {
+  void encode_pack_encoder(id<MTLCommandBuffer> cb,
+                           std::uint32_t op_id,
+                           std::uint32_t slot,
+                           id<MTLBuffer> src_buf,
+                           std::uint64_t src_offset,
+                           std::uint32_t eff_src_stride) {
+    const auto &info = ops_[op_id];
+    const std::uint32_t T = stats_.chunk_tokens;
+    const std::uint32_t K = info.in_features;
+    const bool dual_write =
+        (stats_.active_die_count == 2u) && !stats_.shared_input_surface_active;
+    const auto &bind0 = op_bindings_[op_id][0];
+    const auto &bind1 = op_bindings_[op_id][dual_write ? 1u : 0u];
+
+    id<MTLComputeCommandEncoder> pack_enc = [cb computeCommandEncoder];
+    const AnePackParamsHost pack_p{T, K, eff_src_stride, 0u};
+    if (dual_write) {
+      [pack_enc setComputePipelineState:pack_dual_pso_];
+      [pack_enc setBuffer:src_buf offset:src_offset atIndex:0];
+      [pack_enc setBuffer:bind0.in_bufs[slot] offset:0 atIndex:1];
+      [pack_enc setBuffer:bind1.in_bufs[slot] offset:0 atIndex:2];
+      [pack_enc setBytes:&pack_p length:sizeof(pack_p) atIndex:3];
+    } else {
+      [pack_enc setComputePipelineState:pack_single_pso_];
+      [pack_enc setBuffer:src_buf offset:src_offset atIndex:0];
+      [pack_enc setBuffer:bind0.in_bufs[slot] offset:0 atIndex:1];
+      [pack_enc setBytes:&pack_p length:sizeof(pack_p) atIndex:2];
+    }
+    const MTLSize pack_tg = MTLSizeMake((K + 31u) / 32u, (T + 31u) / 32u, 1u);
+    const MTLSize threads = MTLSizeMake(8u, 32u, 1u);
+    [pack_enc dispatchThreadgroups:pack_tg threadsPerThreadgroup:threads];
+    [pack_enc endEncoding];
+  }
+
+  void encode_unpack_encoder(id<MTLCommandBuffer> cb,
+                             std::uint32_t op_id,
+                             std::uint32_t slot,
+                             const AneUnpackTarget &target) {
+    const auto &info = ops_[op_id];
+    const std::uint32_t T = stats_.chunk_tokens;
+    const bool dual = (stats_.active_die_count == 2u);
+    const auto &bind0 = op_bindings_[op_id][0];
+    const auto &bind1 = op_bindings_[op_id][dual ? 1u : 0u];
+    const std::uint32_t out_stride =
+        target.out_stride != 0u ? target.out_stride : info.split.total_out_features;
+    const std::uint32_t eff_mp =
+        target.mp != 0u ? target.mp : (((T + 63u) / 64u) * 64u);
+
+    id<MTLComputeCommandEncoder> unpack_enc = [cb computeCommandEncoder];
+    if (target.mode == AneUnpackMode::BF16) {
+      if (target.primary_buf == nullptr) {
+        [unpack_enc endEncoding];
+        throw std::invalid_argument("ANE BF16 unpack requires primary_buf");
+      }
+      id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)target.primary_buf;
+      const AneUnpackParamsHost unpack_p{
+          T,
+          info.split.die_rows,
+          dual ? info.split.die_rows : 0u,
+          out_stride,
+          target.dst_col_offset,
+          0u,
+      };
+      if (dual) {
+        [unpack_enc setComputePipelineState:unpack_dual_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:bind1.out_bufs[slot] offset:0 atIndex:1];
+        [unpack_enc setBuffer:dst_buf offset:target.primary_offset atIndex:2];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:3];
+      } else {
+        [unpack_enc setComputePipelineState:unpack_single_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:dst_buf offset:target.primary_offset atIndex:1];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:2];
+      }
+      const MTLSize unpack_tg =
+          MTLSizeMake((info.split.ane_total_rows + 31u) / 32u,
+                      (T + 31u) / 32u, 1u);
+      [unpack_enc dispatchThreadgroups:unpack_tg
+                 threadsPerThreadgroup:MTLSizeMake(8u, 32u, 1u)];
+    } else if (target.mode == AneUnpackMode::Fwht64A8) {
+      if (target.primary_buf == nullptr || target.aux0_buf == nullptr ||
+          target.aux1_buf == nullptr) {
+        [unpack_enc endEncoding];
+        throw std::invalid_argument(
+            "ANE Fwht64A8 unpack requires qa, sa, and ra buffers");
+      }
+      if ((info.split.ane_total_rows % 64u) != 0u || (out_stride % 64u) != 0u ||
+          (target.dst_col_offset % 64u) != 0u) {
+        [unpack_enc endEncoding];
+        throw std::invalid_argument(
+            "ANE Fwht64A8 unpack requires 64-aligned rows/stride/offset");
+      }
+      id<MTLBuffer> qa_buf = (__bridge id<MTLBuffer>)target.primary_buf;
+      id<MTLBuffer> sa_buf = (__bridge id<MTLBuffer>)target.aux0_buf;
+      id<MTLBuffer> ra_buf = (__bridge id<MTLBuffer>)target.aux1_buf;
+      const AneUnpackQuantParamsHost unpack_p{
+          T,
+          eff_mp,
+          info.split.die_rows,
+          dual ? info.split.die_rows : 0u,
+          out_stride,
+          target.dst_col_offset,
+          0u,
+          0u,
+      };
+      if (dual) {
+        [unpack_enc setComputePipelineState:unpack_a8_dual_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:bind1.out_bufs[slot] offset:0 atIndex:1];
+        [unpack_enc setBuffer:qa_buf offset:target.primary_offset atIndex:2];
+        [unpack_enc setBuffer:sa_buf offset:target.aux0_offset atIndex:3];
+        [unpack_enc setBuffer:ra_buf offset:target.aux1_offset atIndex:4];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:5];
+      } else {
+        [unpack_enc setComputePipelineState:unpack_a8_single_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:qa_buf offset:target.primary_offset atIndex:1];
+        [unpack_enc setBuffer:sa_buf offset:target.aux0_offset atIndex:2];
+        [unpack_enc setBuffer:ra_buf offset:target.aux1_offset atIndex:3];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:4];
+      }
+      const MTLSize unpack_tg =
+          MTLSizeMake(info.split.ane_total_rows / 64u, (eff_mp + 31u) / 32u, 1u);
+      [unpack_enc dispatchThreadgroups:unpack_tg
+                 threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+    } else {
+      // AneUnpackMode::Fwht64A4
+      if (target.primary_buf == nullptr || target.aux0_buf == nullptr) {
+        [unpack_enc endEncoding];
+        throw std::invalid_argument(
+            "ANE Fwht64A4 unpack requires codes and scales buffers");
+      }
+      if ((info.split.ane_total_rows % 128u) != 0u ||
+          (out_stride % 128u) != 0u || (target.dst_col_offset % 128u) != 0u) {
+        [unpack_enc endEncoding];
+        throw std::invalid_argument(
+            "ANE Fwht64A4 unpack requires 128-aligned rows/stride/offset");
+      }
+      id<MTLBuffer> c_buf = (__bridge id<MTLBuffer>)target.primary_buf;
+      id<MTLBuffer> s_buf = (__bridge id<MTLBuffer>)target.aux0_buf;
+      const AneUnpackQuantParamsHost unpack_p{
+          T,
+          eff_mp,
+          info.split.die_rows,
+          dual ? info.split.die_rows : 0u,
+          out_stride,
+          target.dst_col_offset,
+          0u,
+          0u,
+      };
+      if (dual) {
+        [unpack_enc setComputePipelineState:unpack_a4_dual_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:bind1.out_bufs[slot] offset:0 atIndex:1];
+        [unpack_enc setBuffer:c_buf offset:target.primary_offset atIndex:2];
+        [unpack_enc setBuffer:s_buf offset:target.aux0_offset atIndex:3];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:4];
+      } else {
+        [unpack_enc setComputePipelineState:unpack_a4_single_pso_];
+        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
+        [unpack_enc setBuffer:c_buf offset:target.primary_offset atIndex:1];
+        [unpack_enc setBuffer:s_buf offset:target.aux0_offset atIndex:2];
+        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:3];
+      }
+      const MTLSize unpack_tg =
+          MTLSizeMake(info.split.ane_total_rows / 128u, (eff_mp + 15u) / 16u, 1u);
+      [unpack_enc dispatchThreadgroups:unpack_tg
+                 threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+    }
+    [unpack_enc endEncoding];
+  }
+
+  void validate_ready_for_enqueue(std::uint32_t op_id,
+                                  void *src_mtl_buffer) const {
     if (!stats_.active) {
       throw std::runtime_error("Dual-ANE engine is not active");
     }
@@ -2014,19 +2487,15 @@ public:
     if (op_id >= ops_.size()) {
       throw std::out_of_range("ANE op_id out of range");
     }
-    if (src_mtl_buffer == nullptr || dst_mtl_buffer == nullptr) {
-      throw std::invalid_argument("ANE enqueue_op buffers must be non-null");
+    if (src_mtl_buffer == nullptr) {
+      throw std::invalid_argument("ANE src buffer must be non-null");
     }
+  }
 
-    const auto &info = ops_[op_id];
-    const std::uint32_t T = stats_.chunk_tokens;
-    const std::uint32_t K = info.in_features;
-    const std::uint32_t eff_src_stride = src_stride != 0u ? src_stride : K;
+  void register_ane_dispatch_listener(std::uint64_t seq,
+                                      std::uint32_t op_id,
+                                      std::uint32_t slot) {
     const bool dual = (stats_.active_die_count == 2u);
-
-    const std::uint64_t seq = ++next_seq_;
-    const std::uint32_t slot = static_cast<std::uint32_t>((seq - 1u) & 1u);
-
     const auto &bind0 = op_bindings_[op_id][0];
     const auto &bind1 = op_bindings_[op_id][dual ? 1u : 0u];
 
@@ -2034,32 +2503,202 @@ public:
     join->remaining.store(stats_.active_die_count, std::memory_order_relaxed);
     join->seq = seq;
 
+    Impl *self = this;
+    CompiledAneBank *bank0 = bind0.bank;
+    id req0 = bind0.requests[slot];
+    CompiledAneBank *bank1 = dual ? bind1.bank : nullptr;
+    id req1 = dual ? bind1.requests[slot] : nil;
+
+    [ane_ready_event_
+        notifyListener:event_listener_
+               atValue:seq
+                 block:^(id<MTLSharedEvent> /*ev*/, std::uint64_t /*val*/) {
+                   if (self->has_error()) {
+                     self->signal_ane_done(seq);
+                     return;
+                   }
+                   self->workers_[0]->enqueue(AneEvalJob{bank0, req0, join});
+                   if (dual) {
+                     self->workers_[1]->enqueue(AneEvalJob{bank1, req1, join});
+                   }
+                 }];
+  }
+
+  void *begin_collapsed_cb() {
+    if (!stats_.active) {
+      throw std::runtime_error("Dual-ANE engine is not active");
+    }
+    if (has_error()) {
+      throw std::runtime_error("Prior Dual-ANE error: " + current_error());
+    }
+    if (open_collapsed_cb_ != nil) {
+      throw std::logic_error("ANE collapsed command buffer is already open");
+    }
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+      if (cb == nil) {
+        latch_error("Failed to create ANE collapsed command buffer");
+        throw std::runtime_error("Failed to create ANE collapsed command buffer");
+      }
+      open_collapsed_cb_ = cb;
+      return (__bridge void *)open_collapsed_cb_;
+    }
+  }
+
+  std::uint64_t encode_pack_and_commit(void *mtl_command_buffer,
+                                       std::uint32_t op_id,
+                                       void *src_mtl_buffer,
+                                       std::uint64_t src_offset,
+                                       std::uint32_t src_stride) {
+    validate_ready_for_enqueue(op_id, src_mtl_buffer);
+    if (open_collapsed_cb_ == nil ||
+        (__bridge void *)open_collapsed_cb_ != mtl_command_buffer) {
+      throw std::logic_error(
+          "encode_pack_and_commit requires the active collapsed command buffer");
+    }
+    const auto &info = ops_[op_id];
+    const std::uint32_t eff_src_stride =
+        src_stride != 0u ? src_stride : info.in_features;
+    const std::uint64_t seq = ++next_seq_;
+    const std::uint32_t slot = static_cast<std::uint32_t>((seq - 1u) & 1u);
+
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = open_collapsed_cb_;
+      open_collapsed_cb_ = nil;
+      id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_mtl_buffer;
+
+      register_ane_dispatch_listener(seq, op_id, slot);
+      if (seq > 2u) {
+        [cb encodeWaitForEvent:unpack_done_event_ value:(seq - 2u)];
+      }
+      encode_pack_encoder(cb, op_id, slot, src_buf, src_offset, eff_src_stride);
+      [cb encodeSignalEvent:ane_ready_event_ value:seq];
+      Impl *self = this;
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusError) {
+          self->latch_error(
+              ns_error_text(@"ANE collapsed pack CB failed", completed.error));
+          self->signal_ane_done(seq);
+        }
+      }];
+      [cb commit];
+
+      last_cb_ = cb;
+      last_enqueued_seq_ = seq;
+      enqueued_ops_.fetch_add(1u, std::memory_order_relaxed);
+      stats_.total_enqueued_ops =
+          enqueued_ops_.load(std::memory_order_relaxed);
+      return seq;
+    }
+  }
+
+  void submit_gpu_suffix_cb(
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix) {
+    if (!encode_gpu_suffix) {
+      return;
+    }
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb_b1 = [queue_ commandBuffer];
+      if (cb_b1 == nil) {
+        latch_error("Failed to create CB_B1 GPU suffix command buffer");
+        throw std::runtime_error(
+            "Failed to create CB_B1 GPU suffix command buffer");
+      }
+      // Critical Apple10 AGX scheduling fence: prevent Metal from overlapping
+      // the 80-core NAX suffix kernel in CB_B1 with CB_A's tiny ane_pack kernel
+      // (which has no buffer hazard with CB_B1 in BF16/W4A8 and would otherwise
+      // be starved for 2.4-5.2 ms, delaying ane_ready_event_!). Waiting on
+      // ane_ready_event_ guarantees ane_pack finishes in ~0.05 ms and launches
+      // Dual-ANE and CB_B1 in true lockstep parallelism.
+      if (last_enqueued_seq_ > 0u) {
+        [cb_b1 encodeWaitForEvent:ane_ready_event_ value:last_enqueued_seq_];
+      }
+      encode_gpu_suffix((__bridge void *)cb_b1);
+      Impl *self = this;
+      [cb_b1 addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusError) {
+          self->latch_error(ns_error_text(
+              @"ANE co-execution GPU suffix CB_B1 failed", completed.error));
+        }
+      }];
+      [cb_b1 commit];
+    }
+  }
+
+  void *begin_unpack_cb(std::uint64_t seq,
+                        std::uint32_t op_id,
+                        const AneUnpackTarget &target) {
+    if (!stats_.active) {
+      throw std::runtime_error("Dual-ANE engine is not active");
+    }
+    if (op_id >= ops_.size()) {
+      throw std::out_of_range("ANE op_id out of range");
+    }
+    if (open_collapsed_cb_ != nil) {
+      throw std::logic_error(
+          "ANE collapsed command buffer must be committed before begin_unpack_cb");
+    }
+    const std::uint32_t slot = static_cast<std::uint32_t>((seq - 1u) & 1u);
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+      if (cb == nil) {
+        latch_error("Failed to create ANE collapsed unpack command buffer");
+        throw std::runtime_error(
+            "Failed to create ANE collapsed unpack command buffer");
+      }
+      [cb encodeWaitForEvent:ane_done_event_ value:seq];
+      encode_unpack_encoder(cb, op_id, slot, target);
+      [cb encodeSignalEvent:unpack_done_event_ value:seq];
+      open_collapsed_cb_ = cb;
+      return (__bridge void *)open_collapsed_cb_;
+    }
+  }
+
+  void commit_collapsed_cb(void *mtl_command_buffer) {
+    if (open_collapsed_cb_ == nil ||
+        (__bridge void *)open_collapsed_cb_ != mtl_command_buffer) {
+      throw std::logic_error(
+          "commit_collapsed_cb requires the active collapsed command buffer");
+    }
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = open_collapsed_cb_;
+      open_collapsed_cb_ = nil;
+      Impl *self = this;
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusError) {
+          self->latch_error(
+              ns_error_text(@"ANE collapsed CB failed", completed.error));
+        }
+      }];
+      [cb commit];
+      last_cb_ = cb;
+    }
+  }
+
+  void enqueue_op_ex(
+      std::uint32_t op_id,
+      void *src_mtl_buffer,
+      std::uint64_t src_offset,
+      std::uint32_t src_stride,
+      const AneUnpackTarget &target,
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix) {
+    validate_ready_for_enqueue(op_id, src_mtl_buffer);
+    if (target.primary_buf == nullptr) {
+      throw std::invalid_argument("ANE unpack primary buffer must be non-null");
+    }
+
+    const auto &info = ops_[op_id];
+    const std::uint32_t eff_src_stride =
+        src_stride != 0u ? src_stride : info.in_features;
+
+    const std::uint64_t seq = ++next_seq_;
+    const std::uint32_t slot = static_cast<std::uint32_t>((seq - 1u) & 1u);
+
     @autoreleasepool {
       id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_mtl_buffer;
-      id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)dst_mtl_buffer;
-
-      // Register listener BEFORE committing CB_A so signal can never be missed.
-      // When GPU pack finishes, listener dispatches ane0 (and ane1 in parallel!)
-      // on persistent per-die worker threads with ZERO CPU blocking wait!
       Impl *self = this;
-      CompiledAneBank *bank0 = bind0.bank;
-      id req0 = bind0.requests[slot];
-      CompiledAneBank *bank1 = dual ? bind1.bank : nullptr;
-      id req1 = dual ? bind1.requests[slot] : nil;
 
-      [ane_ready_event_
-          notifyListener:event_listener_
-                 atValue:seq
-                   block:^(id<MTLSharedEvent> /*ev*/, std::uint64_t /*val*/) {
-                     if (self->has_error()) {
-                       self->signal_ane_done(seq);
-                       return;
-                     }
-                     self->workers_[0]->enqueue(AneEvalJob{bank0, req0, join});
-                     if (dual) {
-                       self->workers_[1]->enqueue(AneEvalJob{bank1, req1, join});
-                     }
-                   }];
+      register_ane_dispatch_listener(seq, op_id, slot);
 
       // CB_A: (wait unpack_done[seq-2]) -> Pack BF16 -> FP16 planar IOSurface(s) -> signal ane_ready
       id<MTLCommandBuffer> cb_a = [queue_ commandBuffer];
@@ -2071,88 +2710,30 @@ public:
       if (seq > 2u) {
         [cb_a encodeWaitForEvent:unpack_done_event_ value:(seq - 2u)];
       }
-      id<MTLComputeCommandEncoder> pack_enc = [cb_a computeCommandEncoder];
-      const AnePackParamsHost pack_p{T, K, eff_src_stride, 0u};
-      if (dual) {
-        [pack_enc setComputePipelineState:pack_dual_pso_];
-        [pack_enc setBuffer:src_buf offset:src_offset atIndex:0];
-        [pack_enc setBuffer:bind0.in_bufs[slot] offset:0 atIndex:1];
-        [pack_enc setBuffer:bind1.in_bufs[slot] offset:0 atIndex:2];
-        [pack_enc setBytes:&pack_p length:sizeof(pack_p) atIndex:3];
-      } else {
-        [pack_enc setComputePipelineState:pack_single_pso_];
-        [pack_enc setBuffer:src_buf offset:src_offset atIndex:0];
-        [pack_enc setBuffer:bind0.in_bufs[slot] offset:0 atIndex:1];
-        [pack_enc setBytes:&pack_p length:sizeof(pack_p) atIndex:2];
-      }
-      const MTLSize pack_tg = MTLSizeMake((K + 31u) / 32u, (T + 31u) / 32u, 1u);
-      const MTLSize threads = MTLSizeMake(8u, 32u, 1u);
-      [pack_enc dispatchThreadgroups:pack_tg threadsPerThreadgroup:threads];
-      [pack_enc endEncoding];
+      encode_pack_encoder(cb_a, op_id, slot, src_buf, src_offset,
+                          eff_src_stride);
       [cb_a encodeSignalEvent:ane_ready_event_ value:seq];
       [cb_a addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         if (completed.status == MTLCommandBufferStatusError) {
           self->latch_error(
               ns_error_text(@"ANE pack CB_A failed", completed.error));
-          // Wake ane_done_event_ so CB_B2 never hangs on Metal error.
           self->signal_ane_done(seq);
         }
       }];
       [cb_a commit];
+      last_enqueued_seq_ = seq;
 
-      // CB_B1 (optional): GPU bf16/w4a8 suffix [N_ane, N) submitted IMMEDIATELY
-      // to execute concurrently in hardware while ane0 || ane1 evaluate [0, N_ane)!
-      if (encode_gpu_suffix) {
-        id<MTLCommandBuffer> cb_b1 = [queue_ commandBuffer];
-        if (cb_b1 == nil) {
-          latch_error("Failed to create CB_B1 GPU suffix command buffer");
-          throw std::runtime_error(
-              "Failed to create CB_B1 GPU suffix command buffer");
-        }
-        encode_gpu_suffix((__bridge void *)cb_b1);
-        [cb_b1 addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-          if (completed.status == MTLCommandBufferStatusError) {
-            self->latch_error(ns_error_text(
-                @"ANE co-execution GPU suffix CB_B1 failed", completed.error));
-          }
-        }];
-        [cb_b1 commit];
-      }
+      // CB_B1 (optional): GPU bf16/w4a8/w4a4 suffix [N_ane, N) submitted IMMEDIATELY.
+      submit_gpu_suffix_cb(std::move(encode_gpu_suffix));
 
-      // CB_B2: wait(ane_done, seq) -> Unpack FP16 planar IOSurface(s) -> dst[:, 0..N_ane) BF16
-      //        -> signal(unpack_done, seq)
+      // CB_B2: wait(ane_done, seq) -> Unpack (BF16 / Fwht64A8 / Fwht64A4) -> signal(unpack_done, seq)
       id<MTLCommandBuffer> cb_b2 = [queue_ commandBuffer];
       if (cb_b2 == nil) {
         latch_error("Failed to create CB_B2 unpack command buffer");
         throw std::runtime_error("Failed to create CB_B2 unpack command buffer");
       }
       [cb_b2 encodeWaitForEvent:ane_done_event_ value:seq];
-      id<MTLComputeCommandEncoder> unpack_enc = [cb_b2 computeCommandEncoder];
-      const AneUnpackParamsHost unpack_p{
-          T,
-          info.split.die_rows,
-          dual ? info.split.die_rows : 0u,
-          out_stride,
-          dst_col_offset,
-          0u,
-      };
-      if (dual) {
-        [unpack_enc setComputePipelineState:unpack_dual_pso_];
-        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
-        [unpack_enc setBuffer:bind1.out_bufs[slot] offset:0 atIndex:1];
-        [unpack_enc setBuffer:dst_buf offset:dst_offset atIndex:2];
-        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:3];
-      } else {
-        [unpack_enc setComputePipelineState:unpack_single_pso_];
-        [unpack_enc setBuffer:bind0.out_bufs[slot] offset:0 atIndex:0];
-        [unpack_enc setBuffer:dst_buf offset:dst_offset atIndex:1];
-        [unpack_enc setBytes:&unpack_p length:sizeof(unpack_p) atIndex:2];
-      }
-      const MTLSize unpack_tg =
-          MTLSizeMake((info.split.ane_total_rows + 31u) / 32u,
-                      (T + 31u) / 32u, 1u);
-      [unpack_enc dispatchThreadgroups:unpack_tg threadsPerThreadgroup:threads];
-      [unpack_enc endEncoding];
+      encode_unpack_encoder(cb_b2, op_id, slot, target);
       [cb_b2 encodeSignalEvent:unpack_done_event_ value:seq];
       [cb_b2 addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         if (completed.status == MTLCommandBufferStatusError) {
@@ -2168,6 +2749,26 @@ public:
       stats_.total_enqueued_ops =
           enqueued_ops_.load(std::memory_order_relaxed);
     }
+  }
+
+  void enqueue_op(
+      std::uint32_t op_id,
+      void *src_mtl_buffer,
+      std::uint64_t src_offset,
+      void *dst_mtl_buffer,
+      std::uint64_t dst_offset,
+      std::uint32_t out_stride,
+      std::function<void(void *mtl_command_buffer)> encode_gpu_suffix,
+      std::uint32_t src_stride,
+      std::uint32_t dst_col_offset) {
+    AneUnpackTarget target{};
+    target.mode = AneUnpackMode::BF16;
+    target.primary_buf = dst_mtl_buffer;
+    target.primary_offset = dst_offset;
+    target.out_stride = out_stride;
+    target.dst_col_offset = dst_col_offset;
+    enqueue_op_ex(op_id, src_mtl_buffer, src_offset, src_stride, target,
+                  std::move(encode_gpu_suffix));
   }
 
   void flush_and_wait(std::uint32_t timeout_ms) {
@@ -2227,6 +2828,10 @@ public:
   id<MTLComputePipelineState> pack_dual_pso_ = nil;
   id<MTLComputePipelineState> unpack_single_pso_ = nil;
   id<MTLComputePipelineState> unpack_dual_pso_ = nil;
+  id<MTLComputePipelineState> unpack_a8_single_pso_ = nil;
+  id<MTLComputePipelineState> unpack_a8_dual_pso_ = nil;
+  id<MTLComputePipelineState> unpack_a4_single_pso_ = nil;
+  id<MTLComputePipelineState> unpack_a4_dual_pso_ = nil;
   id<MTLSharedEvent> ane_ready_event_ = nil;
   id<MTLSharedEvent> ane_done_event_ = nil;
   id<MTLSharedEvent> unpack_done_event_ = nil;
@@ -2245,6 +2850,7 @@ public:
   std::atomic<std::uint64_t> next_seq_{0};
   std::uint64_t last_enqueued_seq_ = 0;
   id<MTLCommandBuffer> last_cb_ = nil;
+  id<MTLCommandBuffer> open_collapsed_cb_ = nil;
   std::mutex done_mutex_;
   std::condition_variable done_cv_;
   std::uint64_t signaled_done_ = 0;
@@ -2276,10 +2882,7 @@ std::string AneDualOffloadEngine::compute_cache_key(
     std::span<const AneOffloadOpSpec> specs,
     std::uint32_t active_dies,
     std::string_view os_build) {
-  const double alpha =
-      config.alpha_override.value_or(
-          config.linear_route == AneLinearRoute::W4A8 ? config.alpha_w4a8
-                                                      : config.alpha_bf16);
+  const double alpha = select_route_alpha(config);
   const auto alpha_permille = static_cast<std::uint32_t>(
       std::llround(std::clamp(alpha, 0.0, config.max_alpha) * 1000.0));
 
@@ -2317,10 +2920,7 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
   impl->config_ = config;
   impl->stats_.chunk_tokens = config.chunk_tokens;
   impl->stats_.linear_route = config.linear_route;
-  const double target_alpha =
-      config.alpha_override.value_or(
-          config.linear_route == AneLinearRoute::W4A8 ? config.alpha_w4a8
-                                                      : config.alpha_bf16);
+  const double target_alpha = select_route_alpha(config);
   impl->stats_.target_alpha = std::clamp(target_alpha, 0.0, config.max_alpha);
 
   // 1. Validate strict GDN recurrence exclusion on every supplied op spec BEFORE
@@ -2552,8 +3152,11 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
   impl->stats_.bank_shards_per_die =
       static_cast<std::uint32_t>(shards.size());
 
-  // 8. Pre-build ping-pong IOSurfaces & _ANERequests and start persistent workers.
-  impl->bind_op_requests();
+  // 8. Pre-build ping-pong IOSurfaces (shared single input surface when dual +
+  //    enabled, auto-falling back to dual surfaces if ANE driver rejects it)
+  //    and start persistent workers.
+  impl->bind_op_requests(config.share_input_surface);
+  impl->probe_shared_input_surface();
   impl->start_workers();
   impl->stats_.active = true;
   if (impl->stats_.status_message.empty()) {
@@ -2802,6 +3405,46 @@ void AneDualOffloadEngine::enqueue_op(
                     src_stride, dst_col_offset);
 }
 
+void AneDualOffloadEngine::enqueue_op_ex(
+    std::uint32_t op_id,
+    void *src_mtl_buffer,
+    std::uint64_t src_offset,
+    std::uint32_t src_stride,
+    const AneUnpackTarget &target,
+    std::function<void(void *mtl_command_buffer)> encode_gpu_suffix) {
+  impl_->enqueue_op_ex(op_id, src_mtl_buffer, src_offset, src_stride, target,
+                       std::move(encode_gpu_suffix));
+}
+
+void *AneDualOffloadEngine::begin_collapsed_cb() {
+  return impl_->begin_collapsed_cb();
+}
+
+std::uint64_t AneDualOffloadEngine::encode_pack_and_commit(
+    void *mtl_command_buffer,
+    std::uint32_t op_id,
+    void *src_mtl_buffer,
+    std::uint64_t src_offset,
+    std::uint32_t src_stride) {
+  return impl_->encode_pack_and_commit(mtl_command_buffer, op_id,
+                                       src_mtl_buffer, src_offset, src_stride);
+}
+
+void AneDualOffloadEngine::submit_gpu_suffix_cb(
+    std::function<void(void *mtl_command_buffer)> encode_gpu_suffix) {
+  impl_->submit_gpu_suffix_cb(std::move(encode_gpu_suffix));
+}
+
+void *AneDualOffloadEngine::begin_unpack_cb(std::uint64_t seq,
+                                            std::uint32_t op_id,
+                                            const AneUnpackTarget &target) {
+  return impl_->begin_unpack_cb(seq, op_id, target);
+}
+
+void AneDualOffloadEngine::commit_collapsed_cb(void *mtl_command_buffer) {
+  impl_->commit_collapsed_cb(mtl_command_buffer);
+}
+
 void AneDualOffloadEngine::flush_and_wait(std::uint32_t timeout_ms) {
   impl_->flush_and_wait(timeout_ms);
 }
@@ -2819,6 +3462,18 @@ void AneDualOffloadEngine::run_op_sync(
   impl_->enqueue_op(op_id, src_mtl_buffer, src_offset, dst_mtl_buffer,
                     dst_offset, out_stride, std::move(encode_gpu_suffix),
                     src_stride, dst_col_offset);
+  impl_->flush_and_wait(30000u);
+}
+
+void AneDualOffloadEngine::run_op_sync_ex(
+    std::uint32_t op_id,
+    void *src_mtl_buffer,
+    std::uint64_t src_offset,
+    std::uint32_t src_stride,
+    const AneUnpackTarget &target,
+    std::function<void(void *mtl_command_buffer)> encode_gpu_suffix) {
+  impl_->enqueue_op_ex(op_id, src_mtl_buffer, src_offset, src_stride, target,
+                       std::move(encode_gpu_suffix));
   impl_->flush_and_wait(30000u);
 }
 

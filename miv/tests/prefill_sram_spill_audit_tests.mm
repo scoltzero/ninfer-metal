@@ -55,6 +55,7 @@ const std::vector<std::string> kAllPrefillLibs = {
     "omlx_m5_attention_minference.metallib",
     "omlx_m5_gdn_chunk_nax.metallib",
     "omlx_m5_cache_blend.metallib",
+    "omlx_m5_ane_pack_unpack.metallib",
 };
 
 struct AgxSpillInfo {
@@ -108,7 +109,8 @@ AgxSpillInfo inspect_agx_runtime_state(id<MTLComputePipelineState> pso) {
 std::uint64_t expected_tg_sram_cap(std::string_view lib_name,
                                    std::string_view fn_name) {
   if (lib_name == "omlx_m5_w4a8_nax.metallib" ||
-      lib_name == "omlx_m5_w4a8_moe_nax.metallib") {
+      lib_name == "omlx_m5_w4a8_moe_nax.metallib" ||
+      lib_name == "omlx_m5_ane_pack_unpack.metallib") {
     return kWp31Out64MaxTgSram;
   }
   if (fn_name.find("gqa_bk16_wn4") != std::string_view::npos) {
@@ -526,6 +528,156 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
         executed.push_back("omlx_m5_gdn_extract_transition_m_c64");
       }
     }
+  }
+
+  // 5. WP 3C Dual-ANE pack/unpack + fused fwht64_a8 & fwht64_a4 smoke.
+  if (id<MTLLibrary> lib = load_lib("omlx_m5_ane_pack_unpack.metallib")) {
+    struct AnePackParamsHost {
+      std::uint32_t T;
+      std::uint32_t K;
+      std::uint32_t src_stride;
+      std::uint32_t reserved;
+    };
+    struct AneUnpackParamsHost {
+      std::uint32_t T;
+      std::uint32_t ane0_n;
+      std::uint32_t ane1_n;
+      std::uint32_t out_stride;
+      std::uint32_t dst_col_offset;
+      std::uint32_t reserved;
+    };
+    struct AneUnpackQuantParamsHost {
+      std::uint32_t T;
+      std::uint32_t mp;
+      std::uint32_t ane0_n;
+      std::uint32_t ane1_n;
+      std::uint32_t out_stride;
+      std::uint32_t dst_col_offset;
+      std::uint32_t reserved0;
+      std::uint32_t reserved1;
+    };
+
+    constexpr std::uint32_t kT = 64U;
+    constexpr std::uint32_t kMp = 64U;
+    constexpr std::uint32_t kK = 128U;
+    constexpr std::uint32_t kDieN = 128U;
+    constexpr std::uint32_t kOutStride = 256U;
+
+    id<MTLBuffer> src_bf16 = make_zero_buf(std::size_t(kT) * kK * 2ULL);
+    id<MTLBuffer> in_fp16_0 = make_zero_buf(std::size_t(kK) * kT * 2ULL);
+    id<MTLBuffer> in_fp16_1 = make_zero_buf(std::size_t(kK) * kT * 2ULL);
+    id<MTLBuffer> out_fp16_0 = make_zero_buf(std::size_t(kDieN) * kT * 2ULL);
+    id<MTLBuffer> out_fp16_1 = make_zero_buf(std::size_t(kDieN) * kT * 2ULL);
+    id<MTLBuffer> dst_bf16 = make_zero_buf(std::size_t(kT) * kOutStride * 2ULL);
+    id<MTLBuffer> qa_out = make_zero_buf(std::size_t(kMp) * kOutStride);
+    id<MTLBuffer> sa_out =
+        make_zero_buf(std::size_t(kOutStride / 64U) * kMp * sizeof(float));
+    id<MTLBuffer> ra_out =
+        make_zero_buf(std::size_t(kOutStride / 64U) * kMp * sizeof(float));
+    id<MTLBuffer> a4_codes = make_zero_buf(std::size_t(kMp) * (kOutStride / 2U));
+    id<MTLBuffer> a4_scales =
+        make_zero_buf(std::size_t(kMp) * (kOutStride / 32U));
+
+    auto run_ane_smoke = [&](const char *fn_name, auto &&encode_fn) {
+      id<MTLComputePipelineState> pso = make_pso(lib, fn_name);
+      if (!pso) {
+        return;
+      }
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      encode_fn(enc);
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(std::string("Layer 4 smoke failed for ") + fn_name);
+      } else {
+        executed.push_back(fn_name);
+      }
+    };
+
+    const AnePackParamsHost pp{kT, kK, kK, 0U};
+    run_ane_smoke("omlx_m5_ane_pack_bf16_to_fp16_planar_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:src_bf16 offset:0 atIndex:0];
+                    [enc setBuffer:in_fp16_0 offset:0 atIndex:1];
+                    [enc setBytes:&pp length:sizeof(pp) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(kK / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_pack_bf16_to_fp16_planar_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:src_bf16 offset:0 atIndex:0];
+                    [enc setBuffer:in_fp16_0 offset:0 atIndex:1];
+                    [enc setBuffer:in_fp16_1 offset:0 atIndex:2];
+                    [enc setBytes:&pp length:sizeof(pp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(kK / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+
+    const AneUnpackParamsHost up_s{kT, kDieN, 0U, kOutStride, 0U, 0U};
+    const AneUnpackParamsHost up_d{kT, kDieN, kDieN, kOutStride, 0U, 0U};
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_bf16_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:dst_bf16 offset:0 atIndex:1];
+                    [enc setBytes:&up_s length:sizeof(up_s) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_bf16_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:dst_bf16 offset:0 atIndex:2];
+                    [enc setBytes:&up_d length:sizeof(up_d) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+
+    const AneUnpackQuantParamsHost qp_s{kT, kMp, kDieN, 0U, kOutStride, 0U, 0U, 0U};
+    const AneUnpackQuantParamsHost qp_d{kT, kMp, kDieN, kDieN, kOutStride, 0U, 0U, 0U};
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:qa_out offset:0 atIndex:1];
+                    [enc setBuffer:sa_out offset:0 atIndex:2];
+                    [enc setBuffer:ra_out offset:0 atIndex:3];
+                    [enc setBytes:&qp_s length:sizeof(qp_s) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 64U, kMp / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:qa_out offset:0 atIndex:2];
+                    [enc setBuffer:sa_out offset:0 atIndex:3];
+                    [enc setBuffer:ra_out offset:0 atIndex:4];
+                    [enc setBytes:&qp_d length:sizeof(qp_d) atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 64U, kMp / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:a4_codes offset:0 atIndex:1];
+                    [enc setBuffer:a4_scales offset:0 atIndex:2];
+                    [enc setBytes:&qp_s length:sizeof(qp_s) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 128U, kMp / 16U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:a4_codes offset:0 atIndex:2];
+                    [enc setBuffer:a4_scales offset:0 atIndex:3];
+                    [enc setBytes:&qp_d length:sizeof(qp_d) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 128U, kMp / 16U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
   }
 
   smoke_report = {{"executed_kernels", executed},

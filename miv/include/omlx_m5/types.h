@@ -18,11 +18,19 @@ inline constexpr std::int32_t kMaxRepetitionContextSize = 4096;
 enum class PrefillLinearMode : std::uint8_t {
   BFloat16 = 0, // "bf16"
   W4A8 = 1,     // "w4a8"
+  W4A4 = 2,     // "w4a4" (MXFP4-only)
 };
 
 enum class PrefillAttentionMode : std::uint8_t {
   ExactNax = 0, // "exact_nax"
   Sage2 = 1,    // "sage2"
+};
+
+enum class PrefillAneMode : std::uint8_t {
+  Off = 0,             // "off"
+  Auto = 1,            // "auto"
+  CompactInt8 = 2,     // "compact_int8"
+  UltraFp16SwiGlu = 3, // "ultra_fp16_swiglu"
 };
 
 namespace detail {
@@ -51,6 +59,8 @@ prefill_linear_mode_to_string(PrefillLinearMode mode) noexcept {
     return "bf16";
   case PrefillLinearMode::W4A8:
     return "w4a8";
+  case PrefillLinearMode::W4A4:
+    return "w4a4";
   }
   return "bf16";
 }
@@ -76,6 +86,26 @@ to_string(PrefillAttentionMode mode) noexcept {
   return prefill_attention_mode_to_string(mode);
 }
 
+[[nodiscard]] constexpr const char *
+prefill_ane_mode_to_string(PrefillAneMode mode) noexcept {
+  switch (mode) {
+  case PrefillAneMode::Off:
+    return "off";
+  case PrefillAneMode::Auto:
+    return "auto";
+  case PrefillAneMode::CompactInt8:
+    return "compact_int8";
+  case PrefillAneMode::UltraFp16SwiGlu:
+    return "ultra_fp16_swiglu";
+  }
+  return "off";
+}
+
+[[nodiscard]] constexpr const char *
+to_string(PrefillAneMode mode) noexcept {
+  return prefill_ane_mode_to_string(mode);
+}
+
 [[nodiscard]] constexpr std::optional<PrefillLinearMode>
 try_parse_prefill_linear_mode(std::string_view value) noexcept {
   if (detail::ascii_iequals(value, "bf16")) {
@@ -83,6 +113,9 @@ try_parse_prefill_linear_mode(std::string_view value) noexcept {
   }
   if (detail::ascii_iequals(value, "w4a8")) {
     return PrefillLinearMode::W4A8;
+  }
+  if (detail::ascii_iequals(value, "w4a4")) {
+    return PrefillLinearMode::W4A4;
   }
   return std::nullopt;
 }
@@ -93,7 +126,7 @@ parse_prefill_linear_mode(std::string_view value) {
     return *parsed;
   }
   throw std::invalid_argument(
-      "prefill_linear_mode must be 'bf16' or 'w4a8', got: " +
+      "prefill_linear_mode must be 'bf16', 'w4a8', or 'w4a4', got: " +
       std::string(value));
 }
 
@@ -116,6 +149,43 @@ parse_prefill_attention_mode(std::string_view value) {
   throw std::invalid_argument(
       "prefill_attention_mode must be 'exact_nax' or 'sage2', got: " +
       std::string(value));
+}
+
+[[nodiscard]] constexpr std::optional<PrefillAneMode>
+try_parse_prefill_ane_mode(std::string_view value) noexcept {
+  if (detail::ascii_iequals(value, "off")) {
+    return PrefillAneMode::Off;
+  }
+  if (detail::ascii_iequals(value, "auto")) {
+    return PrefillAneMode::Auto;
+  }
+  if (detail::ascii_iequals(value, "compact_int8")) {
+    return PrefillAneMode::CompactInt8;
+  }
+  if (detail::ascii_iequals(value, "ultra_fp16_swiglu")) {
+    return PrefillAneMode::UltraFp16SwiGlu;
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] inline PrefillAneMode
+parse_prefill_ane_mode(std::string_view value) {
+  if (const auto parsed = try_parse_prefill_ane_mode(value)) {
+    return *parsed;
+  }
+  throw std::invalid_argument(
+      "prefill_ane_mode must be 'off', 'auto', 'compact_int8', or "
+      "'ultra_fp16_swiglu', got: " +
+      std::string(value));
+}
+
+[[nodiscard]] constexpr PrefillAneMode
+effective_requested_prefill_ane_mode(PrefillAneMode mode,
+                                     bool legacy_ane_offload) noexcept {
+  if (mode != PrefillAneMode::Off) {
+    return mode;
+  }
+  return legacy_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
 }
 
 [[nodiscard]] constexpr bool
@@ -155,6 +225,7 @@ struct LoadOptions {
   PrefillAttentionMode prefill_attention_mode = PrefillAttentionMode::ExactNax;
   bool prefill_sparse_minference = false;
   bool prefill_cache_blend = false;
+  PrefillAneMode prefill_ane_mode = PrefillAneMode::Off;
   bool prefill_ane_offload = false;
   std::map<std::string, std::string> path_overrides;
   std::string sampling_contract = "legacy_rejection_v1";
@@ -333,15 +404,23 @@ struct StatsReport {
   std::uint32_t lora_adapted_layers = 0;
 
   std::string prefill_linear_mode = "bf16";
+  std::string prefill_linear_mode_effective = "bf16";
+  bool prefill_linear_fallback = false;
+  std::string prefill_linear_fallback_reason;
+  std::string model_quant_format;
   std::string prefill_attention_mode = "exact_nax";
   bool prefill_sparse_minference = false;
   bool prefill_sparse_minference_effective = false;
   std::string prefill_sparse_minference_inactive_reason;
   bool prefill_cache_blend = false;
+  std::string prefill_ane_mode = "off";
+  std::string prefill_ane_mode_effective = "off";
+  std::string prefill_ane_inactive_reason;
   bool prefill_ane_offload = false;
   bool prefill_ane_active = false;
   double prefill_ane_split_alpha = 0.0;
   std::uint64_t prefill_w4a8_tokens = 0;
+  std::uint64_t prefill_w4a4_tokens = 0;
   std::uint64_t prefill_sage2_tokens = 0;
   std::uint64_t prefill_minference_blocks_skipped = 0;
   std::uint64_t prefill_minference_blocks_total = 0;
@@ -369,8 +448,11 @@ inline void append_prefill_execution_identity_fields(
       execution_fields.emplace("prefill_sparse_minference", "1");
     }
   }
-  if (options.prefill_ane_offload) {
-    execution_fields.emplace("prefill_ane_offload", "1");
+  const PrefillAneMode eff_ane = effective_requested_prefill_ane_mode(
+      options.prefill_ane_mode, options.prefill_ane_offload);
+  if (eff_ane != PrefillAneMode::Off) {
+    execution_fields.emplace("prefill_ane_mode",
+                             prefill_ane_mode_to_string(eff_ane));
   }
 }
 
@@ -378,6 +460,7 @@ inline void populate_prefill_config_stats(const LoadOptions &options,
                                           StatsReport &stats) {
   stats.prefill_linear_mode =
       prefill_linear_mode_to_string(options.prefill_linear_mode);
+  stats.prefill_linear_mode_effective = stats.prefill_linear_mode;
   stats.prefill_attention_mode =
       prefill_attention_mode_to_string(options.prefill_attention_mode);
   stats.prefill_sparse_minference = options.prefill_sparse_minference;
@@ -390,7 +473,10 @@ inline void populate_prefill_config_stats(const LoadOptions &options,
           ? std::string("requires_sage2")
           : std::string{};
   stats.prefill_cache_blend = options.prefill_cache_blend;
-  stats.prefill_ane_offload = options.prefill_ane_offload;
+  const PrefillAneMode eff_ane = effective_requested_prefill_ane_mode(
+      options.prefill_ane_mode, options.prefill_ane_offload);
+  stats.prefill_ane_mode = prefill_ane_mode_to_string(eff_ane);
+  stats.prefill_ane_offload = (eff_ane != PrefillAneMode::Off);
 }
 
 struct FakeBackendOptions {

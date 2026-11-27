@@ -2865,7 +2865,10 @@ omlx_m5_compile_metallib(
   omlx_m5_ane_pack_unpack_metallib
   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ane_pack_unpack.metal"
   "omlx_m5_ane_pack_unpack.metallib"
-  "15.0")
+  "15.0"
+  EXTRA_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
 add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_ane_pack_unpack_metallib)
 
 target_sources(
@@ -2911,7 +2914,8 @@ target_link_libraries(
   omlx_m5_core_runtime)
 add_dependencies(
   omlx_m5_ane_dual_offload_tests
-  omlx_m5_ane_pack_unpack_metallib)
+  omlx_m5_ane_pack_unpack_metallib
+  omlx_m5_qwen_forward_resources)
 add_test(
   NAME omlx_m5_ane_dual_offload
   COMMAND
