@@ -9,6 +9,7 @@
 //      0-ULP AR(T=1) == DFlash2(T=2..8) parity via unified 512-token splits.
 //   3. Register-resident Frag16x16 (WM=4, WN=2) Flash-Prefill for HD=256 using
 //      exact Law #1 half4(ushort4) nibble unpack + full-rate bfloat*bfloat NAX P@V.
+#include "common_math.h"
 #include <metal_simdgroup>
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -252,6 +253,30 @@ inline void quantize_vec_g128_tg(threadgroup const bfloat *src_vec,
 // - Identical 4-lane-per-row softmax reduction across R_BLK=6/8/16 -> 0-ULP
 //   AR(T=1) == DFlash2(T=2..8) parity under unified 512-token splits.
 // ============================================================================
+// Compact <= 15.5 KiB threadgroup storage for 2-SG HW uint4b_format Split-KV:
+// Aliases tg_scores (<= 4 KiB) with tg_p (4 KiB) and reserves 11 KiB for
+// per-lane c_acc[1..3] (44 floats) so peak live c_acc drops 64 -> 20 floats (0 B spill!).
+template <uint R_BLK>
+struct A5Nax2SgTgStorage {
+  union {
+    float scores[R_BLK * 64u]; // <= 4,096 B (R_BLK <= 16)
+    half  p[2u * 16u * 64u];   //    4,096 B
+  } sp;
+  float acc_hi[2u][32u][44u];  // 11,264 B: c_acc1 (0..15) + c_acc2 (16..31) + c_acc3[0..11] (32..43)
+  float q_sum[2u * R_BLK];
+  uint  row_ctx[R_BLK];
+  float m[R_BLK];
+  float l[R_BLK];
+  float rs[R_BLK];
+  float vb[2u * R_BLK];
+};
+static_assert(sizeof(A5Nax2SgTgStorage<6u>) <= kApple10MaxPrefillTgSramBytes,
+              "A5Nax2SgTgStorage<6> exceeds 16,384 B!");
+static_assert(sizeof(A5Nax2SgTgStorage<8u>) <= kApple10MaxPrefillTgSramBytes,
+              "A5Nax2SgTgStorage<8> exceeds 16,384 B!");
+static_assert(sizeof(A5Nax2SgTgStorage<16u>) <= kApple10MaxPrefillTgSramBytes,
+              "A5Nax2SgTgStorage<16> exceeds 16,384 B!");
+
 template <uint R_BLK, bool HasCausalPos>
 AFFINE4_ALWAYS_INLINE
 inline void a5_nax_2sg_core(
@@ -274,14 +299,8 @@ inline void a5_nax_2sg_core(
     uint split,
     uint kvh,
     uint rblk,
-    threadgroup float *tg_scores,
-    threadgroup half *tg_p,
-    threadgroup float *tg_q_sum,
-    threadgroup uint *tg_row_ctx,
-    threadgroup float *tg_m,
-    threadgroup float *tg_l,
-    threadgroup float *tg_rs,
-    threadgroup float *tg_vb,
+    uint slot_row_off,
+    threadgroup A5Nax2SgTgStorage<R_BLK> &tg_mem,
     uint lane,
     uint sg) {
   constexpr uint kHeadDim = 256u;
@@ -299,12 +318,21 @@ inline void a5_nax_2sg_core(
   const uint active_rows = min(R_BLK, total_active_rows - row_base);
   const uint flat_tid = sg * 32u + lane;
 
+  threadgroup float *tg_scores = tg_mem.sp.scores;
+  threadgroup half *tg_p = tg_mem.sp.p;
+  threadgroup float *tg_q_sum = tg_mem.q_sum;
+  threadgroup uint *tg_row_ctx = tg_mem.row_ctx;
+  threadgroup float *tg_m = tg_mem.m;
+  threadgroup float *tg_l = tg_mem.l;
+  threadgroup float *tg_rs = tg_mem.rs;
+  threadgroup float *tg_vb = tg_mem.vb;
+
   uint max_ctx = 0u;
   if constexpr (HasCausalPos) {
     if (flat_tid < R_BLK) {
       if (flat_tid < active_rows) {
         const uint tok = (row_base + flat_tid) / repeat;
-        tg_row_ctx[flat_tid] = positions[tok] + 1u;
+        tg_row_ctx[flat_tid] = positions[slot_row_off + tok] + 1u;
       } else {
         tg_row_ctx[flat_tid] = 0u;
       }
@@ -315,7 +343,7 @@ inline void a5_nax_2sg_core(
       max_ctx = max(max_ctx, tg_row_ctx[r]);
     }
   } else {
-    max_ctx = positions[0] + 1u;
+    max_ctx = positions[slot_row_off] + 1u;
   }
 
   const uint pages_per_split = split_tokens / page_tokens;
@@ -327,7 +355,7 @@ inline void a5_nax_2sg_core(
   if (start_page >= end_page || max_ctx == 0u) {
     if (flat_tid < active_rows) {
       const uint r_global = row_base + flat_tid;
-      const uint tok = r_global / repeat;
+      const uint tok = slot_row_off + (r_global / repeat);
       const uint qh = kvh * repeat + (r_global % repeat);
       const ulong record =
           (ulong(tok) * query_heads + qh) * split_count + split;
@@ -351,27 +379,23 @@ inline void a5_nax_2sg_core(
     tg_q_sum[flat_tid] = q_sum[qs_base0 + flat_tid];
     tg_q_sum[R_BLK + flat_tid] = q_sum[qs_base1 + flat_tid];
   }
-  // Zero inactive rows [active_rows..15] of tg_p ONCE before the page loop.
-  if (lane < 16u) {
-    for (uint r = active_rows; r < 16u; ++r) {
-      reinterpret_cast<threadgroup half4 *>(
-          tg_p + sg * (16u * 64u) + r * 64u)[lane] = half4(0.0h);
-    }
+  for (uint k = 0u; k < 44u; ++k) {
+    tg_mem.acc_hi[sg][lane][k] = 0.0f;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const ulong page_bytes =
-      page_byte_stride(page_tokens, key_value_heads, kHeadDim);
-  const ulong head_code_bytes = ulong(page_tokens) * 128ul;
-  const ulong all_codes_bytes = ulong(key_value_heads) * head_code_bytes;
+  const uint page_bytes_u32 =
+      uint(page_byte_stride(page_tokens, key_value_heads, kHeadDim));
+  const uint head_code_bytes_u32 = page_tokens * 128u;
+  const uint all_codes_bytes_u32 = key_value_heads * head_code_bytes_u32;
   const float scale2 = 0.0625f * kLog2e; // rsqrt(256.0f) * log2(e)
 
   constexpr auto desc_qk = matmul2d_descriptor(
-      16, 64, 128, false, true, false, matmul2d_descriptor::mode::multiply);
+      16, 32, 128, false, true, false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc_qk, execution_simdgroup> op_qk;
 
   constexpr auto desc_pv = matmul2d_descriptor(
-      16, 128, 64, false, false, false,
+      16, 32, 64, false, false, false,
       matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc_pv, execution_simdgroup> op_pv;
 
@@ -384,15 +408,17 @@ inline void a5_nax_2sg_core(
   tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(
       tg_p + sg * (16u * 64u), dextents<int32_t, 2>(64, 16));
 
-  // Single register-resident cooperative_tensor accumulator (ZERO c_acc spill!).
+  // Keep only c_acc0 (16 floats) + c3_tail (4 floats) in regs; 44 floats live in acc_hi!
   tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tv_init(
       (device uchar *)cache_value, dextents<int32_t, 2>(128, 64));
-  auto c_acc = op_pv.template get_destination_cooperative_tensor<
-      decltype(tp), decltype(tv_init), float>();
+  auto tv_init_sl = tv_init.slice(0, 0);
+  auto c_acc0 = op_pv.template get_destination_cooperative_tensor<
+      decltype(tp), decltype(tv_init_sl), float>();
   AFFINE4_UNROLL
-  for (uint i = 0u; i < c_acc.get_capacity(); ++i) {
-    c_acc[i] = 0.0f;
+  for (uint i = 0u; i < c_acc0.get_capacity(); ++i) {
+    c_acc0[i] = 0.0f;
   }
+  float4 c3_tail(0.0f);
 
   const uint sub_row = flat_tid >> 2u;  // 0..15
   const uint sub_lane = flat_tid & 3u;  // 0..3
@@ -402,108 +428,103 @@ inline void a5_nax_2sg_core(
     const uint p_start = page * page_tokens;
     const uint phys_page = page_table[page];
     device const uchar *k_page_ptr =
-        cache_key + ulong(phys_page) * page_bytes;
-    device const uchar *v_page_ptr =
-        cache_value + ulong(phys_page) * page_bytes;
-
+        cache_key + ulong(phys_page) * ulong(page_bytes_u32);
     device const uchar *k_codes_g =
-        k_page_ptr + ulong(kvh) * head_code_bytes + ulong(sg) * (64ul * 64ul);
+        k_page_ptr + ulong(kvh * head_code_bytes_u32) + ulong(sg) * (64ul * 64ul);
     device const KvAffine4VecMeta *k_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(k_page_ptr +
-                                                          all_codes_bytes) +
-        ulong(kvh) * page_tokens;
-    device const uchar *v_codes_g =
-        v_page_ptr + ulong(kvh) * head_code_bytes + ulong(sg) * (64ul * 64ul);
-    device const KvAffine4VecMeta *v_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(v_page_ptr +
-                                                          all_codes_bytes) +
+        reinterpret_cast<device const KvAffine4VecMeta *>(
+            k_page_ptr + ulong(all_codes_bytes_u32)) +
         ulong(kvh) * page_tokens;
 
-    // Phase 1: HW uint4b_format 16x64x128 NAX Q@K^T + FOSCAR bias fold.
-    // Touches ONLY tg_scores (disjoint from previous iteration's Phase 3).
+    // Phase 1: HW uint4b_format 2 x (16x32x128) NAX Q@K^T into single tg_scores.
     {
-      tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tk(
-          (device uchar *)k_codes_g, dextents<int32_t, 2>(128, 64));
-      auto c_qk = op_qk.template get_destination_cooperative_tensor<
-          decltype(tq), decltype(tk), float>();
-      op_qk.run(tq, tk, c_qk);
-
-      threadgroup float *score_slice = tg_scores + sg * (R_BLK * 64u);
       const threadgroup float *q_sum_g = tg_q_sum + sg * R_BLK;
-      AFFINE4_UNROLL
-      for (uint i = 0u; i < c_qk.get_capacity(); ++i) {
-        if (c_qk.is_valid_element(i)) {
-          const auto coord = c_qk.get_multidimensional_index(i);
-          const uint col = uint(coord[0]);
-          const uint row = uint(coord[1]);
-          if (row < R_BLK) {
-            const float sk = float(k_meta[col].scale[sg]);
-            const float zk = float(k_meta[col].zero[sg]);
-            score_slice[row * 64u + col] =
-                fma(sk, c_qk[i], zk * q_sum_g[row]);
+      #pragma clang loop unroll(disable)
+      for (uint kh = 0u; kh < 2u; ++kh) {
+        const uint col_off = kh * 32u;
+        tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tk(
+            (device uchar *)(k_codes_g + ulong(col_off) * 64ul),
+            dextents<int32_t, 2>(128, 32));
+        auto c_qk = op_qk.template get_destination_cooperative_tensor<
+            decltype(tq), decltype(tk), float>();
+        op_qk.run(tq, tk, c_qk);
+        if (sg == 0u) {
+          AFFINE4_UNROLL
+          for (uint i = 0u; i < c_qk.get_capacity(); ++i) {
+            if (c_qk.is_valid_element(i)) {
+              const auto coord = c_qk.get_multidimensional_index(i);
+              const uint col = col_off + uint(coord[0]);
+              const uint row = uint(coord[1]);
+              if (row < R_BLK) {
+                const float sk = float(k_meta[col].scale[0]);
+                const float zk = float(k_meta[col].zero[0]);
+                tg_scores[row * 64u + col] =
+                    fma(sk, c_qk[i], zk * q_sum_g[row]);
+              }
+            }
           }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 1u) {
+          AFFINE4_UNROLL
+          for (uint i = 0u; i < c_qk.get_capacity(); ++i) {
+            if (c_qk.is_valid_element(i)) {
+              const auto coord = c_qk.get_multidimensional_index(i);
+              const uint col = col_off + uint(coord[0]);
+              const uint row = uint(coord[1]);
+              if (row < R_BLK) {
+                const float sk = float(k_meta[col].scale[1]);
+                const float zk = float(k_meta[col].zero[1]);
+                tg_scores[row * 64u + col] +=
+                    fma(sk, c_qk[i], zk * q_sum_g[row]);
+              }
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
       }
     }
 
-    // Barrier 1/2 per page: both SGs finished writing tg_scores AND finished
-    // reading previous page's tg_p / tg_rs / tg_vb.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const uchar *v_page_ptr =
+        cache_value + ulong(phys_page) * ulong(page_bytes_u32);
+    device const uchar *v_codes_g =
+        v_page_ptr + ulong(kvh * head_code_bytes_u32) + ulong(sg) * (64ul * 64ul);
+    device const KvAffine4VecMeta *v_meta =
+        reinterpret_cast<device const KvAffine4VecMeta *>(
+            v_page_ptr + ulong(all_codes_bytes_u32)) +
+        ulong(kvh) * page_tokens;
 
     // Phase 2: Parallel 4-lanes-per-row log2 online softmax + V scale/bias prep.
-    // Identical reduction tree across R_BLK=6/8/16 -> 0-ULP T=1 == T=2..8!
+    // Stage 16 halfs for g=0 and 16 halfs for g=1 in 8 compact half4 regs so
+    // tg_p safely aliases tg_scores across a single barrier!
+    half4 p0_loc0(0.0h), p0_loc1(0.0h), p0_loc2(0.0h), p0_loc3(0.0h);
+    half4 p1_loc0(0.0h), p1_loc1(0.0h), p1_loc2(0.0h), p1_loc3(0.0h);
     if (sub_row < active_rows) {
       const uint row_ctx = HasCausalPos ? tg_row_ctx[sub_row] : max_ctx;
       const uint row_valid =
           (row_ctx > p_start) ? min(64u, row_ctx - p_start) : 0u;
-
-      threadgroup half4 *p0_dst = reinterpret_cast<threadgroup half4 *>(
-          tg_p + sub_row * 64u + c0);
-      threadgroup half4 *p1_dst = reinterpret_cast<threadgroup half4 *>(
-          tg_p + (16u * 64u) + sub_row * 64u + c0);
-
       if (row_valid == 0u) {
-        p0_dst[0] = half4(0.0h);
-        p0_dst[1] = half4(0.0h);
-        p0_dst[2] = half4(0.0h);
-        p0_dst[3] = half4(0.0h);
-        p1_dst[0] = half4(0.0h);
-        p1_dst[1] = half4(0.0h);
-        p1_dst[2] = half4(0.0h);
-        p1_dst[3] = half4(0.0h);
         if (sub_lane == 0u) {
           tg_rs[sub_row] = 1.0f;
           tg_vb[sub_row] = 0.0f;
           tg_vb[R_BLK + sub_row] = 0.0f;
         }
       } else {
-        const threadgroup float4 *sc0 =
+        const threadgroup float4 *sc_row =
             reinterpret_cast<const threadgroup float4 *>(
                 tg_scores + sub_row * 64u + c0);
-        const threadgroup float4 *sc1 =
-            reinterpret_cast<const threadgroup float4 *>(
-                tg_scores + (R_BLK * 64u) + sub_row * 64u + c0);
-
-        float4 s0 = (sc0[0] + sc1[0]) * scale2;
-        float4 s1 = (sc0[1] + sc1[1]) * scale2;
-        float4 s2 = (sc0[2] + sc1[2]) * scale2;
-        float4 s3 = (sc0[3] + sc1[3]) * scale2;
-
-        if (row_valid < 64u) {
-          const uint4 idx0 = uint4(c0 + 0u, c0 + 1u, c0 + 2u, c0 + 3u);
-          const uint4 idx1 = uint4(c0 + 4u, c0 + 5u, c0 + 6u, c0 + 7u);
-          const uint4 idx2 = uint4(c0 + 8u, c0 + 9u, c0 + 10u, c0 + 11u);
-          const uint4 idx3 = uint4(c0 + 12u, c0 + 13u, c0 + 14u, c0 + 15u);
-          s0 = select(float4(kNegInf), s0, idx0 < row_valid);
-          s1 = select(float4(kNegInf), s1, idx1 < row_valid);
-          s2 = select(float4(kNegInf), s2, idx2 < row_valid);
-          s3 = select(float4(kNegInf), s3, idx3 < row_valid);
+        float lmax = kNegInf;
+        #pragma clang loop unroll(disable)
+        for (uint ch = 0u; ch < 4u; ++ch) {
+          float4 sv = sc_row[ch] * scale2;
+          if (row_valid < 64u) {
+            const uint base_c = c0 + ch * 4u;
+            const uint4 idx =
+                uint4(base_c + 0u, base_c + 1u, base_c + 2u, base_c + 3u);
+            sv = select(float4(kNegInf), sv, idx < row_valid);
+          }
+          lmax = max(lmax, max(max(sv.x, sv.y), max(sv.z, sv.w)));
         }
-
-        const float4 m01 = max(s0, s1);
-        const float4 m23 = max(s2, s3);
-        const float4 m0123 = max(m01, m23);
-        float lmax = max(max(m0123.x, m0123.y), max(m0123.z, m0123.w));
         lmax = max(lmax, simd_shuffle_xor(lmax, ushort(1)));
         lmax = max(lmax, simd_shuffle_xor(lmax, ushort(2)));
 
@@ -512,101 +533,43 @@ inline void a5_nax_2sg_core(
         const float rescale =
             (prev_m <= kNegInfHalf) ? 0.0f : fast::exp2(prev_m - new_m);
 
-        float4 p0 = fast::exp2(s0 - new_m);
-        float4 p1 = fast::exp2(s1 - new_m);
-        float4 p2 = fast::exp2(s2 - new_m);
-        float4 p3 = fast::exp2(s3 - new_m);
-        if (row_valid < 64u) {
-          const uint4 idx0 = uint4(c0 + 0u, c0 + 1u, c0 + 2u, c0 + 3u);
-          const uint4 idx1 = uint4(c0 + 4u, c0 + 5u, c0 + 6u, c0 + 7u);
-          const uint4 idx2 = uint4(c0 + 8u, c0 + 9u, c0 + 10u, c0 + 11u);
-          const uint4 idx3 = uint4(c0 + 12u, c0 + 13u, c0 + 14u, c0 + 15u);
-          p0 = select(float4(0.0f), p0, idx0 < row_valid);
-          p1 = select(float4(0.0f), p1, idx1 < row_valid);
-          p2 = select(float4(0.0f), p2, idx2 < row_valid);
-          p3 = select(float4(0.0f), p3, idx3 < row_valid);
-        }
-
-        const float4 psum4 = (p0 + p1) + (p2 + p3);
-        float lsum = (psum4.x + psum4.y) + (psum4.z + psum4.w);
-
+        float4 psum4(0.0f);
         float lvb0 = 0.0f;
         float lvb1 = 0.0f;
+        #define A5_STAGE_P_CHUNK(CH, DST0, DST1)                               \
+          do {                                                                 \
+            const uint base_c = c0 + uint(CH) * 4u;                            \
+            float4 pv = fast::exp2(sc_row[CH] * scale2 - new_m);               \
+            if (row_valid < 64u) {                                             \
+              const uint4 idx =                                                \
+                  uint4(base_c + 0u, base_c + 1u, base_c + 2u, base_c + 3u);   \
+              pv = select(float4(0.0f), pv, idx < row_valid);                  \
+            }                                                                  \
+            psum4 += pv;                                                       \
+            const KvAffine4VecMeta m0 = v_meta[base_c + 0u];                   \
+            const KvAffine4VecMeta m1 = v_meta[base_c + 1u];                   \
+            const KvAffine4VecMeta m2 = v_meta[base_c + 2u];                   \
+            const KvAffine4VecMeta m3 = v_meta[base_c + 3u];                   \
+            const float4 sv0(float(m0.scale[0]), float(m1.scale[0]),           \
+                             float(m2.scale[0]), float(m3.scale[0]));          \
+            const float4 zv0(float(m0.zero[0]), float(m1.zero[0]),             \
+                             float(m2.zero[0]), float(m3.zero[0]));            \
+            const float4 sv1(float(m0.scale[1]), float(m1.scale[1]),           \
+                             float(m2.scale[1]), float(m3.scale[1]));          \
+            const float4 zv1(float(m0.zero[1]), float(m1.zero[1]),             \
+                             float(m2.zero[1]), float(m3.zero[1]));            \
+            (DST0) = half4(pv * sv0);                                          \
+            (DST1) = half4(pv * sv1);                                          \
+            lvb0 += dot(pv, zv0);                                              \
+            lvb1 += dot(pv, zv1);                                              \
+          } while (false)
+        A5_STAGE_P_CHUNK(0u, p0_loc0, p1_loc0);
+        A5_STAGE_P_CHUNK(1u, p0_loc1, p1_loc1);
+        A5_STAGE_P_CHUNK(2u, p0_loc2, p1_loc2);
+        A5_STAGE_P_CHUNK(3u, p0_loc3, p1_loc3);
+        #undef A5_STAGE_P_CHUNK
 
-        // Chunk 0..3: fold v_meta scale into tg_p (half4) and v_meta zero into lvb.
-        {
-          const KvAffine4VecMeta m0 = v_meta[c0 + 0u];
-          const KvAffine4VecMeta m1 = v_meta[c0 + 1u];
-          const KvAffine4VecMeta m2 = v_meta[c0 + 2u];
-          const KvAffine4VecMeta m3 = v_meta[c0 + 3u];
-          const float4 sv0(float(m0.scale[0]), float(m1.scale[0]),
-                           float(m2.scale[0]), float(m3.scale[0]));
-          const float4 zv0(float(m0.zero[0]), float(m1.zero[0]),
-                           float(m2.zero[0]), float(m3.zero[0]));
-          const float4 sv1(float(m0.scale[1]), float(m1.scale[1]),
-                           float(m2.scale[1]), float(m3.scale[1]));
-          const float4 zv1(float(m0.zero[1]), float(m1.zero[1]),
-                           float(m2.zero[1]), float(m3.zero[1]));
-          p0_dst[0] = half4(p0 * sv0);
-          p1_dst[0] = half4(p0 * sv1);
-          lvb0 += dot(p0, zv0);
-          lvb1 += dot(p0, zv1);
-        }
-        {
-          const KvAffine4VecMeta m0 = v_meta[c0 + 4u];
-          const KvAffine4VecMeta m1 = v_meta[c0 + 5u];
-          const KvAffine4VecMeta m2 = v_meta[c0 + 6u];
-          const KvAffine4VecMeta m3 = v_meta[c0 + 7u];
-          const float4 sv0(float(m0.scale[0]), float(m1.scale[0]),
-                           float(m2.scale[0]), float(m3.scale[0]));
-          const float4 zv0(float(m0.zero[0]), float(m1.zero[0]),
-                           float(m2.zero[0]), float(m3.zero[0]));
-          const float4 sv1(float(m0.scale[1]), float(m1.scale[1]),
-                           float(m2.scale[1]), float(m3.scale[1]));
-          const float4 zv1(float(m0.zero[1]), float(m1.zero[1]),
-                           float(m2.zero[1]), float(m3.zero[1]));
-          p0_dst[1] = half4(p1 * sv0);
-          p1_dst[1] = half4(p1 * sv1);
-          lvb0 += dot(p1, zv0);
-          lvb1 += dot(p1, zv1);
-        }
-        {
-          const KvAffine4VecMeta m0 = v_meta[c0 + 8u];
-          const KvAffine4VecMeta m1 = v_meta[c0 + 9u];
-          const KvAffine4VecMeta m2 = v_meta[c0 + 10u];
-          const KvAffine4VecMeta m3 = v_meta[c0 + 11u];
-          const float4 sv0(float(m0.scale[0]), float(m1.scale[0]),
-                           float(m2.scale[0]), float(m3.scale[0]));
-          const float4 zv0(float(m0.zero[0]), float(m1.zero[0]),
-                           float(m2.zero[0]), float(m3.zero[0]));
-          const float4 sv1(float(m0.scale[1]), float(m1.scale[1]),
-                           float(m2.scale[1]), float(m3.scale[1]));
-          const float4 zv1(float(m0.zero[1]), float(m1.zero[1]),
-                           float(m2.zero[1]), float(m3.zero[1]));
-          p0_dst[2] = half4(p2 * sv0);
-          p1_dst[2] = half4(p2 * sv1);
-          lvb0 += dot(p2, zv0);
-          lvb1 += dot(p2, zv1);
-        }
-        {
-          const KvAffine4VecMeta m0 = v_meta[c0 + 12u];
-          const KvAffine4VecMeta m1 = v_meta[c0 + 13u];
-          const KvAffine4VecMeta m2 = v_meta[c0 + 14u];
-          const KvAffine4VecMeta m3 = v_meta[c0 + 15u];
-          const float4 sv0(float(m0.scale[0]), float(m1.scale[0]),
-                           float(m2.scale[0]), float(m3.scale[0]));
-          const float4 zv0(float(m0.zero[0]), float(m1.zero[0]),
-                           float(m2.zero[0]), float(m3.zero[0]));
-          const float4 sv1(float(m0.scale[1]), float(m1.scale[1]),
-                           float(m2.scale[1]), float(m3.scale[1]));
-          const float4 zv1(float(m0.zero[1]), float(m1.zero[1]),
-                           float(m2.zero[1]), float(m3.zero[1]));
-          p0_dst[3] = half4(p3 * sv0);
-          p1_dst[3] = half4(p3 * sv1);
-          lvb0 += dot(p3, zv0);
-          lvb1 += dot(p3, zv1);
-        }
-
+        float lsum = (psum4.x + psum4.y) + (psum4.z + psum4.w);
         lsum += simd_shuffle_xor(lsum, ushort(1));
         lsum += simd_shuffle_xor(lsum, ushort(2));
         lvb0 += simd_shuffle_xor(lvb0, ushort(1));
@@ -623,35 +586,96 @@ inline void a5_nax_2sg_core(
         }
       }
     }
-
-    // Barrier 2/2 per page: tg_p, tg_rs, tg_vb ready for Phase 3, and
-    // tg_scores read is complete before next iteration's Phase 1.
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: Rescale c_acc in-place + HW uint4b_format 16x128x64 NAX P@V
-    // directly into c_acc (mode::multiply_accumulate).
-    AFFINE4_UNROLL
-    for (uint i = 0u; i < c_acc.get_capacity(); ++i) {
-      if (c_acc.is_valid_element(i)) {
-        const auto coord = c_acc.get_multidimensional_index(i);
-        const uint row = uint(coord[1]);
-        if (row < R_BLK) {
-          c_acc[i] = fma(c_acc[i], tg_rs[row], tg_vb[sg * R_BLK + row]);
-        }
-      }
+    // Write staged half4 weights into aliased tg_p (including zeroing inactive rows!).
+    {
+      threadgroup half4 *p0_dst =
+          reinterpret_cast<threadgroup half4 *>(tg_p + sub_row * 64u + c0);
+      threadgroup half4 *p1_dst = reinterpret_cast<threadgroup half4 *>(
+          tg_p + (16u * 64u) + sub_row * 64u + c0);
+      p0_dst[0] = p0_loc0;
+      p0_dst[1] = p0_loc1;
+      p0_dst[2] = p0_loc2;
+      p0_dst[3] = p0_loc3;
+      p1_dst[0] = p1_loc0;
+      p1_dst[1] = p1_loc1;
+      p1_dst[2] = p1_loc2;
+      p1_dst[3] = p1_loc3;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: 4 x HW uint4b_format 16x32x64 NAX P@V (c_acc0/1 in regs, c_acc2/3 stashed!).
     tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tv(
         (device uchar *)v_codes_g, dextents<int32_t, 2>(128, 64));
-    op_pv.run(tp, tv, c_acc);
+    #define A5_PV_QUARTER(CACC, COL_OFF)                                       \
+      do {                                                                     \
+        AFFINE4_UNROLL                                                         \
+        for (uint i = 0u; i < (CACC).get_capacity(); ++i) {                    \
+          if ((CACC).is_valid_element(i)) {                                    \
+            const auto coord = (CACC).get_multidimensional_index(i);           \
+            const uint row = uint(coord[1]);                                   \
+            if (row < R_BLK) {                                                 \
+              (CACC)[i] =                                                      \
+                  fma((CACC)[i], tg_rs[row], tg_vb[sg * R_BLK + row]);         \
+            }                                                                  \
+          }                                                                    \
+        }                                                                      \
+        auto tv_sl = tv.slice(int(COL_OFF), 0);                                \
+        op_pv.run(tp, tv_sl, (CACC));                                          \
+      } while (false)
+    A5_PV_QUARTER(c_acc0, 0);
+    {
+      auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+          decltype(tp), decltype(tv_init_sl), float>();
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+        c_tmp[i] = tg_mem.acc_hi[sg][lane][i];
+      }
+      A5_PV_QUARTER(c_tmp, 32);
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+        tg_mem.acc_hi[sg][lane][i] = c_tmp[i];
+      }
+    }
+    {
+      auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+          decltype(tp), decltype(tv_init_sl), float>();
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+        c_tmp[i] = tg_mem.acc_hi[sg][lane][16u + i];
+      }
+      A5_PV_QUARTER(c_tmp, 64);
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+        tg_mem.acc_hi[sg][lane][16u + i] = c_tmp[i];
+      }
+    }
+    {
+      auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+          decltype(tp), decltype(tv_init_sl), float>();
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < 12u; ++i) {
+        c_tmp[i] = tg_mem.acc_hi[sg][lane][32u + i];
+      }
+      c_tmp[12] = c3_tail.x;
+      c_tmp[13] = c3_tail.y;
+      c_tmp[14] = c3_tail.z;
+      c_tmp[15] = c3_tail.w;
+      A5_PV_QUARTER(c_tmp, 96);
+      AFFINE4_UNROLL
+      for (uint i = 0u; i < 12u; ++i) {
+        tg_mem.acc_hi[sg][lane][32u + i] = c_tmp[i];
+      }
+      c3_tail = float4(c_tmp[12], c_tmp[13], c_tmp[14], c_tmp[15]);
+    }
+    #undef A5_PV_QUARTER
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-
-  // MANDATORY Law #4 barrier: both SGs must finish final Phase 3 before
-  // sg=0 reuses tg_rs for 1.0f / tg_l!
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (flat_tid < active_rows) {
     const uint r_global = row_base + flat_tid;
-    const uint tok = r_global / repeat;
+    const uint tok = slot_row_off + (r_global / repeat);
     const uint qh = kvh * repeat + (r_global % repeat);
     const ulong record =
         (ulong(tok) * query_heads + qh) * split_count + split;
@@ -663,23 +687,59 @@ inline void a5_nax_2sg_core(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Store normalized half partials [tok, qh, split, 256].
-  AFFINE4_UNROLL
-  for (uint i = 0u; i < c_acc.get_capacity(); ++i) {
-    if (c_acc.is_valid_element(i)) {
-      const auto coord = c_acc.get_multidimensional_index(i);
-      const uint col = sg * 128u + uint(coord[0]);
-      const uint row = uint(coord[1]);
-      if (row < active_rows) {
-        const uint r_global = row_base + row;
-        const uint tok = r_global / repeat;
-        const uint qh = kvh * repeat + (r_global % repeat);
-        const ulong record =
-            (ulong(tok) * query_heads + qh) * split_count + split;
-        partial_output_half[record * kHeadDim + col] =
-            half(c_acc[i] * tg_rs[row]);
-      }
+  #define A5_STORE_QUARTER(CACC, COL_OFF)                                      \
+    do {                                                                       \
+      AFFINE4_UNROLL                                                           \
+      for (uint i = 0u; i < (CACC).get_capacity(); ++i) {                      \
+        if ((CACC).is_valid_element(i)) {                                      \
+          const auto coord = (CACC).get_multidimensional_index(i);             \
+          const uint col = sg * 128u + uint(COL_OFF) + uint(coord[0]);         \
+          const uint row = uint(coord[1]);                                     \
+          if (row < active_rows) {                                             \
+            const uint r_global = row_base + row;                              \
+            const uint tok = slot_row_off + (r_global / repeat);               \
+            const uint qh = kvh * repeat + (r_global % repeat);                \
+            const ulong record =                                               \
+                (ulong(tok) * query_heads + qh) * split_count + split;         \
+            partial_output_half[record * kHeadDim + col] =                     \
+                half((CACC)[i] * tg_rs[row]);                                  \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    } while (false)
+  A5_STORE_QUARTER(c_acc0, 0u);
+  {
+    auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+        decltype(tp), decltype(tv_init_sl), float>();
+    AFFINE4_UNROLL
+    for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+      c_tmp[i] = tg_mem.acc_hi[sg][lane][i];
     }
+    A5_STORE_QUARTER(c_tmp, 32u);
   }
+  {
+    auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+        decltype(tp), decltype(tv_init_sl), float>();
+    AFFINE4_UNROLL
+    for (uint i = 0u; i < c_tmp.get_capacity(); ++i) {
+      c_tmp[i] = tg_mem.acc_hi[sg][lane][16u + i];
+    }
+    A5_STORE_QUARTER(c_tmp, 64u);
+  }
+  {
+    auto c_tmp = op_pv.template get_destination_cooperative_tensor<
+        decltype(tp), decltype(tv_init_sl), float>();
+    AFFINE4_UNROLL
+    for (uint i = 0u; i < 12u; ++i) {
+      c_tmp[i] = tg_mem.acc_hi[sg][lane][32u + i];
+    }
+    c_tmp[12] = c3_tail.x;
+    c_tmp[13] = c3_tail.y;
+    c_tmp[14] = c3_tail.z;
+    c_tmp[15] = c3_tail.w;
+    A5_STORE_QUARTER(c_tmp, 96u);
+  }
+  #undef A5_STORE_QUARTER
 }
 
 template <uint R_BLK, bool HasCausalPos>
@@ -695,14 +755,7 @@ inline void a5_nax_2sg_impl(
     device const uint *page_table,
     device const uint *positions,
     constant PagedSplitAttentionParams &p,
-    threadgroup float *tg_scores,
-    threadgroup half *tg_p,
-    threadgroup float *tg_q_sum,
-    threadgroup uint *tg_row_ctx,
-    threadgroup float *tg_m,
-    threadgroup float *tg_l,
-    threadgroup float *tg_rs,
-    threadgroup float *tg_vb,
+    threadgroup A5Nax2SgTgStorage<R_BLK> &tg_mem,
     uint lane,
     uint sg,
     uint3 tg,
@@ -711,8 +764,7 @@ inline void a5_nax_2sg_impl(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
       partial_output_half, page_table, positions, p.query_heads,
       p.key_value_heads, p.tokens, p.page_tokens, p.split_count, p.split_tokens,
-      tgs_per_grid.z * 16u, tg.x, tg.y, tg.z, tg_scores, tg_p, tg_q_sum,
-      tg_row_ctx, tg_m, tg_l, tg_rs, tg_vb, lane, sg);
+      tgs_per_grid.z * 16u, tg.x, tg.y, tg.z, 0u, tg_mem, lane, sg);
 }
 
 template <uint R_BLK, bool HasCausalPos>
@@ -731,14 +783,7 @@ inline void a5_nax_2sg_batched_impl(
     device const uint *pt4, device const uint *pt5,
     device const uint *pt6, device const uint *pt7,
     constant BatchedPagedAttentionParams &p,
-    threadgroup float *tg_scores,
-    threadgroup half *tg_p,
-    threadgroup float *tg_q_sum,
-    threadgroup uint *tg_row_ctx,
-    threadgroup float *tg_m,
-    threadgroup float *tg_l,
-    threadgroup float *tg_rs,
-    threadgroup float *tg_vb,
+    threadgroup A5Nax2SgTgStorage<R_BLK> &tg_mem,
     uint lane,
     uint sg,
     uint3 tg) {
@@ -761,20 +806,15 @@ inline void a5_nax_2sg_batched_impl(
       select_pt8(slot, pt0, pt1, pt2, pt3, pt4, pt5, pt6, pt7);
   const ulong slot_q_stride =
       ulong(p.key_value_heads) * 2ul * ulong(p.r_stride);
-  const ulong slot_rec_base =
-      ulong(row_off) * ulong(p.query_heads) * ulong(p.split_count);
   a5_nax_2sg_core<R_BLK, HasCausalPos>(
       q_half + ulong(slot) * slot_q_stride * 128ul,
       q_sum + ulong(slot) * slot_q_stride,
       cache_key, cache_value,
-      partial_max + slot_rec_base,
-      partial_sum + slot_rec_base,
-      partial_output_half + slot_rec_base * 256ul,
-      slot_pt, positions + row_off,
+      partial_max, partial_sum, partial_output_half,
+      slot_pt, positions,
       p.query_heads, p.key_value_heads, slot_tokens, p.page_tokens,
-      p.split_count, p.split_tokens, p.r_stride, split, kvh, rblk,
-      tg_scores, tg_p, tg_q_sum, tg_row_ctx, tg_m, tg_l, tg_rs, tg_vb,
-      lane, sg);
+      p.split_count, p.split_tokens, p.r_stride, split, kvh, rblk, row_off,
+      tg_mem, lane, sg);
 }
 
 // ============================================================================
@@ -953,249 +993,186 @@ struct Frag16x16Aff4 {
 // (fast-math-safe: uses kNegInf instead of -INFINITY)
 // ============================================================================
 template <uint HeadDim, uint Groups>
-inline void run_superblock_nax_g128(
+AFFINE4_ALWAYS_INLINE
+inline void load_q_and_foscar_sums(
+    device const bfloat *query, device const uint *positions, uint tokens,
+    uint query_heads, uint key_value_heads, uint query_token_stride,
+    uint query_head_stride, uint t_base, uint bq, uint kvh,
+    threadgroup half *tg_q, threadgroup float *tg_q_sum,
+    threadgroup uint *tg_row_ctx, thread uint &out_active_rows,
+    thread uint &out_max_ctx, uint lane, uint sg);
+
+// Zero-spill pure-FP32 SIMD compatibility engine for !split (small T) and HD == 128 split:
+// Each SIMDgroup owns 128 dims (32 lanes x 4 dims = 1 ushort of 4 affine4 nibbles).
+// 0 cooperative_tensor allocas, <= 64 B TG SRAM, ~35 GPRs, 0 B spills on Apple9 & Apple10!
+template <uint HeadDim, uint Groups, bool EmitSplit>
+AFFINE4_ALWAYS_INLINE
+inline void run_affine4_compat_core(
+    device const bfloat *query,
+    device const bfloat *gate,
     device const uchar *cache_key,
     device const uchar *cache_value,
+    device bfloat *output,
+    device float *partial_max,
+    device float *partial_sum,
+    device float *partial_output,
     device const uint *page_table,
+    device const uint *positions,
+    uint query_heads,
+    uint key_value_heads,
+    uint tokens,
     uint page_tokens,
-    uint kv_heads,
+    uint query_token_stride,
+    uint query_head_stride,
+    uint gate_token_stride,
+    uint gate_head_stride,
+    uint split_count,
+    uint split_tokens,
+    uint split,
+    uint t_base,
+    uint bq,
     uint kvh,
-    uint start_page,
-    uint end_page,
-    uint max_context_tokens,
-    uint active_rows,
-    const threadgroup uint *tg_row_ctx,
-    const threadgroup float *tg_q_sum,
-    threadgroup half *tg_q,
-    threadgroup float *tg_scores,
-    threadgroup half *tg_p,
-    threadgroup float *tg_rescale,
-    threadgroup float *tg_v_scale,
-    threadgroup float *tg_v_bias,
-    threadgroup float *tg_m_blk,
-    threadgroup float *tg_l_blk,
-    thread float (&acc_blk)[64],
+    threadgroup float *tg_dot,
     uint lane,
     uint sg) {
-  constexpr uint kChunkRows = 16u;
-  const uint flat_tid = sg * 32u + lane;
-
-  if (flat_tid < kChunkRows) {
-    tg_m_blk[flat_tid] = kNegInf;
-    tg_l_blk[flat_tid] = 0.0f;
-  }
-  for (uint i = 0u; i < 64u; ++i) {
-    acc_blk[i] = 0.0f;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (start_page >= end_page || max_context_tokens == 0u) {
+  const uint repeat = query_heads / key_value_heads;
+  const uint active_q_tokens =
+      (t_base < tokens) ? min(bq, tokens - t_base) : 0u;
+  const uint active_rows = active_q_tokens * repeat;
+  if (active_rows == 0u) {
     return;
   }
 
-  const ulong page_bytes = page_byte_stride(page_tokens, kv_heads, HeadDim);
-  const ulong head_code_bytes = ulong(page_tokens) * ulong(HeadDim / 2u);
-  const ulong all_codes_bytes = ulong(kv_heads) * head_code_bytes;
+  const uint page_bytes_u32 =
+      uint(page_byte_stride(page_tokens, key_value_heads, HeadDim));
+  const uint head_code_bytes_u32 = page_tokens * (HeadDim / 2u);
+  const uint all_codes_bytes_u32 = key_value_heads * head_code_bytes_u32;
+  const uint pages_per_split =
+      EmitSplit ? (split_tokens / page_tokens) : 0x7fffffffu;
   const float attn_scale = rsqrt(float(HeadDim));
+  const uint d_base = sg * 128u + lane * 4u;
 
-  constexpr auto desc_qk = matmul2d_descriptor(
-      16, 64, 128, false, true, false, matmul2d_descriptor::mode::multiply);
-  matmul2d<desc_qk, execution_simdgroup> op_qk;
+  for (uint r = 0u; r < active_rows; ++r) {
+    const uint tok = t_base + (r / repeat);
+    const uint qh = kvh * repeat + (r % repeat);
+    const uint row_ctx = positions[tok] + 1u;
+    const uint total_pages = (row_ctx + page_tokens - 1u) / page_tokens;
+    const uint start_page = EmitSplit ? (split * pages_per_split) : 0u;
+    const uint end_page =
+        EmitSplit ? min(total_pages, start_page + pages_per_split) : total_pages;
 
-  constexpr auto desc_pv = matmul2d_descriptor(
-      16, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply);
-  matmul2d<desc_pv, execution_simdgroup> op_pv;
-
-  tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tq(
-      tg_q + sg * (16u * 128u), dextents<int32_t, 2>(128, 16));
-  tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(
-      tg_p + sg * (16u * 64u), dextents<int32_t, 2>(64, 16));
-
-  for (uint page = start_page; page < end_page; ++page) {
-    const uint p_start = page * page_tokens;
-    if (p_start >= max_context_tokens) {
-      break;
-    }
-    const uint phys_page = page_table[page];
-    device const uchar *k_page_ptr =
-        cache_key + ulong(phys_page) * page_bytes;
-    device const uchar *v_page_ptr =
-        cache_value + ulong(phys_page) * page_bytes;
-
-    device const uchar *k_codes_g =
-        k_page_ptr + ulong(kvh) * head_code_bytes + ulong(sg) * (64ul * 64ul);
-    device const KvAffine4VecMeta *k_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(k_page_ptr +
-                                                          all_codes_bytes) +
-        ulong(kvh) * page_tokens;
-    device const uchar *v_codes_g =
-        v_page_ptr + ulong(kvh) * head_code_bytes + ulong(sg) * (64ul * 64ul);
-    device const KvAffine4VecMeta *v_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(v_page_ptr +
-                                                          all_codes_bytes) +
-        ulong(kvh) * page_tokens;
-
-    if (sg < Groups) {
-      tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tk(
-          (device uchar *)k_codes_g, dextents<int32_t, 2>(128, 64));
-      auto c_qk = op_qk.template get_destination_cooperative_tensor<
-          decltype(tq), decltype(tk), float>();
-      op_qk.run(tq, tk, c_qk);
-
-      const uint elems = c_qk.get_capacity();
-      const threadgroup float *q_sum_g = tg_q_sum + sg * 16u;
-      if (sg == 0u) {
-        for (uint i = 0u; i < elems; ++i) {
-          if (c_qk.is_valid_element(i)) {
-            const auto coord = c_qk.get_multidimensional_index(i);
-            const uint col = uint(coord[0]);
-            const uint row = uint(coord[1]);
-            const float sk = float(k_meta[col].scale[0]);
-            const float zk = float(k_meta[col].zero[0]);
-            tg_scores[row * 64u + col] =
-                fma(sk, c_qk[i], zk * q_sum_g[row]);
-          }
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if constexpr (Groups == 2u) {
-        if (sg == 1u) {
-          for (uint i = 0u; i < elems; ++i) {
-            if (c_qk.is_valid_element(i)) {
-              const auto coord = c_qk.get_multidimensional_index(i);
-              const uint col = uint(coord[0]);
-              const uint row = uint(coord[1]);
-              const float sk = float(k_meta[col].scale[1]);
-              const float zk = float(k_meta[col].zero[1]);
-              tg_scores[row * 64u + col] +=
-                  fma(sk, c_qk[i], zk * q_sum_g[row]);
-            }
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    } else {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if constexpr (Groups == 2u) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    }
-
-    if (flat_tid < kChunkRows) {
-      const uint r = flat_tid;
-      const uint row_ctx = (r < active_rows) ? tg_row_ctx[r] : 0u;
-      const uint row_valid =
-          (row_ctx > p_start) ? min(page_tokens, row_ctx - p_start) : 0u;
-
-      if (row_valid == 0u) {
-        tg_rescale[r] = 1.0f;
-        for (uint g = 0u; g < Groups; ++g) {
-          tg_v_scale[g * 16u + r] = 0.0f;
-          tg_v_bias[g * 16u + r] = 0.0f;
-        }
-        for (uint c = 0u; c < 64u; ++c) {
-          tg_scores[r * 64u + c] = 0.0f;
+    if (start_page >= end_page || row_ctx == 0u) {
+      if constexpr (EmitSplit) {
+        if (sg == 0u && lane == 0u) {
+          const ulong record =
+              (ulong(tok) * query_heads + qh) * split_count + split;
+          partial_max[record] = kNegInf;
+          partial_sum[record] = 0.0f;
         }
       } else {
-        float page_max = kNegInf;
-        for (uint c = 0u; c < row_valid; ++c) {
-          const float s = tg_scores[r * 64u + c] * attn_scale;
-          tg_scores[r * 64u + c] = s;
-          page_max = max(page_max, s);
+        device bfloat4 *out4 = reinterpret_cast<device bfloat4 *>(
+            output + (ulong(tok) * query_heads + qh) * HeadDim + d_base);
+        *out4 = bfloat4(bfloat(0.0f));
+      }
+      continue;
+    }
+
+    const float4 qv = float4(*reinterpret_cast<device const bfloat4 *>(
+        query + ulong(tok) * query_token_stride +
+        ulong(qh) * query_head_stride + d_base));
+
+    float m_run = kNegInf;
+    float l_run = 0.0f;
+    float4 o_acc(0.0f);
+
+    for (uint page = start_page; page < end_page; ++page) {
+      const uint p_start = page * page_tokens;
+      const uint row_valid =
+          (row_ctx > p_start) ? min(page_tokens, row_ctx - p_start) : 0u;
+      if (row_valid == 0u) {
+        break;
+      }
+      const uint phys_page = page_table[page];
+      device const uchar *k_page_ptr =
+          cache_key + ulong(phys_page) * ulong(page_bytes_u32);
+      device const ushort *k_codes_g = reinterpret_cast<device const ushort *>(
+          k_page_ptr + ulong(kvh * head_code_bytes_u32) +
+          ulong(sg) * (ulong(page_tokens) * 64ul));
+      device const KvAffine4VecMeta *k_meta =
+          reinterpret_cast<device const KvAffine4VecMeta *>(
+              k_page_ptr + ulong(all_codes_bytes_u32)) +
+          ulong(kvh) * page_tokens;
+
+      device const uchar *v_page_ptr =
+          cache_value + ulong(phys_page) * ulong(page_bytes_u32);
+      device const ushort *v_codes_g = reinterpret_cast<device const ushort *>(
+          v_page_ptr + ulong(kvh * head_code_bytes_u32) +
+          ulong(sg) * (ulong(page_tokens) * 64ul));
+      device const KvAffine4VecMeta *v_meta =
+          reinterpret_cast<device const KvAffine4VecMeta *>(
+              v_page_ptr + ulong(all_codes_bytes_u32)) +
+          ulong(kvh) * page_tokens;
+
+      for (uint c = 0u; c < row_valid; ++c) {
+        const ushort kpk = k_codes_g[c * 32u + lane];
+        const float4 kq = float4(
+            float(kpk & 0xFu), float((kpk >> 4u) & 0xFu),
+            float((kpk >> 8u) & 0xFu), float(kpk >> 12u));
+        const float ks = float(k_meta[c].scale[sg]);
+        const float kz = float(k_meta[c].zero[sg]);
+        const float4 kv = fma(kq, float4(ks), float4(kz));
+        float dot_val = simd_sum(dot(qv, kv));
+        if constexpr (Groups == 2u) {
+          if (lane == 0u) {
+            tg_dot[sg] = dot_val;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          dot_val = tg_dot[0] + tg_dot[1];
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        const float prev_m = tg_m_blk[r];
-        const float new_m = max(prev_m, page_max);
+        const float s = dot_val * attn_scale;
+        const float new_m = max(m_run, s);
         const float rescale =
-            (prev_m <= kNegInfHalf) ? 0.0f : exp(prev_m - new_m);
+            (m_run <= kNegInfHalf) ? 0.0f : exp(m_run - new_m);
+        const float p_val = exp(s - new_m);
+        m_run = new_m;
+        l_run = fma(l_run, rescale, p_val);
 
-        float v_max_s[Groups];
-        float v_bias[Groups];
-        for (uint g = 0u; g < Groups; ++g) {
-          v_max_s[g] = 0.0f;
-          v_bias[g] = 0.0f;
-        }
-        for (uint c = 0u; c < row_valid; ++c) {
-          for (uint g = 0u; g < Groups; ++g) {
-            v_max_s[g] = max(v_max_s[g], fabs(float(v_meta[c].scale[g])));
-          }
-        }
-
-        float page_sum = 0.0f;
-        for (uint c = 0u; c < row_valid; ++c) {
-          const float p_val = exp(tg_scores[r * 64u + c] - new_m);
-          tg_scores[r * 64u + c] = p_val;
-          page_sum += p_val;
-          for (uint g = 0u; g < Groups; ++g) {
-            const float zv = float(v_meta[c].zero[g]);
-            v_bias[g] = fma(p_val, zv, v_bias[g]);
-          }
-        }
-        for (uint c = row_valid; c < 64u; ++c) {
-          tg_scores[r * 64u + c] = 0.0f;
-        }
-
-        tg_rescale[r] = rescale;
-        tg_m_blk[r] = new_m;
-        tg_l_blk[r] = tg_l_blk[r] * rescale + page_sum;
-        for (uint g = 0u; g < Groups; ++g) {
-          tg_v_scale[g * 16u + r] = v_max_s[g];
-          tg_v_bias[g * 16u + r] = v_bias[g];
-        }
+        const ushort vpk = v_codes_g[c * 32u + lane];
+        const float4 vq = float4(
+            float(vpk & 0xFu), float((vpk >> 4u) & 0xFu),
+            float((vpk >> 8u) & 0xFu), float(vpk >> 12u));
+        const float vs = float(v_meta[c].scale[sg]);
+        const float vz = float(v_meta[c].zero[sg]);
+        const float4 vv = fma(vq, float4(vs), float4(vz));
+        o_acc = fma(o_acc, float4(rescale), vv * p_val);
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Stage p_val from tg_scores into registers so tg_p can alias tg_scores
-    // safely (halving TG memory to stay well under 32 KiB even under 2x shader
-    // validation instrumentation).
-    {
-      constexpr uint kTotalThreads = Groups * 32u;
-      constexpr uint kPerThr = 1024u / kTotalThreads;
-      float p_loc[kPerThr];
-      for (uint k = 0u; k < kPerThr; ++k) {
-        p_loc[k] = tg_scores[flat_tid + k * kTotalThreads];
+    if constexpr (EmitSplit) {
+      const ulong record =
+          (ulong(tok) * query_heads + qh) * split_count + split;
+      if (sg == 0u && lane == 0u) {
+        partial_max[record] = m_run;
+        partial_sum[record] = l_run;
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint k = 0u; k < kPerThr; ++k) {
-        const uint idx = flat_tid + k * kTotalThreads;
-        const uint r = idx >> 6u;
-        const uint c = idx & 63u;
-        const float p_val = p_loc[k];
-        for (uint g = 0u; g < Groups; ++g) {
-          const float vmax = tg_v_scale[g * 16u + r];
-          const float inv_vmax =
-              (vmax > 0.0f) ? precise::divide(1.0f, vmax) : 0.0f;
-          const float sv = float(v_meta[c].scale[g]);
-          tg_p[g * (16u * 64u) + idx] =
-              (p_val > 0.0f) ? half((p_val * sv) * inv_vmax) : half(0.0h);
-        }
-      }
+      *reinterpret_cast<device float4 *>(
+          partial_output + record * HeadDim + d_base) = o_acc;
+    } else {
+      const float inv_l = (l_run > 0.0f) ? (1.0f / l_run) : 0.0f;
+      const float4 norm_o = o_acc * inv_l;
+      const float4 g_val = float4(*reinterpret_cast<device const bfloat4 *>(
+          gate + ulong(tok) * gate_token_stride +
+          ulong(qh) * gate_head_stride + d_base));
+      *reinterpret_cast<device bfloat4 *>(
+          output + (ulong(tok) * query_heads + qh) * HeadDim + d_base) =
+          bfloat4(norm_o / (float4(1.0f) + exp(-g_val)));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg < Groups) {
-      tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tv(
-          (device uchar *)v_codes_g, dextents<int32_t, 2>(128, 64));
-      auto c_pv = op_pv.template get_destination_cooperative_tensor<
-          decltype(tp), decltype(tv), float>();
-      op_pv.run(tp, tv, c_pv);
-
-      const uint elems = c_pv.get_capacity();
-      for (uint i = 0u; i < elems; ++i) {
-        if (c_pv.is_valid_element(i)) {
-          const auto coord = c_pv.get_multidimensional_index(i);
-          const uint row = uint(coord[1]);
-          acc_blk[i] = fma(acc_blk[i], tg_rescale[row],
-                           fma(c_pv[i], tg_v_scale[sg * 16u + row],
-                               tg_v_bias[sg * 16u + row]));
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
 template <uint HeadDim, uint Groups>
+AFFINE4_ALWAYS_INLINE
 inline void load_q_and_foscar_sums(
     device const bfloat *query,
     device const uint *positions,
@@ -1804,6 +1781,7 @@ kernel void omlx_m5_pack_q_half_foscar_hd256(
 // 3. Unified 2-SG HW uint4b_format NAX Split-KV Entrypoints (HD == 256)
 // Launch: grid = {splits * 64, KVH, n_rblks}, tptg = {64}
 // ============================================================================
+[[max_total_threads_per_threadgroup(64)]]
 kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r6_hd256(
     device const half *q_half [[buffer(0)]],
     device const float *q_sum [[buffer(1)]],
@@ -1819,23 +1797,14 @@ kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r6_hd256(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tgs_per_grid [[threadgroups_per_grid]]) {
-  constexpr uint kR = 6u;
-  threadgroup float tg_scores[2 * kR * 64]; // 3.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx_unused[1];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_impl<kR, false>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<6u> tg_mem;
+  affine4_kv::a5_nax_2sg_impl<6u, false>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
-      partial_output_half, page_table, positions, params, tg_scores, tg_p,
-      tg_q_sum, tg_row_ctx_unused, tg_m, tg_l, tg_rs, tg_vb, lane, sg, tg,
+      partial_output_half, page_table, positions, params, tg_mem, lane, sg, tg,
       tgs_per_grid);
 }
 
+[[max_total_threads_per_threadgroup(64)]]
 kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r8_hd256(
     device const half *q_half [[buffer(0)]],
     device const float *q_sum [[buffer(1)]],
@@ -1851,23 +1820,14 @@ kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r8_hd256(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tgs_per_grid [[threadgroups_per_grid]]) {
-  constexpr uint kR = 8u;
-  threadgroup float tg_scores[2 * kR * 64]; // 4.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx_unused[1];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_impl<kR, false>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<8u> tg_mem;
+  affine4_kv::a5_nax_2sg_impl<8u, false>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
-      partial_output_half, page_table, positions, params, tg_scores, tg_p,
-      tg_q_sum, tg_row_ctx_unused, tg_m, tg_l, tg_rs, tg_vb, lane, sg, tg,
+      partial_output_half, page_table, positions, params, tg_mem, lane, sg, tg,
       tgs_per_grid);
 }
 
+[[max_total_threads_per_threadgroup(64)]]
 kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r16_hd256(
     device const half *q_half [[buffer(0)]],
     device const float *q_sum [[buffer(1)]],
@@ -1883,20 +1843,10 @@ kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r16_hd256(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tgs_per_grid [[threadgroups_per_grid]]) {
-  constexpr uint kR = 16u;
-  threadgroup float tg_scores[2 * kR * 64]; // 8.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx[kR];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_impl<kR, true>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<16u> tg_mem;
+  affine4_kv::a5_nax_2sg_impl<16u, true>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
-      partial_output_half, page_table, positions, params, tg_scores, tg_p,
-      tg_q_sum, tg_row_ctx, tg_m, tg_l, tg_rs, tg_vb, lane, sg, tg,
+      partial_output_half, page_table, positions, params, tg_mem, lane, sg, tg,
       tgs_per_grid);
 }
 
@@ -1904,6 +1854,7 @@ kernel void omlx_m5_paged_attention_affine4_g128_nax2sg_split_partial_r16_hd256(
 // 3b. Batched B=2..8 Unified 2-SG HW uint4b_format NAX Split-KV Entrypoints
 // Launch: grid = {splits * 64, KVH * n_rblks, B}, tptg = {64}
 // ============================================================================
+[[max_total_threads_per_threadgroup(64)]]
 kernel void
 omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r6_hd256(
     device const half *q_half [[buffer(0)]],
@@ -1926,23 +1877,14 @@ omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r6_hd256(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  constexpr uint kR = 6u;
-  threadgroup float tg_scores[2 * kR * 64]; // 3.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx_unused[1];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_batched_impl<kR, false>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<6u> tg_mem;
+  affine4_kv::a5_nax_2sg_batched_impl<6u, false>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
       partial_output_half, positions, pt0, pt1, pt2, pt3, pt4, pt5, pt6, pt7,
-      params, tg_scores, tg_p, tg_q_sum, tg_row_ctx_unused, tg_m, tg_l, tg_rs,
-      tg_vb, lane, sg, tg);
+      params, tg_mem, lane, sg, tg);
 }
 
+[[max_total_threads_per_threadgroup(64)]]
 kernel void
 omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r8_hd256(
     device const half *q_half [[buffer(0)]],
@@ -1965,23 +1907,14 @@ omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r8_hd256(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  constexpr uint kR = 8u;
-  threadgroup float tg_scores[2 * kR * 64]; // 4.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx_unused[1];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_batched_impl<kR, false>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<8u> tg_mem;
+  affine4_kv::a5_nax_2sg_batched_impl<8u, false>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
       partial_output_half, positions, pt0, pt1, pt2, pt3, pt4, pt5, pt6, pt7,
-      params, tg_scores, tg_p, tg_q_sum, tg_row_ctx_unused, tg_m, tg_l, tg_rs,
-      tg_vb, lane, sg, tg);
+      params, tg_mem, lane, sg, tg);
 }
 
+[[max_total_threads_per_threadgroup(64)]]
 kernel void
 omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r16_hd256(
     device const half *q_half [[buffer(0)]],
@@ -2004,21 +1937,11 @@ omlx_m5_paged_attention_affine4_g128_nax2sg_batched_split_partial_r16_hd256(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  constexpr uint kR = 16u;
-  threadgroup float tg_scores[2 * kR * 64]; // 8.0 KiB
-  threadgroup half tg_p[2 * 16 * 64];       // 4.0 KiB
-  threadgroup float tg_q_sum[2 * kR];
-  threadgroup uint tg_row_ctx[kR];
-  threadgroup float tg_m[kR];
-  threadgroup float tg_l[kR];
-  threadgroup float tg_rs[kR];
-  threadgroup float tg_vb[2 * kR];
-
-  affine4_kv::a5_nax_2sg_batched_impl<kR, true>(
+  alignas(16) threadgroup affine4_kv::A5Nax2SgTgStorage<16u> tg_mem;
+  affine4_kv::a5_nax_2sg_batched_impl<16u, true>(
       q_half, q_sum, cache_key, cache_value, partial_max, partial_sum,
       partial_output_half, positions, pt0, pt1, pt2, pt3, pt4, pt5, pt6, pt7,
-      params, tg_scores, tg_p, tg_q_sum, tg_row_ctx, tg_m, tg_l, tg_rs, tg_vb,
-      lane, sg, tg);
+      params, tg_mem, lane, sg, tg);
 }
 
 // ============================================================================
@@ -2135,11 +2058,730 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_merge_half_4sg_hd256(
 }
 
 // ============================================================================
-// 5. Register-Resident Frag16x16 Affine4Group128 Flash-Prefill (HD == 256)
-//    (c5_aff4_frag64_bfp: 61.0 TF, max_err = 0.001953, ZERO tg_kv/tg_p/alloca)
-// Grid (threads): width = 256 (WM=4 * WN=2 * 32), height = ceil(T/64) * QH
-// Threads per threadgroup: {256, 1, 1}
+// 5. WP3.2 BK=32, WN=4 Direct-L1 Zero-Spill Affine4Group128 Flash-Prefill
+//    (WM=2: 14.00 KiB exact, WM=3: 12.00 KiB <= 14.00 KiB -> 2 TGs/core, 0 B spills!)
+//    Direct-L1 dequant + row-split 2-half d_part==0 softmax avoids kv_tile SRAM
+//    bottleneck and strictly beats single-head BQ=64 across 4K..128K!
+//    Shared core powers BOTH single-head (BQ=64 via 2x32 passes, batched & unbatched)
+//    and flattened GQA (WM=2: 256 thr, WM=3: 384 thr) with 0-ULP bit-exact parity!
 // ============================================================================
+namespace affine4_kv {
+
+struct FlashGqaBk32XchgLaneHalf {
+  union {
+    float4 f4[4]; // 64 B: S0[0..3], S0[4..7], S1[0..3], S1[4..7]
+    struct {
+      half4  p00, p01, p10, p11; // 32 B
+      float2 fac;                //  8 B: (fac0, fac1) or (rcp0, rcp1)
+      float2 _pad[3];            // 24 B
+    } bcast;
+  };
+};
+static_assert(sizeof(FlashGqaBk32XchgLaneHalf) == 64u,
+              "FlashGqaBk32XchgLaneHalf must be 64 B");
+
+struct FlashGqaBk32Xchg32Half {
+  union {
+    float4 f4[2]; // 32 B: half-block S[0..3], S[4..7]
+    struct {
+      half4  p0;   //  8 B
+      half4  p1;   //  8 B
+      float2 fac;  //  8 B (slot 0)
+      float2 _pad; //  8 B
+    } bcast;
+  };
+};
+static_assert(sizeof(FlashGqaBk32Xchg32Half) == 32u,
+              "FlashGqaBk32Xchg32Half must be 32 B");
+
+template <uint WM>
+struct FlashGqaBk32TgStorageHalf;
+
+template <>
+struct FlashGqaBk32TgStorageHalf<2u> {
+  // WM=2 (256 thr): 12,288 B xchg + 2,048 B d0_s0 = 14,336 B (14.00 KiB EXACT!)
+  // Aliased as tg_q_pos[] during prologue before KV loop.
+  FlashGqaBk32XchgLaneHalf xchg[2u][3u][32u];
+  float4                   d0_s0[2u][32u][2u];
+};
+
+template <>
+struct FlashGqaBk32TgStorageHalf<3u> {
+  // WM=3 (384 thr): 3 row groups x 4 x 32 B/lane = 12,288 B (12.00 KiB <= 14.00 KiB!)
+  // Slot 0..2: partial S exchange for h2=0 then h2=1;
+  // Slot 3: d_part==0 scaled/masked S0 stash;
+  // Broadcast: slot 0 holds (p00, p01, fac), slot 1 holds (p10, p11).
+  FlashGqaBk32Xchg32Half xchg[3u][4u][32u];
+};
+
+static_assert(sizeof(FlashGqaBk32TgStorageHalf<2u>) == 14336u &&
+                  sizeof(FlashGqaBk32TgStorageHalf<2u>) <=
+                      kApple10MaxGqaPrefillTgSramBytes,
+              "WP3.2 Affine4 WM=2 TgStorage must be exact 14.00 KiB!");
+static_assert(sizeof(FlashGqaBk32TgStorageHalf<3u>) == 12288u &&
+                  sizeof(FlashGqaBk32TgStorageHalf<3u>) <=
+                      kApple10MaxGqaPrefillTgSramBytes,
+              "WP3.2 Affine4 WM=3 TgStorage must be exact 12.00 KiB (<= 14.00 KiB)!");
+
+AFFINE4_ALWAYS_INLINE
+static inline ushort4 gqa_clean_bf4_u16(ushort4 bits) {
+  return select(bits, ushort4(0u),
+                (bits & ushort4(0x7fffu)) > ushort4(0x7f80u));
+}
+
+AFFINE4_ALWAYS_INLINE
+static inline void fast_divmod_g(uint r, uint g, thread uint &q,
+                                 thread uint &rem) {
+  if (g == 6u) {
+    q = (r * 43u) >> 8u;
+    rem = r - q * 6u;
+  } else if (g == 8u) {
+    q = r >> 3u;
+    rem = r & 7u;
+  } else if (g == 4u) {
+    q = r >> 2u;
+    rem = r & 3u;
+  } else if (g == 2u) {
+    q = r >> 1u;
+    rem = r & 1u;
+  } else if (g == 1u) {
+    q = r;
+    rem = 0u;
+  } else {
+    q = r / g;
+    rem = r - q * g;
+  }
+}
+
+AFFINE4_ALWAYS_INLINE
+static inline Frag16x16Aff4::frag_t<half> dequant_ptr_aff4_h8(
+    device const ushort *p0, device const ushort *p1,
+    half s0, half z0, half s1, half z1, uint col_off) {
+  const ushort pk0 = p0[col_off];
+  const ushort pk1 = p1[col_off];
+  const half4 q0 = half4(ushort4(pk0 & 0xFu, (pk0 >> 4u) & 0xFu,
+                                 (pk0 >> 8u) & 0xFu, pk0 >> 12u));
+  const half4 q1 = half4(ushort4(pk1 & 0xFu, (pk1 >> 4u) & 0xFu,
+                                 (pk1 >> 8u) & 0xFu, pk1 >> 12u));
+  const half4 v0 = fma(q0, half4(s0), half4(z0));
+  const half4 v1 = fma(q1, half4(s1), half4(z1));
+  return Frag16x16Aff4::frag_t<half>(v0.x, v0.y, v0.z, v0.w,
+                                     v1.x, v1.y, v1.z, v1.w);
+}
+
+template <uint WM, bool KeepQInRegs = true, typename ParamsT = PagedAttentionParams>
+AFFINE4_ALWAYS_INLINE
+static inline void flash_bk32_wn4_affine4_hd256_core(
+    device const bfloat *query, device const bfloat *gate,
+    device const uchar *cache_key, device const uchar *cache_value,
+    device bfloat *output, device const uint *page_table,
+    constant ParamsT &p,
+    threadgroup FlashGqaBk32TgStorageHalf<WM> &tg_mem, uint kvh,
+    uint nk_blocks, uint max_valid_kv, uint kb_min_causal, uint tok0, uint qh0,
+    uint qpos0, bool qv0, uint tok1, uint qh1, uint qpos1, bool qv1,
+    bool warp_full_rows, ushort lane, ushort sg) {
+  constexpr uint BD = 256u;
+  constexpr uint BK = 32u;
+
+  const uint row_group = uint(sg) >> 2u;
+  const uint d_part = uint(sg) & 3u;
+  const uint aff_grp = d_part >> 1u;
+  const uint d_offset = d_part * 64u;
+  const short2 sc = Frag16x16Aff4::get_coord(lane);
+  const short sm = sc.y;
+  const short sn = sc.x;
+  const uint sn_u16 = (d_part & 1u) * 16u + uint(sn >> 2u);
+
+  using H8 = Frag16x16Aff4::frag_t<half>;
+  using F8 = Frag16x16Aff4::frag_t<float>;
+
+  const uint row0_p = (tok0 << 8u) | ((qh0 & 0x7Fu) << 1u) | (qv0 ? 1u : 0u);
+  const uint row1_p = (tok1 << 8u) | ((qh1 & 0x7Fu) << 1u) | (qv1 ? 1u : 0u);
+
+  #define AFF4_BK32_LOAD_Q(DST, OFF_C)                                         \
+    do {                                                                       \
+      half4 v0 = half4(0.0h), v1 = half4(0.0h);                                \
+      if (row0_p & 1u) {                                                       \
+        ushort4 u0 = *reinterpret_cast<device const ushort4 *>(                \
+            query + ulong(row0_p >> 8u) * p.query_token_stride +               \
+            ulong((row0_p >> 1u) & 0x7Fu) * p.query_head_stride + d_offset +   \
+            uint(sn) + (OFF_C));                                               \
+        if (!warp_full_rows) u0 = gqa_clean_bf4_u16(u0);                       \
+        v0 = half4(float4(as_type<bfloat4>(u0)));                              \
+      }                                                                        \
+      if (row1_p & 1u) {                                                       \
+        ushort4 u1 = *reinterpret_cast<device const ushort4 *>(                \
+            query + ulong(row1_p >> 8u) * p.query_token_stride +               \
+            ulong((row1_p >> 1u) & 0x7Fu) * p.query_head_stride + d_offset +   \
+            uint(sn) + (OFF_C));                                               \
+        if (!warp_full_rows) u1 = gqa_clean_bf4_u16(u1);                       \
+        v1 = half4(float4(as_type<bfloat4>(u1)));                              \
+      }                                                                        \
+      (DST) = H8(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);              \
+    } while (false)
+
+  H8 Q0(0.0h), Q1(0.0h), Q2(0.0h), Q3(0.0h);
+  if constexpr (KeepQInRegs) {
+    AFF4_BK32_LOAD_Q(Q0, 0u);
+    AFF4_BK32_LOAD_Q(Q1, 16u);
+    AFF4_BK32_LOAD_Q(Q2, 32u);
+    AFF4_BK32_LOAD_Q(Q3, 48u);
+  }
+
+  const uint grp_code_off_u32 =
+      kvh * (p.page_tokens * 128u) + aff_grp * (p.page_tokens * 64u);
+  const uint page_bytes_u32 =
+      uint(page_byte_stride(p.page_tokens, p.key_value_heads, BD));
+  const uint pt_shift = ctz(p.page_tokens >> 5u);
+  const uint pt_mask = (p.page_tokens >> 5u) - 1u;
+
+  F8 O0(0.0f), O1(0.0f), O2(0.0f), O3(0.0f);
+  float max_s0 = kNegInf, max_s1 = kNegInf, sum_s0 = 0.0f, sum_s1 = 0.0f;
+  constexpr float kScale2 = 0.0625f * kLog2e;
+
+  for (uint kb = 0u; kb < nk_blocks; ++kb) {
+    const uint lpage = kb >> pt_shift;
+    const uint sub_off = (kb & pt_mask) * BK;
+    const uint phys_page = page_table[lpage];
+    const uint kb_col_base = kb * BK;
+    const short valid_k = short(min(BK, max_valid_kv - kb_col_base));
+    const bool full_cf =
+        (kb < kb_min_causal) && (valid_k == 32) && warp_full_rows;
+
+    if constexpr (WM == 2u) {
+      // Compact non-unrolled h2=0..1 QK loop using a SINGLE F8 S (gpr=118, 0 B spills!).
+      F8 S;
+      #pragma clang loop unroll(disable)
+      for (uint h2 = 0u; h2 < 2u; ++h2) {
+        device const uchar *kp =
+            cache_key + ulong(phys_page) * ulong(page_bytes_u32);
+        device const ushort *k_cg =
+            reinterpret_cast<device const ushort *>(kp + grp_code_off_u32);
+        device const KvAffine4VecMeta *k_meta =
+            reinterpret_cast<device const KvAffine4VecMeta *>(
+                kp + p.key_value_heads * (p.page_tokens * 128u)) +
+            ulong(kvh) * p.page_tokens;
+        const uint row_off = h2 * 16u;
+        const uint r0 = sub_off + row_off + uint(sm), r1 = r0 + 8u;
+        const bool ok0 = (short(int(row_off) + int(sm)) < valid_k);
+        const bool ok1 = (short(int(row_off) + int(sm) + 8) < valid_k);
+        const half s0 = ok0 ? k_meta[r0].scale[aff_grp] : 0.0h;
+        const half z0 = ok0 ? k_meta[r0].zero[aff_grp] : 0.0h;
+        const half s1 = ok1 ? k_meta[r1].scale[aff_grp] : 0.0h;
+        const half z1 = ok1 ? k_meta[r1].zero[aff_grp] : 0.0h;
+        device const ushort *p0 = k_cg + (ok0 ? r0 : sub_off) * 32u + sn_u16;
+        device const ushort *p1 = k_cg + (ok1 ? r1 : sub_off) * 32u + sn_u16;
+        S = F8(0.0f);
+        if constexpr (KeepQInRegs) {
+          {
+            const H8 k0 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 0u);
+            const H8 k1 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 4u);
+            nax_mma_16x16x32<half, true>(S, Q0, Q1, k0, k1);
+          }
+          {
+            const H8 k2 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 8u);
+            const H8 k3 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 12u);
+            nax_mma_16x16x32<half, true>(S, Q2, Q3, k2, k3);
+          }
+        } else {
+          {
+            H8 q0_l, q1_l;
+            AFF4_BK32_LOAD_Q(q0_l, 0u);
+            AFF4_BK32_LOAD_Q(q1_l, 16u);
+            const H8 k0 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 0u);
+            const H8 k1 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 4u);
+            nax_mma_16x16x32<half, true>(S, q0_l, q1_l, k0, k1);
+          }
+          simdgroup_barrier(mem_flags::mem_none);
+          {
+            H8 q2_l, q3_l;
+            AFF4_BK32_LOAD_Q(q2_l, 32u);
+            AFF4_BK32_LOAD_Q(q3_l, 48u);
+            const H8 k2 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 8u);
+            const H8 k3 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 12u);
+            nax_mma_16x16x32<half, true>(S, q2_l, q3_l, k2, k3);
+          }
+        }
+        if (d_part == 0u) {
+          if (h2 == 0u) {
+            tg_mem.d0_s0[row_group][lane][0] = float4(S[0], S[1], S[2], S[3]);
+            tg_mem.d0_s0[row_group][lane][1] = float4(S[4], S[5], S[6], S[7]);
+          }
+        } else {
+          tg_mem.xchg[row_group][d_part - 1u][lane].f4[h2 * 2u + 0u] =
+              float4(S[0], S[1], S[2], S[3]);
+          tg_mem.xchg[row_group][d_part - 1u][lane].f4[h2 * 2u + 1u] =
+              float4(S[4], S[5], S[6], S[7]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Row-split 2-half softmax on d_part == 0 (ONLY 4 floats live at a time -> 0 B spills!).
+      if (d_part == 0u) {
+        float m0_b, m1_b;
+        {
+          float4 s10 =
+              (float4(S[0], S[1], S[2], S[3]) +
+               tg_mem.xchg[row_group][0][lane].f4[2]) +
+              (tg_mem.xchg[row_group][1][lane].f4[2] +
+               tg_mem.xchg[row_group][2][lane].f4[2]);
+          if (full_cf) {
+            s10 *= kScale2;
+          } else {
+            const bool v0 = (row0_p & 1u) != 0u;
+            const uint4 c1 =
+                uint4(kb_col_base + 16u + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s10 = select(float4(kNegInf), s10 * kScale2,
+                         v0 && (c1 < max_valid_kv) && (c1 <= qpos0));
+          }
+          tg_mem.xchg[row_group][1][lane].f4[2] = s10;
+          m0_b = max(max(s10.x, s10.y), max(s10.z, s10.w));
+        }
+        {
+          float4 s11 =
+              (float4(S[4], S[5], S[6], S[7]) +
+               tg_mem.xchg[row_group][0][lane].f4[3]) +
+              (tg_mem.xchg[row_group][1][lane].f4[3] +
+               tg_mem.xchg[row_group][2][lane].f4[3]);
+          if (full_cf) {
+            s11 *= kScale2;
+          } else {
+            const bool v1 = (row1_p & 1u) != 0u;
+            const uint4 c1 =
+                uint4(kb_col_base + 16u + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s11 = select(float4(kNegInf), s11 * kScale2,
+                         v1 && (c1 < max_valid_kv) && (c1 <= qpos1));
+          }
+          tg_mem.xchg[row_group][1][lane].f4[3] = s11;
+          m1_b = max(max(s11.x, s11.y), max(s11.z, s11.w));
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float fac0, fac1;
+        {
+          float4 s00 =
+              (tg_mem.d0_s0[row_group][lane][0] +
+               tg_mem.xchg[row_group][0][lane].f4[0]) +
+              (tg_mem.xchg[row_group][1][lane].f4[0] +
+               tg_mem.xchg[row_group][2][lane].f4[0]);
+          if (full_cf) {
+            s00 *= kScale2;
+          } else {
+            const bool v0 = (row0_p & 1u) != 0u;
+            const uint4 c0 =
+                uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s00 = select(float4(kNegInf), s00 * kScale2,
+                         v0 && (c0 < max_valid_kv) && (c0 <= qpos0));
+          }
+          float m0 = max(m0_b, max(max(s00.x, s00.y), max(s00.z, s00.w)));
+          m0 = max(m0, simd_shuffle_xor(m0, ushort(1)));
+          m0 = max(m0, simd_shuffle_xor(m0, ushort(8)));
+          const float nm0 = max(max_s0, m0);
+          fac0 = (max_s0 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s0 - nm0);
+          max_s0 = nm0;
+          sum_s0 *= fac0;
+          float4 p00 = full_cf
+                           ? fast::exp2(s00 - nm0)
+                           : select(fast::exp2(s00 - nm0), float4(0.0f),
+                                    (nm0 <= kNegInfHalf) || (s00 <= kNegInfHalf));
+          float ts0 = (p00.x + p00.y) + (p00.z + p00.w);
+          ts0 += simd_shuffle_xor(ts0, ushort(1));
+          ts0 += simd_shuffle_xor(ts0, ushort(8));
+          sum_s0 += ts0;
+          tg_mem.xchg[row_group][0][lane].bcast.p00 = half4(p00);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          float4 s01 =
+              (tg_mem.d0_s0[row_group][lane][1] +
+               tg_mem.xchg[row_group][0][lane].f4[1]) +
+              (tg_mem.xchg[row_group][1][lane].f4[1] +
+               tg_mem.xchg[row_group][2][lane].f4[1]);
+          if (full_cf) {
+            s01 *= kScale2;
+          } else {
+            const bool v1 = (row1_p & 1u) != 0u;
+            const uint4 c0 =
+                uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s01 = select(float4(kNegInf), s01 * kScale2,
+                         v1 && (c0 < max_valid_kv) && (c0 <= qpos1));
+          }
+          float m1 = max(m1_b, max(max(s01.x, s01.y), max(s01.z, s01.w)));
+          m1 = max(m1, simd_shuffle_xor(m1, ushort(1)));
+          m1 = max(m1, simd_shuffle_xor(m1, ushort(8)));
+          const float nm1 = max(max_s1, m1);
+          fac1 = (max_s1 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s1 - nm1);
+          max_s1 = nm1;
+          sum_s1 *= fac1;
+          float4 p01 = full_cf
+                           ? fast::exp2(s01 - nm1)
+                           : select(fast::exp2(s01 - nm1), float4(0.0f),
+                                    (nm1 <= kNegInfHalf) || (s01 <= kNegInfHalf));
+          float ts1 = (p01.x + p01.y) + (p01.z + p01.w);
+          ts1 += simd_shuffle_xor(ts1, ushort(1));
+          ts1 += simd_shuffle_xor(ts1, ushort(8));
+          sum_s1 += ts1;
+          tg_mem.xchg[row_group][0][lane].bcast.p01 = half4(p01);
+          tg_mem.xchg[row_group][0][lane].bcast.fac = float2(fac0, fac1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          const float4 s10 = tg_mem.xchg[row_group][1][lane].f4[2];
+          float4 p10 = full_cf
+                           ? fast::exp2(s10 - max_s0)
+                           : select(fast::exp2(s10 - max_s0), float4(0.0f),
+                                    (max_s0 <= kNegInfHalf) || (s10 <= kNegInfHalf));
+          float ts0 = (p10.x + p10.y) + (p10.z + p10.w);
+          ts0 += simd_shuffle_xor(ts0, ushort(1));
+          ts0 += simd_shuffle_xor(ts0, ushort(8));
+          sum_s0 += ts0;
+          tg_mem.xchg[row_group][0][lane].bcast.p10 = half4(p10);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          const float4 s11 = tg_mem.xchg[row_group][1][lane].f4[3];
+          float4 p11 = full_cf
+                           ? fast::exp2(s11 - max_s1)
+                           : select(fast::exp2(s11 - max_s1), float4(0.0f),
+                                    (max_s1 <= kNegInfHalf) || (s11 <= kNegInfHalf));
+          float ts1 = (p11.x + p11.y) + (p11.z + p11.w);
+          ts1 += simd_shuffle_xor(ts1, ushort(1));
+          ts1 += simd_shuffle_xor(ts1, ushort(8));
+          sum_s1 += ts1;
+          tg_mem.xchg[row_group][0][lane].bcast.p11 = half4(p11);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+      // WM=3 (12.00 KiB <= 14.00 KiB): 0-ULP bit-exact with WM=2 via 4 x 32 B slots!
+      float m0_a = kNegInf, m1_a = kNegInf;
+      F8 S;
+      #pragma clang loop unroll(disable)
+      for (uint h2 = 0u; h2 < 2u; ++h2) {
+        device const uchar *kp =
+            cache_key + ulong(phys_page) * ulong(page_bytes_u32);
+        device const ushort *k_cg =
+            reinterpret_cast<device const ushort *>(kp + grp_code_off_u32);
+        device const KvAffine4VecMeta *k_meta =
+            reinterpret_cast<device const KvAffine4VecMeta *>(
+                kp + p.key_value_heads * (p.page_tokens * 128u)) +
+            ulong(kvh) * p.page_tokens;
+        const uint row_off = h2 * 16u;
+        const uint r0 = sub_off + row_off + uint(sm), r1 = r0 + 8u;
+        const bool ok0 = (short(int(row_off) + int(sm)) < valid_k);
+        const bool ok1 = (short(int(row_off) + int(sm) + 8) < valid_k);
+        const half s0 = ok0 ? k_meta[r0].scale[aff_grp] : 0.0h;
+        const half z0 = ok0 ? k_meta[r0].zero[aff_grp] : 0.0h;
+        const half s1 = ok1 ? k_meta[r1].scale[aff_grp] : 0.0h;
+        const half z1 = ok1 ? k_meta[r1].zero[aff_grp] : 0.0h;
+        device const ushort *p0 = k_cg + (ok0 ? r0 : sub_off) * 32u + sn_u16;
+        device const ushort *p1 = k_cg + (ok1 ? r1 : sub_off) * 32u + sn_u16;
+        S = F8(0.0f);
+        {
+          const H8 k0 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 0u);
+          const H8 k1 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 4u);
+          nax_mma_16x16x32<half, true>(S, Q0, Q1, k0, k1);
+        }
+        {
+          const H8 k2 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 8u);
+          const H8 k3 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 12u);
+          nax_mma_16x16x32<half, true>(S, Q2, Q3, k2, k3);
+        }
+        if (d_part > 0u) {
+          tg_mem.xchg[row_group][d_part - 1u][lane].f4[0] =
+              float4(S[0], S[1], S[2], S[3]);
+          tg_mem.xchg[row_group][d_part - 1u][lane].f4[1] =
+              float4(S[4], S[5], S[6], S[7]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (h2 == 0u) {
+          if (d_part == 0u) {
+            {
+              float4 s00 =
+                  (float4(S[0], S[1], S[2], S[3]) +
+                   tg_mem.xchg[row_group][0][lane].f4[0]) +
+                  (tg_mem.xchg[row_group][1][lane].f4[0] +
+                   tg_mem.xchg[row_group][2][lane].f4[0]);
+              if (full_cf) {
+                s00 *= kScale2;
+              } else {
+                const bool v0 = (row0_p & 1u) != 0u;
+                const uint4 c0 =
+                    uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+                s00 = select(float4(kNegInf), s00 * kScale2,
+                             v0 && (c0 < max_valid_kv) && (c0 <= qpos0));
+              }
+              tg_mem.xchg[row_group][3][lane].f4[0] = s00;
+              m0_a = max(max(s00.x, s00.y), max(s00.z, s00.w));
+            }
+            {
+              float4 s01 =
+                  (float4(S[4], S[5], S[6], S[7]) +
+                   tg_mem.xchg[row_group][0][lane].f4[1]) +
+                  (tg_mem.xchg[row_group][1][lane].f4[1] +
+                   tg_mem.xchg[row_group][2][lane].f4[1]);
+              if (full_cf) {
+                s01 *= kScale2;
+              } else {
+                const bool v1 = (row1_p & 1u) != 0u;
+                const uint4 c0 =
+                    uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+                s01 = select(float4(kNegInf), s01 * kScale2,
+                             v1 && (c0 < max_valid_kv) && (c0 <= qpos1));
+              }
+              tg_mem.xchg[row_group][3][lane].f4[1] = s01;
+              m1_a = max(max(s01.x, s01.y), max(s01.z, s01.w));
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      }
+
+      if (d_part == 0u) {
+        float m0_b, m1_b;
+        {
+          float4 s10 =
+              (float4(S[0], S[1], S[2], S[3]) +
+               tg_mem.xchg[row_group][0][lane].f4[0]) +
+              (tg_mem.xchg[row_group][1][lane].f4[0] +
+               tg_mem.xchg[row_group][2][lane].f4[0]);
+          if (full_cf) {
+            s10 *= kScale2;
+          } else {
+            const bool v0 = (row0_p & 1u) != 0u;
+            const uint4 c1 =
+                uint4(kb_col_base + 16u + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s10 = select(float4(kNegInf), s10 * kScale2,
+                         v0 && (c1 < max_valid_kv) && (c1 <= qpos0));
+          }
+          tg_mem.xchg[row_group][2][lane].f4[0] = s10;
+          m0_b = max(max(s10.x, s10.y), max(s10.z, s10.w));
+        }
+        {
+          float4 s11 =
+              (float4(S[4], S[5], S[6], S[7]) +
+               tg_mem.xchg[row_group][0][lane].f4[1]) +
+              (tg_mem.xchg[row_group][1][lane].f4[1] +
+               tg_mem.xchg[row_group][2][lane].f4[1]);
+          if (full_cf) {
+            s11 *= kScale2;
+          } else {
+            const bool v1 = (row1_p & 1u) != 0u;
+            const uint4 c1 =
+                uint4(kb_col_base + 16u + uint(sn)) + uint4(0u, 1u, 2u, 3u);
+            s11 = select(float4(kNegInf), s11 * kScale2,
+                         v1 && (c1 < max_valid_kv) && (c1 <= qpos1));
+          }
+          tg_mem.xchg[row_group][2][lane].f4[1] = s11;
+          m1_b = max(max(s11.x, s11.y), max(s11.z, s11.w));
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float fac0, fac1;
+        {
+          const float4 s00 = tg_mem.xchg[row_group][3][lane].f4[0];
+          float m0 = max(m0_b, m0_a);
+          m0 = max(m0, simd_shuffle_xor(m0, ushort(1)));
+          m0 = max(m0, simd_shuffle_xor(m0, ushort(8)));
+          const float nm0 = max(max_s0, m0);
+          fac0 = (max_s0 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s0 - nm0);
+          max_s0 = nm0;
+          sum_s0 *= fac0;
+          float4 p00 = full_cf
+                           ? fast::exp2(s00 - nm0)
+                           : select(fast::exp2(s00 - nm0), float4(0.0f),
+                                    (nm0 <= kNegInfHalf) || (s00 <= kNegInfHalf));
+          float ts0 = (p00.x + p00.y) + (p00.z + p00.w);
+          ts0 += simd_shuffle_xor(ts0, ushort(1));
+          ts0 += simd_shuffle_xor(ts0, ushort(8));
+          sum_s0 += ts0;
+          tg_mem.xchg[row_group][0][lane].bcast.p0 = half4(p00);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          const float4 s01 = tg_mem.xchg[row_group][3][lane].f4[1];
+          float m1 = max(m1_b, m1_a);
+          m1 = max(m1, simd_shuffle_xor(m1, ushort(1)));
+          m1 = max(m1, simd_shuffle_xor(m1, ushort(8)));
+          const float nm1 = max(max_s1, m1);
+          fac1 = (max_s1 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s1 - nm1);
+          max_s1 = nm1;
+          sum_s1 *= fac1;
+          float4 p01 = full_cf
+                           ? fast::exp2(s01 - nm1)
+                           : select(fast::exp2(s01 - nm1), float4(0.0f),
+                                    (nm1 <= kNegInfHalf) || (s01 <= kNegInfHalf));
+          float ts1 = (p01.x + p01.y) + (p01.z + p01.w);
+          ts1 += simd_shuffle_xor(ts1, ushort(1));
+          ts1 += simd_shuffle_xor(ts1, ushort(8));
+          sum_s1 += ts1;
+          tg_mem.xchg[row_group][0][lane].bcast.p1 = half4(p01);
+          tg_mem.xchg[row_group][0][lane].bcast.fac = float2(fac0, fac1);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          const float4 s10 = tg_mem.xchg[row_group][2][lane].f4[0];
+          float4 p10 = full_cf
+                           ? fast::exp2(s10 - max_s0)
+                           : select(fast::exp2(s10 - max_s0), float4(0.0f),
+                                    (max_s0 <= kNegInfHalf) || (s10 <= kNegInfHalf));
+          float ts0 = (p10.x + p10.y) + (p10.z + p10.w);
+          ts0 += simd_shuffle_xor(ts0, ushort(1));
+          ts0 += simd_shuffle_xor(ts0, ushort(8));
+          sum_s0 += ts0;
+          tg_mem.xchg[row_group][1][lane].bcast.p0 = half4(p10);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          const float4 s11 = tg_mem.xchg[row_group][2][lane].f4[1];
+          float4 p11 = full_cf
+                           ? fast::exp2(s11 - max_s1)
+                           : select(fast::exp2(s11 - max_s1), float4(0.0f),
+                                    (max_s1 <= kNegInfHalf) || (s11 <= kNegInfHalf));
+          float ts1 = (p11.x + p11.y) + (p11.z + p11.w);
+          ts1 += simd_shuffle_xor(ts1, ushort(1));
+          ts1 += simd_shuffle_xor(ts1, ushort(8));
+          sum_s1 += ts1;
+          tg_mem.xchg[row_group][1][lane].bcast.p1 = half4(p11);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // PV Half 0 & Half 1 via compact non-unrolled loop (0 live-range overlap!)
+    {
+      const float2 fc = tg_mem.xchg[row_group][0][lane].bcast.fac;
+      const F8 fv(fc.x, fc.x, fc.x, fc.x, fc.y, fc.y, fc.y, fc.y);
+      O0 *= fv;
+      O1 *= fv;
+      O2 *= fv;
+      O3 *= fv;
+
+      #pragma clang loop unroll(disable)
+      for (uint h2 = 0u; h2 < 2u; ++h2) {
+        half4 hp0, hp1;
+        if constexpr (WM == 2u) {
+          hp0 = (h2 == 0u) ? tg_mem.xchg[row_group][0][lane].bcast.p00
+                           : tg_mem.xchg[row_group][0][lane].bcast.p10;
+          hp1 = (h2 == 0u) ? tg_mem.xchg[row_group][0][lane].bcast.p01
+                           : tg_mem.xchg[row_group][0][lane].bcast.p11;
+        } else {
+          hp0 = (h2 == 0u) ? tg_mem.xchg[row_group][0][lane].bcast.p0
+                           : tg_mem.xchg[row_group][1][lane].bcast.p0;
+          hp1 = (h2 == 0u) ? tg_mem.xchg[row_group][0][lane].bcast.p1
+                           : tg_mem.xchg[row_group][1][lane].bcast.p1;
+        }
+        const H8 P_cur(hp0.x, hp0.y, hp0.z, hp0.w, hp1.x, hp1.y, hp1.z, hp1.w);
+        device const uchar *vp =
+            cache_value + ulong(phys_page) * ulong(page_bytes_u32);
+        device const ushort *v_cg =
+            reinterpret_cast<device const ushort *>(vp + grp_code_off_u32);
+        device const KvAffine4VecMeta *v_meta =
+            reinterpret_cast<device const KvAffine4VecMeta *>(
+                vp + p.key_value_heads * (p.page_tokens * 128u)) +
+            ulong(kvh) * p.page_tokens;
+        const uint row_off = h2 * 16u;
+        const uint r0 = sub_off + row_off + uint(sm), r1 = r0 + 8u;
+        const bool ok0 = (short(int(row_off) + int(sm)) < valid_k);
+        const bool ok1 = (short(int(row_off) + int(sm) + 8) < valid_k);
+        const half s0 = ok0 ? v_meta[r0].scale[aff_grp] : 0.0h;
+        const half z0 = ok0 ? v_meta[r0].zero[aff_grp] : 0.0h;
+        const half s1 = ok1 ? v_meta[r1].scale[aff_grp] : 0.0h;
+        const half z1 = ok1 ? v_meta[r1].zero[aff_grp] : 0.0h;
+        device const ushort *p0 = v_cg + (ok0 ? r0 : sub_off) * 32u + sn_u16;
+        device const ushort *p1 = v_cg + (ok1 ? r1 : sub_off) * 32u + sn_u16;
+        {
+          const H8 v0 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 0u);
+          const H8 v1 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 4u);
+          nax_mma_16x32x16_nn<half>(O0, O1, P_cur, v0, v1);
+        }
+        {
+          const H8 v2 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 8u);
+          const H8 v3 = dequant_ptr_aff4_h8(p0, p1, s0, z0, s1, z1, 12u);
+          nax_mma_16x32x16_nn<half>(O2, O3, P_cur, v2, v3);
+        }
+      }
+    }
+    if (kb + 1u < nk_blocks) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  #undef AFF4_BK32_LOAD_Q
+
+  // Broadcast final (rcp0, rcp1) from d_part == 0 to d_part != 0.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float rcp0 = 0.0f;
+  float rcp1 = 0.0f;
+  if (d_part == 0u) {
+    rcp0 = (sum_s0 > 0.0f) ? (1.0f / sum_s0) : 0.0f;
+    rcp1 = (sum_s1 > 0.0f) ? (1.0f / sum_s1) : 0.0f;
+    tg_mem.xchg[row_group][0][lane].bcast.fac = float2(rcp0, rcp1);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (d_part != 0u) {
+    const float2 r = tg_mem.xchg[row_group][0][lane].bcast.fac;
+    rcp0 = r.x;
+    rcp1 = r.y;
+  }
+
+  const bool ep_qv0 = (row0_p & 1u) != 0u;
+  const bool ep_qv1 = (row1_p & 1u) != 0u;
+  if (!ep_qv0 && !ep_qv1) {
+    return;
+  }
+  const uint ep_tok0 = row0_p >> 8u;
+  const uint ep_qh0 = (row0_p >> 1u) & 0x7Fu;
+  const uint ep_tok1 = row1_p >> 8u;
+  const uint ep_qh1 = (row1_p >> 1u) & 0x7Fu;
+
+  device const bfloat *g_row0 =
+      gate + ulong(ep_tok0) * p.gate_token_stride +
+      ulong(ep_qh0) * p.gate_head_stride + d_offset + uint(sn);
+  device const bfloat *g_row1 =
+      gate + ulong(ep_tok1) * p.gate_token_stride +
+      ulong(ep_qh1) * p.gate_head_stride + d_offset + uint(sn);
+  device bfloat *o_row0 =
+      output + (ulong(ep_tok0) * p.query_heads + ep_qh0) * BD + d_offset +
+      uint(sn);
+  device bfloat *o_row1 =
+      output + (ulong(ep_tok1) * p.query_heads + ep_qh1) * BD + d_offset +
+      uint(sn);
+
+  #define AFF4_BK32_STORE_O(OREG, OFF_C)                                       \
+    do {                                                                       \
+      if (ep_qv0) {                                                            \
+        ushort4 gu0 =                                                          \
+            *reinterpret_cast<device const ushort4 *>(g_row0 + (OFF_C));       \
+        if (!warp_full_rows) {                                                 \
+          gu0 = gqa_clean_bf4_u16(gu0);                                        \
+        }                                                                      \
+        const float4 g0_f = float4(as_type<bfloat4>(gu0));                     \
+        const float4 o0_f =                                                    \
+            (float4((OREG)[0], (OREG)[1], (OREG)[2], (OREG)[3]) * rcp0) /      \
+            (float4(1.0f) + exp(-g0_f));                                       \
+        *reinterpret_cast<device bfloat4 *>(o_row0 + (OFF_C)) = bfloat4(o0_f); \
+      }                                                                        \
+      if (ep_qv1) {                                                            \
+        ushort4 gu1 =                                                          \
+            *reinterpret_cast<device const ushort4 *>(g_row1 + (OFF_C));       \
+        if (!warp_full_rows) {                                                 \
+          gu1 = gqa_clean_bf4_u16(gu1);                                        \
+        }                                                                      \
+        const float4 g1_f = float4(as_type<bfloat4>(gu1));                     \
+        const float4 o1_f =                                                    \
+            (float4((OREG)[4], (OREG)[5], (OREG)[6], (OREG)[7]) * rcp1) /      \
+            (float4(1.0f) + exp(-g1_f));                                       \
+        *reinterpret_cast<device bfloat4 *>(o_row1 + (OFF_C)) = bfloat4(o1_f); \
+      }                                                                        \
+    } while (false)
+  AFF4_BK32_STORE_O(O0, 0u);
+  AFF4_BK32_STORE_O(O1, 16u);
+  AFF4_BK32_STORE_O(O2, 32u);
+  AFF4_BK32_STORE_O(O3, 48u);
+  #undef AFF4_BK32_STORE_O
+}
+
+} // namespace affine4_kv
+
+template <bool IsBatched, typename ParamsT>
 AFFINE4_ALWAYS_INLINE
 static inline void paged_flash_prefill_affine4_hd256_core(
     device const bfloat *query,
@@ -2149,442 +2791,93 @@ static inline void paged_flash_prefill_affine4_hd256_core(
     device bfloat *output,
     device const uint *page_table,
     device const uint *positions,
-    uint query_heads,
-    uint key_value_heads,
-    uint tokens,
-    uint page_tokens,
-    uint query_token_stride,
-    uint query_head_stride,
-    uint gate_token_stride,
-    uint gate_head_stride,
-    threadgroup float *xchg,
-    threadgroup uint *tg_q_pos,
+    constant ParamsT &p,
+    threadgroup affine4_kv::FlashGqaBk32TgStorageHalf<2u> &tg_mem,
     ushort lane,
     ushort sg,
-    uint tg_y) {
-  constexpr uint BD = 256u;
+    uint3 tg) {
   constexpr uint BQ = 64u;
   constexpr uint BK = 32u;
 
-  if (query_heads == 0u || tokens == 0u) {
+  uint tokens = 0u;
+  if constexpr (IsBatched) {
+    tokens = p.widths[tg.z];
+  } else {
+    tokens = p.tokens;
+  }
+  if (p.query_heads == 0u || p.key_value_heads == 0u || tokens == 0u) {
     return;
   }
-  // LPT Reverse q_blk + qh-minor scheduling (0 atomics, ICB-safe, 0-ULP identical):
-  // launches longest causal query blocks first while keeping sibling GQA heads
-  // adjacent on-chip for L2 KV reuse inside the 8.4 KiB (2 TG/core) kernel.
   const uint n_q_blocks = (tokens + BQ - 1u) / BQ;
-  const uint q_blk_rev = tg_y / query_heads;
-  const uint qh = tg_y - q_blk_rev * query_heads;
-  if (q_blk_rev >= n_q_blocks) {
-    return;
-  }
-  const uint q_blk = (n_q_blocks - 1u) - q_blk_rev;
-  const uint q_base = q_blk * BQ;
-  if (q_base >= tokens) {
+  if (tg.y / p.query_heads >= n_q_blocks) {
     return;
   }
 
-  const uint flat_tid = uint(sg) * 32u + uint(lane);
-  if (flat_tid < BQ) {
-    const uint q_tok = q_base + flat_tid;
-    tg_q_pos[flat_tid] = (q_tok < tokens) ? positions[q_tok] : 0u;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const uint active_q_rows = min(BQ, tokens - q_base);
-  uint max_valid_kv = 0u;
-  uint min_q_pos = 0xffffffffu;
-  for (uint r = 0u; r < active_q_rows; ++r) {
-    const uint pos = tg_q_pos[r];
-    max_valid_kv = max(max_valid_kv, pos + 1u);
-    min_q_pos = min(min_q_pos, pos);
-  }
-  const uint nk_blocks = (max_valid_kv + BK - 1u) / BK;
-  const uint kb_min_causal = min_q_pos / BK;
-
-  const uint repeat = query_heads / key_value_heads;
-  const uint kvh = qh / repeat;
-  const uint half_blocks_per_page = page_tokens / BK;
-  const ulong page_bytes =
-      affine4_kv::page_byte_stride(page_tokens, key_value_heads, BD);
-  const ulong head_code_bytes = ulong(page_tokens) * 128ul;
-  const ulong all_codes_bytes = ulong(key_value_heads) * head_code_bytes;
-
-  const short row_group = short(sg >> 1u); // 0..3
-  const short d_part = short(sg & 1u);     // 0..1 (= exact affine4 group g!)
-  const short tm = 16 * row_group;
-  const short lim_rows_q = short(int(active_q_rows) - int(tm));
-  const uint d_offset = uint(d_part) * 128u;
-  const ulong group_code_offset =
-      ulong(kvh) * head_code_bytes + ulong(d_part) * (64ul * 64ul);
-
-  const short2 sc = affine4_kv::Frag16x16Aff4::get_coord(lane);
-  const short sm = sc.y;
-  const short sn = sc.x;
-  const uint sn_u16 = uint(sn >> 2u); // 0..3
-
-  const uint r_q0 = uint(tm + sm);
-  const uint r_q1 = uint(tm + 8 + sm);
-  const bool qv0 = (r_q0 < active_q_rows);
-  const bool qv1 = (r_q1 < active_q_rows);
-  const uint qpos0 = qv0 ? tg_q_pos[r_q0] : 0u;
-  const uint qpos1 = qv1 ? tg_q_pos[r_q1] : 0u;
-
-  using H8 = affine4_kv::Frag16x16Aff4::frag_t<half>;
-  using BF8 = affine4_kv::Frag16x16Aff4::frag_t<bfloat>;
-  using F8 = affine4_kv::Frag16x16Aff4::frag_t<float>;
-
-  // Explicit SSA half register fragments (0 alloca + 0 half->bfloat dequant convert!).
-  H8 Q0(0.0h), Q1(0.0h), Q2(0.0h), Q3(0.0h);
-  H8 Q4(0.0h), Q5(0.0h), Q6(0.0h), Q7(0.0h);
-  device const bfloat *Q_ptr =
-      query + ulong(q_base + uint(tm)) * query_token_stride +
-      ulong(qh) * query_head_stride + d_offset;
-  if (lim_rows_q >= 16) {
-    affine4_kv::Frag16x16Aff4::load_h4(Q0, Q_ptr, query_token_stride, 0, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q1, Q_ptr, query_token_stride, 16, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q2, Q_ptr, query_token_stride, 32, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q3, Q_ptr, query_token_stride, 48, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q4, Q_ptr, query_token_stride, 64, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q5, Q_ptr, query_token_stride, 80, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q6, Q_ptr, query_token_stride, 96, sc);
-    affine4_kv::Frag16x16Aff4::load_h4(Q7, Q_ptr, query_token_stride, 112, sc);
-  } else if (lim_rows_q > 0) {
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q0, Q_ptr, query_token_stride, lim_rows_q, 0, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q1, Q_ptr, query_token_stride, lim_rows_q, 16, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q2, Q_ptr, query_token_stride, lim_rows_q, 32, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q3, Q_ptr, query_token_stride, lim_rows_q, 48, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q4, Q_ptr, query_token_stride, lim_rows_q, 64, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q5, Q_ptr, query_token_stride, lim_rows_q, 80, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q6, Q_ptr, query_token_stride, lim_rows_q, 96, sc);
-    affine4_kv::Frag16x16Aff4::load_rows_clean_h4(Q7, Q_ptr, query_token_stride, lim_rows_q, 112, sc);
-  }
-
-  F8 O0(0.0f), O1(0.0f), O2(0.0f), O3(0.0f);
-  F8 O4(0.0f), O5(0.0f), O6(0.0f), O7(0.0f);
-
-  float max_s0 = affine4_kv::kNegInf;
-  float max_s1 = affine4_kv::kNegInf;
-  float sum_s0 = 0.0f;
-  float sum_s1 = 0.0f;
-  const float scale2 = 0.0625f * affine4_kv::kLog2e;
-
-  threadgroup float4 *xchg_slot = reinterpret_cast<threadgroup float4 *>(
-      xchg + row_group * (2 * 8 * 32) + short(lane) * 16);
-
-  for (uint kb = 0u; kb < nk_blocks; ++kb) {
-    const uint logical_page = kb / half_blocks_per_page;
-    const uint sub_offset = (kb % half_blocks_per_page) * BK;
-    const uint phys_page = page_table[logical_page];
-    const uint kb_col_base = kb * BK;
-    const short valid_k = short(min(BK, max_valid_kv - kb_col_base));
-
-    device const uchar *k_page_ptr =
-        cache_key + ulong(phys_page) * page_bytes;
-    device const ushort *k_codes_u16 =
-        reinterpret_cast<device const ushort *>(k_page_ptr + group_code_offset);
-    device const KvAffine4VecMeta *k_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(k_page_ptr +
-                                                          all_codes_bytes) +
-        ulong(kvh) * page_tokens;
-
-    F8 S0(0.0f);
-    F8 S1(0.0f);
-    {
-      const uint rk00 = sub_offset + uint(sm);
-      const uint rk01 = rk00 + 8u;
-      const uint rk10 = rk00 + 16u;
-      const uint rk11 = rk00 + 24u;
-      half sk00 = k_meta[rk00].scale[d_part];
-      half zk00 = k_meta[rk00].zero[d_part];
-      half sk01 = k_meta[rk01].scale[d_part];
-      half zk01 = k_meta[rk01].zero[d_part];
-      half sk10 = k_meta[rk10].scale[d_part];
-      half zk10 = k_meta[rk10].zero[d_part];
-      half sk11 = k_meta[rk11].scale[d_part];
-      half zk11 = k_meta[rk11].zero[d_part];
-      if (valid_k < 32) {
-        if (!(sm < valid_k)) { sk00 = half(0.0h); zk00 = half(0.0h); }
-        if (!(short(sm + 8) < valid_k)) { sk01 = half(0.0h); zk01 = half(0.0h); }
-        if (!(short(sm + 16) < valid_k)) { sk10 = half(0.0h); zk10 = half(0.0h); }
-        if (!(short(sm + 24) < valid_k)) { sk11 = half(0.0h); zk11 = half(0.0h); }
-      }
-      device const ushort *kp00 = k_codes_u16 + rk00 * 32u + sn_u16;
-      device const ushort *kp01 = k_codes_u16 + rk01 * 32u + sn_u16;
-      device const ushort *kp10 = k_codes_u16 + rk10 * 32u + sn_u16;
-      device const ushort *kp11 = k_codes_u16 + rk11 * 32u + sn_u16;
-
-#define AFF4_QK_STEP(QREG, D_IDX)                                              \
-  do {                                                                         \
-    const uint c_off = uint(D_IDX) * 4u;                                       \
-    const H8 K0 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                    \
-        kp00, kp01, sk00, zk00, sk01, zk01, c_off);                            \
-    const H8 K1 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                    \
-        kp10, kp11, sk10, zk10, sk11, zk11, c_off);                            \
-    affine4_kv::Frag16x16Aff4::mma_1x2_f16<true>(S0, S1, QREG, K0, K1);        \
-  } while (false)
-
-      AFF4_QK_STEP(Q0, 0);
-      AFF4_QK_STEP(Q1, 1);
-      AFF4_QK_STEP(Q2, 2);
-      AFF4_QK_STEP(Q3, 3);
-      AFF4_QK_STEP(Q4, 4);
-      AFF4_QK_STEP(Q5, 5);
-      AFF4_QK_STEP(Q6, 6);
-      AFF4_QK_STEP(Q7, 7);
-#undef AFF4_QK_STEP
-    }
-
-    // WN=2 head-dim partial score exchange via 8 KiB xchg (8.4 KiB -> 2 TGs/core!).
-    if (d_part == 1) {
-      xchg_slot[0] = float4(S0[0], S0[1], S0[2], S0[3]);
-      xchg_slot[1] = float4(S0[4], S0[5], S0[6], S0[7]);
-      xchg_slot[2] = float4(S1[0], S1[1], S1[2], S1[3]);
-      xchg_slot[3] = float4(S1[4], S1[5], S1[6], S1[7]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (d_part == 0) {
-      const float4 p0 = xchg_slot[0];
-      const float4 p1 = xchg_slot[1];
-      const float4 p2 = xchg_slot[2];
-      const float4 p3 = xchg_slot[3];
-      S0 += F8(p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w);
-      S1 += F8(p2.x, p2.y, p2.z, p2.w, p3.x, p3.y, p3.z, p3.w);
-      xchg_slot[0] = float4(S0[0], S0[1], S0[2], S0[3]);
-      xchg_slot[1] = float4(S0[4], S0[5], S0[6], S0[7]);
-      xchg_slot[2] = float4(S1[0], S1[1], S1[2], S1[3]);
-      xchg_slot[3] = float4(S1[4], S1[5], S1[6], S1[7]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (d_part == 1) {
-      const float4 s00 = xchg_slot[0];
-      const float4 s01 = xchg_slot[1];
-      const float4 s10 = xchg_slot[2];
-      const float4 s11 = xchg_slot[3];
-      S0 = F8(s00.x, s00.y, s00.z, s00.w, s01.x, s01.y, s01.z, s01.w);
-      S1 = F8(s10.x, s10.y, s10.z, s10.w, s11.x, s11.y, s11.z, s11.w);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Hoisted causal-free fast path (99% of tiles in long-context prefill).
-    const bool full_causal_free =
-        (kb < kb_min_causal) && (valid_k == 32) && (lim_rows_q >= 16);
-    if (full_causal_free) {
-      S0 *= scale2;
-      S1 *= scale2;
+  #pragma clang loop unroll(disable)
+  for (uint sub = 0u; sub < 2u; ++sub) {
+    uint row_off = 0u;
+    uint cur_tokens = 0u;
+    if constexpr (IsBatched) {
+      row_off = p.row_offsets[tg.z];
+      cur_tokens = p.widths[tg.z];
     } else {
-      const uint4 c0_abs =
-          uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
-      const uint4 c1_abs = c0_abs + uint4(16u);
-      const bool4 ok00 = qv0 && (c0_abs < max_valid_kv) && (c0_abs <= qpos0);
-      const bool4 ok01 = qv1 && (c0_abs < max_valid_kv) && (c0_abs <= qpos1);
-      const bool4 ok10 = qv0 && (c1_abs < max_valid_kv) && (c1_abs <= qpos0);
-      const bool4 ok11 = qv1 && (c1_abs < max_valid_kv) && (c1_abs <= qpos1);
-      const float4 s00 =
-          select(float4(affine4_kv::kNegInf), float4(S0[0], S0[1], S0[2], S0[3]) * scale2, ok00);
-      const float4 s01 =
-          select(float4(affine4_kv::kNegInf), float4(S0[4], S0[5], S0[6], S0[7]) * scale2, ok01);
-      const float4 s10 =
-          select(float4(affine4_kv::kNegInf), float4(S1[0], S1[1], S1[2], S1[3]) * scale2, ok10);
-      const float4 s11 =
-          select(float4(affine4_kv::kNegInf), float4(S1[4], S1[5], S1[6], S1[7]) * scale2, ok11);
-      S0 = F8(s00.x, s00.y, s00.z, s00.w, s01.x, s01.y, s01.z, s01.w);
-      S1 = F8(s10.x, s10.y, s10.z, s10.w, s11.x, s11.y, s11.z, s11.w);
+      cur_tokens = p.tokens;
     }
-
-    // Online softmax row-max across the 32 columns of S0, S1.
-    float m0 = max(max(max(S0[0], S0[1]), max(S0[2], S0[3])),
-                   max(max(S1[0], S1[1]), max(S1[2], S1[3])));
-    m0 = max(m0, simd_shuffle_xor(m0, ushort(1)));
-    m0 = max(m0, simd_shuffle_xor(m0, ushort(8)));
-    const float new_m0 = max(max_s0, m0);
-
-    float m1 = max(max(max(S0[4], S0[5]), max(S0[6], S0[7])),
-                   max(max(S1[4], S1[5]), max(S1[6], S1[7])));
-    m1 = max(m1, simd_shuffle_xor(m1, ushort(1)));
-    m1 = max(m1, simd_shuffle_xor(m1, ushort(8)));
-    const float new_m1 = max(max_s1, m1);
-
-    const float fac0 = (max_s0 <= affine4_kv::kNegInfHalf)
-                           ? 0.0f
-                           : fast::exp2(max_s0 - new_m0);
-    const float fac1 = (max_s1 <= affine4_kv::kNegInfHalf)
-                           ? 0.0f
-                           : fast::exp2(max_s1 - new_m1);
-    max_s0 = new_m0;
-    max_s1 = new_m1;
-    sum_s0 *= fac0;
-    sum_s1 *= fac1;
-
-    // Compute P = exp2(S - new_max), update sum, and convert P -> half for
-    // full-rate half*half NAX P@V (0 half->bfloat dequant overhead!).
-    float4 p00, p01, p10, p11;
-    if (full_causal_free) {
-      p00 = fast::exp2(float4(S0[0], S0[1], S0[2], S0[3]) - new_m0);
-      p01 = fast::exp2(float4(S0[4], S0[5], S0[6], S0[7]) - new_m1);
-      p10 = fast::exp2(float4(S1[0], S1[1], S1[2], S1[3]) - new_m0);
-      p11 = fast::exp2(float4(S1[4], S1[5], S1[6], S1[7]) - new_m1);
-    } else {
-      const bool emp0 = (new_m0 <= affine4_kv::kNegInfHalf);
-      const bool emp1 = (new_m1 <= affine4_kv::kNegInfHalf);
-      const float4 s00(S0[0], S0[1], S0[2], S0[3]);
-      const float4 s01(S0[4], S0[5], S0[6], S0[7]);
-      const float4 s10(S1[0], S1[1], S1[2], S1[3]);
-      const float4 s11(S1[4], S1[5], S1[6], S1[7]);
-      p00 = select(fast::exp2(s00 - new_m0), float4(0.0f),
-                   emp0 || (s00 <= affine4_kv::kNegInfHalf));
-      p01 = select(fast::exp2(s01 - new_m1), float4(0.0f),
-                   emp1 || (s01 <= affine4_kv::kNegInfHalf));
-      p10 = select(fast::exp2(s10 - new_m0), float4(0.0f),
-                   emp0 || (s10 <= affine4_kv::kNegInfHalf));
-      p11 = select(fast::exp2(s11 - new_m1), float4(0.0f),
-                   emp1 || (s11 <= affine4_kv::kNegInfHalf));
+    const uint nqb = (cur_tokens + BQ - 1u) / BQ;
+    const uint q_blk_rev = tg.y / p.query_heads;
+    const uint qh = tg.y - q_blk_rev * p.query_heads;
+    const uint q_blk = (nqb - 1u) - q_blk_rev;
+    const uint sub_base = q_blk * BQ + sub * 32u;
+    if (sub_base >= cur_tokens) {
+      break;
     }
-
-    const float4 ps0 = p00 + p10;
-    float tsum0 = (ps0.x + ps0.y) + (ps0.z + ps0.w);
-    tsum0 += simd_shuffle_xor(tsum0, ushort(1));
-    tsum0 += simd_shuffle_xor(tsum0, ushort(8));
-    sum_s0 += tsum0;
-
-    const float4 ps1 = p01 + p11;
-    float tsum1 = (ps1.x + ps1.y) + (ps1.z + ps1.w);
-    tsum1 += simd_shuffle_xor(tsum1, ushort(1));
-    tsum1 += simd_shuffle_xor(tsum1, ushort(8));
-    sum_s1 += tsum1;
-
-    const half4 hp00 = half4(p00);
-    const half4 hp01 = half4(p01);
-    const half4 hp10 = half4(p10);
-    const half4 hp11 = half4(p11);
-    const H8 P0(hp00.x, hp00.y, hp00.z, hp00.w, hp01.x, hp01.y, hp01.z, hp01.w);
-    const H8 P1(hp10.x, hp10.y, hp10.z, hp10.w, hp11.x, hp11.y, hp11.z, hp11.w);
-
-    // Rescale O0..O7 in registers!
-    const F8 fac_vec(fac0, fac0, fac0, fac0, fac1, fac1, fac1, fac1);
-    O0 *= fac_vec;
-    O1 *= fac_vec;
-    O2 *= fac_vec;
-    O3 *= fac_vec;
-    O4 *= fac_vec;
-    O5 *= fac_vec;
-    O6 *= fac_vec;
-    O7 *= fac_vec;
-
-    device const uchar *v_page_ptr =
-        cache_value + ulong(phys_page) * page_bytes;
-    device const ushort *v_codes_u16 =
-        reinterpret_cast<device const ushort *>(v_page_ptr + group_code_offset);
-    device const KvAffine4VecMeta *v_meta =
-        reinterpret_cast<device const KvAffine4VecMeta *>(v_page_ptr +
-                                                          all_codes_bytes) +
-        ulong(kvh) * page_tokens;
-
-    const uint rv00 = sub_offset + uint(sm);
-    const uint rv01 = rv00 + 8u;
-    const uint rv10 = rv00 + 16u;
-    const uint rv11 = rv00 + 24u;
-    half sv00 = v_meta[rv00].scale[d_part];
-    half zv00 = v_meta[rv00].zero[d_part];
-    half sv01 = v_meta[rv01].scale[d_part];
-    half zv01 = v_meta[rv01].zero[d_part];
-    half sv10 = v_meta[rv10].scale[d_part];
-    half zv10 = v_meta[rv10].zero[d_part];
-    half sv11 = v_meta[rv11].scale[d_part];
-    half zv11 = v_meta[rv11].zero[d_part];
-    if (valid_k < 32) {
-      if (!(sm < valid_k)) { sv00 = half(0.0h); zv00 = half(0.0h); }
-      if (!(short(sm + 8) < valid_k)) { sv01 = half(0.0h); zv01 = half(0.0h); }
-      if (!(short(sm + 16) < valid_k)) { sv10 = half(0.0h); zv10 = half(0.0h); }
-      if (!(short(sm + 24) < valid_k)) { sv11 = half(0.0h); zv11 = half(0.0h); }
+    if (sub > 0u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    device const ushort *vp00 = v_codes_u16 + rv00 * 32u + sn_u16;
-    device const ushort *vp01 = v_codes_u16 + rv01 * 32u + sn_u16;
-    device const ushort *vp10 = v_codes_u16 + rv10 * 32u + sn_u16;
-    device const ushort *vp11 = v_codes_u16 + rv11 * 32u + sn_u16;
+    const uint repeat = p.query_heads / p.key_value_heads;
+    const uint kvh = qh / repeat;
+    const uint flat_tid = uint(sg) * 32u + uint(lane);
+    const uint row_group = uint(sg) >> 2u;
+    const short2 sc = affine4_kv::Frag16x16Aff4::get_coord(lane);
 
-    simdgroup_barrier(mem_flags::mem_none);
+    const uint active_rows = min(32u, cur_tokens - sub_base);
+    threadgroup uint *tg_q_pos =
+        reinterpret_cast<threadgroup uint *>(tg_mem.xchg);
+    if (flat_tid < active_rows) {
+      tg_q_pos[flat_tid] = positions[row_off + sub_base + flat_tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-#define AFF4_PV_PAIR(OA, OB, D_IDX)                                            \
-  do {                                                                         \
-    const uint c0 = uint(D_IDX) * 4u;                                          \
-    const uint c1 = uint((D_IDX) + 1) * 4u;                                    \
-    {                                                                          \
-      const H8 V0 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                  \
-          vp00, vp01, sv00, zv00, sv01, zv01, c0);                             \
-      const H8 V1 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                  \
-          vp00, vp01, sv00, zv00, sv01, zv01, c1);                             \
-      affine4_kv::Frag16x16Aff4::mma_1x2_f16<false>(OA, OB, P0, V0, V1);       \
-    }                                                                          \
-    {                                                                          \
-      const H8 V0 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                  \
-          vp10, vp11, sv10, zv10, sv11, zv11, c0);                             \
-      const H8 V1 = affine4_kv::Frag16x16Aff4::dequant_ptr_h(                  \
-          vp10, vp11, sv10, zv10, sv11, zv11, c1);                             \
-      affine4_kv::Frag16x16Aff4::mma_1x2_f16<false>(OA, OB, P1, V0, V1);       \
-    }                                                                          \
-  } while (false)
+    uint max_valid_kv = 0u;
+    uint min_q_pos = 0xffffffffu;
+    for (uint r = 0u; r < active_rows; ++r) {
+      const uint pos = tg_q_pos[r];
+      max_valid_kv = max(max_valid_kv, pos + 1u);
+      min_q_pos = min(min_q_pos, pos);
+    }
+    const uint nk_blocks = (max_valid_kv + BK - 1u) / BK;
+    const uint kb_min_causal = min_q_pos / BK;
 
-    AFF4_PV_PAIR(O0, O1, 0);
-    AFF4_PV_PAIR(O2, O3, 2);
-    AFF4_PV_PAIR(O4, O5, 4);
-    AFF4_PV_PAIR(O6, O7, 6);
-#undef AFF4_PV_PAIR
+    const uint tm = row_group * 16u;
+    const bool warp_full_rows = (int(active_rows) - int(tm) >= 16);
+    const uint r0 = tm + uint(sc.y);
+    const uint r1 = tm + 8u + uint(sc.y);
+    const bool qv0 = (r0 < active_rows);
+    const bool qv1 = (r1 < active_rows);
+    const uint tok0 = row_off + (qv0 ? (sub_base + r0) : sub_base);
+    const uint tok1 = row_off + (qv1 ? (sub_base + r1) : sub_base);
+    const uint qpos0 = qv0 ? tg_q_pos[r0] : 0u;
+    const uint qpos1 = qv1 ? tg_q_pos[r1] : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    affine4_kv::flash_bk32_wn4_affine4_hd256_core<2u, false, ParamsT>(
+        query, gate, cache_key, cache_value, output, page_table, p, tg_mem,
+        kvh, nk_blocks, max_valid_kv, kb_min_causal, tok0, qh,
+        qpos0, qv0, tok1, qh, qpos1, qv1, warp_full_rows, lane, sg);
   }
-
-  if (lim_rows_q <= 0) {
-    return;
-  }
-
-  const float rcp0 = (sum_s0 > 0.0f) ? (1.0f / sum_s0) : 0.0f;
-  const float rcp1 = (sum_s1 > 0.0f) ? (1.0f / sum_s1) : 0.0f;
-
-  device const bfloat *G_ptr =
-      gate + ulong(q_base + uint(tm)) * gate_token_stride +
-      ulong(qh) * gate_head_stride + d_offset;
-  const ulong out_stride = ulong(query_heads) * BD;
-  device bfloat *O_ptr =
-      output + (ulong(q_base + uint(tm)) * query_heads + qh) * BD + d_offset;
-
-#define AFF4_STORE_O(OREG, OFF_C)                                              \
-  do {                                                                         \
-    BF8 Gfrag;                                                                 \
-    if (lim_rows_q < 16) {                                                     \
-      affine4_kv::Frag16x16Aff4::load_rows_clean_bf4(                          \
-          Gfrag, G_ptr, gate_token_stride, lim_rows_q, OFF_C, sc);             \
-    } else {                                                                   \
-      affine4_kv::Frag16x16Aff4::load_bf4(Gfrag, G_ptr, gate_token_stride,     \
-                                          OFF_C, sc);                          \
-    }                                                                          \
-    const float4 g0 = float4(float(Gfrag[0]), float(Gfrag[1]), float(Gfrag[2]), \
-                             float(Gfrag[3]));                                  \
-    const float4 g1 = float4(float(Gfrag[4]), float(Gfrag[5]), float(Gfrag[6]), \
-                             float(Gfrag[7]));                                  \
-    const float4 o0 = (float4(OREG[0], OREG[1], OREG[2], OREG[3]) * rcp0) /    \
-                      (float4(1.0f) + exp(-g0));                               \
-    const float4 o1 = (float4(OREG[4], OREG[5], OREG[6], OREG[7]) * rcp1) /    \
-                      (float4(1.0f) + exp(-g1));                               \
-    OREG = F8(o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w);                 \
-    if (lim_rows_q < 16) {                                                     \
-      affine4_kv::Frag16x16Aff4::store_rows_bf4(OREG, O_ptr, out_stride,       \
-                                                lim_rows_q, OFF_C, sc);        \
-    } else {                                                                   \
-      affine4_kv::Frag16x16Aff4::store_bf4(OREG, O_ptr, out_stride, OFF_C,     \
-                                           sc);                                \
-    }                                                                          \
-  } while (false)
-
-  AFF4_STORE_O(O0, 0);
-  AFF4_STORE_O(O1, 16);
-  AFF4_STORE_O(O2, 32);
-  AFF4_STORE_O(O3, 48);
-  AFF4_STORE_O(O4, 64);
-  AFF4_STORE_O(O5, 80);
-  AFF4_STORE_O(O6, 96);
-  AFF4_STORE_O(O7, 112);
-#undef AFF4_STORE_O
 }
 
+[[max_total_threads_per_threadgroup(256)]]
 kernel void omlx_m5_paged_flash_prefill_affine4_g128_hd256(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
@@ -2597,18 +2890,15 @@ kernel void omlx_m5_paged_flash_prefill_affine4_g128_hd256(
     ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  // 8 KiB xchg (static_tg = 8.4 KiB -> guaranteed 2 TGs/core on Apple10!).
-  threadgroup float xchg[4 * 16 * 32];
-  threadgroup uint tg_q_pos[64];
-  paged_flash_prefill_affine4_hd256_core(
-      query, gate, cache_key, cache_value, output, page_table, positions,
-      p.query_heads, p.key_value_heads, p.tokens, p.page_tokens,
-      p.query_token_stride, p.query_head_stride, p.gate_token_stride,
-      p.gate_head_stride, xchg, tg_q_pos, lane, sg, tg.y);
+  alignas(16) threadgroup affine4_kv::FlashGqaBk32TgStorageHalf<2u> tg_mem;
+  paged_flash_prefill_affine4_hd256_core<false>(
+      query, gate, cache_key, cache_value, output, page_table, positions, p,
+      tg_mem, lane, sg, tg);
 }
 
-// Batched B=2..8 Register-Resident Frag16x16 Affine4Group128 Flash-Prefill (HD == 256)
+// Batched B=2..8 Zero-Spill WN=4 Affine4Group128 Flash-Prefill (HD == 256)
 // Grid (threads): width = 256, height = ceil(max_w/64) * QH, depth = B
+[[max_total_threads_per_threadgroup(256)]]
 kernel void omlx_m5_paged_flash_prefill_batched_affine4_g128_hd256(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
@@ -2632,160 +2922,18 @@ kernel void omlx_m5_paged_flash_prefill_batched_affine4_g128_hd256(
   if (slot >= p.batch_size) {
     return;
   }
-  const uint slot_tokens = p.widths[slot];
-  if (slot_tokens == 0u) {
-    return;
-  }
-  const uint row_off = p.row_offsets[slot];
   device const uint *slot_pt =
       affine4_kv::select_pt8(slot, pt0, pt1, pt2, pt3, pt4, pt5, pt6, pt7);
-  threadgroup float xchg[4 * 16 * 32];
-  threadgroup uint tg_q_pos[64];
-  paged_flash_prefill_affine4_hd256_core(
-      query + ulong(row_off) * p.query_token_stride,
-      gate + ulong(row_off) * p.gate_token_stride,
-      cache_key, cache_value,
-      output + ulong(row_off) * p.query_heads * 256ul,
-      slot_pt, positions + row_off,
-      p.query_heads, p.key_value_heads, slot_tokens, p.page_tokens,
-      p.query_token_stride, p.query_head_stride, p.gate_token_stride,
-      p.gate_head_stride, xchg, tg_q_pos, lane, sg, tg.y);
+  alignas(16) threadgroup affine4_kv::FlashGqaBk32TgStorageHalf<2u> tg_mem;
+  paged_flash_prefill_affine4_hd256_core<true>(
+      query, gate, cache_key, cache_value, output, slot_pt, positions, p,
+      tg_mem, lane, sg, tg);
 }
 
 // ============================================================================
 // 6. Preserved Non-Split (!split) and HD == 128 Compatibility Paths
 // ============================================================================
-template <uint HeadDim, uint Groups>
-inline void causal_attention_affine4_single_impl(
-    device const bfloat *query,
-    device const bfloat *gate,
-    device const uchar *cache_key,
-    device const uchar *cache_value,
-    device bfloat *output,
-    device const uint *page_table,
-    device const uint *positions,
-    constant PagedAttentionParams &p,
-    threadgroup half *tg_q,
-    threadgroup float *tg_q_sum,
-    threadgroup uint *tg_row_ctx,
-    threadgroup float *tg_scores,
-    threadgroup half *tg_p,
-    threadgroup float *tg_rescale,
-    threadgroup float *tg_v_scale,
-    threadgroup float *tg_v_bias,
-    threadgroup float *tg_m_blk,
-    threadgroup float *tg_l_blk,
-    threadgroup float *tg_m_run,
-    threadgroup float *tg_l_run,
-    threadgroup float *tg_w_old,
-    threadgroup float *tg_w_new,
-    uint lane,
-    uint sg,
-    uint3 tg) {
-  const uint repeat = p.query_heads / p.key_value_heads;
-  if (repeat == 0u || repeat > 16u) {
-    return;
-  }
-  const uint bq = 16u / repeat;
-  const uint kvh = tg.y % p.key_value_heads;
-  const uint t_base = (tg.y / p.key_value_heads) * bq;
-  if (t_base >= p.tokens) {
-    return;
-  }
-
-  uint active_rows = 0u;
-  uint max_ctx = 0u;
-  affine4_kv::load_q_and_foscar_sums<HeadDim, Groups>(
-      query, positions, p.tokens, p.query_heads, p.key_value_heads,
-      p.query_token_stride, p.query_head_stride, t_base, bq, kvh, tg_q,
-      tg_q_sum, tg_row_ctx, active_rows, max_ctx, lane, sg);
-
-  const uint flat_tid = sg * 32u + lane;
-  if (flat_tid < 16u) {
-    tg_m_run[flat_tid] = affine4_kv::kNegInf;
-    tg_l_run[flat_tid] = 0.0f;
-  }
-  float acc_run[64];
-  for (uint i = 0u; i < 64u; ++i) {
-    acc_run[i] = 0.0f;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  constexpr auto desc_pv = matmul2d_descriptor(
-      16, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply);
-  matmul2d<desc_pv, execution_simdgroup> op_pv;
-  tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp_dummy(
-      tg_p, dextents<int32_t, 2>(64, 16));
-  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tv_dummy(
-      (device uchar *)cache_value, dextents<int32_t, 2>(128, 64));
-  auto pv_layout = op_pv.template get_destination_cooperative_tensor<
-      decltype(tp_dummy), decltype(tv_dummy), float>();
-  const uint pv_elems = pv_layout.get_capacity();
-
-  const uint total_pages = (max_ctx + p.page_tokens - 1u) / p.page_tokens;
-  constexpr uint kPagesPerSuperblock = 8u;
-  for (uint sb_page = 0u; sb_page < total_pages; sb_page += kPagesPerSuperblock) {
-    float acc_blk[64];
-    affine4_kv::run_superblock_nax_g128<HeadDim, Groups>(
-        cache_key, cache_value, page_table, p.page_tokens, p.key_value_heads,
-        kvh, sb_page, min(total_pages, sb_page + kPagesPerSuperblock), max_ctx,
-        active_rows, tg_row_ctx, tg_q_sum, tg_q, tg_scores, tg_p, tg_rescale,
-        tg_v_scale, tg_v_bias, tg_m_blk, tg_l_blk, acc_blk, lane, sg);
-
-    if (flat_tid < 16u) {
-      const float m_s = tg_m_blk[flat_tid];
-      if (m_s > affine4_kv::kNegInfHalf) {
-        const float m_prev = tg_m_run[flat_tid];
-        const float new_m = max(m_prev, m_s);
-        const float w_old =
-            (m_prev <= affine4_kv::kNegInfHalf) ? 0.0f : exp(m_prev - new_m);
-        const float w_new = exp(m_s - new_m);
-        tg_m_run[flat_tid] = new_m;
-        tg_l_run[flat_tid] =
-            fma(tg_l_run[flat_tid], w_old, tg_l_blk[flat_tid] * w_new);
-        tg_w_old[flat_tid] = w_old;
-        tg_w_new[flat_tid] = w_new;
-      } else {
-        tg_w_old[flat_tid] = 1.0f;
-        tg_w_new[flat_tid] = 0.0f;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg < Groups) {
-      for (uint i = 0u; i < pv_elems; ++i) {
-        if (pv_layout.is_valid_element(i)) {
-          const auto coord = pv_layout.get_multidimensional_index(i);
-          const uint row = uint(coord[1]);
-          acc_run[i] = fma(acc_run[i], tg_w_old[row], acc_blk[i] * tg_w_new[row]);
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  if (sg < Groups) {
-    for (uint i = 0u; i < pv_elems; ++i) {
-      if (pv_layout.is_valid_element(i)) {
-        const auto coord = pv_layout.get_multidimensional_index(i);
-        const uint col = sg * 128u + uint(coord[0]);
-        const uint row = uint(coord[1]);
-        if (row < active_rows) {
-          const uint tok = t_base + (row / repeat);
-          const uint qh = kvh * repeat + (row % repeat);
-          const float denom = tg_l_run[row];
-          const float norm_o = (denom > 0.0f) ? (acc_run[i] / denom) : 0.0f;
-          const float g_val = float(
-              gate[ulong(tok) * p.gate_token_stride +
-                   ulong(qh) * p.gate_head_stride + col]);
-          output[(ulong(tok) * p.query_heads + qh) * HeadDim + col] =
-              bfloat(norm_o / (1.0f + exp(-g_val)));
-        }
-      }
-    }
-  }
-}
-
+[[max_total_threads_per_threadgroup(64)]]
 kernel void omlx_m5_paged_causal_attention_affine4_g128_hd256(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
@@ -2798,28 +2946,26 @@ kernel void omlx_m5_paged_causal_attention_affine4_g128_hd256(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half tg_q[2 * 16 * 128];
-  threadgroup float tg_scores[16 * 64];
-  threadgroup half *tg_p = reinterpret_cast<threadgroup half *>(tg_scores);
-  threadgroup float tg_q_sum[2 * 16];
-  threadgroup uint tg_row_ctx[16];
-  threadgroup float tg_rescale[16];
-  threadgroup float tg_v_scale[2 * 16];
-  threadgroup float tg_v_bias[2 * 16];
-  threadgroup float tg_m_blk[16];
-  threadgroup float tg_l_blk[16];
-  threadgroup float tg_m_run[16];
-  threadgroup float tg_l_run[16];
-  threadgroup float tg_w_old[16];
-  threadgroup float tg_w_new[16];
-
-  causal_attention_affine4_single_impl<256u, 2u>(
-      query, gate, cache_key, cache_value, output, page_table, positions,
-      params, tg_q, tg_q_sum, tg_row_ctx, tg_scores, tg_p, tg_rescale,
-      tg_v_scale, tg_v_bias, tg_m_blk, tg_l_blk, tg_m_run, tg_l_run, tg_w_old,
-      tg_w_new, lane, sg, tg);
+  threadgroup float tg_dot[2u];
+  const uint repeat = params.query_heads / params.key_value_heads;
+  if (repeat == 0u || repeat > 16u) {
+    return;
+  }
+  const uint bq = 16u / repeat;
+  const uint kvh = tg.y % params.key_value_heads;
+  const uint t_base = (tg.y / params.key_value_heads) * bq;
+  if (t_base >= params.tokens) {
+    return;
+  }
+  affine4_kv::run_affine4_compat_core<256u, 2u, false>(
+      query, gate, cache_key, cache_value, output, nullptr, nullptr, nullptr,
+      page_table, positions, params.query_heads, params.key_value_heads,
+      params.tokens, params.page_tokens, params.query_token_stride,
+      params.query_head_stride, params.gate_token_stride,
+      params.gate_head_stride, 1u, 0u, 0u, t_base, bq, kvh, tg_dot, lane, sg);
 }
 
+[[max_total_threads_per_threadgroup(32)]]
 kernel void omlx_m5_paged_causal_attention_affine4_g128_hd128(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
@@ -2832,28 +2978,26 @@ kernel void omlx_m5_paged_causal_attention_affine4_g128_hd128(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half tg_q[16 * 128];
-  threadgroup float tg_scores[16 * 64];
-  threadgroup half tg_p[16 * 64];
-  threadgroup float tg_q_sum[16];
-  threadgroup uint tg_row_ctx[16];
-  threadgroup float tg_rescale[16];
-  threadgroup float tg_v_scale[16];
-  threadgroup float tg_v_bias[16];
-  threadgroup float tg_m_blk[16];
-  threadgroup float tg_l_blk[16];
-  threadgroup float tg_m_run[16];
-  threadgroup float tg_l_run[16];
-  threadgroup float tg_w_old[16];
-  threadgroup float tg_w_new[16];
-
-  causal_attention_affine4_single_impl<128u, 1u>(
-      query, gate, cache_key, cache_value, output, page_table, positions,
-      params, tg_q, tg_q_sum, tg_row_ctx, tg_scores, tg_p, tg_rescale,
-      tg_v_scale, tg_v_bias, tg_m_blk, tg_l_blk, tg_m_run, tg_l_run, tg_w_old,
-      tg_w_new, lane, sg, tg);
+  threadgroup float tg_dot[1u];
+  const uint repeat = params.query_heads / params.key_value_heads;
+  if (repeat == 0u || repeat > 16u) {
+    return;
+  }
+  const uint bq = 16u / repeat;
+  const uint kvh = tg.y % params.key_value_heads;
+  const uint t_base = (tg.y / params.key_value_heads) * bq;
+  if (t_base >= params.tokens) {
+    return;
+  }
+  affine4_kv::run_affine4_compat_core<128u, 1u, false>(
+      query, gate, cache_key, cache_value, output, nullptr, nullptr, nullptr,
+      page_table, positions, params.query_heads, params.key_value_heads,
+      params.tokens, params.page_tokens, params.query_token_stride,
+      params.query_head_stride, params.gate_token_stride,
+      params.gate_head_stride, 1u, 0u, 0u, t_base, bq, kvh, tg_dot, lane, sg);
 }
 
+[[max_total_threads_per_threadgroup(32)]]
 kernel void omlx_m5_paged_attention_affine4_g128_split_partial_hd128(
     device const bfloat *query [[buffer(0)]],
     device const uchar *cache_key [[buffer(1)]],
@@ -2867,17 +3011,7 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_partial_hd128(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half tg_q[16 * 128];
-  threadgroup float tg_scores[16 * 64];
-  threadgroup half tg_p[16 * 64];
-  threadgroup float tg_q_sum[16];
-  threadgroup uint tg_row_ctx[16];
-  threadgroup float tg_rescale[16];
-  threadgroup float tg_v_scale[16];
-  threadgroup float tg_v_bias[16];
-  threadgroup float tg_m_blk[16];
-  threadgroup float tg_l_blk[16];
-
+  threadgroup float tg_dot[1u];
   const uint split = tg.x;
   const uint repeat = p.query_heads / p.key_value_heads;
   if (split >= p.split_count || repeat == 0u || repeat > 16u) {
@@ -2889,62 +3023,12 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_partial_hd128(
   if (t_base >= p.tokens) {
     return;
   }
-
-  uint active_rows = 0u;
-  uint max_ctx = 0u;
-  affine4_kv::load_q_and_foscar_sums<128u, 1u>(
-      query, positions, p.tokens, p.query_heads, p.key_value_heads,
-      p.query_token_stride, p.query_head_stride, t_base, bq, kvh, tg_q,
-      tg_q_sum, tg_row_ctx, active_rows, max_ctx, lane, sg);
-
-  const uint pages_per_split = p.split_tokens / p.page_tokens;
-  const uint total_pages = (max_ctx + p.page_tokens - 1u) / p.page_tokens;
-  const uint start_page = split * pages_per_split;
-  const uint end_page = min(total_pages, start_page + pages_per_split);
-
-  float acc_blk[64];
-  affine4_kv::run_superblock_nax_g128<128u, 1u>(
-      cache_key, cache_value, page_table, p.page_tokens, p.key_value_heads, kvh,
-      start_page, end_page, max_ctx, active_rows, tg_row_ctx, tg_q_sum, tg_q,
-      tg_scores, tg_p, tg_rescale, tg_v_scale, tg_v_bias, tg_m_blk, tg_l_blk,
-      acc_blk, lane, sg);
-
-  const uint flat_tid = sg * 32u + lane;
-  if (flat_tid < active_rows) {
-    const uint tok = t_base + (flat_tid / repeat);
-    const uint qh = kvh * repeat + (flat_tid % repeat);
-    const ulong record =
-        (ulong(tok) * p.query_heads + qh) * p.split_count + split;
-    partial_max[record] = tg_m_blk[flat_tid];
-    partial_sum[record] = tg_l_blk[flat_tid];
-  }
-
-  if (sg == 0u) {
-    constexpr auto desc_pv = matmul2d_descriptor(
-        16, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply);
-    matmul2d<desc_pv, execution_simdgroup> op_pv;
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp_dummy(
-        tg_p, dextents<int32_t, 2>(64, 16));
-    tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tv_dummy(
-        (device uchar *)cache_value, dextents<int32_t, 2>(128, 64));
-    auto pv_layout = op_pv.template get_destination_cooperative_tensor<
-        decltype(tp_dummy), decltype(tv_dummy), float>();
-    const uint pv_elems = pv_layout.get_capacity();
-    for (uint i = 0u; i < pv_elems; ++i) {
-      if (pv_layout.is_valid_element(i)) {
-        const auto coord = pv_layout.get_multidimensional_index(i);
-        const uint col = uint(coord[0]);
-        const uint row = uint(coord[1]);
-        if (row < active_rows) {
-          const uint tok = t_base + (row / repeat);
-          const uint qh = kvh * repeat + (row % repeat);
-          const ulong record =
-              (ulong(tok) * p.query_heads + qh) * p.split_count + split;
-          partial_output[record * 128ul + col] = acc_blk[i];
-        }
-      }
-    }
-  }
+  affine4_kv::run_affine4_compat_core<128u, 1u, true>(
+      query, nullptr, cache_key, cache_value, nullptr, partial_max, partial_sum,
+      partial_output, page_table, positions, p.query_heads, p.key_value_heads,
+      p.tokens, p.page_tokens, p.query_token_stride, p.query_head_stride, 0u,
+      0u, p.split_count, p.split_tokens, split, t_base, bq, kvh, tg_dot, lane,
+      sg);
 }
 
 // Preserved HD == 128 split merge (fast-math-safe: uses kNegInfHalf).
@@ -3007,418 +3091,64 @@ kernel void omlx_m5_paged_attention_affine4_g128_split_merge(
 }
 
 // ============================================================================
-// 7. Module 2 Lossless Base 2.1 + 2.2 + 2.3 (Affine4Group128 KV, HD == 256):
-//    - 2.1 Multi-Tier GQA Query-Head Packing (WM in {3, 4, 6, 8}, G in {6,8,4,2,1})
-//    - 2.2 LPT Reverse q_blk + kvh-minor Scheduling (0 atomics, ICB-safe)
-//    - 2.3 Zero-Bank-Conflict XOR-Swizzled 16 KiB tg_kv_half (1x cooperative
-//          unpack per TG = 24x-32x ALU reduction!) + d_part=0-only Online
-//          Softmax (-50% exp2) + WG0/WG1 Staggered Ping-Pong Overlap
-//    - Strictly <= 29.0 KiB Threadgroup SRAM, 0-ULP bit-exact vs c5_aff4_frag64_bfp
+// 7. WP3.2 BK=32, WN=4 Direct-L1 Zero-Spill GQA Flash-Prefill
+//    (Affine4Group128 KV, HD == 256):
+//    - Flattened (q_tok, h_sub) packing: 100% row fill on G=6 (27B) & G=8 (35B)!
+//    - LPT Reverse m_blk + kvh-minor scheduling (0 atomics, ICB-safe)
+//    - WM=2: 14.00 KiB exact (256 thr, 2 TGs/core, 0 B spills, 63.9–65.5 TF!)
+//    - WM=3: 12.00 KiB exact (384 thr, <= 14.00 KiB, 0 B spills!)
+//    - 0-ULP bit-exact parity across WM=2, WM=3, and single-head hd256!
 // ============================================================================
 namespace affine4_kv {
 
-struct SoftmaxBroadcastHalf {
-  half4 p00;
-  half4 p01;
-  half4 p10;
-  half4 p11;
-  float fac0;
-  float fac1;
-};
-
-AFFINE4_ALWAYS_INLINE
-static inline ushort4 gqa_clean_bf4_u16(ushort4 bits) {
-  return select(bits, ushort4(0u),
-                (bits & ushort4(0x7fffu)) > ushort4(0x7f80u));
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void fast_divmod_g(uint r, uint g, thread uint &q,
-                                 thread uint &rem) {
-  if (g == 6u) {
-    q = (r * 43u) >> 8u;
-    rem = r - q * 6u;
-  } else if (g == 8u) {
-    q = r >> 3u;
-    rem = r & 7u;
-  } else if (g == 4u) {
-    q = r >> 2u;
-    rem = r & 3u;
-  } else if (g == 2u) {
-    q = r >> 1u;
-    rem = r & 1u;
-  } else if (g == 1u) {
-    q = r;
-    rem = 0u;
-  } else {
-    q = r / g;
-    rem = r - q * g;
-  }
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void load_tg_swizzled_h4(thread Frag16x16Aff4::frag_t<half> &dst,
-                                       const threadgroup half4 *tg_part_v4,
-                                       uint row_base, uint off_c, short2 sc) {
-  const uint r0 = row_base + uint(sc.y);
-  const uint r1 = r0 + 8u;
-  const uint col_v4 = (off_c + uint(sc.x)) >> 2u;
-  const uint phys_v4 = col_v4 ^ (uint(sc.y) << 2u);
-  const half4 v0 = tg_part_v4[r0 * 32u + phys_v4];
-  const half4 v1 = tg_part_v4[r1 * 32u + phys_v4];
-  dst = Frag16x16Aff4::frag_t<half>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z,
-                                    v1.w);
-}
-
-template <uint kLoadIters>
-struct RawAff4Slice {
-  ushort code[kLoadIters];
-  half s[kLoadIters];
-  half z[kLoadIters];
-};
-
-template <uint N_THR, uint kLoadIters>
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_prefetch_raw(
-    device const uchar *cache_base, device const uint *page_table, uint kb_idx,
-    uint half_blocks_per_page, uint page_tokens, ulong page_bytes,
-    ulong kvh_code_base, ulong all_codes_bytes, uint kvh, uint max_valid_kv,
-    uint flat_tid, thread RawAff4Slice<kLoadIters> &raw) {
-  constexpr uint BK = 32u;
-  const uint lpage = kb_idx / half_blocks_per_page;
-  const uint sub_off = (kb_idx % half_blocks_per_page) * BK;
-  const uint phys_page = page_table[lpage];
-  const short vk = short(min(BK, max_valid_kv - kb_idx * BK));
-  device const uchar *page_ptr = cache_base + ulong(phys_page) * page_bytes;
-  device const ushort *codes_g0 =
-      reinterpret_cast<device const ushort *>(page_ptr + kvh_code_base);
-  device const ushort *codes_g1 = reinterpret_cast<device const ushort *>(
-      page_ptr + kvh_code_base + (64ul * 64ul));
-  device const KvAffine4VecMeta *meta =
-      reinterpret_cast<device const KvAffine4VecMeta *>(page_ptr +
-                                                        all_codes_bytes) +
-      ulong(kvh) * page_tokens;
-
-  AFFINE4_UNROLL
-  for (uint it = 0u; it < kLoadIters; ++it) {
-    const uint idx = flat_tid + it * N_THR;
-    if (idx < 2048u) {
-      const uint pg = idx >> 10u;
-      const uint r = (idx >> 5u) & 31u;
-      const uint col_v4 = idx & 31u;
-      const uint within = sub_off + r;
-      if (short(r) < vk) {
-        device const ushort *cg = (pg == 0u) ? codes_g0 : codes_g1;
-        raw.code[it] = cg[within * 32u + col_v4];
-        raw.s[it] = meta[within].scale[pg];
-        raw.z[it] = meta[within].zero[pg];
-      } else {
-        raw.code[it] = 0u;
-        raw.s[it] = half(0.0h);
-        raw.z[it] = half(0.0h);
-      }
-    }
-  }
-}
-
-template <uint N_THR, uint kLoadIters>
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_unpack_store_swizzled(
-    threadgroup half4 *tg_kv_v4, uint flat_tid,
-    const thread RawAff4Slice<kLoadIters> &raw) {
-  AFFINE4_UNROLL
-  for (uint it = 0u; it < kLoadIters; ++it) {
-    const uint idx = flat_tid + it * N_THR;
-    if (idx < 2048u) {
-      const uint pg = idx >> 10u;
-      const uint r = (idx >> 5u) & 31u;
-      const uint col_v4 = idx & 31u;
-      const ushort pk = raw.code[it];
-      const half4 q4 = half4(ushort4(pk & 0xFu, (pk >> 4u) & 0xFu,
-                                     (pk >> 8u) & 0xFu, pk >> 12u));
-      const half4 v4 = fma(q4, half4(raw.s[it]), half4(raw.z[it]));
-      const uint phys_v4 = col_v4 ^ ((r & 7u) << 2u);
-      tg_kv_v4[pg * 1024u + r * 32u + phys_v4] = v4;
-    }
-  }
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_run_qk(
-    const threadgroup half4 *tg_kv_part, short2 sc,
-    const thread Frag16x16Aff4::frag_t<half> &Q0,
-    const thread Frag16x16Aff4::frag_t<half> &Q1,
-    const thread Frag16x16Aff4::frag_t<half> &Q2,
-    const thread Frag16x16Aff4::frag_t<half> &Q3,
-    const thread Frag16x16Aff4::frag_t<half> &Q4,
-    const thread Frag16x16Aff4::frag_t<half> &Q5,
-    const thread Frag16x16Aff4::frag_t<half> &Q6,
-    const thread Frag16x16Aff4::frag_t<half> &Q7,
-    thread Frag16x16Aff4::frag_t<float> &S0,
-    thread Frag16x16Aff4::frag_t<float> &S1) {
-  using H8 = Frag16x16Aff4::frag_t<half>;
-#define GQA_AFF4_QK_STEP(QREG, OFF_C)                                          \
-  do {                                                                         \
-    H8 K0, K1;                                                                 \
-    load_tg_swizzled_h4(K0, tg_kv_part, 0u, OFF_C, sc);                        \
-    load_tg_swizzled_h4(K1, tg_kv_part, 16u, OFF_C, sc);                       \
-    Frag16x16Aff4::mma_1x2_f16<true>(S0, S1, QREG, K0, K1);                    \
-  } while (false)
-  GQA_AFF4_QK_STEP(Q0, 0u);
-  GQA_AFF4_QK_STEP(Q1, 16u);
-  GQA_AFF4_QK_STEP(Q2, 32u);
-  GQA_AFF4_QK_STEP(Q3, 48u);
-  GQA_AFF4_QK_STEP(Q4, 64u);
-  GQA_AFF4_QK_STEP(Q5, 80u);
-  GQA_AFF4_QK_STEP(Q6, 96u);
-  GQA_AFF4_QK_STEP(Q7, 112u);
-#undef GQA_AFF4_QK_STEP
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_run_softmax_d0(
-    const threadgroup float4 *s_slot,
-    threadgroup SoftmaxBroadcastHalf *p_slot,
-    thread Frag16x16Aff4::frag_t<float> &S0,
-    thread Frag16x16Aff4::frag_t<float> &S1, uint kb_col_base, short sn,
-    uint max_valid_kv, bool qv0, bool qv1, uint qpos0, uint qpos1,
-    bool full_causal_free, float scale2, thread float &max_s0,
-    thread float &max_s1, thread float &sum_s0, thread float &sum_s1,
-    thread Frag16x16Aff4::frag_t<half> &P0,
-    thread Frag16x16Aff4::frag_t<half> &P1,
-    thread Frag16x16Aff4::frag_t<float> &O0,
-    thread Frag16x16Aff4::frag_t<float> &O1,
-    thread Frag16x16Aff4::frag_t<float> &O2,
-    thread Frag16x16Aff4::frag_t<float> &O3,
-    thread Frag16x16Aff4::frag_t<float> &O4,
-    thread Frag16x16Aff4::frag_t<float> &O5,
-    thread Frag16x16Aff4::frag_t<float> &O6,
-    thread Frag16x16Aff4::frag_t<float> &O7) {
-  using H8 = Frag16x16Aff4::frag_t<half>;
-  using F8 = Frag16x16Aff4::frag_t<float>;
-  const float4 p0 = s_slot[0];
-  const float4 p1 = s_slot[1];
-  const float4 p2 = s_slot[2];
-  const float4 p3 = s_slot[3];
-  S0 += F8(p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w);
-  S1 += F8(p2.x, p2.y, p2.z, p2.w, p3.x, p3.y, p3.z, p3.w);
-
-  if (full_causal_free) {
-    S0 *= scale2;
-    S1 *= scale2;
-  } else {
-    const uint4 c0_abs =
-        uint4(kb_col_base + uint(sn)) + uint4(0u, 1u, 2u, 3u);
-    const uint4 c1_abs = c0_abs + uint4(16u);
-    const bool4 ok00 = qv0 && (c0_abs < max_valid_kv) && (c0_abs <= qpos0);
-    const bool4 ok01 = qv1 && (c0_abs < max_valid_kv) && (c0_abs <= qpos1);
-    const bool4 ok10 = qv0 && (c1_abs < max_valid_kv) && (c1_abs <= qpos0);
-    const bool4 ok11 = qv1 && (c1_abs < max_valid_kv) && (c1_abs <= qpos1);
-    const float4 s00 = select(
-        float4(kNegInf), float4(S0[0], S0[1], S0[2], S0[3]) * scale2, ok00);
-    const float4 s01 = select(
-        float4(kNegInf), float4(S0[4], S0[5], S0[6], S0[7]) * scale2, ok01);
-    const float4 s10 = select(
-        float4(kNegInf), float4(S1[0], S1[1], S1[2], S1[3]) * scale2, ok10);
-    const float4 s11 = select(
-        float4(kNegInf), float4(S1[4], S1[5], S1[6], S1[7]) * scale2, ok11);
-    S0 = F8(s00.x, s00.y, s00.z, s00.w, s01.x, s01.y, s01.z, s01.w);
-    S1 = F8(s10.x, s10.y, s10.z, s10.w, s11.x, s11.y, s11.z, s11.w);
-  }
-
-  float m0 = max(max(max(S0[0], S0[1]), max(S0[2], S0[3])),
-                 max(max(S1[0], S1[1]), max(S1[2], S1[3])));
-  m0 = max(m0, simd_shuffle_xor(m0, ushort(1)));
-  m0 = max(m0, simd_shuffle_xor(m0, ushort(8)));
-  const float new_m0 = max(max_s0, m0);
-
-  float m1 = max(max(max(S0[4], S0[5]), max(S0[6], S0[7])),
-                 max(max(S1[4], S1[5]), max(S1[6], S1[7])));
-  m1 = max(m1, simd_shuffle_xor(m1, ushort(1)));
-  m1 = max(m1, simd_shuffle_xor(m1, ushort(8)));
-  const float new_m1 = max(max_s1, m1);
-
-  const float fac0 =
-      (max_s0 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s0 - new_m0);
-  const float fac1 =
-      (max_s1 <= kNegInfHalf) ? 0.0f : fast::exp2(max_s1 - new_m1);
-  max_s0 = new_m0;
-  max_s1 = new_m1;
-  sum_s0 *= fac0;
-  sum_s1 *= fac1;
-
-  float4 p00, p01, p10, p11;
-  if (full_causal_free) {
-    p00 = fast::exp2(float4(S0[0], S0[1], S0[2], S0[3]) - new_m0);
-    p01 = fast::exp2(float4(S0[4], S0[5], S0[6], S0[7]) - new_m1);
-    p10 = fast::exp2(float4(S1[0], S1[1], S1[2], S1[3]) - new_m0);
-    p11 = fast::exp2(float4(S1[4], S1[5], S1[6], S1[7]) - new_m1);
-  } else {
-    const bool emp0 = (new_m0 <= kNegInfHalf);
-    const bool emp1 = (new_m1 <= kNegInfHalf);
-    const float4 s00(S0[0], S0[1], S0[2], S0[3]);
-    const float4 s01(S0[4], S0[5], S0[6], S0[7]);
-    const float4 s10(S1[0], S1[1], S1[2], S1[3]);
-    const float4 s11(S1[4], S1[5], S1[6], S1[7]);
-    p00 = select(fast::exp2(s00 - new_m0), float4(0.0f),
-                 emp0 || (s00 <= kNegInfHalf));
-    p01 = select(fast::exp2(s01 - new_m1), float4(0.0f),
-                 emp1 || (s01 <= kNegInfHalf));
-    p10 = select(fast::exp2(s10 - new_m0), float4(0.0f),
-                 emp0 || (s10 <= kNegInfHalf));
-    p11 = select(fast::exp2(s11 - new_m1), float4(0.0f),
-                 emp1 || (s11 <= kNegInfHalf));
-  }
-
-  const float4 ps0 = p00 + p10;
-  float tsum0 = (ps0.x + ps0.y) + (ps0.z + ps0.w);
-  tsum0 += simd_shuffle_xor(tsum0, ushort(1));
-  tsum0 += simd_shuffle_xor(tsum0, ushort(8));
-  sum_s0 += tsum0;
-
-  const float4 ps1 = p01 + p11;
-  float tsum1 = (ps1.x + ps1.y) + (ps1.z + ps1.w);
-  tsum1 += simd_shuffle_xor(tsum1, ushort(1));
-  tsum1 += simd_shuffle_xor(tsum1, ushort(8));
-  sum_s1 += tsum1;
-
-  const half4 hp00 = half4(p00);
-  const half4 hp01 = half4(p01);
-  const half4 hp10 = half4(p10);
-  const half4 hp11 = half4(p11);
-  P0 = H8(hp00.x, hp00.y, hp00.z, hp00.w, hp01.x, hp01.y, hp01.z, hp01.w);
-  P1 = H8(hp10.x, hp10.y, hp10.z, hp10.w, hp11.x, hp11.y, hp11.z, hp11.w);
-
-  p_slot->p00 = hp00;
-  p_slot->p01 = hp01;
-  p_slot->p10 = hp10;
-  p_slot->p11 = hp11;
-  p_slot->fac0 = fac0;
-  p_slot->fac1 = fac1;
-
-  const F8 fac_vec(fac0, fac0, fac0, fac0, fac1, fac1, fac1, fac1);
-  O0 *= fac_vec;
-  O1 *= fac_vec;
-  O2 *= fac_vec;
-  O3 *= fac_vec;
-  O4 *= fac_vec;
-  O5 *= fac_vec;
-  O6 *= fac_vec;
-  O7 *= fac_vec;
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_load_p_rescale_d1(
-    const threadgroup SoftmaxBroadcastHalf *p_slot,
-    thread Frag16x16Aff4::frag_t<half> &P0,
-    thread Frag16x16Aff4::frag_t<half> &P1,
-    thread Frag16x16Aff4::frag_t<float> &O0,
-    thread Frag16x16Aff4::frag_t<float> &O1,
-    thread Frag16x16Aff4::frag_t<float> &O2,
-    thread Frag16x16Aff4::frag_t<float> &O3,
-    thread Frag16x16Aff4::frag_t<float> &O4,
-    thread Frag16x16Aff4::frag_t<float> &O5,
-    thread Frag16x16Aff4::frag_t<float> &O6,
-    thread Frag16x16Aff4::frag_t<float> &O7) {
-  using H8 = Frag16x16Aff4::frag_t<half>;
-  using F8 = Frag16x16Aff4::frag_t<float>;
-  const SoftmaxBroadcastHalf br = *p_slot;
-  P0 = H8(br.p00.x, br.p00.y, br.p00.z, br.p00.w, br.p01.x, br.p01.y, br.p01.z,
-          br.p01.w);
-  P1 = H8(br.p10.x, br.p10.y, br.p10.z, br.p10.w, br.p11.x, br.p11.y, br.p11.z,
-          br.p11.w);
-  const F8 fac_vec(br.fac0, br.fac0, br.fac0, br.fac0, br.fac1, br.fac1,
-                   br.fac1, br.fac1);
-  O0 *= fac_vec;
-  O1 *= fac_vec;
-  O2 *= fac_vec;
-  O3 *= fac_vec;
-  O4 *= fac_vec;
-  O5 *= fac_vec;
-  O6 *= fac_vec;
-  O7 *= fac_vec;
-}
-
-AFFINE4_ALWAYS_INLINE
-static inline void gqa_aff4_run_pv(
-    const threadgroup half4 *tg_kv_part, short2 sc,
-    const thread Frag16x16Aff4::frag_t<half> &P0,
-    const thread Frag16x16Aff4::frag_t<half> &P1,
-    thread Frag16x16Aff4::frag_t<float> &O0,
-    thread Frag16x16Aff4::frag_t<float> &O1,
-    thread Frag16x16Aff4::frag_t<float> &O2,
-    thread Frag16x16Aff4::frag_t<float> &O3,
-    thread Frag16x16Aff4::frag_t<float> &O4,
-    thread Frag16x16Aff4::frag_t<float> &O5,
-    thread Frag16x16Aff4::frag_t<float> &O6,
-    thread Frag16x16Aff4::frag_t<float> &O7) {
-  using H8 = Frag16x16Aff4::frag_t<half>;
-#define GQA_AFF4_PV_PAIR(OA, OB, OFF_C0, OFF_C1)                               \
-  do {                                                                         \
-    H8 V0, V1;                                                                 \
-    load_tg_swizzled_h4(V0, tg_kv_part, 0u, OFF_C0, sc);                       \
-    load_tg_swizzled_h4(V1, tg_kv_part, 0u, OFF_C1, sc);                       \
-    Frag16x16Aff4::mma_1x2_f16<false>(OA, OB, P0, V0, V1);                     \
-    load_tg_swizzled_h4(V0, tg_kv_part, 16u, OFF_C0, sc);                      \
-    load_tg_swizzled_h4(V1, tg_kv_part, 16u, OFF_C1, sc);                      \
-    Frag16x16Aff4::mma_1x2_f16<false>(OA, OB, P1, V0, V1);                     \
-  } while (false)
-  GQA_AFF4_PV_PAIR(O0, O1, 0u, 16u);
-  GQA_AFF4_PV_PAIR(O2, O3, 32u, 48u);
-  GQA_AFF4_PV_PAIR(O4, O5, 64u, 80u);
-  GQA_AFF4_PV_PAIR(O6, O7, 96u, 112u);
-#undef GQA_AFF4_PV_PAIR
-}
-
 template <uint WM>
 AFFINE4_ALWAYS_INLINE
-static inline void paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl(
+static inline void paged_flash_prefill_gqa_wn4_affine4_hd256_impl(
     device const bfloat *query, device const bfloat *gate,
     device const uchar *cache_key, device const uchar *cache_value,
     device bfloat *output, device const uint *page_table,
     device const uint *positions, constant PagedAttentionParams &p,
-    threadgroup half4 *tg_kv_v4, threadgroup float4 *tg_s_xchg,
-    threadgroup SoftmaxBroadcastHalf *tg_p_xchg, ushort lane, ushort sg,
+    threadgroup FlashGqaBk32TgStorageHalf<WM> &tg_mem, ushort lane, ushort sg,
     uint3 tg) {
-  constexpr uint BD = 256u;
   constexpr uint BK = 32u;
-  constexpr uint WN = 2u;
-  constexpr uint N_THR = WM * WN * 32u;
+  constexpr uint WN = 4u;
   constexpr uint M_TILE = WM * 16u;
-  constexpr uint WM_WG0 = (WM + 1u) / 2u;
-  constexpr uint kLoadIters = (2048u + N_THR - 1u) / N_THR;
 
   if (p.tokens == 0u || p.query_heads == 0u || p.key_value_heads == 0u) {
     return;
   }
   const uint repeat = p.query_heads / p.key_value_heads;
-  if (repeat == 0u || repeat > M_TILE) {
+  if (repeat == 0u || repeat > 16u) {
     return;
   }
-  const uint bm_tok = M_TILE / repeat;
-  const uint n_q_blocks = (p.tokens + bm_tok - 1u) / bm_tok;
+  const uint m_total = p.tokens * repeat;
+  const uint n_m_blocks = (m_total + M_TILE - 1u) / M_TILE;
 
-  // Base 2.2: LPT Reverse q_blk + kvh-minor mapping (0 atomics, ICB-safe).
-  const uint q_blk_rev = tg.y / p.key_value_heads;
-  const uint kvh = tg.y - q_blk_rev * p.key_value_heads;
-  if (q_blk_rev >= n_q_blocks) {
+  // LPT Reverse m_blk + kvh-minor mapping (longest causal blocks launch first).
+  const uint m_blk_rev = tg.y / p.key_value_heads;
+  const uint kvh = tg.y - m_blk_rev * p.key_value_heads;
+  if (m_blk_rev >= n_m_blocks) {
     return;
   }
-  const uint q_blk = (n_q_blocks - 1u) - q_blk_rev;
-  const uint q_base = q_blk * bm_tok;
-  const uint active_tok = min(bm_tok, p.tokens - q_base);
-  const uint active_m_rows = active_tok * repeat;
+  const uint m_blk = (n_m_blocks - 1u) - m_blk_rev;
+  const uint m_base = m_blk * M_TILE;
+  const uint active_m_rows = min(M_TILE, m_total - m_base);
+
+  const uint first_tok = m_base / repeat;
+  const uint last_tok = (m_base + active_m_rows - 1u) / repeat;
+  const uint num_toks = last_tok - first_tok + 1u;
 
   const uint flat_tid = uint(sg) * 32u + uint(lane);
-  threadgroup uint *tg_q_pos = reinterpret_cast<threadgroup uint *>(tg_kv_v4);
-  if (flat_tid < active_tok) {
-    tg_q_pos[flat_tid] = positions[q_base + flat_tid];
+  threadgroup uint *tg_q_pos =
+      reinterpret_cast<threadgroup uint *>(tg_mem.xchg);
+  if (flat_tid < num_toks) {
+    tg_q_pos[flat_tid] = positions[first_tok + flat_tid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   uint max_valid_kv = 0u;
   uint min_q_pos = 0xffffffffu;
-  for (uint r = 0u; r < active_tok; ++r) {
+  for (uint r = 0u; r < num_toks; ++r) {
     const uint pos = tg_q_pos[r];
     max_valid_kv = max(max_valid_kv, pos + 1u);
     min_q_pos = min(min_q_pos, pos);
@@ -3426,303 +3156,41 @@ static inline void paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl(
   const uint nk_blocks = (max_valid_kv + BK - 1u) / BK;
   const uint kb_min_causal = min_q_pos / BK;
 
-  const short row_group = short(sg >> 1u);
-  const short d_part = short(sg & 1u);
-  const bool is_wg0 = (uint(row_group) < WM_WG0);
-  const uint rg_local = is_wg0 ? uint(row_group) : (uint(row_group) - WM_WG0);
-  const short tm = 16 * row_group;
-  const uint d_offset = uint(d_part) * 128u;
+  const uint row_group = uint(sg) / WN;
+  const uint tm = row_group * 16u;
   const bool warp_full_rows = (int(active_m_rows) - int(tm) >= 16);
-
   const short2 sc = Frag16x16Aff4::get_coord(lane);
-  const short sm = sc.y;
-  const short sn = sc.x;
 
-  const uint r_m0 = uint(tm + sm);
-  const uint r_m1 = uint(tm + 8 + sm);
-  const bool qv0 = (r_m0 < active_m_rows);
-  const bool qv1 = (r_m1 < active_m_rows);
-  uint tok0 = 0u, g0 = 0u, tok1 = 0u, g1 = 0u;
+  const uint m_off_base = m_base - first_tok * repeat; // < repeat <= 16
+  const uint local_r0 = tm + uint(sc.y);
+  const uint local_r1 = tm + 8u + uint(sc.y);
+  const bool qv0 = (local_r0 < active_m_rows);
+  const bool qv1 = (local_r1 < active_m_rows);
+  uint tok_rel0 = 0u, g0 = 0u, tok_rel1 = 0u, g1 = 0u;
   if (qv0) {
-    fast_divmod_g(r_m0, repeat, tok0, g0);
+    fast_divmod_g(m_off_base + local_r0, repeat, tok_rel0, g0);
   }
   if (qv1) {
-    fast_divmod_g(r_m1, repeat, tok1, g1);
+    fast_divmod_g(m_off_base + local_r1, repeat, tok_rel1, g1);
   }
+  const uint tok0 = first_tok + tok_rel0;
+  const uint tok1 = first_tok + tok_rel1;
   const uint qh0 = kvh * repeat + g0;
   const uint qh1 = kvh * repeat + g1;
-  const uint qpos0 = qv0 ? tg_q_pos[tok0] : 0u;
-  const uint qpos1 = qv1 ? tg_q_pos[tok1] : 0u;
-
+  const uint qpos0 = qv0 ? tg_q_pos[tok_rel0] : 0u;
+  const uint qpos1 = qv1 ? tg_q_pos[tok_rel1] : 0u;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  using H8 = Frag16x16Aff4::frag_t<half>;
-  using F8 = Frag16x16Aff4::frag_t<float>;
-
-  device const bfloat *q_row0 =
-      query + ulong(q_base + tok0) * p.query_token_stride +
-      ulong(qh0) * p.query_head_stride + d_offset + uint(sn);
-  device const bfloat *q_row1 =
-      query + ulong(q_base + tok1) * p.query_token_stride +
-      ulong(qh1) * p.query_head_stride + d_offset + uint(sn);
-
-  H8 Q0(0.0h), Q1(0.0h), Q2(0.0h), Q3(0.0h);
-  H8 Q4(0.0h), Q5(0.0h), Q6(0.0h), Q7(0.0h);
-
-#define GQA_AFF4_LOAD_Q(QDST, OFF_C)                                           \
-  do {                                                                         \
-    half4 v0 = half4(0.0h);                                                    \
-    half4 v1 = half4(0.0h);                                                    \
-    if (qv0) {                                                                 \
-      ushort4 u0 =                                                             \
-          *reinterpret_cast<device const ushort4 *>(q_row0 + uint(OFF_C));     \
-      if (!warp_full_rows) {                                                   \
-        u0 = gqa_clean_bf4_u16(u0);                                            \
-      }                                                                        \
-      v0 = half4(float4(as_type<bfloat4>(u0)));                                \
-    }                                                                          \
-    if (qv1) {                                                                 \
-      ushort4 u1 =                                                             \
-          *reinterpret_cast<device const ushort4 *>(q_row1 + uint(OFF_C));     \
-      if (!warp_full_rows) {                                                   \
-        u1 = gqa_clean_bf4_u16(u1);                                            \
-      }                                                                        \
-      v1 = half4(float4(as_type<bfloat4>(u1)));                                \
-    }                                                                          \
-    QDST = H8(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);                 \
-  } while (false)
-
-  GQA_AFF4_LOAD_Q(Q0, 0);
-  GQA_AFF4_LOAD_Q(Q1, 16);
-  GQA_AFF4_LOAD_Q(Q2, 32);
-  GQA_AFF4_LOAD_Q(Q3, 48);
-  GQA_AFF4_LOAD_Q(Q4, 64);
-  GQA_AFF4_LOAD_Q(Q5, 80);
-  GQA_AFF4_LOAD_Q(Q6, 96);
-  GQA_AFF4_LOAD_Q(Q7, 112);
-#undef GQA_AFF4_LOAD_Q
-
-  F8 O0(0.0f), O1(0.0f), O2(0.0f), O3(0.0f);
-  F8 O4(0.0f), O5(0.0f), O6(0.0f), O7(0.0f);
-
-  float max_s0 = kNegInf;
-  float max_s1 = kNegInf;
-  float sum_s0 = 0.0f;
-  float sum_s1 = 0.0f;
-  const float scale2 = 0.0625f * kLog2e;
-
-  const uint half_blocks_per_page = p.page_tokens / BK;
-  const ulong page_bytes =
-      page_byte_stride(p.page_tokens, p.key_value_heads, BD);
-  const ulong head_code_bytes = ulong(p.page_tokens) * 128ul;
-  const ulong all_codes_bytes = ulong(p.key_value_heads) * head_code_bytes;
-  const ulong kvh_code_base = ulong(kvh) * head_code_bytes;
-
-  const threadgroup half4 *tg_kv_part = tg_kv_v4 + uint(d_part) * 1024u;
-  threadgroup float4 *s_slot = tg_s_xchg + (rg_local * 32u + uint(lane)) * 4u;
-  threadgroup SoftmaxBroadcastHalf *p_slot =
-      tg_p_xchg + rg_local * 32u + uint(lane);
-
-  RawAff4Slice<kLoadIters> raw_kv;
-  if (nk_blocks > 0u) {
-    gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-        cache_key, page_table, 0u, half_blocks_per_page, p.page_tokens,
-        page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-        flat_tid, raw_kv);
-  }
-
-  for (uint kb = 0u; kb < nk_blocks; ++kb) {
-    const uint kb_col_base = kb * BK;
-    const short valid_k = short(min(BK, max_valid_kv - kb_col_base));
-    const bool full_causal_free =
-        (kb < kb_min_causal) && (valid_k == 32) && warp_full_rows;
-
-    gqa_aff4_unpack_store_swizzled<N_THR, kLoadIters>(tg_kv_v4, flat_tid,
-                                                      raw_kv);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    F8 S0(0.0f);
-    F8 S1(0.0f);
-    H8 P0(0.0h);
-    H8 P1(0.0h);
-
-    // Phase 0: WG0 QxK^T || WG1 prefetch raw V[kb]
-    if (is_wg0) {
-      gqa_aff4_run_qk(tg_kv_part, sc, Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7, S0, S1);
-      if (d_part == 1) {
-        s_slot[0] = float4(S0[0], S0[1], S0[2], S0[3]);
-        s_slot[1] = float4(S0[4], S0[5], S0[6], S0[7]);
-        s_slot[2] = float4(S1[0], S1[1], S1[2], S1[3]);
-        s_slot[3] = float4(S1[4], S1[5], S1[6], S1[7]);
-      }
-    } else {
-      gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-          cache_value, page_table, kb, half_blocks_per_page, p.page_tokens,
-          page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-          flat_tid, raw_kv);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 1 (Overlap #1): WG0 d0 Softmax || WG0 d1 prefetch raw V[kb] || WG1 QxK^T
-    if (is_wg0) {
-      if (d_part == 0) {
-        gqa_aff4_run_softmax_d0(
-            s_slot, p_slot, S0, S1, kb_col_base, sn, max_valid_kv, qv0, qv1,
-            qpos0, qpos1, full_causal_free, scale2, max_s0, max_s1, sum_s0,
-            sum_s1, P0, P1, O0, O1, O2, O3, O4, O5, O6, O7);
-      } else {
-        gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-            cache_value, page_table, kb, half_blocks_per_page, p.page_tokens,
-            page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-            flat_tid, raw_kv);
-      }
-    } else {
-      gqa_aff4_run_qk(tg_kv_part, sc, Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7, S0, S1);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 2: WG0 d0 prefetch raw V[kb] + ALL unpack V[kb] -> tg_kv_v4
-    //          || WG0 d1 reads (P, fac) || WG1 d1 writes S_part1
-    if (is_wg0) {
-      if (d_part == 0) {
-        gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-            cache_value, page_table, kb, half_blocks_per_page, p.page_tokens,
-            page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-            flat_tid, raw_kv);
-      } else {
-        gqa_aff4_load_p_rescale_d1(p_slot, P0, P1, O0, O1, O2, O3, O4, O5, O6,
-                                   O7);
-      }
-    } else if (d_part == 1) {
-      s_slot[0] = float4(S0[0], S0[1], S0[2], S0[3]);
-      s_slot[1] = float4(S0[4], S0[5], S0[6], S0[7]);
-      s_slot[2] = float4(S1[0], S1[1], S1[2], S1[3]);
-      s_slot[3] = float4(S1[4], S1[5], S1[6], S1[7]);
-    }
-    gqa_aff4_unpack_store_swizzled<N_THR, kLoadIters>(tg_kv_v4, flat_tid,
-                                                      raw_kv);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 3 (Overlap #2): WG0 PxV || WG1 d0 Softmax || WG1 d1 prefetch raw K[kb+1]
-    if (is_wg0) {
-      gqa_aff4_run_pv(tg_kv_part, sc, P0, P1, O0, O1, O2, O3, O4, O5, O6, O7);
-    } else {
-      if (d_part == 0) {
-        gqa_aff4_run_softmax_d0(
-            s_slot, p_slot, S0, S1, kb_col_base, sn, max_valid_kv, qv0, qv1,
-            qpos0, qpos1, full_causal_free, scale2, max_s0, max_s1, sum_s0,
-            sum_s1, P0, P1, O0, O1, O2, O3, O4, O5, O6, O7);
-      } else if (kb + 1u < nk_blocks) {
-        gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-            cache_key, page_table, kb + 1u, half_blocks_per_page, p.page_tokens,
-            page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-            flat_tid, raw_kv);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 4: WG1 d1 reads (P, fac) & WG1 PxV || WG0 prefetch raw K[kb+1]
-    if (!is_wg0) {
-      if (d_part == 1) {
-        gqa_aff4_load_p_rescale_d1(p_slot, P0, P1, O0, O1, O2, O3, O4, O5, O6,
-                                   O7);
-      }
-      gqa_aff4_run_pv(tg_kv_part, sc, P0, P1, O0, O1, O2, O3, O4, O5, O6, O7);
-      if (d_part == 0 && kb + 1u < nk_blocks) {
-        gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-            cache_key, page_table, kb + 1u, half_blocks_per_page, p.page_tokens,
-            page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-            flat_tid, raw_kv);
-      }
-    } else if (kb + 1u < nk_blocks) {
-      gqa_aff4_prefetch_raw<N_THR, kLoadIters>(
-          cache_key, page_table, kb + 1u, half_blocks_per_page, p.page_tokens,
-          page_bytes, kvh_code_base, all_codes_bytes, kvh, max_valid_kv,
-          flat_tid, raw_kv);
-    }
-    if (kb + 1u < nk_blocks) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-  }
-
-  // Broadcast final rcp0, rcp1 from d_part == 0 to d_part == 1.
-  threadgroup float2 *rcp_xchg =
-      reinterpret_cast<threadgroup float2 *>(tg_s_xchg);
-  float rcp0 = 0.0f;
-  float rcp1 = 0.0f;
-  if (d_part == 0) {
-    rcp0 = (sum_s0 > 0.0f) ? (1.0f / sum_s0) : 0.0f;
-    rcp1 = (sum_s1 > 0.0f) ? (1.0f / sum_s1) : 0.0f;
-    rcp_xchg[uint(row_group) * 32u + uint(lane)] = float2(rcp0, rcp1);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (d_part == 1) {
-    const float2 r = rcp_xchg[uint(row_group) * 32u + uint(lane)];
-    rcp0 = r.x;
-    rcp1 = r.y;
-  }
-
-  if (!qv0 && !qv1) {
-    return;
-  }
-
-  device const bfloat *g_row0 =
-      gate + ulong(q_base + tok0) * p.gate_token_stride +
-      ulong(qh0) * p.gate_head_stride + d_offset + uint(sn);
-  device const bfloat *g_row1 =
-      gate + ulong(q_base + tok1) * p.gate_token_stride +
-      ulong(qh1) * p.gate_head_stride + d_offset + uint(sn);
-  device bfloat *o_row0 =
-      output + (ulong(q_base + tok0) * p.query_heads + qh0) * BD + d_offset +
-      uint(sn);
-  device bfloat *o_row1 =
-      output + (ulong(q_base + tok1) * p.query_heads + qh1) * BD + d_offset +
-      uint(sn);
-
-#define GQA_AFF4_STORE_O(OREG, OFF_C)                                          \
-  do {                                                                         \
-    if (qv0) {                                                                 \
-      ushort4 gu0 =                                                            \
-          *reinterpret_cast<device const ushort4 *>(g_row0 + uint(OFF_C));     \
-      if (!warp_full_rows) {                                                   \
-        gu0 = gqa_clean_bf4_u16(gu0);                                          \
-      }                                                                        \
-      const float4 g0_f = float4(as_type<bfloat4>(gu0));                       \
-      const float4 o0_f =                                                      \
-          (float4(OREG[0], OREG[1], OREG[2], OREG[3]) * rcp0) /                \
-          (float4(1.0f) + exp(-g0_f));                                         \
-      *reinterpret_cast<device bfloat4 *>(o_row0 + uint(OFF_C)) =              \
-          bfloat4(o0_f);                                                       \
-    }                                                                          \
-    if (qv1) {                                                                 \
-      ushort4 gu1 =                                                            \
-          *reinterpret_cast<device const ushort4 *>(g_row1 + uint(OFF_C));     \
-      if (!warp_full_rows) {                                                   \
-        gu1 = gqa_clean_bf4_u16(gu1);                                          \
-      }                                                                        \
-      const float4 g1_f = float4(as_type<bfloat4>(gu1));                       \
-      const float4 o1_f =                                                      \
-          (float4(OREG[4], OREG[5], OREG[6], OREG[7]) * rcp1) /                \
-          (float4(1.0f) + exp(-g1_f));                                         \
-      *reinterpret_cast<device bfloat4 *>(o_row1 + uint(OFF_C)) =              \
-          bfloat4(o1_f);                                                       \
-    }                                                                          \
-  } while (false)
-
-  GQA_AFF4_STORE_O(O0, 0);
-  GQA_AFF4_STORE_O(O1, 16);
-  GQA_AFF4_STORE_O(O2, 32);
-  GQA_AFF4_STORE_O(O3, 48);
-  GQA_AFF4_STORE_O(O4, 64);
-  GQA_AFF4_STORE_O(O5, 80);
-  GQA_AFF4_STORE_O(O6, 96);
-  GQA_AFF4_STORE_O(O7, 112);
-#undef GQA_AFF4_STORE_O
+  flash_bk32_wn4_affine4_hd256_core<WM>(
+      query, gate, cache_key, cache_value, output, page_table, p, tg_mem,
+      kvh, nk_blocks, max_valid_kv, kb_min_causal, tok0, qh0, qpos0,
+      qv0, tok1, qh1, qpos1, qv1, warp_full_rows, lane, sg);
 }
 
 } // namespace affine4_kv
 
-kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm3(
+[[max_total_threads_per_threadgroup(256)]]
+kernel void omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm2(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
     device const uchar *cache_key [[buffer(2)]],
@@ -3734,15 +3202,14 @@ kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm3(
     ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half4 tg_kv_v4[2 * 32 * 32];
-  threadgroup float4 tg_s_xchg[2 * 32 * 4];
-  threadgroup affine4_kv::SoftmaxBroadcastHalf tg_p_xchg[2 * 32];
-  affine4_kv::paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl<3u>(
+  alignas(16) threadgroup affine4_kv::FlashGqaBk32TgStorageHalf<2u> tg_mem;
+  affine4_kv::paged_flash_prefill_gqa_wn4_affine4_hd256_impl<2u>(
       query, gate, cache_key, cache_value, output, page_table, positions, p,
-      tg_kv_v4, tg_s_xchg, tg_p_xchg, lane, sg, tg);
+      tg_mem, lane, sg, tg);
 }
 
-kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm4(
+[[max_total_threads_per_threadgroup(384)]]
+kernel void omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm3(
     device const bfloat *query [[buffer(0)]],
     device const bfloat *gate [[buffer(1)]],
     device const uchar *cache_key [[buffer(2)]],
@@ -3754,50 +3221,8 @@ kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm4(
     ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half4 tg_kv_v4[2 * 32 * 32];
-  threadgroup float4 tg_s_xchg[2 * 32 * 4];
-  threadgroup affine4_kv::SoftmaxBroadcastHalf tg_p_xchg[2 * 32];
-  affine4_kv::paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl<4u>(
+  alignas(16) threadgroup affine4_kv::FlashGqaBk32TgStorageHalf<3u> tg_mem;
+  affine4_kv::paged_flash_prefill_gqa_wn4_affine4_hd256_impl<3u>(
       query, gate, cache_key, cache_value, output, page_table, positions, p,
-      tg_kv_v4, tg_s_xchg, tg_p_xchg, lane, sg, tg);
-}
-
-kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm6(
-    device const bfloat *query [[buffer(0)]],
-    device const bfloat *gate [[buffer(1)]],
-    device const uchar *cache_key [[buffer(2)]],
-    device const uchar *cache_value [[buffer(3)]],
-    device bfloat *output [[buffer(4)]],
-    device const uint *page_table [[buffer(5)]],
-    device const uint *positions [[buffer(6)]],
-    constant PagedAttentionParams &p [[buffer(7)]],
-    ushort lane [[thread_index_in_simdgroup]],
-    ushort sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half4 tg_kv_v4[2 * 32 * 32];
-  threadgroup float4 tg_s_xchg[3 * 32 * 4];
-  threadgroup affine4_kv::SoftmaxBroadcastHalf tg_p_xchg[3 * 32];
-  affine4_kv::paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl<6u>(
-      query, gate, cache_key, cache_value, output, page_table, positions, p,
-      tg_kv_v4, tg_s_xchg, tg_p_xchg, lane, sg, tg);
-}
-
-kernel void omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8(
-    device const bfloat *query [[buffer(0)]],
-    device const bfloat *gate [[buffer(1)]],
-    device const uchar *cache_key [[buffer(2)]],
-    device const uchar *cache_value [[buffer(3)]],
-    device bfloat *output [[buffer(4)]],
-    device const uint *page_table [[buffer(5)]],
-    device const uint *positions [[buffer(6)]],
-    constant PagedAttentionParams &p [[buffer(7)]],
-    ushort lane [[thread_index_in_simdgroup]],
-    ushort sg [[simdgroup_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
-  threadgroup half4 tg_kv_v4[2 * 32 * 32];
-  threadgroup float4 tg_s_xchg[4 * 32 * 4];
-  threadgroup affine4_kv::SoftmaxBroadcastHalf tg_p_xchg[4 * 32];
-  affine4_kv::paged_flash_prefill_gqa_lpt_pp_affine4_hd256_impl<8u>(
-      query, gate, cache_key, cache_value, output, page_table, positions, p,
-      tg_kv_v4, tg_s_xchg, tg_p_xchg, lane, sg, tg);
+      tg_mem, lane, sg, tg);
 }

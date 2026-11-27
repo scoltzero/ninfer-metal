@@ -422,6 +422,10 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
   U64 prep_conv_tg_bytes = 0;
   U64 rec_tg_bytes = 0;
   U64 rec_conv_dv32_tg_bytes = 0;
+  U64 rec_dv16_flex_tg_bytes = 0;
+  U64 rec_conv_dv16_flex_tg_bytes = 0;
+  U64 rec_dv32_flex_tg_bytes = 0;
+  U64 rec_conv_dv32_flex_tg_bytes = 0;
   U64 rec_dv64_tg_bytes = 0;
   U64 rec_conv_dv64_tg_bytes = 0;
   U64 ng_inplace_bf16_tg_bytes = 0;
@@ -455,6 +459,30 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
         {.key = "test.gdn_chunk_recurrence_conv_dv32_c64",
          .library_key = "test.gdn_chunk_nax",
          .function_name = "omlx_m5_gdn_chunk_recurrence_conv_dv32_c64",
+         .variant = "test",
+         .support_indirect_command_buffers = icb_ok});
+    const auto rec_dv16_flex_info = ctx.warmup_pipeline(
+        {.key = "test.gdn_chunk_recurrence_dv16_flex_c64",
+         .library_key = "test.gdn_chunk_nax",
+         .function_name = "omlx_m5_gdn_chunk_recurrence_dv16_flex_c64",
+         .variant = "test",
+         .support_indirect_command_buffers = icb_ok});
+    const auto rec_conv_dv16_flex_info = ctx.warmup_pipeline(
+        {.key = "test.gdn_chunk_recurrence_conv_dv16_flex_c64",
+         .library_key = "test.gdn_chunk_nax",
+         .function_name = "omlx_m5_gdn_chunk_recurrence_conv_dv16_flex_c64",
+         .variant = "test",
+         .support_indirect_command_buffers = icb_ok});
+    const auto rec_dv32_flex_info = ctx.warmup_pipeline(
+        {.key = "test.gdn_chunk_recurrence_dv32_flex_c64",
+         .library_key = "test.gdn_chunk_nax",
+         .function_name = "omlx_m5_gdn_chunk_recurrence_dv32_flex_c64",
+         .variant = "test",
+         .support_indirect_command_buffers = icb_ok});
+    const auto rec_conv_dv32_flex_info = ctx.warmup_pipeline(
+        {.key = "test.gdn_chunk_recurrence_conv_dv32_flex_c64",
+         .library_key = "test.gdn_chunk_nax",
+         .function_name = "omlx_m5_gdn_chunk_recurrence_conv_dv32_flex_c64",
          .variant = "test",
          .support_indirect_command_buffers = icb_ok});
     const auto rec_dv64_info = ctx.warmup_pipeline(
@@ -498,6 +526,12 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
     prep_conv_tg_bytes = prep_conv_info.static_threadgroup_memory_bytes;
     rec_tg_bytes = rec_info.static_threadgroup_memory_bytes;
     rec_conv_dv32_tg_bytes = rec_conv_dv32_info.static_threadgroup_memory_bytes;
+    rec_dv16_flex_tg_bytes = rec_dv16_flex_info.static_threadgroup_memory_bytes;
+    rec_conv_dv16_flex_tg_bytes =
+        rec_conv_dv16_flex_info.static_threadgroup_memory_bytes;
+    rec_dv32_flex_tg_bytes = rec_dv32_flex_info.static_threadgroup_memory_bytes;
+    rec_conv_dv32_flex_tg_bytes =
+        rec_conv_dv32_flex_info.static_threadgroup_memory_bytes;
     rec_dv64_tg_bytes = rec_dv64_info.static_threadgroup_memory_bytes;
     rec_conv_dv64_tg_bytes = rec_conv_dv64_info.static_threadgroup_memory_bytes;
     ng_inplace_bf16_tg_bytes = ng_bf16_info.static_threadgroup_memory_bytes;
@@ -509,6 +543,10 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
                 prep_conv_info.max_threads_per_threadgroup >= 128ULL &&
                 rec_info.max_threads_per_threadgroup >= 128ULL &&
                 rec_conv_dv32_info.max_threads_per_threadgroup >= 128ULL &&
+                rec_dv16_flex_info.max_threads_per_threadgroup >= 128ULL &&
+                rec_conv_dv16_flex_info.max_threads_per_threadgroup >= 128ULL &&
+                rec_dv32_flex_info.max_threads_per_threadgroup >= 128ULL &&
+                rec_conv_dv32_flex_info.max_threads_per_threadgroup >= 128ULL &&
                 rec_dv64_info.max_threads_per_threadgroup >= 128ULL &&
                 rec_conv_dv64_info.max_threads_per_threadgroup >= 128ULL &&
                 ng_bf16_info.max_threads_per_threadgroup >= 128ULL &&
@@ -519,9 +557,14 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
 
     const U64 apple10_cap = 32768ULL;
     const U64 sram_cap = 16384ULL * sram_scale;
+    const U64 dv16_cap = 10240ULL * sram_scale;
     require(prep_tg_bytes <= apple10_cap && prep_conv_tg_bytes <= apple10_cap &&
                 rec_tg_bytes <= apple10_cap &&
                 rec_conv_dv32_tg_bytes <= apple10_cap &&
+                rec_dv16_flex_tg_bytes <= apple10_cap &&
+                rec_conv_dv16_flex_tg_bytes <= apple10_cap &&
+                rec_dv32_flex_tg_bytes <= apple10_cap &&
+                rec_conv_dv32_flex_tg_bytes <= apple10_cap &&
                 rec_dv64_tg_bytes <= apple10_cap &&
                 rec_conv_dv64_tg_bytes <= apple10_cap &&
                 ng_inplace_bf16_tg_bytes <= sram_pad &&
@@ -532,11 +575,15 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
     require(prep_tg_bytes <= sram_cap && prep_conv_tg_bytes <= sram_cap &&
                 rec_tg_bytes <= sram_cap &&
                 rec_conv_dv32_tg_bytes <= sram_cap &&
+                rec_dv16_flex_tg_bytes <= dv16_cap &&
+                rec_conv_dv16_flex_tg_bytes <= dv16_cap &&
+                rec_dv32_flex_tg_bytes <= sram_cap &&
+                rec_conv_dv32_flex_tg_bytes <= sram_cap &&
                 rec_dv64_tg_bytes <= sram_cap &&
                 rec_conv_dv64_tg_bytes <= sram_cap &&
                 rec_mega_bf16_tg_bytes <= sram_cap &&
                 rec_mega_f16_tg_bytes <= sram_cap,
-            "GDN chunk NAX static TG SRAM exceeded 16.0 KiB design ceiling");
+            "GDN chunk NAX static TG SRAM exceeded WP3.3 ceiling (16 KiB / 10 KiB dv16)");
     gpu_pipeline_ready = true;
   } catch (const std::exception &ex) {
     require(!is_apple9_plus,
@@ -556,6 +603,12 @@ Json test_memory_and_pipeline_invariants(const MetalContext &ctx,
           {"prepare_conv_c64_tg_sram_bytes", prep_conv_tg_bytes},
           {"recurrence_c64_tg_sram_bytes", rec_tg_bytes},
           {"recurrence_conv_dv32_c64_tg_sram_bytes", rec_conv_dv32_tg_bytes},
+          {"recurrence_dv16_flex_c64_tg_sram_bytes", rec_dv16_flex_tg_bytes},
+          {"recurrence_conv_dv16_flex_c64_tg_sram_bytes",
+           rec_conv_dv16_flex_tg_bytes},
+          {"recurrence_dv32_flex_c64_tg_sram_bytes", rec_dv32_flex_tg_bytes},
+          {"recurrence_conv_dv32_flex_c64_tg_sram_bytes",
+           rec_conv_dv32_flex_tg_bytes},
           {"recurrence_dv64_c64_tg_sram_bytes", rec_dv64_tg_bytes},
           {"recurrence_conv_dv64_c64_tg_sram_bytes", rec_conv_dv64_tg_bytes},
           {"norm_gate_inplace_bf16_tg_sram_bytes", ng_inplace_bf16_tg_bytes},
@@ -1278,6 +1331,224 @@ Json test_dv64_zero_ulp_parity(const MetalContext &ctx,
   return reports;
 }
 
+Json test_wp33_adaptive_scheduler_and_flex_parity(
+    const MetalContext &ctx, const std::filesystem::path &libs,
+    bool gpu_pipeline_ready) {
+  // 1. Deterministic 64-core & 80-core zero-straggler wave schedule verification.
+  {
+    ScopedEnv clear_slice("OMLX_M5_GDN_STAGE2_SLICE", nullptr);
+    ScopedEnv clear_pers("OMLX_M5_GDN_STAGE2_PERSISTENT", nullptr);
+    {
+      ScopedEnv fake64("OMLX_M5_FAKE_GPU_CORES", "64");
+      const auto s27_64 = select_gdn_stage2_schedule(48U, 80U);
+      require(s27_64.use_dv16 && s27_64.slices_per_head == 8U &&
+                  s27_64.total_tasks == 384U && s27_64.launch_tgs == 384U,
+              "WP3.3 27B/64c must select dv16_flex K_dv=8 (384 tasks = 6 TGs/core)");
+      const auto s35_64 = select_gdn_stage2_schedule(32U, 80U);
+      require(s35_64.use_dv16 && s35_64.slices_per_head == 8U &&
+                  s35_64.total_tasks == 256U && s35_64.launch_tgs == 256U,
+              "WP3.3 35B/64c must select dv16_flex K_dv=8 (256 tasks = 1.00 wave @ 4 TGs/core)");
+    }
+    {
+      ScopedEnv fake80("OMLX_M5_FAKE_GPU_CORES", "80");
+      const auto s27_80 = select_gdn_stage2_schedule(48U, 64U);
+      require(s27_80.use_dv16 && s27_80.slices_per_head == 8U &&
+                  s27_80.total_tasks == 384U && s27_80.launch_tgs == 384U,
+              "WP3.3 27B/80c must select dv16_flex K_dv=8 (384 tasks <= 400 slots = 1.00 wave)");
+      const auto s35_80 = select_gdn_stage2_schedule(32U, 64U);
+      require(s35_80.use_dv16 && s35_80.slices_per_head == 10U &&
+                  s35_80.total_tasks == 320U && s35_80.launch_tgs == 320U,
+              "WP3.3 35B/80c must select dv16_flex K_dv=10 (320 tasks = 1.00 wave @ 4 TGs/core)");
+    }
+    {
+      ScopedEnv fake80("OMLX_M5_FAKE_GPU_CORES", "80");
+      ScopedEnv pers("OMLX_M5_GDN_STAGE2_PERSISTENT", "1");
+      const auto s27_p = select_gdn_stage2_schedule(48U, 80U);
+      require(s27_p.use_dv16 && s27_p.total_tasks == 384U &&
+                  s27_p.launch_tgs == 240U,
+              "WP3.3 persistent mode 27B/80c must cap launch_tgs to 80*3=240");
+    }
+    {
+      ScopedEnv ov16("OMLX_M5_GDN_STAGE2_SLICE", "16x10");
+      const auto s = select_gdn_stage2_schedule(32U, 64U);
+      require(s.use_dv16 && s.slices_per_head == 10U && s.total_tasks == 320U,
+              "WP3.3 OMLX_M5_GDN_STAGE2_SLICE=16x10 override failed");
+    }
+    {
+      ScopedEnv ov32("OMLX_M5_GDN_STAGE2_SLICE", "32x5");
+      const auto s = select_gdn_stage2_schedule(48U, 64U);
+      require(!s.use_dv16 && s.slices_per_head == 5U && s.total_tasks == 240U,
+              "WP3.3 OMLX_M5_GDN_STAGE2_SLICE=32x5 override failed");
+    }
+  }
+
+  if (!gpu_pipeline_ready) {
+    return {{"schedule_verified", true}, {"gpu_skipped", true}};
+  }
+
+  // 2. GPU 0-ULP bit-exact parity of dv16_flex (K_dv=8,10), dv32_flex (K_dv=4,5),
+  //    and persistent strided queue vs Wave 3 dv32 across Hv=48 (27B) & Hv=32 (35B)!
+  Json parity_rows = Json::array();
+  constexpr U32 kd = 128U;
+  constexpr U32 vd = 128U;
+  constexpr U32 max_t = 512U;
+
+  struct Geom {
+    const char *name;
+    U32 hk;
+    U32 hv;
+  };
+  for (const auto &g :
+       std::array<Geom, 2>{{{"27b_hv48", 16U, 48U}, {"35b_hv32", 16U, 32U}}}) {
+    const U32 hk = g.hk;
+    const U32 hv = g.hv;
+    const U32 gv = hv * vd;
+    const U32 conv_w = 2U * hk * kd + gv;
+
+    std::vector<std::uint16_t> qkv_words(std::size_t(max_t) * conv_w);
+    std::vector<std::uint16_t> conv_wt_words(std::size_t(conv_w) * 4U);
+    std::vector<std::uint16_t> init_hist_words(3U * conv_w);
+    std::vector<std::uint16_t> z_words(std::size_t(max_t) * gv);
+    std::vector<std::uint16_t> norm_wt_words(vd);
+    std::vector<std::uint16_t> a_words(std::size_t(max_t) * hv);
+    std::vector<std::uint16_t> b_words(std::size_t(max_t) * hv);
+    std::vector<std::uint16_t> a_log_words(hv);
+    std::vector<std::uint16_t> dt_bias_words(hv);
+    std::vector<float> init_state(std::size_t(gv) * kd);
+
+    for (std::size_t i = 0; i < qkv_words.size(); ++i) {
+      qkv_words[i] = float_to_bf16(
+          float(int((i * 41ULL + 13ULL + hv) % 251ULL) - 125) / 64.0f);
+    }
+    for (std::size_t i = 0; i < conv_wt_words.size(); ++i) {
+      conv_wt_words[i] =
+          float_to_bf16(float(int((i * 19ULL + 7ULL) % 89ULL) - 44) / 64.0f);
+    }
+    for (std::size_t i = 0; i < init_hist_words.size(); ++i) {
+      init_hist_words[i] =
+          float_to_bf16(float(int((i * 23ULL + 3ULL) % 131ULL) - 65) / 64.0f);
+    }
+    for (std::size_t i = 0; i < z_words.size(); ++i) {
+      z_words[i] =
+          float_to_bf16(float(int((i * 31ULL + 17ULL) % 197ULL) - 98) / 64.0f);
+    }
+    for (U32 d = 0; d < vd; ++d) {
+      norm_wt_words[d] = float_to_bf16(0.75f + 0.5f * float(d % 17U) / 16.0f);
+    }
+    for (std::size_t i = 0; i < a_words.size(); ++i) {
+      a_words[i] =
+          float_to_bf16(float(int((i * 13ULL + 7ULL) % 101ULL) - 55) / 16.0f);
+      b_words[i] =
+          float_to_bf16(float(int((i * 29ULL + 3ULL) % 97ULL) - 48) / 16.0f);
+    }
+    for (U32 h = 0; h < hv; ++h) {
+      a_log_words[h] = float_to_bf16(-1.1f + 0.04f * float(h));
+      dt_bias_words[h] = float_to_bf16(-0.4f + 0.025f * float(h));
+    }
+    for (std::size_t i = 0; i < init_state.size(); ++i) {
+      init_state[i] =
+          float(int((i * 43ULL + 11ULL) % 199ULL) - 99) / 256.0f;
+    }
+
+    auto qkv_buf = ctx.upload(std::as_bytes(std::span(qkv_words)));
+    auto conv_wt_buf = ctx.upload(std::as_bytes(std::span(conv_wt_words)));
+    auto hist_buf = ctx.make_buffer(init_hist_words.size() * 2ULL);
+    auto z_buf = ctx.upload(std::as_bytes(std::span(z_words)));
+    auto norm_wt_buf = ctx.upload(std::as_bytes(std::span(norm_wt_words)));
+    auto a_buf = ctx.upload(std::as_bytes(std::span(a_words)));
+    auto b_buf = ctx.upload(std::as_bytes(std::span(b_words)));
+    auto a_log_buf = ctx.upload(std::as_bytes(std::span(a_log_words)));
+    auto dt_bias_buf = ctx.upload(std::as_bytes(std::span(dt_bias_words)));
+    auto state_ref_buf = ctx.make_buffer(init_state.size() * sizeof(float));
+    auto state_test_buf = ctx.make_buffer(init_state.size() * sizeof(float));
+    auto out_ref_buf = ctx.make_buffer(std::size_t(max_t) * gv * 2ULL);
+    auto out_test_buf = ctx.make_buffer(std::size_t(max_t) * gv * 2ULL);
+    const auto ws_layout = gdn_chunk_nax_workspace_layout(max_t, hk, hv);
+    auto ws_buf = ctx.make_private_buffer(ws_layout.total_bytes);
+
+    for (U32 live_t : {73U, 193U, 512U}) {
+      const U32 mp = ((live_t + 7U) / 8U) * 8U;
+      const auto p8 = words({hk, hv, kd, vd, conv_w, 4U, live_t, word(1.0e-6f)});
+      const auto p9 =
+          words({hk, hv, kd, vd, conv_w, 4U, live_t, word(1.0e-6f), mp});
+
+      auto run_mode = [&](const char *slice_env, const char *pers_env,
+                          U32 fake_cores, MetalBuffer &st_buf,
+                          MetalBuffer &out_buf) {
+        ScopedEnv e_slice("OMLX_M5_GDN_STAGE2_SLICE", slice_env);
+        ScopedEnv e_pers("OMLX_M5_GDN_STAGE2_PERSISTENT", pers_env);
+        const std::string cores_s = std::to_string(fake_cores);
+        ScopedEnv e_cores("OMLX_M5_FAKE_GPU_CORES", cores_s.c_str());
+        st_buf.write(std::as_bytes(std::span(init_state)));
+        hist_buf.write(std::as_bytes(std::span(init_hist_words)));
+        std::vector<std::uint16_t> sentinel(std::size_t(live_t) * gv, 0x5A5AU);
+        out_buf.write(std::as_bytes(std::span(sentinel)));
+        Encoder e(ctx, libs, live_t,
+                  std::string("test.wp33.") + g.name + "." +
+                      (slice_env ? slice_env : "auto") + ".c" + cores_s + ".T" +
+                      std::to_string(live_t));
+        const bool ok = try_emit_gdn_mega_prefill(
+            e, live_t, gv, hk, hv, kd, vd, conv_w,
+            {&qkv_buf, 0, qkv_buf.size()},
+            {&conv_wt_buf, 0, conv_wt_buf.size()},
+            {&hist_buf, 0, hist_buf.size()},
+            {&a_buf, 0, a_buf.size()},
+            {&b_buf, 0, b_buf.size()},
+            {&a_log_buf, 0, a_log_buf.size()},
+            {&dt_bias_buf, 0, dt_bias_buf.size()},
+            {&st_buf, 0, st_buf.size()},
+            {&z_buf, 0, z_buf.size()},
+            {&norm_wt_buf, 0, norm_wt_buf.size()},
+            {&out_buf, 0, out_buf.size()}, false, {&ws_buf, 0, ws_buf.size()},
+            true, p8, p9, false, fake_cores);
+        require(ok, "WP3.3 try_emit_gdn_mega_prefill failed");
+        auto prof = e.finish(false);
+        const std::array calls{MetalCommandInvocation{
+            .plan = &prof.plan,
+            .bindings = prof.bindings,
+            .parameters = &prof.parameters}};
+        (void)ctx.execute_batch(calls);
+      };
+
+      // Reference: dv32x4 direct
+      run_mode("32x4", "0", 80U, state_ref_buf, out_ref_buf);
+      const auto ref_out = read_u16_buf(out_ref_buf, std::size_t(live_t) * gv);
+      const auto ref_st = read_f32_buf(state_ref_buf, init_state.size());
+
+      struct Variant {
+        const char *label;
+        const char *slice;
+        const char *pers;
+        U32 cores;
+      };
+      for (const auto &v : std::array<Variant, 6>{{
+               {"auto_64c", nullptr, "0", 64U},
+               {"auto_80c", nullptr, "0", 80U},
+               {"dv16x8", "16x8", "0", 64U},
+               {"dv16x10_direct", "16x10", "0", 80U},
+               {"dv16x10_persistent", "16x10", "1", 80U},
+               {"dv32x5", "32x5", "0", 80U},
+           }}) {
+        run_mode(v.slice, v.pers, v.cores, state_test_buf, out_test_buf);
+        const auto got_out =
+            read_u16_buf(out_test_buf, std::size_t(live_t) * gv);
+        const auto got_st = read_f32_buf(state_test_buf, init_state.size());
+        require(got_out == ref_out,
+                std::string("WP3.3 0-ULP output mismatch: ") + g.name + " " +
+                    v.label + " T=" + std::to_string(live_t));
+        require(got_st == ref_st,
+                std::string("WP3.3 0-ULP state mismatch: ") + g.name + " " +
+                    v.label + " T=" + std::to_string(live_t));
+      }
+
+      parity_rows.push_back({{"geom", g.name},
+                             {"tokens", live_t},
+                             {"variants_0ulp_exact", 6}});
+    }
+  }
+  return {{"schedule_verified", true}, {"parity", parity_rows}};
+}
+
 Json run_qwen_fixture_integration(const MetalContext &ctx,
                                   const std::filesystem::path &root,
                                   const std::filesystem::path &libs,
@@ -1498,6 +1769,8 @@ int main(int argc, char **argv) {
         test_memory_and_pipeline_invariants(ctx, libs, gpu_pipeline_ready);
     const auto op = test_operator_parity(ctx, libs, gpu_pipeline_ready);
     const auto dv64 = test_dv64_zero_ulp_parity(ctx, libs, gpu_pipeline_ready);
+    const auto wp33 = test_wp33_adaptive_scheduler_and_flex_parity(
+        ctx, libs, gpu_pipeline_ready);
     const auto e2e =
         test_qwen_forward_integration(ctx, fixtures, libs, gpu_pipeline_ready);
 
@@ -1506,6 +1779,7 @@ int main(int argc, char **argv) {
                        {"invariants", inv},
                        {"operator_parity", op},
                        {"dv64_zero_ulp_parity", dv64},
+                       {"wp33_adaptive_scheduler", wp33},
                        {"qwen_integration", e2e},
                        {"passed", true}})
                      .dump(2)

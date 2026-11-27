@@ -4430,7 +4430,8 @@ public:
           state_block.state0, rec_ref, params,
           silicon_tuning.gdn_tb8_min_tokens, gdn_chunk_ws,
           gdn_chunk_nax_enabled_, U32(c.linear_num_key_heads),
-          U32(c.linear_num_value_heads), dynamic_tokens);
+          U32(c.linear_num_value_heads), dynamic_tokens,
+          silicon_tuning.gpu_cores);
     }
 
     if (out_f16) {
@@ -9163,7 +9164,8 @@ public:
     emit_gdn_recurrent_forward(
         e, slice_len, gv, kd, vd, convolved, a_s, b_s, a_log, dt_bias,
         state0_ref, recurrent, params, silicon_tuning.gdn_tb8_min_tokens,
-        gdn_chunk_ws, gdn_chunk_nax_enabled_, kh, hv, /*dynamic_tokens=*/false);
+        gdn_chunk_ws, gdn_chunk_nax_enabled_, kh, hv, /*dynamic_tokens=*/false,
+        silicon_tuning.gpu_cores);
     auto &ng = e.emit("gdn_layer", "omlx_m5_gdn_norm_gate",
                       {.width = 32U, .height = U64(slice_len) * hv},
                       {.width = 32U}, {recurrent, z_s, gdn_norm, mix_s});

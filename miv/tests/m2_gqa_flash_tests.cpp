@@ -94,20 +94,16 @@ Json check_sram_limits(const MetalContext &ctx,
   ctx.register_library(
       {.key = "m2.affine4",
        .path = libs / "omlx_m5_attention_affine4.metallib"});
-  const std::array<std::pair<const char *, const char *>, 8> kernels{{
-      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm3"},
-      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm4"},
-      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm6"},
-      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm8"},
-      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm3"},
-      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm4"},
-      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm6"},
-      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8"},
+  const std::array<std::pair<const char *, const char *>, 4> kernels{{
+      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_nax_hd256_wm2"},
+      {"m2.nax_prefill", "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_nax_hd256_wm3"},
+      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm2"},
+      {"m2.affine4", "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm3"},
   }};
   const char *sv_env = std::getenv("MTL_SHADER_VALIDATION");
   const bool sv_on = sv_env != nullptr && std::string_view(sv_env) != "0" &&
                      !std::string_view(sv_env).empty();
-  const U64 sram_cap = sv_on ? (31360ULL * 2ULL + 1024ULL) : 31360ULL;
+  const U64 sram_cap = sv_on ? (14336ULL * 2ULL + 1024ULL) : 14336ULL;
   Json info = Json::object();
   for (const auto &[lib_key, fn] : kernels) {
     const auto pi = ctx.warmup_pipeline(
@@ -118,7 +114,7 @@ Json check_sram_limits(const MetalContext &ctx,
          .support_indirect_command_buffers =
              ctx.capabilities().profile.compute_icb_eligible});
     require(pi.static_threadgroup_memory_bytes <= sram_cap,
-            std::string(fn) + " exceeded 30.625 KiB SRAM cap: " +
+            std::string(fn) + " exceeded 14.00 KiB SRAM cap: " +
                 std::to_string(pi.static_threadgroup_memory_bytes));
     info[fn] = pi.static_threadgroup_memory_bytes;
   }
@@ -443,11 +439,13 @@ int main(int argc, char **argv) {
       }
     }
 
-    // 2. Explicit Multi-Tier sweep WM in {3, 4, 6, 8} at T=33, H=65 for G=6 & G=8.
-    for (const U32 wm : {3u, 4u, 6u, 8u}) {
+    // 2. Explicit Multi-Tier sweep WM in {2, 3} at T=33, H=65 for G=6 & G=8.
+    for (const U32 wm : {2u, 3u}) {
       cases.push_back(run_equivalence_case(ctx, libs, 24u, 4u, 33u, 65u, false,
                                            wm, false, false, false));
       cases.push_back(run_equivalence_case(ctx, libs, 24u, 4u, 33u, 65u, true,
+                                           wm, false, false, false));
+      cases.push_back(run_equivalence_case(ctx, libs, 16u, 2u, 33u, 65u, true,
                                            wm, false, false, false));
     }
 

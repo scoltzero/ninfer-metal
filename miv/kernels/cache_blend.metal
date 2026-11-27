@@ -171,7 +171,6 @@ struct BlendGdnCumDecayParams {
 namespace blend_detail {
 
 constant constexpr uint kChunkSize = 64u;
-constant constexpr uint kHalfChunk = 32u;
 constant constexpr uint kKeyDim = 128u;
 constant constexpr uint kValDim = 128u;
 constant constexpr ulong kQkPairBfloats = 2ul * ulong(kChunkSize) * ulong(kKeyDim);
@@ -694,16 +693,26 @@ kernel void omlx_m5_blend_refresh_kv_page_summary_affine4_g128(
 //    Launch: grid = {128, value_heads, 2}, tptg = {128} (4 SGs, each owns 16 rows)
 //    Static TG SRAM: 4 * 64 * 16 * 2 B = 8,192 B (8.0 KiB <= 16 KiB!).
 // ============================================================================
+// Zero-spill GDN Exact Affine Transition Extraction (`M_C` via S_init = I_128, V = 0):
+// Uses Apple10 register-fragment NAX (`nax_mma_16x16x32` / `nax_mma_16x32x16_nt`, 0 B spills!)
+// with a portable Apple9 pure-FP32 fallback (also 0 B spills!). Static TG SRAM = 9,216 B.
 [[max_total_threads_per_threadgroup(128)]]
 kernel void omlx_m5_gdn_extract_transition_m_c64(
     device const bfloat *qk_ws [[buffer(0)]],
     device const uchar *ctrl_ws [[buffer(1)]],
     device float *m_out_f32 [[buffer(2)]],
     constant BlendGdnExtractMParams &params [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
   constexpr uint kValSgDim = 16u;
-  threadgroup bfloat tg_work[4u * blend_detail::kChunkSize * kValSgDim];
+  constexpr uint kWorkPad = 72u; // 64 + 8 (16-byte bfloat4 aligned)
+  struct BlendExtractMTgStorage {
+    bfloat work[4u * kValSgDim * kWorkPad]; // 9,216 B (9.00 KiB <= 16.00 KiB!)
+  };
+  static_assert(sizeof(BlendExtractMTgStorage) <= kApple10MaxPrefillTgSramBytes,
+                "BlendExtractMTgStorage exceeds 16,384 B!");
+  alignas(16) threadgroup BlendExtractMTgStorage tg_mem;
 
   const uint hv = tg.y;
   const uint half_idx = tg.z;
@@ -716,72 +725,226 @@ kernel void omlx_m5_gdn_extract_transition_m_c64(
   const uint repeat = params.value_heads / params.key_heads;
   const uint hk = hv / repeat;
   const uint dv_sg_base = half_idx * 64u + sg * kValSgDim;
+  device float *m_sg =
+      m_out_f32 + (ulong(hv) * ulong(blend_detail::kValDim) + ulong(dv_sg_base)) *
+                      ulong(blend_detail::kKeyDim);
 
-  threadgroup bfloat *my_work =
-      tg_work + sg * (blend_detail::kChunkSize * kValSgDim);
-  tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tMyS(
-      my_work, dextents<int32_t, 2>(int(blend_detail::kHalfChunk), int(kValSgDim)));
-  tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tMyWork(
-      my_work, dextents<int32_t, 2>(int(kValSgDim), int(blend_detail::kChunkSize)));
-  auto tMyWork0 = tMyWork.slice(0, 0);
-  auto tMyWork1 = tMyWork.slice(0, int(blend_detail::kHalfChunk));
-
-  constexpr auto desc_nt_mac = matmul2d_descriptor(
-      int(blend_detail::kHalfChunk), int(kValSgDim), int(blend_detail::kHalfChunk),
-      false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
-  constexpr auto desc_nn_mul = matmul2d_descriptor(
-      int(blend_detail::kHalfChunk), int(kValSgDim), int(blend_detail::kHalfChunk),
-      false, false, true, matmul2d_descriptor::mode::multiply);
-  constexpr auto desc_nn_mac = matmul2d_descriptor(
-      int(blend_detail::kHalfChunk), int(kValSgDim), int(blend_detail::kHalfChunk),
-      false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
-  constexpr auto desc_tn_mac = matmul2d_descriptor(
-      int(kValSgDim), int(blend_detail::kHalfChunk), int(blend_detail::kHalfChunk),
-      true, false, true, matmul2d_descriptor::mode::multiply_accumulate);
-
-  matmul2d<desc_nt_mac, execution_simdgroup> op_nt_mac;
-  matmul2d<desc_nn_mul, execution_simdgroup> op_nn_mul;
-  matmul2d<desc_nn_mac, execution_simdgroup> op_nn_mac;
-  matmul2d<desc_tn_mac, execution_simdgroup> op_tn_mac;
-
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tDummyNk(
-      (device bfloat *)qk_ws,
-      dextents<int32_t, 2>(int(blend_detail::kKeyDim), int(blend_detail::kChunkSize)));
-  auto tDummyNkSub = tDummyNk.slice(0, 0);
-
-  auto c_s0 = op_tn_mac.get_destination_cooperative_tensor<
-      decltype(tMyWork0), decltype(tDummyNkSub), float>();
-  auto c_s1 = op_tn_mac.get_destination_cooperative_tensor<
-      decltype(tMyWork0), decltype(tDummyNkSub), float>();
-  auto c_s2 = op_tn_mac.get_destination_cooperative_tensor<
-      decltype(tMyWork0), decltype(tDummyNkSub), float>();
-  auto c_s3 = op_tn_mac.get_destination_cooperative_tensor<
-      decltype(tMyWork0), decltype(tDummyNkSub), float>();
-
-  // Initialize M = I_128 in registers (ZERO global read!).
-  auto init_identity = [&](thread auto &c_sb, uint col_off) {
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_sb.get_capacity(); ++e) {
-      if (c_sb.is_valid_element(e)) {
-        const auto idx = c_sb.get_multidimensional_index(e);
-        const uint col = col_off + uint(idx[0]);
-        const uint row = dv_sg_base + uint(idx[1]);
-        c_sb[e] = (row == col) ? 1.0f : 0.0f;
-      } else {
-        c_sb[e] = 0.0f;
-      }
+  // Initialize M_sg = I_128 rows [dv_sg_base .. +16) directly in m_out_f32.
+  for (uint row = 0u; row < kValSgDim; ++row) {
+    const uint g_row = dv_sg_base + row;
+    for (uint col = lane; col < blend_detail::kKeyDim; col += 32u) {
+      m_sg[ulong(row) * blend_detail::kKeyDim + col] =
+          (g_row == col) ? 1.0f : 0.0f;
     }
-  };
-  init_identity(c_s0, 0u);
-  init_identity(c_s1, 32u);
-  init_identity(c_s2, 64u);
-  init_identity(c_s3, 96u);
+  }
 
+  threadgroup bfloat *my_work = tg_mem.work + sg * (kValSgDim * kWorkPad);
+
+  // Check Apple10 16x16x32 cooperative tensor lane layout at compile time on Apple10.
+  bool is_apple10 = false;
+  {
+    constexpr auto desc_chk = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc_chk, execution_simdgroup> chk_op;
+    auto ct_chk =
+        chk_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    const auto c0 = ct_chk.get_multidimensional_index(ushort(0u));
+    const auto c2 = ct_chk.get_multidimensional_index(ushort(2u));
+    is_apple10 = (int(c2[0]) - int(c0[0]) == 2) && (int(c2[1]) == int(c0[1]));
+  }
+
+  if (is_apple10) {
+    const ushort2 lc = nax_apple10_lane_coord(ushort(lane));
+    const uint fm = uint(lc.x);
+    const uint fn = uint(lc.y);
+    const vec<bfloat, 8> kZeroBf8(bfloat(0.0f));
+
+    for (uint c = 0u; c * blend_detail::kChunkSize < params.tokens; ++c) {
+      const uint t0 = c * blend_detail::kChunkSize;
+      const uint clen = min(blend_detail::kChunkSize, params.tokens - t0);
+      const uint n_rblks = (clen + 15u) / 16u;
+
+      device const bfloat *ws_nk =
+          qk_ws +
+          (ulong(c) * ulong(params.key_heads) + ulong(hk)) *
+              blend_detail::kQkPairBfloats;
+      device const uchar *ctrl_raw =
+          ctrl_ws +
+          (ulong(c) * ulong(params.value_heads) + ulong(hv)) *
+              blend_detail::kCtrlStrideBytes;
+      device const bfloat *ctrl_solve =
+          reinterpret_cast<device const bfloat *>(ctrl_raw);
+      device const float *ctrl_pref =
+          reinterpret_cast<device const float *>(ctrl_raw + blend_detail::kCtrlPrefByteOff);
+      device const float *ctrl_suff =
+          reinterpret_cast<device const float *>(ctrl_raw + blend_detail::kCtrlSuffByteOff);
+      const float decay_last =
+          reinterpret_cast<device const float *>(ctrl_raw + blend_detail::kCtrlMetaByteOff)[0];
+
+      // 1 & 2. pred = nk @ M_sg^T -> rhsT[dv=0..15][r=0..63] = bfloat(-pref[r] * pred)
+      for (uint rb = 0u; rb < 4u; ++rb) {
+        const uint r_base = rb * 16u;
+        vec<float, 8> pred(0.0f);
+        if (rb < n_rblks) {
+          for (uint k0 = 0u; k0 < blend_detail::kKeyDim; k0 += 32u) {
+            const bfloat4 a0_0 = *reinterpret_cast<device const bfloat4 *>(
+                ws_nk + ulong(r_base + fm) * blend_detail::kKeyDim + k0 + fn);
+            const bfloat4 a0_1 = *reinterpret_cast<device const bfloat4 *>(
+                ws_nk + ulong(r_base + fm + 8u) * blend_detail::kKeyDim + k0 + fn);
+            const bfloat4 a1_0 = *reinterpret_cast<device const bfloat4 *>(
+                ws_nk + ulong(r_base + fm) * blend_detail::kKeyDim + k0 + 16u + fn);
+            const bfloat4 a1_1 = *reinterpret_cast<device const bfloat4 *>(
+                ws_nk + ulong(r_base + fm + 8u) * blend_detail::kKeyDim + k0 + 16u + fn);
+            const vec<bfloat, 8> a0(a0_0.x, a0_0.y, a0_0.z, a0_0.w,
+                                    a0_1.x, a0_1.y, a0_1.z, a0_1.w);
+            const vec<bfloat, 8> a1(a1_0.x, a1_0.y, a1_0.z, a1_0.w,
+                                    a1_1.x, a1_1.y, a1_1.z, a1_1.w);
+
+            const bfloat4 m0_0 = bfloat4(*reinterpret_cast<device const float4 *>(
+                m_sg + ulong(fm) * blend_detail::kKeyDim + k0 + fn));
+            const bfloat4 m0_1 = bfloat4(*reinterpret_cast<device const float4 *>(
+                m_sg + ulong(fm + 8u) * blend_detail::kKeyDim + k0 + fn));
+            const bfloat4 m1_0 = bfloat4(*reinterpret_cast<device const float4 *>(
+                m_sg + ulong(fm) * blend_detail::kKeyDim + k0 + 16u + fn));
+            const bfloat4 m1_1 = bfloat4(*reinterpret_cast<device const float4 *>(
+                m_sg + ulong(fm + 8u) * blend_detail::kKeyDim + k0 + 16u + fn));
+            const vec<bfloat, 8> b0(m0_0.x, m0_0.y, m0_0.z, m0_0.w,
+                                    m0_1.x, m0_1.y, m0_1.z, m0_1.w);
+            const vec<bfloat, 8> b1(m1_0.x, m1_0.y, m1_0.z, m1_0.w,
+                                    m1_1.x, m1_1.y, m1_1.z, m1_1.w);
+            nax_mma_16x16x32<bfloat, true>(pred, a0, a1, b0, b1);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          const uint r = r_base + fm + h * 8u;
+          const float pref = (r < clen) ? ctrl_pref[r] : 0.0f;
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            my_work[(fn + j) * kWorkPad + r] =
+                (r < clen) ? bfloat(-pref * pred[h * 4u + j]) : bfloat(0.0f);
+          }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      // 3. Lower-triangular delta = solve @ rhs in REVERSE rb = 3..0 so my_work
+      //    overwrites rhsT in-place with deltaSuffT[dv][r] = bfloat(suff[r] * delta)!
+      for (int rb_i = 3; rb_i >= 0; --rb_i) {
+        const uint rb = uint(rb_i);
+        const uint r_base = rb * 16u;
+        vec<float, 8> delta(0.0f);
+        if (rb < n_rblks) {
+          for (uint kt = 0u; kt <= rb; kt += 2u) {
+            const uint k0 = kt * 16u;
+            const bfloat4 s0_0 = *reinterpret_cast<device const bfloat4 *>(
+                ctrl_solve + ulong(r_base + fm) * blend_detail::kChunkSize + k0 + fn);
+            const bfloat4 s0_1 = *reinterpret_cast<device const bfloat4 *>(
+                ctrl_solve + ulong(r_base + fm + 8u) * blend_detail::kChunkSize + k0 + fn);
+            const vec<bfloat, 8> a0(s0_0.x, s0_0.y, s0_0.z, s0_0.w,
+                                    s0_1.x, s0_1.y, s0_1.z, s0_1.w);
+            const bfloat4 r0_0 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                my_work + fm * kWorkPad + k0 + fn);
+            const bfloat4 r0_1 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                my_work + (fm + 8u) * kWorkPad + k0 + fn);
+            const vec<bfloat, 8> b0(r0_0.x, r0_0.y, r0_0.z, r0_0.w,
+                                    r0_1.x, r0_1.y, r0_1.z, r0_1.w);
+
+            const bool has_k1 = (kt + 1u <= rb);
+            vec<bfloat, 8> a1 = kZeroBf8;
+            vec<bfloat, 8> b1 = kZeroBf8;
+            if (has_k1) {
+              const bfloat4 s1_0 = *reinterpret_cast<device const bfloat4 *>(
+                  ctrl_solve + ulong(r_base + fm) * blend_detail::kChunkSize + k0 + 16u + fn);
+              const bfloat4 s1_1 = *reinterpret_cast<device const bfloat4 *>(
+                  ctrl_solve + ulong(r_base + fm + 8u) * blend_detail::kChunkSize + k0 + 16u + fn);
+              a1 = vec<bfloat, 8>(s1_0.x, s1_0.y, s1_0.z, s1_0.w,
+                                  s1_1.x, s1_1.y, s1_1.z, s1_1.w);
+              const bfloat4 r1_0 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  my_work + fm * kWorkPad + k0 + 16u + fn);
+              const bfloat4 r1_1 = *reinterpret_cast<const threadgroup bfloat4 *>(
+                  my_work + (fm + 8u) * kWorkPad + k0 + 16u + fn);
+              b1 = vec<bfloat, 8>(r1_0.x, r1_0.y, r1_0.z, r1_0.w,
+                                  r1_1.x, r1_1.y, r1_1.z, r1_1.w);
+            }
+            nax_mma_16x16x32<bfloat, true>(delta, a0, a1, b0, b1);
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          const uint r = r_base + fm + h * 8u;
+          const float suff = (r < clen) ? ctrl_suff[r] : 0.0f;
+          #pragma clang loop unroll(full)
+          for (uint j = 0u; j < 4u; ++j) {
+            my_work[(fn + j) * kWorkPad + r] =
+                (r < clen) ? bfloat(suff * delta[h * 4u + j]) : bfloat(0.0f);
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+
+      // 4. Update M_sg[16, 128] = decay_last * M_sg + deltaSuffT[16, 64] @ nk[64, 128]
+      //    one [16, 32] slice at a time via nax_mma_16x32x16_nn!
+      for (uint k0 = 0u; k0 < blend_detail::kKeyDim; k0 += 32u) {
+        vec<float, 8> ms0, ms1;
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          const float4 f0 = *reinterpret_cast<device const float4 *>(
+              m_sg + ulong(fm + h * 8u) * blend_detail::kKeyDim + k0 + fn) *
+              decay_last;
+          const float4 f1 = *reinterpret_cast<device const float4 *>(
+              m_sg + ulong(fm + h * 8u) * blend_detail::kKeyDim + k0 + 16u + fn) *
+              decay_last;
+          ms0[h * 4u + 0u] = f0[0]; ms0[h * 4u + 1u] = f0[1];
+          ms0[h * 4u + 2u] = f0[2]; ms0[h * 4u + 3u] = f0[3];
+          ms1[h * 4u + 0u] = f1[0]; ms1[h * 4u + 1u] = f1[1];
+          ms1[h * 4u + 2u] = f1[2]; ms1[h * 4u + 3u] = f1[3];
+        }
+        for (uint rb = 0u; rb < n_rblks; ++rb) {
+          const uint r_base = rb * 16u;
+          const bfloat4 d0 = *reinterpret_cast<const threadgroup bfloat4 *>(
+              my_work + fm * kWorkPad + r_base + fn);
+          const bfloat4 d1 = *reinterpret_cast<const threadgroup bfloat4 *>(
+              my_work + (fm + 8u) * kWorkPad + r_base + fn);
+          const vec<bfloat, 8> a_ds(d0.x, d0.y, d0.z, d0.w,
+                                    d1.x, d1.y, d1.z, d1.w);
+          const bfloat4 n0_0 = *reinterpret_cast<device const bfloat4 *>(
+              ws_nk + ulong(r_base + fm) * blend_detail::kKeyDim + k0 + fn);
+          const bfloat4 n0_1 = *reinterpret_cast<device const bfloat4 *>(
+              ws_nk + ulong(r_base + fm + 8u) * blend_detail::kKeyDim + k0 + fn);
+          const bfloat4 n1_0 = *reinterpret_cast<device const bfloat4 *>(
+              ws_nk + ulong(r_base + fm) * blend_detail::kKeyDim + k0 + 16u + fn);
+          const bfloat4 n1_1 = *reinterpret_cast<device const bfloat4 *>(
+              ws_nk + ulong(r_base + fm + 8u) * blend_detail::kKeyDim + k0 + 16u + fn);
+          const vec<bfloat, 8> b0(n0_0.x, n0_0.y, n0_0.z, n0_0.w,
+                                  n0_1.x, n0_1.y, n0_1.z, n0_1.w);
+          const vec<bfloat, 8> b1(n1_0.x, n1_0.y, n1_0.z, n1_0.w,
+                                  n1_1.x, n1_1.y, n1_1.z, n1_1.w);
+          nax_mma_16x32x16_nn<bfloat>(ms0, ms1, a_ds, b0, b1);
+        }
+        #pragma clang loop unroll(full)
+        for (uint h = 0u; h < 2u; ++h) {
+          *reinterpret_cast<device float4 *>(
+              m_sg + ulong(fm + h * 8u) * blend_detail::kKeyDim + k0 + fn) =
+              float4(ms0[h * 4u + 0u], ms0[h * 4u + 1u],
+                     ms0[h * 4u + 2u], ms0[h * 4u + 3u]);
+          *reinterpret_cast<device float4 *>(
+              m_sg + ulong(fm + h * 8u) * blend_detail::kKeyDim + k0 + 16u + fn) =
+              float4(ms1[h * 4u + 0u], ms1[h * 4u + 1u],
+                     ms1[h * 4u + 2u], ms1[h * 4u + 3u]);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return;
+  }
+
+  // Portable Apple9 (M4) zero-spill FP32 SIMD fallback (exact same recurrence math).
   for (uint c = 0u; c * blend_detail::kChunkSize < params.tokens; ++c) {
     const uint t0 = c * blend_detail::kChunkSize;
     const uint clen = min(blend_detail::kChunkSize, params.tokens - t0);
-    const bool has_hi = (clen > blend_detail::kHalfChunk);
-
     device const bfloat *ws_nk =
         qk_ws +
         (ulong(c) * ulong(params.key_heads) + ulong(hk)) *
@@ -799,148 +962,44 @@ kernel void omlx_m5_gdn_extract_transition_m_c64(
     const float decay_last =
         reinterpret_cast<device const float *>(ctrl_raw + blend_detail::kCtrlMetaByteOff)[0];
 
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tNk(
-        (device bfloat *)ws_nk,
-        dextents<int32_t, 2>(int(blend_detail::kKeyDim), int(blend_detail::kChunkSize)));
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tSolve(
-        (device bfloat *)ctrl_solve,
-        dextents<int32_t, 2>(int(blend_detail::kChunkSize), int(blend_detail::kChunkSize)));
-
-    // 1. pred = nk @ M^T
-    auto c_pred0 = op_nt_mac.get_destination_cooperative_tensor<
-        decltype(tDummyNkSub), decltype(tMyS), float>();
-    auto c_pred1 = op_nt_mac.get_destination_cooperative_tensor<
-        decltype(tDummyNkSub), decltype(tMyS), float>();
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_pred0.get_capacity(); ++e) {
-      c_pred0[e] = 0.0f;
-      c_pred1[e] = 0.0f;
-    }
-
-    auto accum_k = [&](const thread auto &c_sb, int k_off) {
-      #pragma clang loop unroll(full)
-      for (uint16_t e = 0; e < c_sb.get_capacity(); ++e) {
-        if (c_sb.is_valid_element(e)) {
-          const auto idx = c_sb.get_multidimensional_index(e);
-          my_work[uint(idx[1]) * blend_detail::kHalfChunk + uint(idx[0])] =
-              bfloat(c_sb[e]);
+    for (uint dv = 0u; dv < kValSgDim; ++dv) {
+      device float *m_row = m_sg + ulong(dv) * blend_detail::kKeyDim;
+      for (uint r = 0u; r < clen; ++r) {
+        device const bfloat *nk_r = ws_nk + ulong(r) * blend_detail::kKeyDim;
+        float acc = 0.0f;
+        for (uint k = lane; k < blend_detail::kKeyDim; k += 32u) {
+          acc = fma(float(nk_r[k]), float(bfloat(m_row[k])), acc);
+        }
+        const float pred = simd_sum(acc);
+        if (lane == 0u) {
+          my_work[dv * kWorkPad + r] = bfloat(-ctrl_pref[r] * pred);
         }
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
-      auto tNk0 = tNk.slice(k_off, 0);
-      op_nt_mac.run(tNk0, tMyS, c_pred0);
-      if (has_hi) {
-        auto tNk1 = tNk.slice(k_off, int(blend_detail::kHalfChunk));
-        op_nt_mac.run(tNk1, tMyS, c_pred1);
-      }
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-    };
-    accum_k(c_s0, 0);
-    accum_k(c_s1, 32);
-    accum_k(c_s2, 64);
-    accum_k(c_s3, 96);
-
-    // 2. V == 0 => rhs = -prefix[r] * pred
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_pred0.get_capacity(); ++e) {
-      if (c_pred0.is_valid_element(e)) {
-        const auto idx = c_pred0.get_multidimensional_index(e);
-        const uint dv = uint(idx[0]);
-        const uint r = uint(idx[1]);
-        my_work[r * kValSgDim + dv] =
-            (r < clen) ? bfloat(-ctrl_pref[r] * c_pred0[e]) : bfloat(0.0f);
-      }
-    }
-    if (has_hi) {
-      #pragma clang loop unroll(full)
-      for (uint16_t e = 0; e < c_pred1.get_capacity(); ++e) {
-        if (c_pred1.is_valid_element(e)) {
-          const auto idx = c_pred1.get_multidimensional_index(e);
-          const uint dv = uint(idx[0]);
-          const uint r = blend_detail::kHalfChunk + uint(idx[1]);
-          my_work[r * kValSgDim + dv] =
-              (r < clen) ? bfloat(-ctrl_pref[r] * c_pred1[e]) : bfloat(0.0f);
+      for (int r_i = int(clen) - 1; r_i >= 0; --r_i) {
+        const uint r = uint(r_i);
+        float acc = 0.0f;
+        for (uint j = lane; j <= r; j += 32u) {
+          acc = fma(float(ctrl_solve[r * blend_detail::kChunkSize + j]),
+                    float(my_work[dv * kWorkPad + j]), acc);
         }
-      }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 3. Causal 2x2 delta = solve @ rhs
-    auto tSolve00 = tSolve.slice(0, 0);
-    auto c_delta0 = op_nn_mul.get_destination_cooperative_tensor<
-        decltype(tSolve00), decltype(tMyWork0), float>();
-    auto c_delta1 = op_nn_mul.get_destination_cooperative_tensor<
-        decltype(tSolve00), decltype(tMyWork0), float>();
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_delta0.get_capacity(); ++e) {
-      c_delta0[e] = 0.0f;
-      c_delta1[e] = 0.0f;
-    }
-    op_nn_mul.run(tSolve00, tMyWork0, c_delta0);
-    if (has_hi) {
-      auto tSolve10 = tSolve.slice(0, int(blend_detail::kHalfChunk));
-      auto tSolve11 = tSolve.slice(int(blend_detail::kHalfChunk),
-                                   int(blend_detail::kHalfChunk));
-      op_nn_mul.run(tSolve10, tMyWork0, c_delta1);
-      op_nn_mac.run(tSolve11, tMyWork1, c_delta1);
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 4. Update M = decay_last * M + (suffix * delta)^T @ nk
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_delta0.get_capacity(); ++e) {
-      if (c_delta0.is_valid_element(e)) {
-        const auto idx = c_delta0.get_multidimensional_index(e);
-        const uint dv = uint(idx[0]);
-        const uint r = uint(idx[1]);
-        my_work[r * kValSgDim + dv] =
-            (r < clen) ? bfloat(ctrl_suff[r] * c_delta0[e]) : bfloat(0.0f);
-      }
-    }
-    if (has_hi) {
-      #pragma clang loop unroll(full)
-      for (uint16_t e = 0; e < c_delta1.get_capacity(); ++e) {
-        if (c_delta1.is_valid_element(e)) {
-          const auto idx = c_delta1.get_multidimensional_index(e);
-          const uint dv = uint(idx[0]);
-          const uint r = blend_detail::kHalfChunk + uint(idx[1]);
-          my_work[r * kValSgDim + dv] =
-              (r < clen) ? bfloat(ctrl_suff[r] * c_delta1[e]) : bfloat(0.0f);
+        const float delta = simd_sum(acc);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0u) {
+          my_work[dv * kWorkPad + r] = bfloat(ctrl_suff[r] * delta);
         }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      for (uint k = lane; k < blend_detail::kKeyDim; k += 32u) {
+        float val = m_row[k] * decay_last;
+        for (uint r = 0u; r < clen; ++r) {
+          val = fma(float(my_work[dv * kWorkPad + r]),
+                    float(ws_nk[ulong(r) * blend_detail::kKeyDim + k]), val);
+        }
+        m_row[k] = val;
       }
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    auto update_m = [&](thread auto &c_sb, int k_off) {
-      #pragma clang loop unroll(full)
-      for (uint16_t e = 0; e < c_sb.get_capacity(); ++e) {
-        if (c_sb.is_valid_element(e)) {
-          c_sb[e] *= decay_last;
-        }
-      }
-      auto tNk0 = tNk.slice(k_off, 0);
-      op_tn_mac.run(tMyWork0, tNk0, c_sb);
-      if (has_hi) {
-        auto tNk1 = tNk.slice(k_off, int(blend_detail::kHalfChunk));
-        op_tn_mac.run(tMyWork1, tNk1, c_sb);
-      }
-    };
-    update_m(c_s0, 0);
-    update_m(c_s1, 32);
-    update_m(c_s2, 64);
-    update_m(c_s3, 96);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
-
-  device float *m_sg =
-      m_out_f32 + (ulong(hv) * ulong(blend_detail::kValDim) + ulong(dv_sg_base)) *
-                      ulong(blend_detail::kKeyDim);
-  tensor<device float, dextents<int32_t, 2>, tensor_inline> tM_sg(
-      m_sg, dextents<int32_t, 2>(int(blend_detail::kKeyDim), int(kValSgDim)));
-  c_s0.store(tM_sg.slice(0, 0));
-  c_s1.store(tM_sg.slice(32, 0));
-  c_s2.store(tM_sg.slice(64, 0));
-  c_s3.store(tM_sg.slice(96, 0));
 }
 
 // Pack FP32 [Hv, 128, 128] operator (M_C or B_C) into BF16 or FP8 E4M3 + per-row FP16 scale.
@@ -1058,8 +1117,15 @@ kernel void omlx_m5_gdn_state_compose_nax(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
-  alignas(16) threadgroup float tg_a[32u * 32u]; // 4 KiB
-  alignas(16) threadgroup float tg_b[32u * 32u]; // 4 KiB (total 8.0 KiB!)
+  struct BlendComposeTgStorage {
+    float a[32u * 32u]; // 4 KiB
+    float b[32u * 32u]; // 4 KiB (total 8.0 KiB!)
+  };
+  static_assert(sizeof(BlendComposeTgStorage) <= kApple10MaxPrefillTgSramBytes,
+                "BlendComposeTgStorage exceeds 16,384 B!");
+  alignas(16) threadgroup BlendComposeTgStorage tg_mem;
+  threadgroup float *tg_a = tg_mem.a;
+  threadgroup float *tg_b = tg_mem.b;
 
   const uint hv = tg.y;
   const uint row_tile = tg.z; // 0..3 (each tile = 32 rows of Dv=128)
@@ -1075,47 +1141,28 @@ kernel void omlx_m5_gdn_state_compose_nax(
   device const float *s_in_hv = state_in + head_mat_off;
   device float *s_out_hv = state_out + head_mat_off;
 
-  constexpr auto desc_32 = matmul2d_descriptor(
-      32, 32, 32, false, false, false,
-      matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<desc_32, execution_simdgroups<4>> op_32;
+  // Each of the 4 SIMDgroups owns 8 rows x 128 cols via 16 simdgroup_float8x8
+  // tiles (32 floats/lane total -> 0 cooperative_tensor allocas, 0 B spills,
+  // 100% in-place `state_in == state_out` safe!).
+  simdgroup_float8x8 acc[16];
+  #pragma clang loop unroll(full)
+  for (uint t = 0u; t < 16u; ++t) {
+    acc[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  }
 
-  tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tA(
-      tg_a, dextents<int32_t, 2>(32, 32));
-  tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tB(
-      tg_b, dextents<int32_t, 2>(32, 32));
-
-  // Keep all 4 N-tiles [32, 32] of this TG's 32 rows in register accumulators
-  // so in-place `state_in == state_out` has ZERO WAR hazard across N-tiles!
-  auto c0 = op_32.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
-  auto c1 = op_32.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
-  auto c2 = op_32.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
-  auto c3 = op_32.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
-
-  auto zero_acc = [](thread auto &c) {
-    #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c.get_capacity(); ++e) {
-      c[e] = 0.0f;
-    }
-  };
-  zero_acc(c0);
-  zero_acc(c1);
-  zero_acc(c2);
-  zero_acc(c3);
-
-  const uint ld_row = tid >> 2u;       // 0..31
+  const uint ld_row = tid >> 2u;        // 0..31
   const uint ld_col8 = (tid & 3u) * 8u; // 0, 8, 16, 24
+  const uint sg_row_off = sg * 8u;
 
-  // K-outer loop: load S_in[dv_base..+32, k0..+32] ONCE and reuse across all 4 N-tiles!
   for (uint k0 = 0u; k0 < 128u; k0 += 32u) {
-    // Load A tile [32, 32] from S_in
     device const float4 *a_src = reinterpret_cast<device const float4 *>(
         s_in_hv + ulong(dv_base + ld_row) * 128ul + k0 + ld_col8);
     *reinterpret_cast<threadgroup float4 *>(tg_a + ld_row * 32u + ld_col8) = a_src[0];
     *reinterpret_cast<threadgroup float4 *>(tg_a + ld_row * 32u + ld_col8 + 4u) = a_src[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto load_m_and_mac = [&](uint n0, thread auto &c_dst) {
+    for (uint nt = 0u; nt < 4u; ++nt) {
+      const uint n0 = nt * 32u;
       const uint m_row = k0 + ld_row;
       const ulong m_row_flat = head_row_off + m_row;
       const float rs = float(m_row_scales[m_row_flat]);
@@ -1142,25 +1189,35 @@ kernel void omlx_m5_gdn_state_compose_nax(
             float4(blend_detail::decode_fp8_e4m3(q0.x),
                    blend_detail::decode_fp8_e4m3(q0.y),
                    blend_detail::decode_fp8_e4m3(q0.z),
-                   blend_detail::decode_fp8_e4m3(q0.w)) * rs;
+                   blend_detail::decode_fp8_e4m3(q0.w)) *
+            rs;
         *reinterpret_cast<threadgroup float4 *>(tg_b + ld_row * 32u + ld_col8 + 4u) =
             float4(blend_detail::decode_fp8_e4m3(q1.x),
                    blend_detail::decode_fp8_e4m3(q1.y),
                    blend_detail::decode_fp8_e4m3(q1.z),
-                   blend_detail::decode_fp8_e4m3(q1.w)) * rs;
+                   blend_detail::decode_fp8_e4m3(q1.w)) *
+            rs;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      op_32.run(tA, tB, c_dst);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    };
 
-    load_m_and_mac(0u, c0);
-    load_m_and_mac(32u, c1);
-    load_m_and_mac(64u, c2);
-    load_m_and_mac(96u, c3);
+      #pragma clang loop unroll(full)
+      for (uint ks = 0u; ks < 4u; ++ks) {
+        simdgroup_float8x8 ma;
+        simdgroup_load(ma, tg_a + sg_row_off * 32u + ks * 8u, 32u);
+        #pragma clang loop unroll(full)
+        for (uint ns = 0u; ns < 4u; ++ns) {
+          simdgroup_float8x8 mb;
+          simdgroup_load(mb, tg_b + (ks * 8u) * 32u + ns * 8u, 32u);
+          simdgroup_multiply_accumulate(acc[nt * 4u + ns], ma, mb,
+                                        acc[nt * 4u + ns]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
-  // Optional: add B_C + decayed rank-1 HKVD perturbations, then write S_out.
+  // Finalize each 32x32 N-tile via tg_a (reused as [32x32] FP32 output stage),
+  // adding optional B_C + decayed rank-1 HKVD perturbations, then write S_out.
   const uint repeat = params.value_heads / max(1u, params.key_heads);
   const uint hk = hv / repeat;
   const float g_end =
@@ -1170,57 +1227,54 @@ kernel void omlx_m5_gdn_state_compose_nax(
                                 ulong(hv)])
           : 0.0f;
 
-  auto finalize_tile = [&](uint n0, thread auto &c_tile) {
+  for (uint nt = 0u; nt < 4u; ++nt) {
+    const uint n0 = nt * 32u;
     #pragma clang loop unroll(full)
-    for (uint16_t e = 0; e < c_tile.get_capacity(); ++e) {
-      if (c_tile.is_valid_element(e)) {
-        const auto idx = c_tile.get_multidimensional_index(e);
-        const uint dk = n0 + uint(idx[0]);
-        const uint dv = dv_base + uint(idx[1]);
-        float val = c_tile[e];
-
-        if (params.apply_bias != 0u) {
-          const float bs = float(b_row_scales[head_row_off + dv]);
-          const ulong elem_idx = head_mat_off + ulong(dv) * 128ul + dk;
-          if (params.op_format == 0u) {
-            const bfloat b_val =
-                reinterpret_cast<device const bfloat *>(b_data)[elem_idx];
-            val = fma(float(b_val), bs, val);
-          } else if (params.op_format == 2u) {
-            const half b_val =
-                reinterpret_cast<device const half *>(b_data)[elem_idx];
-            val = fma(float(b_val), bs, val);
-          } else {
-            val = fma(blend_detail::decode_fp8_e4m3(b_data[elem_idx]), bs, val);
-          }
-        }
-
-        for (uint p = 0u; p < params.num_hkvd_perturb; ++p) {
-          const uint t_loc = hkvd_t_local[p];
-          const float g_t =
-              float(cum_decay_f16[ulong(t_loc) * ulong(params.value_heads) +
-                                  ulong(hv)]);
-          const float w_dec = exp(min(0.0f, g_end - g_t));
-          const ulong hv_off = ulong(p) * ulong(params.value_heads) + ulong(hv);
-          const ulong hk_off = ulong(p) * ulong(params.key_heads) + ulong(hk);
-          const float bn = hkvd_beta_new[hv_off];
-          const float vn = float(hkvd_v_new[hv_off * 128ul + dv]);
-          const float kn = float(hkvd_k_new[hk_off * 128ul + dk]);
-          const float bo = hkvd_beta_old[hv_off];
-          const float vo = float(hkvd_v_old[hv_off * 128ul + dv]);
-          const float ko = float(hkvd_k_old[hk_off * 128ul + dk]);
-          val = fma(w_dec, fma(bn * vn, kn, -(bo * vo * ko)), val);
-        }
-
-        s_out_hv[ulong(dv) * 128ul + dk] = val;
-      }
+    for (uint ns = 0u; ns < 4u; ++ns) {
+      simdgroup_store(acc[nt * 4u + ns], tg_a + sg_row_off * 32u + ns * 8u, 32u);
     }
-  };
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  finalize_tile(0u, c0);
-  finalize_tile(32u, c1);
-  finalize_tile(64u, c2);
-  finalize_tile(96u, c3);
+    const uint dv = dv_base + ld_row;
+    const float bs =
+        (params.apply_bias != 0u) ? float(b_row_scales[head_row_off + dv]) : 0.0f;
+    for (uint j = 0u; j < 8u; ++j) {
+      const uint dk = n0 + ld_col8 + j;
+      float val = tg_a[ld_row * 32u + ld_col8 + j];
+      if (params.apply_bias != 0u) {
+        const ulong elem_idx = head_mat_off + ulong(dv) * 128ul + dk;
+        if (params.op_format == 0u) {
+          const bfloat b_val =
+              reinterpret_cast<device const bfloat *>(b_data)[elem_idx];
+          val = fma(float(b_val), bs, val);
+        } else if (params.op_format == 2u) {
+          const half b_val =
+              reinterpret_cast<device const half *>(b_data)[elem_idx];
+          val = fma(float(b_val), bs, val);
+        } else {
+          val = fma(blend_detail::decode_fp8_e4m3(b_data[elem_idx]), bs, val);
+        }
+      }
+      for (uint p = 0u; p < params.num_hkvd_perturb; ++p) {
+        const uint t_loc = hkvd_t_local[p];
+        const float g_t =
+            float(cum_decay_f16[ulong(t_loc) * ulong(params.value_heads) +
+                                ulong(hv)]);
+        const float w_dec = exp(min(0.0f, g_end - g_t));
+        const ulong hv_off = ulong(p) * ulong(params.value_heads) + ulong(hv);
+        const ulong hk_off = ulong(p) * ulong(params.key_heads) + ulong(hk);
+        const float bn = hkvd_beta_new[hv_off];
+        const float vn = float(hkvd_v_new[hv_off * 128ul + dv]);
+        const float kn = float(hkvd_k_new[hk_off * 128ul + dk]);
+        const float bo = hkvd_beta_old[hv_off];
+        const float vo = float(hkvd_v_old[hv_off * 128ul + dv]);
+        const float ko = float(hkvd_k_old[hk_off * 128ul + dk]);
+        val = fma(w_dec, fma(bn * vn, kn, -(bo * vo * ko)), val);
+      }
+      s_out_hv[ulong(dv) * 128ul + dk] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 }
 
 // ============================================================================

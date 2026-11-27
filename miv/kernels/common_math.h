@@ -3,9 +3,18 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400)
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 
-// Shared FP4 E2M1 / UE8M0, sub-byte bitplane expansion, SiLU, row-scale, and
+// Shared FP4 E2M1 / UE8M0, sub-byte bitplane expansion, SiLU, row-scale,
+// Apple10 SRAM redline constants, zero-spill NAX MMA leaf helpers, and
 // threadgroup argmax/top-k utilities across m5rt Metal 4 shaders.
+
+// Apple10 (M5 Ultra) physical threadgroup SRAM is 32,768 B/core.
+// Staying <= 16,384 B guarantees >= 2 TGs/core; <= 10,922 B enables 3 TGs/core.
+constant constexpr ulong kApple10MaxPrefillTgSramBytes = 16384ul;
+constant constexpr ulong kApple10MaxGqaPrefillTgSramBytes = 14336ul;
 
 inline float e8m0_to_float(uchar code) {
   const uint bits = code == 0u ? 0x00400000u : uint(code) << 23u;
@@ -115,5 +124,125 @@ inline void insert_top_k(thread float (&scores)[MaxK], thread uint (&ids)[MaxK],
     }
   }
 }
+
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400)
+// Apple10 NAX cooperative_tensor lane-to-(fm, fn) coordinate mapping:
+//   lc.x = fm in [0..7] (owns rows fm and fm + 8),
+//   lc.y = fn in {0, 4, 8, 12} (4 contiguous cols).
+__attribute__((always_inline))
+inline ushort2 nax_apple10_lane_coord(ushort lane) {
+  const ushort qid = lane >> 2u;
+  const ushort fm = (qid & 4u) | ((lane >> 1u) & 3u);
+  const ushort fn = ((qid & 2u) | (lane & 1u)) * 4u;
+  return ushort2(fm, fn);
+}
+
+// Zero-spill Apple10 NAX leaf MMA helpers: cooperative_tensor objects are strictly
+// scoped inside these leaves so plain vec<float, 8> accumulators persist cleanly
+// across loops/barriers with zero stack allocas or descriptor spills.
+template <typename ValT>
+__attribute__((always_inline))
+inline void nax_mma_16x32x16_nt(thread metal::vec<float, 8> &c0,
+                                thread metal::vec<float, 8> &c1,
+                                const thread metal::vec<ValT, 8> &a,
+                                const thread metal::vec<ValT, 8> &b0,
+                                const thread metal::vec<ValT, 8> &b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 32, 16, false, true, /*relaxed_precision=*/true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>, float>();
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    ct_a[i] = a[i];
+    ct_b[i] = b0[i];
+    ct_b[8u + i] = b1[i];
+    ct_c[i] = c0[i];
+    ct_c[8u + i] = c1[i];
+  }
+  op.run(ct_a, ct_b, ct_c);
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    c0[i] = ct_c[i];
+    c1[i] = ct_c[8u + i];
+  }
+}
+
+template <typename ValT>
+__attribute__((always_inline))
+inline void nax_mma_16x32x16_nn(thread metal::vec<float, 8> &c0,
+                                thread metal::vec<float, 8> &c1,
+                                const thread metal::vec<ValT, 8> &a,
+                                const thread metal::vec<ValT, 8> &b0,
+                                const thread metal::vec<ValT, 8> &b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 32, 16, false, false, /*relaxed_precision=*/true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>, float>();
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    ct_a[i] = a[i];
+    ct_b[i] = b0[i];
+    ct_b[8u + i] = b1[i];
+    ct_c[i] = c0[i];
+    ct_c[8u + i] = c1[i];
+  }
+  op.run(ct_a, ct_b, ct_c);
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    c0[i] = ct_c[i];
+    c1[i] = ct_c[8u + i];
+  }
+}
+
+template <typename ValT, bool TransposeB = true>
+__attribute__((always_inline))
+inline void nax_mma_16x16x32(thread metal::vec<float, 8> &c,
+                             const thread metal::vec<ValT, 8> &a0,
+                             const thread metal::vec<ValT, 8> &a1,
+                             const thread metal::vec<ValT, 8> &b0,
+                             const thread metal::vec<ValT, 8> &b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 16, 32, false, TransposeB, /*relaxed_precision=*/true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<ValT, ValT, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>, float>();
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    ct_a[i] = a0[i];
+    ct_a[8u + i] = a1[i];
+    ct_b[i] = b0[i];
+    ct_b[8u + i] = b1[i];
+    ct_c[i] = c[i];
+  }
+  op.run(ct_a, ct_b, ct_c);
+  #pragma clang loop unroll(full)
+  for (ushort i = 0u; i < 8u; ++i) {
+    c[i] = ct_c[i];
+  }
+}
+
+template <typename ValT, bool TransposeB = true>
+__attribute__((always_inline))
+inline void nax_mma_16x16x16(thread metal::vec<float, 8> &c,
+                             const thread metal::vec<ValT, 8> &a,
+                             const thread metal::vec<ValT, 8> &b) {
+  const metal::vec<ValT, 8> z(ValT(0));
+  nax_mma_16x16x32<ValT, TransposeB>(c, a, z, b, z);
+}
+#endif
 
 #endif // OMLX_M5_COMMON_MATH_H
