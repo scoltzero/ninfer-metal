@@ -2858,6 +2858,76 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
     add_test(NAME omlx_m5_w4a8_nax COMMAND $<TARGET_FILE:omlx_m5_w4a8_nax_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
   endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a4_nax.metal")
+    omlx_m5_compile_metallib(
+      omlx_m5_w4a4_nax_metallib
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a4_nax.metal"
+      "omlx_m5_w4a4_nax.metallib"
+      "27.0"
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
+    add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a4_nax_metallib)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a4_moe_nax.metal")
+    omlx_m5_compile_metallib(
+      omlx_m5_w4a4_moe_nax_metallib
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/w4a4_moe_nax.metal"
+      "omlx_m5_w4a4_moe_nax.metallib"
+      "27.0"
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fwht64.h")
+    add_dependencies(omlx_m5_qwen_forward_resources omlx_m5_w4a4_moe_nax_metallib)
+  endif()
+  if(TARGET omlx_m5_w4a4_nax_metallib AND TARGET omlx_m5_w4a4_moe_nax_metallib AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/w4a4_nax_tests.cpp")
+    add_executable(omlx_m5_w4a4_nax_tests tests/w4a4_nax_tests.cpp)
+    target_include_directories(omlx_m5_w4a4_nax_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+    target_compile_options(omlx_m5_w4a4_nax_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(omlx_m5_w4a4_nax_tests PRIVATE omlx_m5_core_runtime)
+    add_dependencies(omlx_m5_w4a4_nax_tests
+      omlx_m5_qwen_forward_resources
+      omlx_m5_w4a4_nax_metallib
+      omlx_m5_w4a4_moe_nax_metallib
+      omlx_m5_w4a8_nax_metallib
+      omlx_m5_mxfp4_nax_metallib
+      omlx_m5_moe_nax_metallib)
+    if(TARGET omlx_m5_gdn_chunk_nax_metallib)
+      add_dependencies(omlx_m5_w4a4_nax_tests omlx_m5_gdn_chunk_nax_metallib)
+    endif()
+    add_test(NAME omlx_m5_w4a4_nax COMMAND $<TARGET_FILE:omlx_m5_w4a4_nax_tests>
+      "${OMLX_M5_METAL_OUTPUT_DIR}")
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/mxfp4_w4a8_ab_microbench.metal" AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/mxfp4_w4a8_ab_microbench.mm")
+    omlx_m5_compile_metallib(
+      omlx_m5_mxfp4_w4a8_ab_microbench_metallib
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/mxfp4_w4a8_ab_microbench.metal"
+      "omlx_m5_mxfp4_w4a8_ab_microbench.metallib"
+      "27.0"
+      EXTRA_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common_math.h")
+    add_executable(
+      omlx_m5_mxfp4_w4a8_ab_microbench
+      tests/mxfp4_w4a8_ab_microbench.mm)
+    target_compile_features(omlx_m5_mxfp4_w4a8_ab_microbench PRIVATE cxx_std_20)
+    target_compile_options(
+      omlx_m5_mxfp4_w4a8_ab_microbench
+      PRIVATE
+      -Wall
+      -Wextra
+      -Wpedantic
+      -Werror
+      "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+    target_link_libraries(
+      omlx_m5_mxfp4_w4a8_ab_microbench
+      PRIVATE
+      "-framework Foundation"
+      "-framework Metal")
+    add_dependencies(
+      omlx_m5_mxfp4_w4a8_ab_microbench
+      omlx_m5_mxfp4_w4a8_ab_microbench_metallib)
+  endif()
 endif()
 
 # Module 4b: Native Dual-ANE Fixed-Chunk Output-Channel-Split Co-Execution Engine
@@ -3026,13 +3096,15 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       $<TARGET_FILE:omlx_m5_prefill_all_modes_e2e_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
 
-  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate (all 12 prefill metallibs)
+  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate (all 14 prefill metallibs)
   if(TARGET omlx_m5_affine_nax_metallib AND
      TARGET omlx_m5_mxfp4_nax_metallib AND
      TARGET omlx_m5_moe_nax_metallib AND
      TARGET omlx_m5_bf16_nax_metallib AND
      TARGET omlx_m5_w4a8_nax_metallib AND
      TARGET omlx_m5_w4a8_moe_nax_metallib AND
+     TARGET omlx_m5_w4a4_nax_metallib AND
+     TARGET omlx_m5_w4a4_moe_nax_metallib AND
      TARGET omlx_m5_attention_nax_prefill_metallib AND
      TARGET omlx_m5_attention_affine4_metallib AND
      TARGET omlx_m5_attention_sage2_metallib AND
@@ -3068,6 +3140,8 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
       omlx_m5_bf16_nax_metallib
       omlx_m5_w4a8_nax_metallib
       omlx_m5_w4a8_moe_nax_metallib
+      omlx_m5_w4a4_nax_metallib
+      omlx_m5_w4a4_moe_nax_metallib
       omlx_m5_attention_nax_prefill_metallib
       omlx_m5_attention_affine4_metallib
       omlx_m5_attention_sage2_metallib

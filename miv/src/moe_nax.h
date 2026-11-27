@@ -27,6 +27,12 @@ inline bool moe_w4a8_nax_runtime_eligible(const MetalContext &ctx,
                               "OMLX_M5_DISABLE_W4A8_NAX");
 }
 
+inline bool moe_w4a4_nax_runtime_eligible(const MetalContext &ctx,
+                                          const std::filesystem::path &libs) {
+  return nax_apple10_eligible(ctx, libs, "omlx_m5_w4a4_moe_nax.metallib",
+                              "OMLX_M5_DISABLE_W4A4_NAX");
+}
+
 inline bool moe_nax_swiglu_out64_env_enabled() {
   // WP3.1 Apple10 M5 Ultra verified: 1-pass BN_out=32 MoE out64 (9,472 B SRAM, 0 spills,
   // 128 threads, 3 TGs/core) beats bm64 by up to 1.74x and HEAD out64 (27,904 B) by 1.04x
@@ -821,6 +827,145 @@ inline bool emit_moe_w4a8_nax_ffn(
                       "moe_affine_nax_down_bm64_sk1_v1", {}, "legacy_route_v1",
                       {}, false, explicit_t);
     }
+  }
+
+  if (emit_reduce) {
+    auto &reduce =
+        e.emit("mlp", "omlx_m5_moe_topk_reduce", {.width = U64(t) * h},
+               {.width = 128u}, {expert_output, routed});
+    e.dynamic(reduce, 2, words({t, top_k, h, 0u}), tok_w0);
+  }
+  return true;
+}
+
+// Phase 3 WP 3A: Hardware-Native MoE MXFP4 W4A4 Prefill FFN (Zero .miv v2 Repack).
+// Consumes shared tiled MXFP4 (a4_codes, a4_scales, a4_mp) produced by RMSNorm+A4.
+// Mode B reuses existing MoeNaxWorkspace::mid_qa / mid_sa (zero extra workspace!).
+inline bool emit_moe_w4a4_nax_ffn(
+    Encoder &e, const MoeNaxWorkspace &ws,
+    const MaterializedWeightView &gw, const MaterializedWeightView &uw,
+    const MaterializedWeightView &dw, Ref a4_codes, Ref a4_scales,
+    U32 a4_mp, Ref route_ids, Ref route_scores, Ref expert_output, Ref routed,
+    U32 t, U32 h, U32 f, U32 top_k = 8u, U32 num_experts = 256u,
+    std::optional<U32> explicit_t = {}, Ref router_logits = {},
+    bool emit_reduce = true, bool w4a4_down_proj = true) {
+  if (!ws.active || t == 0u || t > ws.max_t || top_k != 8u ||
+      num_experts != 256u || !moe_nax_weight_eligible(gw, uw, dw, h, f) ||
+      gw.format != "mxfp4_e2m1_g32_e8m0_v1" ||
+      dw.format != "mxfp4_e2m1_g32_e8m0_v1" ||
+      a4_codes.buffer == nullptr || a4_scales.buffer == nullptr || a4_mp < t ||
+      (h % 128u) != 0u || (f % 128u) != 0u) {
+    return false;
+  }
+
+  const U32 max_tiles = moe_nax_max_tiles(t, top_k, num_experts);
+  const std::optional<U32> tok_w0 =
+      explicit_t.has_value() ? std::optional<U32>{} : std::optional<U32>{0u};
+  const U32 max_wtiles = std::min<U32>(
+      max_tiles,
+      U32((U64(t) * U64(top_k) + 63ULL) / 64ULL + U64(num_experts)));
+  const bool use_gx32 = e.profile.capacity >= 1152u;
+  const U32 gemm_max_tiles_word = max_tiles | (use_gx32 ? 0x80000000u : 0u);
+  const bool use_w4a4_down =
+      (dw.has_fwht64() || w4a4_down_proj) &&
+      (ws.mid_qa.buffer != nullptr) && (ws.mid_sa.buffer != nullptr) &&
+      (ws.max_rows >= max_tiles * 8u);
+  const U32 mid_reserved =
+      ws.max_rows | (dw.has_fwht64() ? 0u : 0x80000000u);
+  auto make_wide_grid = [&](U32 n_col_tiles, U32 tptg) -> MetalDispatchSize {
+    if (use_gx32) {
+      return {.width = 32ULL * U64(tptg),
+              .height = U64((max_wtiles + 31u) / 32u) * U64(n_col_tiles)};
+    }
+    return {.width = U64(n_col_tiles) * U64(tptg), .height = max_wtiles};
+  };
+
+  if (router_logits.buffer != nullptr) {
+    auto &sched = e.emit(
+        "moe_nax", "omlx_m5_moe_nax_router_top8_bucket_schedule_bm64",
+        {.width = 256u}, {.width = 256u},
+        {router_logits, route_ids, route_scores, ws.tile_expert,
+         ws.tile_valid_rows, ws.tile_assign, ws.total_tiles});
+    e.dynamic(sched, 7, words({t, top_k, h, max_tiles}), tok_w0);
+  } else {
+    auto &sched = e.emit(
+        "moe_nax", "omlx_m5_moe_nax_bucket_schedule_bm64", {.width = 256u},
+        {.width = 256u},
+        {route_ids, ws.tile_expert, ws.tile_valid_rows, ws.tile_assign,
+         ws.total_tiles});
+    e.dynamic(sched, 5, words({t, top_k, h, max_tiles}), tok_w0);
+  }
+
+  const U32 up_x_tiles_64 = (f + 63u) / 64u;
+  const U32 up_x_tiles_32 = (f + 31u) / 32u;
+  const U32 dn_x_tiles = (h + 63u) / 64u;
+  if (use_w4a4_down) {
+    auto &up_nax = e.emit(
+        "w4a4_moe_nax",
+        "omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1_fwht64_a4",
+        make_wide_grid(up_x_tiles_64, 128u), {.width = 128u},
+        {a4_codes, a4_scales, ws.tile_assign, ws.tile_expert,
+         ws.tile_valid_rows, ws.total_tiles, plane(gw, "data"),
+         plane(gw, "scale"), plane(uw, "data"), plane(uw, "scale"),
+         ws.mid_qa, ws.mid_sa});
+    e.dynamic(up_nax, 12,
+              words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a4_mp,
+                     mid_reserved}));
+    e.record_weight(gw, f, h, "moe_w4a4_nax_m5_v1",
+                    "moe_w4a4_swiglu_bm64_out64_sk1_fwht64_a4_v1", {},
+                    "w4a4_prefill_v1", {}, false, explicit_t);
+    e.record_weight(uw, f, h, "moe_w4a4_nax_m5_v1",
+                    "moe_w4a4_swiglu_bm64_out64_sk1_fwht64_a4_v1", {},
+                    "w4a4_prefill_v1", {}, false, explicit_t);
+
+    auto &dn_nax = e.emit(
+        "w4a4_moe_nax",
+        "omlx_m5_moe_mxfp4_w4a4_nax_down_scatter_bm64_bn64_sk1",
+        make_wide_grid(dn_x_tiles, 128u), {.width = 128u},
+        {ws.mid_qa, ws.mid_sa, ws.tile_expert, ws.tile_valid_rows,
+         ws.tile_assign, ws.total_tiles, route_scores, plane(dw, "data"),
+         plane(dw, "scale"), expert_output});
+    e.dynamic(dn_nax, 10,
+              words({h, f, U32(dw.padded_k), gemm_max_tiles_word, ws.max_rows,
+                     0u}));
+    e.record_weight(dw, h, f, "moe_w4a4_nax_m5_v1",
+                    "moe_w4a4_down_bm64_bn64_sk1_v1", {}, "w4a4_prefill_v1",
+                    {}, false, explicit_t);
+  } else {
+    auto &up_nax = e.emit(
+        "w4a4_moe_nax", "omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1",
+        make_wide_grid(up_x_tiles_32, 128u), {.width = 128u},
+        {a4_codes, a4_scales, ws.tile_assign, ws.tile_expert,
+         ws.tile_valid_rows, ws.total_tiles, plane(gw, "data"),
+         plane(gw, "scale"), plane(uw, "data"), plane(uw, "scale"),
+         ws.mid_f16});
+    e.dynamic(up_nax, 11,
+              words({f, h, U32(gw.padded_k), gemm_max_tiles_word, a4_mp, 0u}));
+    e.record_weight(gw, f, h, "moe_w4a4_nax_m5_v1",
+                    "moe_w4a4_swiglu_bm64_out64_sk1_v1", {}, "w4a4_prefill_v1",
+                    {}, false, explicit_t);
+    e.record_weight(uw, f, h, "moe_w4a4_nax_m5_v1",
+                    "moe_w4a4_swiglu_bm64_out64_sk1_v1", {}, "w4a4_prefill_v1",
+                    {}, false, explicit_t);
+
+    if (dw.has_fwht64()) {
+      auto &mid_rot = e.emit(
+          "moe_nax", "omlx_m5_moe_nax_mid_fwht64_bf16",
+          {.width = U64(f / 64u) * 32u, .height = U64(max_tiles) * 8u},
+          {.width = 32u}, {ws.mid_f16, ws.total_tiles});
+      e.dynamic(mid_rot, 2, words({t, top_k, f, max_tiles}), tok_w0);
+    }
+
+    auto &dn_nax = e.emit(
+        "moe_nax", "omlx_m5_moe_mxfp4_nax_down_scatter_bm64_bn64_sk1",
+        make_wide_grid(dn_x_tiles, 128u), {.width = 128u},
+        {ws.mid_f16, ws.tile_expert, ws.tile_valid_rows, ws.tile_assign,
+         ws.total_tiles, route_scores, plane(dw, "data"), plane(dw, "scale"),
+         expert_output});
+    e.dynamic(dn_nax, 9,
+              words({h, f, U32(dw.padded_k), gemm_max_tiles_word}));
+    e.record_weight(dw, h, f, "moe_nax_m5_v1", "moe_nax_down_bm64_sk1_v1", {},
+                    "legacy_route_v1", {}, false, explicit_t);
   }
 
   if (emit_reduce) {

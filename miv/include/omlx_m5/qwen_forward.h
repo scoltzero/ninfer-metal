@@ -37,6 +37,7 @@ struct QwenPrefillOptions {
   bool sparse_minference = false;
   bool cache_blend = false;
   bool ane_offload = false;
+  PrefillAneMode ane_mode = PrefillAneMode::Off;
   std::string artifact_digest;
   // Optional override for Dual-ANE fixed chunk tokens (0 => default 1024).
   std::uint32_t ane_chunk_tokens = 0;
@@ -44,11 +45,14 @@ struct QwenPrefillOptions {
 
 struct QwenPrefillTelemetry {
   std::uint64_t prefill_w4a8_tokens = 0;
+  std::uint64_t prefill_w4a4_tokens = 0;
   std::uint64_t prefill_sage2_tokens = 0;
   std::uint64_t prefill_minference_blocks_skipped = 0;
   std::uint64_t prefill_minference_blocks_total = 0;
   bool prefill_ane_active = false;
   double prefill_ane_split_alpha = 0.0;
+  std::string prefill_ane_mode_effective = "off";
+  std::string prefill_ane_inactive_reason;
   std::uint64_t prefill_ane_offload_tokens = 0;
   std::uint64_t prefill_ane_fallback_tokens = 0;
   std::uint64_t prefill_cache_blend_hit_tokens = 0;
@@ -100,7 +104,8 @@ plan_qwen_forward_memory(const QwenModelConfig &, std::uint32_t max_context,
                          bool flash_nax_prefill = false,
                          bool enable_w4a8_workspace = false,
                          bool enable_minference_workspace = false,
-                         bool enable_sage2_kv_workspace = false);
+                         bool enable_sage2_kv_workspace = false,
+                         bool enable_w4a4_workspace = false);
 
 struct QwenLoadBudget {
   std::uint64_t required_bytes = 0;

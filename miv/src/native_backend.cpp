@@ -954,8 +954,89 @@ public:
           *loaded_lora, effective_lora_mode, primary_ws_rows,
           std::uint32_t(options.max_concurrency));
     }
+    {
+      bool saw_mxfp4 = false;
+      bool saw_affine = false;
+      bool saw_bf16 = false;
+      bool saw_down_fwht64 =
+          ((artifact->summary().container_flags & kArtifactFlagFwht64) != 0U);
+      for (const auto &ls : layers.layers()) {
+        for (const auto &st : ls.stages) {
+          if (st.kind != LayerStageKind::linear || st.object_id == UINT32_MAX ||
+              st.role == "moe_router" || st.role == "moe_shared_gate") {
+            continue;
+          }
+          if (st.format == "mxfp4_e2m1_g32_e8m0_v1") {
+            saw_mxfp4 = true;
+          } else if (st.format.starts_with("oq_affine_q")) {
+            saw_affine = true;
+          } else if (st.format == "direct_bf16_v1") {
+            saw_bf16 = true;
+          }
+          if (st.role == "mlp_down" || st.role == "moe_expert_down") {
+            if (artifact->object(st.object_id).has_fwht64()) {
+              saw_down_fwht64 = true;
+            }
+          }
+        }
+      }
+      if (saw_mxfp4 && !saw_affine && !saw_bf16) {
+        model_quant_format = "mxfp4";
+      } else if (saw_affine && !saw_mxfp4 && !saw_bf16) {
+        model_quant_format = "oq_affine";
+      } else if (saw_bf16 && !saw_mxfp4 && !saw_affine) {
+        model_quant_format = "bf16";
+      } else if (saw_mxfp4 || saw_affine || saw_bf16) {
+        model_quant_format = "mixed";
+      }
+      effective_linear_mode = options.prefill_linear_mode;
+      if (options.prefill_linear_mode == PrefillLinearMode::W4A4) {
+        const bool allow_no_fwht64 = []() {
+          const char *v = std::getenv("OMLX_M5_W4A4_ALLOW_NO_FWHT64");
+          return v != nullptr && std::string_view(v) == "1";
+        }();
+        const bool w4a4_lib_ready =
+            apple10_nax &&
+            std::filesystem::is_regular_file(libraries /
+                                             "omlx_m5_w4a4_nax.metallib");
+        const bool w4a8_lib_ready =
+            apple10_nax &&
+            std::filesystem::is_regular_file(libraries /
+                                             "omlx_m5_w4a8_nax.metallib");
+        if (model_quant_format != "mxfp4") {
+          prefill_linear_fallback = true;
+          prefill_linear_fallback_reason = "requires_mxfp4_model";
+          effective_linear_mode =
+              (w4a8_lib_ready && (model_quant_format == "oq_affine" ||
+                                  model_quant_format == "mixed"))
+                  ? PrefillLinearMode::W4A8
+                  : PrefillLinearMode::BFloat16;
+        } else if (!saw_down_fwht64 && !allow_no_fwht64) {
+          prefill_linear_fallback = true;
+          prefill_linear_fallback_reason = "requires_mxfp4_v2_fwht64";
+          effective_linear_mode = w4a8_lib_ready ? PrefillLinearMode::W4A8
+                                                 : PrefillLinearMode::BFloat16;
+        } else if (!w4a4_lib_ready) {
+          prefill_linear_fallback = true;
+          prefill_linear_fallback_reason = "nax_unavailable";
+          effective_linear_mode = w4a8_lib_ready ? PrefillLinearMode::W4A8
+                                                 : PrefillLinearMode::BFloat16;
+        }
+      }
+    }
+    const bool w4a4_keep_qk_a8 = []() {
+      const char *v = std::getenv("OMLX_M5_W4A4_KEEP_QK_A8");
+      if (!v)
+        return false;
+      const std::string_view sv(v);
+      return sv == "1" || sv == "true" || sv == "TRUE" || sv == "on" ||
+             sv == "ON";
+    }();
+    const bool enable_w4a4_ws =
+        (effective_linear_mode == PrefillLinearMode::W4A4);
     const bool enable_w4a8_ws =
-        (options.prefill_linear_mode == PrefillLinearMode::W4A8);
+        (effective_linear_mode == PrefillLinearMode::W4A8 ||
+         (enable_w4a4_ws && w4a4_keep_qk_a8));
     const bool enable_minf_ws =
         (options.prefill_attention_mode == PrefillAttentionMode::Sage2 &&
          options.prefill_sparse_minference &&
@@ -965,7 +1046,7 @@ public:
         std::uint32_t(draft_config.target_layer_ids.size()), false,
         any_speculative, enable_attention_split, coupled, coupled, false, 0u,
         primary_ws_rows, affine4_kv, 0u, enable_flash_nax_prefill,
-        enable_w4a8_ws, enable_minf_ws);
+        enable_w4a8_ws, enable_minf_ws, false, enable_w4a4_ws);
     std::uint64_t per_slot_extra_ws = 0;
     std::uint64_t per_slot_extra_state = 0;
     std::uint64_t companion_weights = 0;
@@ -1262,16 +1343,18 @@ public:
         coupled ? AttentionNumericPolicy::RowExactV1
                 : AttentionNumericPolicy::Legacy;
     QwenPrefillOptions primary_prefill_opts{
-        .linear_mode = options.prefill_linear_mode,
+        .linear_mode = effective_linear_mode,
         .attention_mode = options.prefill_attention_mode,
         .sparse_minference = options.prefill_sparse_minference,
         .cache_blend = options.prefill_cache_blend,
         .ane_offload = options.prefill_ane_offload,
+        .ane_mode = options.prefill_ane_mode,
         .artifact_digest = model_digest,
     };
     QwenPrefillOptions secondary_prefill_opts = primary_prefill_opts;
     secondary_prefill_opts.cache_blend = false;
     secondary_prefill_opts.ane_offload = false;
+    secondary_prefill_opts.ane_mode = PrefillAneMode::Off;
     program = std::make_unique<QwenForward>(
         context, weights, layers, config, max_context, libraries,
         draft_config.target_layer_ids, false, any_speculative,
@@ -1468,7 +1551,10 @@ public:
       execution_fields.emplace("lora", loaded_lora->fingerprint);
       execution_fields.emplace("lora_mode", effective_lora_mode);
     }
-    append_prefill_execution_identity_fields(options, execution_fields);
+    LoadOptions effective_id_options = options;
+    effective_id_options.prefill_linear_mode = effective_linear_mode;
+    append_prefill_execution_identity_fields(effective_id_options,
+                                             execution_fields);
     execution_identity = execution_identity_digest(execution_fields);
     for (std::size_t index = 0; index < occupied.size(); ++index)
       program_at(index).bind_execution_identity(execution_identity);
@@ -1480,7 +1566,7 @@ public:
       blend_cache = std::make_unique<detail::ChunkBlendCache>(blend_budget);
       blend_model_exec_hash = detail::compute_blend_model_exec_hash(
           model_digest, slot_kv_dtype,
-          prefill_linear_mode_to_string(options.prefill_linear_mode),
+          prefill_linear_mode_to_string(effective_linear_mode),
           prefill_attention_mode_to_string(options.prefill_attention_mode),
           options.prefill_sparse_minference, options.prefill_ane_offload);
     }
@@ -1707,6 +1793,10 @@ public:
   std::string lora_mode_active;
   std::uint64_t lora_buffer_bytes = 0;
   std::uint32_t lora_adapted_layers = 0;
+  std::string model_quant_format;
+  PrefillLinearMode effective_linear_mode = PrefillLinearMode::BFloat16;
+  bool prefill_linear_fallback = false;
+  std::string prefill_linear_fallback_reason;
   std::shared_ptr<QwenMergedLoraOverrides> merged_lora;
   std::shared_ptr<QwenBypassLoraRuntime> bypass_lora;
   AdaptiveSpecController spec_controller;
@@ -3946,6 +4036,7 @@ private:
   static void accumulate_prefill_telemetry_locked(
       StatsReport &stats, const QwenPrefillTelemetry &d) noexcept {
     stats.prefill_w4a8_tokens += d.prefill_w4a8_tokens;
+    stats.prefill_w4a4_tokens += d.prefill_w4a4_tokens;
     stats.prefill_sage2_tokens += d.prefill_sage2_tokens;
     stats.prefill_minference_blocks_skipped +=
         d.prefill_minference_blocks_skipped;
@@ -4064,6 +4155,12 @@ NativeBackend::NativeBackend(const LoadOptions &options) : options_(options) {
   backend_stats_.lora_buffer_bytes = ar_program_->lora_buffer_bytes;
   backend_stats_.lora_adapted_layers = ar_program_->lora_adapted_layers;
   populate_prefill_config_stats(options_, backend_stats_);
+  backend_stats_.model_quant_format = ar_program_->model_quant_format;
+  backend_stats_.prefill_linear_mode_effective =
+      prefill_linear_mode_to_string(ar_program_->effective_linear_mode);
+  backend_stats_.prefill_linear_fallback = ar_program_->prefill_linear_fallback;
+  backend_stats_.prefill_linear_fallback_reason =
+      ar_program_->prefill_linear_fallback_reason;
   backend_stats_.prefill_ane_active =
       ar_program_->program->ane_offload_active();
   backend_stats_.prefill_ane_split_alpha =
@@ -5608,6 +5705,12 @@ void NativeBackend::populate_stats(StatsReport &stats) const {
   stats.lora_buffer_bytes = backend_stats_.lora_buffer_bytes;
   stats.lora_adapted_layers = backend_stats_.lora_adapted_layers;
   stats.prefill_linear_mode = backend_stats_.prefill_linear_mode;
+  stats.prefill_linear_mode_effective =
+      backend_stats_.prefill_linear_mode_effective;
+  stats.prefill_linear_fallback = backend_stats_.prefill_linear_fallback;
+  stats.prefill_linear_fallback_reason =
+      backend_stats_.prefill_linear_fallback_reason;
+  stats.model_quant_format = backend_stats_.model_quant_format;
   stats.prefill_attention_mode = backend_stats_.prefill_attention_mode;
   stats.prefill_sparse_minference = backend_stats_.prefill_sparse_minference;
   stats.prefill_sparse_minference_effective =
@@ -5615,10 +5718,15 @@ void NativeBackend::populate_stats(StatsReport &stats) const {
   stats.prefill_sparse_minference_inactive_reason =
       backend_stats_.prefill_sparse_minference_inactive_reason;
   stats.prefill_cache_blend = backend_stats_.prefill_cache_blend;
+  stats.prefill_ane_mode = backend_stats_.prefill_ane_mode;
+  stats.prefill_ane_mode_effective = backend_stats_.prefill_ane_mode_effective;
+  stats.prefill_ane_inactive_reason =
+      backend_stats_.prefill_ane_inactive_reason;
   stats.prefill_ane_offload = backend_stats_.prefill_ane_offload;
   stats.prefill_ane_active = backend_stats_.prefill_ane_active;
   stats.prefill_ane_split_alpha = backend_stats_.prefill_ane_split_alpha;
   stats.prefill_w4a8_tokens = backend_stats_.prefill_w4a8_tokens;
+  stats.prefill_w4a4_tokens = backend_stats_.prefill_w4a4_tokens;
   stats.prefill_sage2_tokens = backend_stats_.prefill_sage2_tokens;
   stats.prefill_minference_blocks_skipped =
       backend_stats_.prefill_minference_blocks_skipped;
