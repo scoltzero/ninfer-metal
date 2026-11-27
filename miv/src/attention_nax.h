@@ -277,14 +277,14 @@ inline void emit_paged_split_attention_exact_gqa(
 }
 
 struct GqaFlashPrefillTier {
-  U32 wm = 8u;
-  U32 tg_threads = 512u;
-  U32 bm_tok = 16u;
+  U32 wm = 2u;
+  U32 tg_threads = 256u;
+  U32 m_tile = 32u;
   const char *bf16_kernel =
-      "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm8";
+      "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_nax_hd256_wm2";
   const char *affine4_kernel =
-      "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8";
-  const char *tier_tag = "L";
+      "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm2";
+  const char *tier_tag = "WM2";
 };
 
 inline bool gqa_flash_prefill_eligible(U32 query_heads, U32 kv_heads,
@@ -306,55 +306,33 @@ inline GqaFlashPrefillTier select_gqa_flash_prefill_tier(
   if (wm == 0u) {
     if (const char *env = std::getenv("OMLX_M5_GQA_FLASH_TIER")) {
       const std::string_view sv(env);
-      if (sv == "3" || sv == "S3" || sv == "wm3" || sv == "WM3")
+      if (sv == "2" || sv == "S" || sv == "wm2" || sv == "WM2")
+        wm = 2u;
+      else if (sv == "3" || sv == "M" || sv == "L" || sv == "wm3" || sv == "WM3")
         wm = 3u;
-      else if (sv == "4" || sv == "S" || sv == "S4" || sv == "wm4" ||
-               sv == "WM4")
-        wm = 4u;
-      else if (sv == "6" || sv == "M" || sv == "wm6" || sv == "WM6")
-        wm = 6u;
-      else if (sv == "8" || sv == "L" || sv == "wm8" || sv == "WM8")
-        wm = 8u;
     }
   }
   if (wm == 0u) {
-    if (tokens > 96u) {
-      wm = 8u;
-    } else if (tokens > 16u) {
-      wm = 6u;
-    } else if (repeat == 6u && tokens <= 8u) {
-      wm = 3u;
-    } else {
-      wm = 4u;
-    }
+    // WP3.2 BK=16 WN=4 (<= 14.00 KiB, 0 B spills, 2 TGs/core):
+    // WM=2 uses 4 barriers/step (256 threads); WM=3 uses 48 rows (8x6 on 27B,
+    // 6x8 on 35B). Default to WM=2 unless calibrated higher on M5 Ultra.
+    (void)tokens;
+    (void)repeat;
+    wm = 2u;
   }
-  if (wm != 3u && wm != 4u && wm != 6u && wm != 8u) {
-    wm = 8u;
+  if (wm != 2u && wm != 3u) {
+    wm = 2u;
   }
-  const U32 m_tile = wm * 16u;
-  const U32 bm_tok = std::max<U32>(1u, m_tile / std::max<U32>(1u, repeat));
   if (wm == 3u) {
-    return {3u, 192u, bm_tok,
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm3",
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm3",
-            "S3"};
+    return {3u, 384u, 48u,
+            "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_nax_hd256_wm3",
+            "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm3",
+            "WM3"};
   }
-  if (wm == 4u) {
-    return {4u, 256u, bm_tok,
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm4",
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm4",
-            "S4"};
-  }
-  if (wm == 6u) {
-    return {6u, 384u, bm_tok,
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm6",
-            "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm6",
-            "M"};
-  }
-  return {8u, 512u, bm_tok,
-          "omlx_m5_paged_flash_prefill_gqa_lpt_pp_nax_hd256_wm8",
-          "omlx_m5_paged_flash_prefill_gqa_lpt_pp_affine4_g128_hd256_wm8",
-          "L"};
+  return {2u, 256u, 32u,
+          "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_nax_hd256_wm2",
+          "omlx_m5_paged_flash_prefill_gqa_bk16_wn4_affine4_g128_hd256_wm2",
+          "WM2"};
 }
 
 // Base 2.2 Wave 2 routing helper: detect short tail / HKVD chunks at long KV
@@ -362,11 +340,14 @@ inline GqaFlashPrefillTier select_gqa_flash_prefill_tier(
 inline bool gqa_flash_prefill_tail_needs_split_kv(
     U32 tokens, U32 query_heads, U32 kv_heads, U32 context_envelope,
     U32 gpu_cores) {
-  if (context_envelope < 4096u || kv_heads == 0u || tokens == 0u)
+  if (context_envelope < 4096u || kv_heads == 0u || tokens == 0u ||
+      query_heads < kv_heads)
     return false;
+  const U32 repeat = query_heads / kv_heads;
   const auto tier = select_gqa_flash_prefill_tier(tokens, query_heads, kv_heads);
-  const U64 q_blocks = (U64(tokens) + tier.bm_tok - 1ull) / tier.bm_tok;
-  const U64 gqa_flash_tgs = q_blocks * U64(kv_heads);
+  const U64 m_total = U64(tokens) * U64(repeat);
+  const U64 m_blocks = (m_total + U64(tier.m_tile) - 1ull) / U64(tier.m_tile);
+  const U64 gqa_flash_tgs = m_blocks * U64(kv_heads);
   return gqa_flash_tgs < 2ull * U64(std::max<U32>(1u, gpu_cores));
 }
 
@@ -414,16 +395,17 @@ inline void emit_paged_flash_prefill_gqa_nax(
     throw std::invalid_argument("GQA FlashNax requires hd256 and valid GQA");
   }
   const auto tier = select_gqa_flash_prefill_tier(t, qh, kvh, forced_wm);
-  const U32 q_blocks = (t + tier.bm_tok - 1u) / tier.bm_tok;
+  const U64 m_total = U64(t) * U64(qh / kvh);
+  const U64 m_blocks = (m_total + U64(tier.m_tile) - 1ull) / U64(tier.m_tile);
   auto &attn = e.emit(
       "attention_nax_prefill", tier.bf16_kernel,
-      {.width = tier.tg_threads, .height = U64(q_blocks) * kvh},
+      {.width = tier.tg_threads, .height = m_blocks * U64(kvh)},
       {.width = tier.tg_threads},
       {query, gate, state_k, state_v, mixer, page_table, attention_positions});
   e.profile.attention_kernel = tier.bf16_kernel;
   e.profile.attention_grid = attn.grid;
   e.profile.attention_numeric_contract_id =
-      "paged.nax_flash_v2.gqa_lpt_pp_bk32.f32_softmax_gate.v1";
+      "paged.nax_flash_v3.gqa_bk16_wn4.f32_softmax_gate.v1";
   e.profile.attention_row_exact_eligible = false;
   e.dynamic(attn, 7, std::move(params), 3, 4);
 }
@@ -769,16 +751,17 @@ inline void emit_paged_flash_prefill_gqa_affine4_g128(
         "GQA Affine4Group128 flash prefill requires hd256 and valid GQA");
   }
   const auto tier = select_gqa_flash_prefill_tier(t, qh, kvh, forced_wm);
-  const U32 q_blocks = (t + tier.bm_tok - 1u) / tier.bm_tok;
+  const U64 m_total = U64(t) * U64(qh / kvh);
+  const U64 m_blocks = (m_total + U64(tier.m_tile) - 1ull) / U64(tier.m_tile);
   auto &attn = e.emit(
       "attention_affine4", tier.affine4_kernel,
-      {.width = tier.tg_threads, .height = U64(q_blocks) * kvh},
+      {.width = tier.tg_threads, .height = m_blocks * U64(kvh)},
       {.width = tier.tg_threads},
       {query, gate, state_k, state_v, mixer, page_table, attention_positions});
   e.profile.attention_kernel = tier.affine4_kernel;
   e.profile.attention_grid = attn.grid;
   e.profile.attention_numeric_contract_id =
-      "paged.nax_affine4_g128_flash_v2.gqa_lpt_pp_bk32.f32_softmax_gate.v1";
+      "paged.nax_affine4_g128_flash_v3.gqa_bk16_wn4.f32_softmax_gate.v1";
   e.profile.attention_row_exact_eligible = false;
   e.dynamic(attn, 7, std::move(params), 3, 4);
 }
@@ -787,19 +770,12 @@ inline void emit_paged_flash_prefill_affine4_g128(
     Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
     Ref state_k, Ref state_v, Ref mixer, Ref page_table,
     Ref attention_positions, std::vector<std::byte> params) {
-  // Real Apple10 M5 Ultra calibration (27B QH=24/KVH=4, chunk=2048):
-  //   - LPT BQ=64 direct-L1 kernel (8.4 KiB SRAM, 2 TG/core): 64.0 TFLOPS (12.08ms @16K, 52.66ms @64K)
-  //   - GQA-packed Ping-Pong wm8 (29.0 KiB SRAM, 1 TG/core):  56.3 TFLOPS (13.74ms @16K, 58.48ms @64K)
-  // Route full chunks (t >= 64) to LPT BQ=64 unless GQA packing is explicitly forced via
-  // OMLX_M5_ENABLE_GQA_FLASH_PREFILL=1 or OMLX_M5_GQA_FLASH_TIER, while keeping GQA-packed
-  // Flash-NAX for short tail/HKVD chunks (t < 64) where BQ=64 underfills rows.
-  const bool force_gqa =
-      env_flag_enabled("OMLX_M5_ENABLE_GQA_FLASH_PREFILL") ||
-      (std::getenv("OMLX_M5_GQA_FLASH_TIER") != nullptr);
+  // WP3.2 BK=16, WN=4 GQA Flash-Prefill (<= 14.0 KiB SRAM, 2 TGs/core, 0 B spill)
+  // enabled by default for all chunk sizes (both t >= 64 and t < 64; short tails
+  // at long KV are routed to Split-KV upstream via gqa_flash_prefill_tail_needs_split_kv).
   if (gqa_flash_prefill_eligible(U32(c.num_attention_heads),
                                  U32(c.num_key_value_heads),
-                                 U32(c.head_dim)) &&
-      (t < 64u || force_gqa)) {
+                                 U32(c.head_dim))) {
     emit_paged_flash_prefill_gqa_affine4_g128(
         e, c, t, query, gate, state_k, state_v, mixer, page_table,
         attention_positions, std::move(params));

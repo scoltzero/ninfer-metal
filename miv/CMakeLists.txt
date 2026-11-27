@@ -3025,4 +3025,43 @@ if(OMLX_M5_BUILD_NAX_METALLIB AND
     COMMAND
       $<TARGET_FILE:omlx_m5_prefill_all_modes_e2e_tests>
       "${OMLX_M5_METAL_OUTPUT_DIR}")
+
+  # WP3 Global Apple10 <= 16.0 KiB Static TG SRAM & 0-Byte Register-Spill CI Audit Gate
+  if(TARGET omlx_m5_attention_nax_prefill_metallib AND
+     TARGET omlx_m5_attention_affine4_metallib AND
+     TARGET omlx_m5_gdn_chunk_nax_metallib AND
+     TARGET omlx_m5_cache_blend_metallib)
+    add_executable(
+      omlx_m5_prefill_sram_spill_audit_tests
+      tests/prefill_sram_spill_audit_tests.mm)
+    target_include_directories(
+      omlx_m5_prefill_sram_spill_audit_tests
+      PRIVATE
+      ${OMLX_M5_THIRD_PARTY_INCLUDE_DIR})
+    target_compile_features(omlx_m5_prefill_sram_spill_audit_tests PRIVATE cxx_std_20)
+    target_compile_options(
+      omlx_m5_prefill_sram_spill_audit_tests
+      PRIVATE
+      -Wall
+      -Wextra
+      -Wpedantic
+      -Werror
+      "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+    target_link_libraries(
+      omlx_m5_prefill_sram_spill_audit_tests
+      PRIVATE
+      "-framework Foundation"
+      "-framework Metal")
+    add_dependencies(
+      omlx_m5_prefill_sram_spill_audit_tests
+      omlx_m5_attention_nax_prefill_metallib
+      omlx_m5_attention_affine4_metallib
+      omlx_m5_gdn_chunk_nax_metallib
+      omlx_m5_cache_blend_metallib)
+    add_test(
+      NAME omlx_m5_prefill_sram_spill_audit
+      COMMAND
+        $<TARGET_FILE:omlx_m5_prefill_sram_spill_audit_tests>
+        "${OMLX_M5_METAL_OUTPUT_DIR}")
+  endif()
 endif()
