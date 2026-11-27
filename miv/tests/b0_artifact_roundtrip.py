@@ -482,6 +482,19 @@ def test_corruption(
     unsupported.write_bytes(raw)
     expect_rejected(unsupported, cpp_inspector)
 
+    unsupported_v3 = root / "unsupported-version-v3.omlxm5"
+    raw = bytearray(source.read_bytes())
+    struct.pack_into("<I", raw, 8, 3)
+    struct.pack_into("<I", raw, 56, zlib.crc32(raw[:56]) & 0xFFFFFFFF)
+    unsupported_v3.write_bytes(raw)
+    expect_rejected(unsupported_v3, cpp_inspector)
+
+    bad_flags = root / "bad-flags.omlxm5"
+    raw = bytearray(source.read_bytes())
+    struct.pack_into("<I", raw, 60, 0x4)
+    bad_flags.write_bytes(raw)
+    expect_rejected(bad_flags, cpp_inspector)
+
     bad_manifest = root / "bad-manifest.omlxm5"
     raw = bytearray(source.read_bytes())
     raw[artifact.HEADER_BYTES] ^= 1
@@ -640,6 +653,8 @@ def test_affine8_nax_pretile_roundtrip(
             "fixture/pure-affine8",
             "--expected-revision",
             "oq-affine8-pretile-rev",
+            "--artifact-version",
+            "1",
         ],
         check=True,
         capture_output=True,
@@ -658,6 +673,8 @@ def test_affine8_nax_pretile_roundtrip(
             "fixture/pure-affine8",
             "--expected-revision",
             "oq-affine8-pretile-rev",
+            "--artifact-version",
+            "1",
             "--nax-pretile",
         ],
         check=True,
@@ -923,12 +940,291 @@ def test_affine8_nax_pretile_roundtrip(
     expect_rejected(bad_q8_bytes, cpp_inspector)
 
 
+def test_miv_v2_fwht64_pi64_roundtrip(
+    root: Path, cpp_inspector: Path | None = None
+) -> None:
+    # 1. Exact Sylvester H_64 orthogonality & involutivity vs explicit matrix
+    idx = np.arange(64, dtype=np.uint32)
+    h64 = np.array(
+        [
+            [(-1.0 if bin(int(i & j)).count("1") & 1 else 1.0) / 8.0 for j in idx]
+            for i in idx
+        ],
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng(777)
+    x_rand = rng.normal(0.0, 1.0, size=(7, 512)).astype(np.float32)
+    y_fwht = x_rand.copy()
+    artifact.fwht64_f32_inplace(y_fwht)
+    y_ref = (x_rand.reshape(7, 8, 64) @ h64).reshape(7, 512)
+    expect(
+        float(np.max(np.abs(y_fwht - y_ref))) < 1e-6,
+        "fwht64_f32_inplace disagrees with explicit Sylvester H_64",
+    )
+    y_back = y_fwht.copy()
+    artifact.fwht64_f32_inplace(y_back)
+    expect(
+        float(np.max(np.abs(y_back - x_rand))) < 1e-6,
+        "fwht64_f32_inplace is not involutive",
+    )
+
+    # 2. Mixed oQ4e (q3/q4/q5/q6/q8, g64/g128, 3D MoE experts, MTP) + MXFP4 v2 CLI convert
+    k = 512
+    n = 20
+    tensors: dict[str, tuple[str, list[int], bytes]] = {}
+    q_cfg: dict[str, object] = {"bits": 4, "group_size": 64, "mode": "affine"}
+    specs = [
+        ("model.layers.0.self_attn.q_proj", 4, 64, (n, k)),
+        ("model.layers.0.self_attn.o_proj", 5, 64, (n, k)),
+        ("model.layers.0.mlp.down_proj", 5, 64, (n, k)),
+        ("model.layers.0.mlp.shared_expert.down_proj", 6, 128, (n, k)),
+        ("model.layers.0.mlp.switch_mlp.down_proj", 4, 64, (4, 8, k)),
+        ("model.layers.0.linear_attn.out_proj", 3, 64, (n, k)),
+        ("language_model.mtp.layers.0.mlp.down_proj", 8, 128, (n, k)),
+        ("language_model.mtp.layers.0.self_attn.o_proj", 6, 64, (n, k)),
+    ]
+    orig_w: dict[str, np.ndarray] = {}
+    for mod, bits, gs, shp in specs:
+        q_cfg[mod] = {"bits": bits, "group_size": gs, "mode": "affine"}
+        w = rng.normal(0.0, 0.25, size=shp).astype(np.float32)
+        codes, sc_u16, bi_u16, _, _ = artifact.quantize_oq_affine_f32(w, bits, gs)
+        sc_f32 = artifact._bf16_u16_to_float32(sc_u16)
+        bi_f32 = artifact._bf16_u16_to_float32(bi_u16)
+        orig_w[mod] = (
+            codes.astype(np.float32).reshape(*shp[:-1], k // gs, gs) * sc_f32[..., None]
+            + bi_f32[..., None]
+        ).reshape(shp)
+        packed = artifact._pack_mlx_affine_u32(codes, bits)
+        tensors[mod + ".weight"] = ("U32", list(packed.shape), packed.tobytes())
+        tensors[mod + ".scales"] = ("BF16", list(sc_u16.shape), sc_u16.tobytes())
+        tensors[mod + ".biases"] = ("BF16", list(bi_u16.shape), bi_u16.tobytes())
+    tensors["model.norm.weight"] = ("BF16", [k], bf16([1.0] * k))
+
+    oq_src = write_model(
+        root / "v2_oq_src",
+        "v2-oq-rev",
+        {"model_type": "qwen3_8", "quantization": q_cfg},
+        tensors,
+    )
+    out_j1 = root / "v2_oq_j1.miv"
+    out_j4 = root / "v2_oq_j4.miv"
+    out_untiled = root / "v2_oq_untiled.miv"
+    out_twostep = root / "v2_oq_twostep.miv"
+    out_no_oproj = root / "v2_oq_no_oproj.miv"
+    out_no_fwht = root / "v2_oq_no_fwht.miv"
+
+    for out_p, extra in (
+        (out_j1, ["--nax-pretile", "--jobs", "1"]),
+        (out_j4, ["--nax-pretile", "--jobs", "4"]),
+        (out_untiled, ["--jobs", "2"]),
+        (out_no_oproj, ["--nax-pretile", "--no-fwht64-o-proj", "--jobs", "2"]),
+        (out_no_fwht, ["--nax-pretile", "--no-fwht64", "--jobs", "2"]),
+    ):
+        subprocess.run(
+            [
+                sys.executable,
+                str(MIV_ROOT / "tools" / "m5_artifact.py"),
+                "convert",
+                "--source",
+                str(oq_src),
+                "--output",
+                str(out_p),
+                "--source-repo",
+                "fixture/v2-oq",
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        [
+            sys.executable,
+            str(MIV_ROOT / "tools" / "m5_artifact.py"),
+            "pretile",
+            "--input",
+            str(out_untiled),
+            "--output",
+            str(out_twostep),
+            "--jobs",
+            "4",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    expect(out_j1.read_bytes() == out_j4.read_bytes(), "--jobs 1 vs 4 bytes differ")
+    expect(
+        out_j1.read_bytes() == out_twostep.read_bytes(),
+        "single-pass v2 convert --nax-pretile vs two-step pretile bytes differ",
+    )
+
+    summary, manifest = artifact.read_artifact(out_j4, verify_payload=True)
+    expect(
+        summary["container_version"] == 2
+        and summary["container_flags"] == 3
+        and summary["schema"] == "omlx-m5-artifact-v2",
+        "v2 summary header/flags/schema mismatch",
+    )
+    objs = {o["name"]: o for o in manifest["objects"]}
+    expect(objs["model.layers.0.self_attn.q_proj"]["layout"] == "oq_nax_lane_g64_v2", "q_proj layout")
+    expect(objs["model.layers.0.self_attn.q_proj"].get("input_transform", "none") == "none", "q_proj unrotated")
+    expect(objs["model.layers.0.linear_attn.out_proj"]["layout"] == "oq_nax_lane_g64_v2", "gdn out layout")
+    expect(objs["model.layers.0.linear_attn.out_proj"].get("input_transform", "none") == "none", "gdn out unrotated")
+    expect(objs["model.layers.0.mlp.down_proj"]["layout"] == "oq_nax_lane_g64_v2", "down_proj layout")
+    expect(objs["model.layers.0.mlp.down_proj"]["input_transform"] == "fwht64", "down_proj rotated")
+    expect(objs["model.layers.0.self_attn.o_proj"]["input_transform"] == "fwht64", "o_proj rotated")
+    expect(objs["model.layers.0.mlp.shared_expert.down_proj"]["layout"] == "oq_nax_lane_g128_v2", "shared g128 layout")
+    expect(objs["model.layers.0.mlp.shared_expert.down_proj"]["input_transform"] == "fwht64", "shared down rotated")
+    expect(objs["model.layers.0.mlp.switch_mlp.down_proj"]["layout"] == "oq_expert_rowsplit_k128_v1", "expert layout")
+    expect(objs["model.layers.0.mlp.switch_mlp.down_proj"]["input_transform"] == "fwht64", "expert down rotated")
+    expect(objs["language_model.mtp.layers.0.mlp.down_proj"]["layout"] == "oq_nax_lane_g128_v2", "mtp down layout")
+    expect(objs["language_model.mtp.layers.0.mlp.down_proj"]["input_transform"] == "fwht64", "mtp down rotated")
+    expect(objs["language_model.mtp.layers.0.self_attn.o_proj"]["input_transform"] == "fwht64", "mtp o_proj rotated")
+
+    # Verify --no-fwht64-o-proj and --no-fwht64
+    s_no_o, m_no_o = artifact.read_artifact(out_no_oproj, verify_payload=True)
+    o_no_o = {o["name"]: o for o in m_no_o["objects"]}
+    expect(s_no_o["container_flags"] == 3, "--no-fwht64-o-proj flags")
+    expect(o_no_o["model.layers.0.self_attn.o_proj"].get("input_transform", "none") == "none", "o_proj should not rotate")
+    expect(o_no_o["model.layers.0.mlp.down_proj"]["input_transform"] == "fwht64", "down_proj should rotate")
+
+    s_nf, m_nf = artifact.read_artifact(out_no_fwht, verify_payload=True)
+    expect(s_nf["container_flags"] == 2, "--no-fwht64 should only set NAX_LANE_V2 flag")
+    expect(all(o.get("input_transform", "none") == "none" for o in m_nf["objects"]), "--no-fwht64 rotated something")
+
+    # Verify SQNR on rotated objects & exact bit-match on unrotated objects
+    for mod, bits, gs, shp in specs:
+        flat_rows = int(np.prod(shp[:-1]))
+        dec = np.asarray(
+            [
+                artifact.decode_artifact_row(out_j4, manifest, mod, r, 0, k)
+                for r in range(flat_rows)
+            ],
+            dtype=np.float32,
+        ).reshape(shp)
+        ref = orig_w[mod]
+        if objs[mod].get("input_transform") == "fwht64":
+            err = float(np.sum((dec - ref) ** 2))
+            sig = float(np.sum(ref ** 2))
+            sqnr_db = 10.0 * np.log10(sig / max(err, 1e-30))
+            min_sqnr = {3: 14.5, 4: 20.5, 5: 26.8, 6: 32.5, 8: 43.0}[bits]
+            expect(sqnr_db > min_sqnr, f"{mod} (q{bits}) SQNR too low: {sqnr_db:.2f} dB")
+        else:
+            expect(np.array_equal(dec, ref), f"unrotated {mod} changed in v2")
+
+        if cpp_inspector is not None:
+            native = json.loads(
+                subprocess.check_output(
+                    [
+                        str(cpp_inspector),
+                        str(out_j4),
+                        "--verify-payload",
+                        "--sample-object",
+                        mod,
+                        "--sample-row",
+                        "0",
+                        "--sample-start",
+                        "13",
+                        "--sample-count",
+                        "77",
+                    ],
+                    text=True,
+                )
+            )
+            py_slice = artifact.decode_artifact_row(out_j4, manifest, mod, 0, 13, 77)
+            expect(
+                np.allclose(native["sample"]["values"], py_slice, rtol=1e-6, atol=1e-6),
+                f"C++ vs Python v2 decode mismatch on {mod}",
+            )
+
+    # 3. MXFP4 v2 with FWHT-64 (2D down_proj + 3D MoE expert down)
+    mx_down_w = rng.normal(0.0, 0.25, size=(16, k)).astype(np.float32)
+    mx_exp_w = rng.normal(0.0, 0.25, size=(2, 8, k)).astype(np.float32)
+    mx_d_p, mx_d_s, _, _ = artifact.quantize_mxfp4_e2m1_f32(mx_down_w)
+    mx_e_p, mx_e_s, _, _ = artifact.quantize_mxfp4_e2m1_f32(mx_exp_w)
+    mx_d_ref = artifact._dequantize_mxfp4_u8_f32(mx_d_p, mx_d_s)
+    mx_src = write_model(
+        root / "v2_mx_src",
+        "v2-mx-rev",
+        {"model_type": "qwen3_6_moe", "quantization": {"bits": 4, "group_size": 32, "mode": "mxfp4"}},
+        {
+            "model.layers.0.mlp.down_proj.weight": ("U32", [16, k // 8], mx_d_p.tobytes()),
+            "model.layers.0.mlp.down_proj.scales": ("U8", [16, k // 32], mx_d_s.tobytes()),
+            "model.layers.0.mlp.switch_mlp.down_proj.weight": ("U32", [2, 8, k // 8], mx_e_p.tobytes()),
+            "model.layers.0.mlp.switch_mlp.down_proj.scales": ("U8", [2, 8, k // 32], mx_e_s.tobytes()),
+        },
+    )
+    mx_v2 = root / "v2_mx.miv"
+    subprocess.run(
+        [
+            sys.executable,
+            str(MIV_ROOT / "tools" / "m5_artifact.py"),
+            "convert",
+            "--source",
+            str(mx_src),
+            "--output",
+            str(mx_v2),
+            "--source-repo",
+            "fixture/v2-mx",
+            "--nax-pretile",
+            "--jobs",
+            "2",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    mx_sum, mx_man = artifact.read_artifact(mx_v2, verify_payload=True)
+    expect(mx_sum["container_version"] == 2 and mx_sum["container_flags"] == 1, "MXFP4 v2 flags should be 0x1")
+    mx_objs = {o["name"]: o for o in mx_man["objects"]}
+    expect(
+        mx_objs["model.layers.0.mlp.down_proj"]["layout"] == "mx_nax_tiled_bk128_v1"
+        and mx_objs["model.layers.0.mlp.down_proj"]["input_transform"] == "fwht64",
+        "MXFP4 2D down_proj layout/transform mismatch",
+    )
+    expect(
+        mx_objs["model.layers.0.mlp.switch_mlp.down_proj"]["layout"] == "mx_expert_rowsplit_k128_v1"
+        and mx_objs["model.layers.0.mlp.switch_mlp.down_proj"]["input_transform"] == "fwht64",
+        "MXFP4 3D expert down layout/transform mismatch",
+    )
+    mx_dec = np.asarray(
+        [artifact.decode_artifact_row(mx_v2, mx_man, "model.layers.0.mlp.down_proj", r, 0, k) for r in range(16)],
+        dtype=np.float32,
+    )
+    mx_sqnr = 10.0 * np.log10(float(np.sum(mx_d_ref ** 2)) / max(float(np.sum((mx_dec - mx_d_ref) ** 2)), 1e-30))
+    expect(mx_sqnr > 17.5, f"MXFP4 FWHT-64 3-exp SQNR too low: {mx_sqnr:.2f} dB")
+    if cpp_inspector is not None:
+        native = json.loads(
+            subprocess.check_output(
+                [
+                    str(cpp_inspector),
+                    str(mx_v2),
+                    "--verify-payload",
+                    "--sample-object",
+                    "model.layers.0.mlp.down_proj",
+                    "--sample-row",
+                    "3",
+                    "--sample-start",
+                    "5",
+                    "--sample-count",
+                    "90",
+                ],
+                text=True,
+            )
+        )
+        py_mx = artifact.decode_artifact_row(mx_v2, mx_man, "model.layers.0.mlp.down_proj", 3, 5, 90)
+        expect(np.allclose(native["sample"]["values"], py_mx, rtol=1e-6, atol=1e-6), "MXFP4 v2 C++ decode mismatch")
+
+
 # Mark helper functions taking positional non-fixture args so pytest collection
 # runs the dedicated pytest entrypoints below while preserving CLI & import APIs.
 test_roundtrip.__test__ = False  # type: ignore[attr-defined]
 test_corruption.__test__ = False  # type: ignore[attr-defined]
 test_unsafe_source_index.__test__ = False  # type: ignore[attr-defined]
 test_affine8_nax_pretile_roundtrip.__test__ = False  # type: ignore[attr-defined]
+test_miv_v2_fwht64_pi64_roundtrip.__test__ = False  # type: ignore[attr-defined]
 
 
 def _discover_cpp_inspector() -> Path | None:
@@ -949,6 +1245,7 @@ def _discover_cpp_inspector() -> Path | None:
 
 def test_pytest_b0_affine8_nax_pretile_roundtrip(tmp_path: Path) -> None:
     test_affine8_nax_pretile_roundtrip(tmp_path, cpp_inspector=None)
+    test_miv_v2_fwht64_pi64_roundtrip(tmp_path / "v2", cpp_inspector=None)
     test_unsafe_source_index(tmp_path)
 
 
@@ -963,6 +1260,7 @@ def test_pytest_b0_full_roundtrip_with_cpp_inspector(tmp_path: Path) -> None:
     fixtures, codes = make_fixtures(tmp_path / "sources")
     outputs = test_roundtrip(tmp_path, fixtures, codes, golden, inspector)
     test_affine8_nax_pretile_roundtrip(tmp_path / "pretile", inspector)
+    test_miv_v2_fwht64_pi64_roundtrip(tmp_path / "v2", inspector)
     oq_path, oq_manifest = outputs["oq"]
     test_corruption(tmp_path, oq_path, copy.deepcopy(oq_manifest), inspector)
 
@@ -984,6 +1282,7 @@ def main() -> None:
         fixtures, codes = make_fixtures(root / "sources")
         outputs = test_roundtrip(root, fixtures, codes, golden, inspector)
         test_affine8_nax_pretile_roundtrip(root / "pretile", inspector)
+        test_miv_v2_fwht64_pi64_roundtrip(root / "v2", inspector)
         oq_path, oq_manifest = outputs["oq"]
         test_corruption(root, oq_path, copy.deepcopy(oq_manifest), inspector)
         test_unsafe_source_index(root)

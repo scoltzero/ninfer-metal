@@ -38,12 +38,39 @@ namespace {
 using Json = nlohmann::json;
 
 constexpr std::array<char, 8> kMagic = {'O', 'M', 'L', 'X', 'M', '5', 'A', '1'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersionV1 = 1;
+constexpr std::uint32_t kVersionV2 = 2;
 constexpr std::uint32_t kHeaderBytes = 64;
 constexpr std::uint64_t kObjectAlignment = 256;
 constexpr std::uint64_t kPlaneAlignment = 256;
 constexpr std::size_t kVerifyStreamChunkBytes = 256 * 1024;
-constexpr std::string_view kSchema = "omlx-m5-artifact-v1";
+constexpr std::string_view kSchemaV1 = "omlx-m5-artifact-v1";
+constexpr std::string_view kSchemaV2 = "omlx-m5-artifact-v2";
+
+constexpr bool is_affine_nax_v2_layout(std::string_view layout) noexcept {
+  return layout == "oq_nax_lane_g64_v2" || layout == "oq_nax_lane_g128_v2";
+}
+
+constexpr std::uint64_t pi64_slot(std::uint64_t off) noexcept {
+  return ((off & 12ULL) << 2U) | ((off >> 2U) & 12ULL) | (off & 3ULL);
+}
+
+void fwht64_block_inplace(float *block) noexcept {
+  for (std::size_t h = 1; h < 64; h <<= 1) {
+    const std::size_t step = h << 1;
+    for (std::size_t i = 0; i < 64; i += step) {
+      for (std::size_t j = 0; j < h; ++j) {
+        const float a = block[i + j];
+        const float b = block[i + j + h];
+        block[i + j] = a + b;
+        block[i + j + h] = a - b;
+      }
+    }
+  }
+  for (std::size_t i = 0; i < 64; ++i) {
+    block[i] *= 0.125F;
+  }
+}
 
 std::uint32_t read_u32(const std::byte *source) {
   return static_cast<std::uint32_t>(static_cast<std::uint8_t>(source[0])) |
@@ -238,7 +265,23 @@ std::uint64_t flattened_rows(const ArtifactObject &object) {
   return rows;
 }
 
-void validate_format_contract(const ArtifactObject &object) {
+void validate_format_contract(const ArtifactObject &object,
+                              std::uint32_t container_version) {
+  if (object.input_transform != "none" && object.input_transform != "fwht64") {
+    throw std::runtime_error("unsupported artifact input_transform: " +
+                             object.input_transform);
+  }
+  if (object.input_transform == "fwht64") {
+    if (container_version < kVersionV2) {
+      throw std::runtime_error(
+          "artifact input_transform=fwht64 requires container version 2");
+    }
+    if (object.format.starts_with("direct_") || object.shape.size() < 2 ||
+        object.shape.back() < 64 || (object.shape.back() % 64) != 0) {
+      throw std::runtime_error(
+          "artifact input_transform=fwht64 requires quantized weight with K >= 64 and K % 64 == 0");
+    }
+  }
   if (object.format.starts_with("direct_")) {
     if (object.layout != "contiguous_le_v1" || object.planes.size() != 1 ||
         object.planes.front().kind != "data" || object.padded_k != 0) {
@@ -292,8 +335,18 @@ void validate_format_contract(const ArtifactObject &object) {
   const auto rows = flattened_rows(object);
   const auto padded_k = object.padded_k;
   if (const auto *affine = affine_format(object.format); affine != nullptr) {
-    if (object.layout == "oq_nax_tiled_g64_v1") {
-      if (object.shape.size() != 2 ||
+    const bool is_nax_v1 = (object.layout == "oq_nax_tiled_g64_v1");
+    const bool is_nax_v2 = is_affine_nax_v2_layout(object.layout);
+    if (is_nax_v2 && container_version < kVersionV2) {
+      throw std::runtime_error(
+          "artifact v2 NAX lane layout requires container version 2");
+    }
+    if (is_nax_v1 || is_nax_v2) {
+      const bool v2_gs_ok =
+          !is_nax_v2 ||
+          (object.layout == "oq_nax_lane_g64_v2" && affine->group_size == 64) ||
+          (object.layout == "oq_nax_lane_g128_v2" && affine->group_size == 128);
+      if (!v2_gs_ok || object.shape.size() != 2 ||
           (affine->group_size != 64 && affine->group_size != 128) ||
           (affine->bits != 3 && affine->bits != 4 && affine->bits != 5 &&
            affine->bits != 6 && affine->bits != 8) ||
@@ -729,7 +782,11 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
   const auto manifest_crc = read_u32(header + 52);
   const auto header_crc = read_u32(header + 56);
   const auto flags = read_u32(header + 60);
-  if (version != kVersion || header_bytes != kHeaderBytes || flags != 0) {
+  const bool valid_version = (version == kVersionV1 || version == kVersionV2);
+  const bool valid_flags = (version == kVersionV1)
+                               ? (flags == 0)
+                               : ((flags & ~kArtifactValidFlagsMask) == 0);
+  if (!valid_version || header_bytes != kHeaderBytes || !valid_flags) {
     throw std::runtime_error("unsupported artifact header");
   }
   if (artifact_crc32({header, 56}) != header_crc) {
@@ -737,7 +794,7 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
   }
   if (manifest_offset != kHeaderBytes ||
       payload_offset % kLegacyPayloadAlignment != 0) {
-    throw std::runtime_error("artifact offsets violate the v1 contract");
+    throw std::runtime_error("artifact offsets violate container contract");
   }
   require_range(manifest_offset, manifest_bytes, payload_offset,
                 "artifact manifest");
@@ -765,14 +822,18 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
       std::string_view(manifest_begin, manifest_span.size())) {
     throw std::runtime_error("artifact manifest is not canonical JSON");
   }
-  if (manifest.value("schema", "") != kSchema ||
-      manifest.value("container_version", 0U) != kVersion ||
+  const std::string_view expected_schema =
+      (version == kVersionV2) ? kSchemaV2 : kSchemaV1;
+  if (manifest.value("schema", "") != expected_schema ||
+      manifest.value("container_version", 0U) != version ||
       manifest.value("payload_bytes", std::uint64_t{0}) != payload_bytes ||
       !manifest.contains("model") || !manifest.contains("objects") ||
       !manifest.contains("views") || !manifest.contains("bindings") ||
       !manifest.at("objects").is_array() || !manifest.at("views").is_array() ||
       !manifest.at("views").empty() || !manifest.at("bindings").is_array() ||
-      manifest.at("objects").size() != object_count) {
+      manifest.at("objects").size() != object_count ||
+      (version == kVersionV2 && manifest.contains("format_features") &&
+       !manifest.at("format_features").is_object())) {
     throw std::runtime_error("artifact manifest contract mismatch");
   }
   const auto manifest_end =
@@ -794,6 +855,7 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
       .source_revision = manifest.at("model").value("source_revision", ""),
       .source_profile = manifest.at("model").value("source_profile", ""),
       .payload_verified = verify_payload,
+      .container_flags = flags,
   };
   if (verify_payload) {
     impl->file.advise_sequential(true);
@@ -813,6 +875,15 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
     object.object_sha256 = record.at("object_sha256").get<std::string>();
     object.source_tensors =
         record.at("source_tensors").get<std::vector<std::string>>();
+    if (record.contains("input_transform")) {
+      if (!record.at("input_transform").is_string()) {
+        throw std::runtime_error(
+            "artifact object input_transform must be a string");
+      }
+      object.input_transform = record.at("input_transform").get<std::string>();
+    } else {
+      object.input_transform = "none";
+    }
     if (object.id != index || object.name.empty() || object.object_bytes == 0 ||
         object.object_offset % kObjectAlignment != 0 ||
         object.object_offset < previous_object_end ||
@@ -862,7 +933,7 @@ ArtifactModel ArtifactModel::open(const std::filesystem::path &path,
     if (previous_plane_end != object_end) {
       throw std::runtime_error("artifact object has trailing bytes");
     }
-    validate_format_contract(object);
+    validate_format_contract(object, version);
     const auto [_, inserted] = impl->object_ids.emplace(object.name, object.id);
     if (!inserted) {
       throw std::runtime_error("artifact object name is duplicated");
@@ -1030,20 +1101,49 @@ ArtifactModel::materialization_plan(std::uint64_t alignment) const {
 std::vector<float>
 ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
                                  std::uint64_t row, std::uint64_t start,
-                                 std::uint64_t count) const {
+                                 std::uint64_t count,
+                                 bool logical_unrotated) const {
   const auto rows = flattened_rows(selected_object);
   const auto logical_k = selected_object.shape.back();
   if (row >= rows || start > logical_k || count > logical_k - start ||
       selected_object.padded_k < logical_k) {
     throw std::out_of_range("artifact decode range is invalid");
   }
+  if (count == 0) {
+    return {};
+  }
+  const bool unrotate = logical_unrotated && selected_object.has_fwht64();
+  std::uint64_t decode_start = start;
+  std::uint64_t decode_count = count;
+  if (unrotate) {
+    if (logical_k < 64 || (logical_k % 64) != 0) {
+      throw std::runtime_error(
+          "artifact fwht64 decode requires K >= 64 and divisible by 64");
+    }
+    decode_start = (start / 64ULL) * 64ULL;
+    const auto decode_end = ((start + count + 63ULL) / 64ULL) * 64ULL;
+    decode_count = decode_end - decode_start;
+  }
+  const auto finalize_row = [&](std::vector<float> raw) -> std::vector<float> {
+    if (!unrotate) {
+      return raw;
+    }
+    for (std::size_t off = 0; off < raw.size(); off += 64U) {
+      fwht64_block_inplace(raw.data() + off);
+    }
+    const auto slice_off = static_cast<std::ptrdiff_t>(start - decode_start);
+    return std::vector<float>(raw.begin() + slice_off,
+                              raw.begin() + slice_off +
+                                  static_cast<std::ptrdiff_t>(count));
+  };
   const auto padded_k = selected_object.padded_k;
   std::vector<float> result;
-  result.reserve(static_cast<std::size_t>(count));
+  result.reserve(static_cast<std::size_t>(decode_count));
 
   if (const auto *affine = affine_format(selected_object.format);
       affine != nullptr) {
-    if (selected_object.layout == "oq_nax_tiled_g64_v1") {
+    const bool is_nax_v2 = is_affine_nax_v2_layout(selected_object.layout);
+    if (selected_object.layout == "oq_nax_tiled_g64_v1" || is_nax_v2) {
       const std::uint64_t bn = rows >= 65536 ? 32 : 16;
       const auto padded_n = ((rows + bn - 1) / bn) * bn;
       const auto groups = logical_k / 64;
@@ -1058,29 +1158,31 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
               ? plane_bytes(selected_object, plane(selected_object, "nax_high2"))
               : std::span<const std::byte>{};
       const auto rn = row % bn;
-      for (std::uint64_t column = start; column < start + count; ++column) {
+      for (std::uint64_t column = decode_start;
+           column < decode_start + decode_count; ++column) {
         const auto g = column / 64;
         const auto col_in_g = column % 64;
+        const auto slot = is_nax_v2 ? pi64_slot(col_in_g) : col_in_g;
         const auto tile_idx = (row / bn) * groups + g;
         std::uint32_t code = 0;
         if (affine->bits == 3) {
           const auto c_byte = static_cast<std::uint8_t>(
-              codes[tile_idx * (bn * 16) + rn * 16 + col_in_g / 4]);
+              codes[tile_idx * (bn * 16) + rn * 16 + slot / 4]);
           const auto h_byte = static_cast<std::uint8_t>(
-              high[tile_idx * (bn * 8) + rn * 8 + col_in_g / 8]);
-          code = ((c_byte >> ((col_in_g & 3U) * 2U)) & 0x03U) |
-                 (((h_byte >> (col_in_g & 7U)) & 1U) << 2U);
+              high[tile_idx * (bn * 8) + rn * 8 + slot / 8]);
+          code = ((c_byte >> ((slot & 3U) * 2U)) & 0x03U) |
+                 (((h_byte >> (slot & 7U)) & 1U) << 2U);
         } else if (affine->bits == 8) {
           code = static_cast<std::uint8_t>(
-              codes[tile_idx * (bn * 64) + rn * 64 + col_in_g]);
+              codes[tile_idx * (bn * 64) + rn * 64 + slot]);
         } else {
           const auto c_byte = static_cast<std::uint8_t>(
-              codes[tile_idx * (bn * 32) + rn * 32 + col_in_g / 2]);
-          code = (c_byte >> ((col_in_g & 1U) * 4U)) & 0x0FU;
+              codes[tile_idx * (bn * 32) + rn * 32 + slot / 2]);
+          code = (c_byte >> ((slot & 1U) * 4U)) & 0x0FU;
           if (affine->bits == 5 || affine->bits == 6) {
             const auto h_byte = static_cast<std::uint8_t>(
-                high[tile_idx * (bn * 16) + rn * 16 + col_in_g / 4]);
-            const auto h2 = (h_byte >> ((col_in_g & 3U) * 2U)) & 0x03U;
+                high[tile_idx * (bn * 16) + rn * 16 + slot / 4]);
+            const auto h2 = (h_byte >> ((slot & 3U) * 2U)) & 0x03U;
             code |= (affine->bits == 5 ? (h2 & 1U) : h2) << 4U;
           }
         }
@@ -1092,7 +1194,7 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
                                   static_cast<float>(code),
                                   bf16_to_float(bias_word)));
       }
-      return result;
+      return finalize_row(std::move(result));
     }
     const auto code_kind = affine->bits == 8   ? "code"
                            : affine->bits == 3 ? "low_2bit"
@@ -1115,7 +1217,8 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
     const auto high_row =
         (affine->bits == 3 || affine->bits == 5) ? padded_k / 8 : padded_k / 4;
     const auto group_row = padded_k / affine->group_size;
-    for (std::uint64_t column = start; column < start + count; ++column) {
+    for (std::uint64_t column = decode_start;
+         column < decode_start + decode_count; ++column) {
       std::uint32_t code = 0;
       if (affine->bits == 8) {
         code = static_cast<std::uint8_t>(base[row * base_row + column]);
@@ -1157,7 +1260,7 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
                                 static_cast<float>(code),
                                 bf16_to_float(bias_word)));
     }
-    return result;
+    return finalize_row(std::move(result));
   }
 
   if (selected_object.format == "mxfp4_e2m1_g32_e8m0_v1") {
@@ -1169,7 +1272,8 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
       const auto scale =
           plane_bytes(selected_object, plane(selected_object, "nax_scale"));
       const auto rn = row % bn;
-      for (std::uint64_t column = start; column < start + count; ++column) {
+      for (std::uint64_t column = decode_start;
+           column < decode_start + decode_count; ++column) {
         const auto blk = column / 128;
         const auto col_in_blk = column % 128;
         const auto tile_idx = (row / bn) * k_blocks + blk;
@@ -1185,7 +1289,7 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
         }
         result.push_back(value);
       }
-      return result;
+      return finalize_row(std::move(result));
     }
     const auto data =
         plane_bytes(selected_object, plane(selected_object, "data"));
@@ -1193,7 +1297,8 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
         plane_bytes(selected_object, plane(selected_object, "scale"));
     const auto data_row = padded_k / 2;
     const auto scale_row = padded_k / 32;
-    for (std::uint64_t column = start; column < start + count; ++column) {
+    for (std::uint64_t column = decode_start;
+         column < decode_start + decode_count; ++column) {
       const auto packed =
           static_cast<std::uint8_t>(data[row * data_row + column / 2]);
       const auto code =
@@ -1206,7 +1311,7 @@ ArtifactModel::decode_weight_row(const ArtifactObject &selected_object,
       }
       result.push_back(value);
     }
-    return result;
+    return finalize_row(std::move(result));
   }
 
   throw std::invalid_argument("artifact object is not a decodable R1 weight: " +

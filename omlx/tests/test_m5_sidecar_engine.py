@@ -4615,4 +4615,95 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
     assert eff["prefill_ane_offload_tokens"] == 4096
 
 
+def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
+    tmp_path: Path,
+) -> None:
+    import struct
+    import zlib
+
+    def _write_container(
+        path: Path, *, version: int, flags: int, object_names: list[str]
+    ) -> Path:
+        manifest = {
+            "schema": "omlx-m5-artifact-v2" if version == 2 else "omlx-m5-artifact-v1",
+            "container_version": version,
+            "objects": [{"name": name} for name in object_names],
+        }
+        raw_manifest = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        manifest_crc = zlib.crc32(raw_manifest) & 0xFFFFFFFF
+        payload_offset = ((64 + len(raw_manifest) + 4095) // 4096) * 4096
+        prefix = struct.pack(
+            "<8sIIQQQQII",
+            b"OMLXM5A1",
+            version,
+            64,
+            64,
+            len(raw_manifest),
+            payload_offset,
+            0,
+            len(object_names),
+            manifest_crc,
+        )
+        header_crc = zlib.crc32(prefix) & 0xFFFFFFFF
+        hdr = prefix + struct.pack("<II", header_crc, flags)
+        path.write_bytes(hdr + raw_manifest + b"\x00" * (payload_offset - 64 - len(raw_manifest)))
+        return path
+
+    # v1 valid (flags == 0)
+    v1_mtp = _write_container(
+        tmp_path / "v1_mtp.miv",
+        version=1,
+        flags=0,
+        object_names=["language_model.model.layers.0.mlp.down_proj", "language_model.mtp.layers.0.mlp.down_proj"],
+    )
+    v1_no_mtp = _write_container(
+        tmp_path / "v1_no_mtp.miv",
+        version=1,
+        flags=0,
+        object_names=["language_model.model.layers.0.mlp.down_proj"],
+    )
+    assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_mtp) is True
+    assert m5_mod.inspect_omlxm5_has_mtp_weights(v1_no_mtp) is False
+
+    # v2 valid for every valid flag bitmask (0, 1=FWHT64, 2=NAX_LANE_V2, 3=both)
+    for flags in (0, 1, 2, 3):
+        v2_mtp = _write_container(
+            tmp_path / f"v2_f{flags}_mtp.miv",
+            version=2,
+            flags=flags,
+            object_names=["language_model.mtp.layers.0.self_attn.o_proj"],
+        )
+        v2_no_mtp = _write_container(
+            tmp_path / f"v2_f{flags}_nomtp.miv",
+            version=2,
+            flags=flags,
+            object_names=["language_model.model.layers.0.self_attn.o_proj"],
+        )
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_mtp) is True
+        assert m5_mod.inspect_omlxm5_has_mtp_weights(v2_no_mtp) is False
+
+    # Invalid headers must return None: v1 with nonzero flags, v2 with reserved flags, version 3
+    bad_v1_flags = _write_container(
+        tmp_path / "bad_v1_flags.miv",
+        version=1,
+        flags=1,
+        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
+    )
+    bad_v2_flags = _write_container(
+        tmp_path / "bad_v2_flags.miv",
+        version=2,
+        flags=4,
+        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
+    )
+    bad_v3 = _write_container(
+        tmp_path / "bad_v3.miv",
+        version=3,
+        flags=0,
+        object_names=["language_model.mtp.layers.0.mlp.down_proj"],
+    )
+    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v1_flags) is None
+    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v2_flags) is None
+    assert m5_mod.inspect_omlxm5_has_mtp_weights(bad_v3) is None
+
+
 

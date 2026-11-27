@@ -1081,6 +1081,8 @@ def test_affine8_pure_q8_g64_and_g128_nax_pretile_roundtrip_and_matmul(
                 "test/pure-q8",
                 "--expected-revision",
                 "rev-pure-q8-001",
+                "--artifact-version",
+                "1",
             ]
         )
     )
@@ -1098,6 +1100,8 @@ def test_affine8_pure_q8_g64_and_g128_nax_pretile_roundtrip_and_matmul(
                 "test/pure-q8",
                 "--expected-revision",
                 "rev-pure-q8-001",
+                "--artifact-version",
+                "1",
                 "--nax-pretile",
             ]
         )
@@ -1246,6 +1250,8 @@ def test_affine8_large_n_bn32_pretile_and_boundary_decode(
             str(out_art),
             "--source-repo",
             "test/bn32-q8",
+            "--artifact-version",
+            "1",
             "--nax-pretile",
         ]
     )
@@ -1413,6 +1419,8 @@ def test_mixed_mxfp4_and_affine8_per_layer_pretile_and_matmul_consistency(
                 str(out_p),
                 "--source-repo",
                 f"test/mixed-{default_mode}",
+                "--artifact-version",
+                "1",
                 *flag,
             ]
         )
@@ -1562,3 +1570,120 @@ def test_affine8_nax_tiled_rejects_high_planes_and_invalid_geometry(
     }
     with pytest.raises(ValueError, match="quantized plane size mismatch"):
         m5_artifact._validate_object_contract(wrong_code_size, 0)
+
+
+def test_miv_v2_cli_defaults_qda_bf16_prerotate_dflash2_and_mtp(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 1) Case 1: unquantized BF16 checkpoint -> qda-search v2 rotates in FP32 BEFORE quantization
+    bf16_src = _make_bf16_checkpoint(tmp_path / "bf16_v2_src")
+    v2_art = tmp_path / "bf16_v2.miv"
+    args = m5_artifact.build_parser().parse_args(
+        [
+            "qda-search",
+            "--source",
+            str(bf16_src),
+            "--target-bpw",
+            "4.5",
+            "--output-artifact",
+            str(v2_art),
+            "--source-repo",
+            "test/bf16-v2",
+            "--nax-pretile",
+            "--jobs",
+            "2",
+        ]
+    )
+    assert args.artifact_version == 2
+    assert args.fwht64 is None
+    assert args.fwht64_o_proj is True
+    m5_artifact.command_qda_search(args)
+    _ = capsys.readouterr()
+
+    summary, manifest = m5_artifact.read_artifact(v2_art, verify_payload=True)
+    assert summary["container_version"] == 2
+    assert summary["container_flags"] == (m5_artifact.FLAG_FWHT64 | m5_artifact.FLAG_NAX_LANE_V2)
+    assert summary["schema"] == "omlx-m5-artifact-v2"
+    assert manifest["format_features"]["fwht64_prerotated"] is True
+    assert manifest["format_features"]["nax_lane_layout"] == "pi64_quartet_v2"
+    objs = {o["name"]: o for o in manifest["objects"]}
+    assert objs["model.layers.0.mlp.down_proj"]["input_transform"] == "fwht64"
+    assert objs["model.layers.0.mlp.down_proj"]["layout"] in (
+        "oq_nax_lane_g64_v2",
+        "oq_nax_lane_g128_v2",
+    )
+    assert objs["model.layers.0.self_attn.q_proj"].get("input_transform", "none") == "none"
+
+    # 2) dflash2_bf16 profile auto-disables fwht64 even under v2 default
+    df_src = _write_checkpoint(
+        tmp_path / "dflash2_src",
+        revision="rev-df2",
+        config={"architectures": ["DFlash2DraftModel"], "model_type": "qwen3"},
+        tensors={
+            "layers.0.mlp.down_proj.weight": (
+                "BF16",
+                [16, 64],
+                _bf16_bytes(np.ones((16, 64), dtype=np.float32)),
+            ),
+        },
+    )
+    df_out = tmp_path / "dflash2_v2.miv"
+    m5_artifact.command_convert(
+        m5_artifact.build_parser().parse_args(
+            [
+                "convert",
+                "--source",
+                str(df_src),
+                "--output",
+                str(df_out),
+                "--source-repo",
+                "test/dflash2",
+                "--profile",
+                "dflash2_bf16",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    df_sum, df_man = m5_artifact.read_artifact(df_out, verify_payload=True)
+    assert df_sum["container_version"] == 2
+    assert df_sum["container_flags"] == 0
+    assert df_man["format_features"]["fwht64_prerotated"] is False
+    assert all(o.get("input_transform", "none") == "none" for o in df_man["objects"])
+
+    # 3) extract-mtp & bundle-mtp preserve v2 format/flags/input_transform
+    mtp_ckpt = _make_oq_checkpoint(tmp_path / "oq_mtp_v2_src", include_mtp=True)
+    full_v2 = tmp_path / "full_v2.miv"
+    mtp_v2 = tmp_path / "mtp_v2.miv"
+    m5_artifact.command_convert(
+        m5_artifact.build_parser().parse_args(
+            [
+                "convert",
+                "--source",
+                str(mtp_ckpt),
+                "--output",
+                str(full_v2),
+                "--source-repo",
+                "test/oq-mtp-v2",
+                "--nax-pretile",
+                "--jobs",
+                "2",
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    m5_artifact.command_extract_mtp(
+        m5_artifact.build_parser().parse_args(
+            [
+                "extract-mtp",
+                "--source",
+                str(full_v2),
+                "--output",
+                str(mtp_v2),
+            ]
+        )
+    )
+    _ = capsys.readouterr()
+    mtp_sum, mtp_man = m5_artifact.read_artifact(mtp_v2, verify_payload=True)
+    assert mtp_sum["container_version"] == 2
+    assert (mtp_sum["container_flags"] & m5_artifact.FLAG_NAX_LANE_V2) != 0
+    assert mtp_man["objects"][0]["layout"] in ("oq_nax_lane_g64_v2", "oq_nax_lane_g128_v2")
