@@ -901,9 +901,11 @@ class IsolatedServeProcess:
         cell_cfg: Dict[str, Any],
         log_path: Path,
         extra_env: Optional[Dict[str, str]] = None,
+        artifact_path: Optional[str] = None,
     ):
         self.serve_bin = serve_bin
         self.model_dir = model_dir
+        self.artifact_path = artifact_path
         self.host = host
         self.port = port
         self.max_context = max_context
@@ -950,6 +952,8 @@ class IsolatedServeProcess:
             "--rolling-prefix-cache",
             "off",
         ]
+        if self.artifact_path:
+            cmd.extend(["--artifact", self.artifact_path])
         if self.metallib_dir:
             cmd.extend(["--metallib-dir", self.metallib_dir])
 
@@ -1154,6 +1158,7 @@ def run_model_cold_matrix(
     *,
     model_label: str,
     model_dir: str,
+    artifact_path: Optional[str] = None,
     serve_bin: str,
     metallib_dir: Optional[str],
     cpp_bench_bin: Optional[str],
@@ -1200,6 +1205,7 @@ def run_model_cold_matrix(
         cell_cfg=cell_cfg,
         log_path=log_path,
         extra_env=extra_env,
+        artifact_path=artifact_path,
     )
 
     tier_summaries: List[Dict[str, Any]] = []
@@ -1385,6 +1391,7 @@ def run_model_cold_matrix(
     return {
         "model_label": model_label,
         "model_dir": model_dir,
+        "artifact_path": artifact_path,
         "cell_id": cell_id,
         "cell_config": cell_cfg,
         "max_context": max_context,
@@ -1402,6 +1409,7 @@ def run_cpp_ppl_eval(
     cpp_bench_bin: str,
     model_label: str,
     model_dir: str,
+    artifact_path: Optional[str] = None,
     metallib_dir: Optional[str],
     kv_dtype: str,
     ppl_lengths: Sequence[int],
@@ -1446,6 +1454,8 @@ def run_cpp_ppl_eval(
                 "--prefill-attention-mode",
                 str(cell_cfg["prefill_attention_mode"]),
             ]
+            if artifact_path:
+                cmd.extend(["--artifact", artifact_path])
             if metallib_dir:
                 cmd.extend(["--metallib-dir", metallib_dir])
             if cell_cfg.get("prefill_sparse_minference"):
@@ -1567,6 +1577,7 @@ def run_cacheblend_rag_eval(
     *,
     model_label: str,
     model_dir: str,
+    artifact_path: Optional[str] = None,
     serve_bin: str,
     metallib_dir: Optional[str],
     cpp_bench_bin: Optional[str],
@@ -1606,6 +1617,7 @@ def run_cacheblend_rag_eval(
         cell_cfg=cell_cfg,
         log_path=log_path,
         extra_env=extra_env,
+        artifact_path=artifact_path,
     )
     try:
         startup = server.start()
@@ -1704,7 +1716,7 @@ def parse_cli() -> argparse.Namespace:
     )
     ap.add_argument(
         "--action",
-        choices=["bench", "bench-rag", "generate-rag", "check-host"],
+        choices=["bench", "ppl", "bench-rag", "generate-rag", "check-host"],
         default="bench",
         help="Harness action (default: bench)",
     )
@@ -1716,6 +1728,7 @@ def parse_cli() -> argparse.Namespace:
         ),
         help="Path to ninfer-metal-serve binary",
     )
+    ap.add_argument("--artifact", default=None, help="Optional explicit .miv artifact path override")
     ap.add_argument("--metallib-dir", default=None, help="Optional metallib directory override")
     ap.add_argument(
         "--cpp-bench-bin",
@@ -1791,6 +1804,14 @@ def parse_env_list(entries: Sequence[str]) -> Dict[str, str]:
     return out
 
 
+def parse_model_spec(spec: str, default_artifact: Optional[str] = None) -> Tuple[str, str, Optional[str]]:
+    label, rest = spec.split("=", 1)
+    if "::" in rest:
+        model_dir, art = rest.split("::", 1)
+        return label, model_dir, art or default_artifact
+    return label, rest, default_artifact
+
+
 def main() -> int:
     args = parse_cli()
     extra_env = parse_env_list(args.env)
@@ -1803,7 +1824,7 @@ def main() -> int:
     if args.action == "generate-rag":
         if not args.model:
             raise SystemExit("--model label=path is required for generate-rag")
-        _, model_dir = args.model[0].split("=", 1)
+        _, model_dir, _ = parse_model_spec(args.model[0], args.artifact)
         tok = TokenizerBridge(model_dir, cpp_bench_bin=args.cpp_bench_bin)
         ds = generate_permuted_rag_dataset(tok, num_docs=args.rag_docs, doc_tokens=args.rag_doc_tokens)
         if args.out_json:
@@ -1824,6 +1845,36 @@ def main() -> int:
         )
         return 0
 
+    if args.action == "ppl":
+        if not args.cpp_bench_bin:
+            raise SystemExit("--action ppl requires --cpp-bench-bin PATH")
+        if not args.model:
+            raise SystemExit("--model label=path is required for ppl")
+        cell_cfg = dict(MATRIX_CELLS[args.cell])
+        ppl_lengths = [int(x.strip()) for x in args.ppl_lengths.split(",") if x.strip()]
+        logits_dir = Path(args.logits_dir) if args.logits_dir else None
+        ppl_results: List[Dict[str, Any]] = []
+        for spec in args.model:
+            label, model_dir, artifact_path = parse_model_spec(spec, args.artifact)
+            res = run_cpp_ppl_eval(
+                cpp_bench_bin=args.cpp_bench_bin,
+                model_label=label,
+                model_dir=model_dir,
+                artifact_path=artifact_path,
+                metallib_dir=args.metallib_dir,
+                kv_dtype=args.kv_dtype,
+                ppl_lengths=ppl_lengths,
+                chunk_size=args.ppl_chunk_size,
+                logits_dir=logits_dir,
+                cell_cfg=cell_cfg,
+                extra_env=extra_env,
+            )
+            ppl_results.extend(res)
+            if args.out_json:
+                Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.out_json).write_text(json.dumps(ppl_results, indent=2), encoding="utf-8")
+        return 0
+
     if args.action == "bench-rag":
         if not args.model:
             raise SystemExit("--model label=path is required for bench-rag")
@@ -1835,11 +1886,12 @@ def main() -> int:
         )
         rag_results: List[Dict[str, Any]] = []
         for spec in args.model:
-            label, model_dir = spec.split("=", 1)
+            label, model_dir, artifact_path = parse_model_spec(spec, args.artifact)
             for ndocs in doc_counts:
                 rec = run_cacheblend_rag_eval(
                     model_label=label,
                     model_dir=model_dir,
+                    artifact_path=artifact_path,
                     serve_bin=args.serve_bin,
                     metallib_dir=args.metallib_dir,
                     cpp_bench_bin=args.cpp_bench_bin,
@@ -1903,6 +1955,7 @@ def main() -> int:
             "os_version": f"macOS {sw_vers}",
             "baseline_commit": args.baseline_commit,
             "serve_bin": args.serve_bin,
+            "artifact": args.artifact,
             "cell_id": args.cell,
             "cell_label": cell_cfg["label"],
             "cell_config": cell_cfg,
@@ -1923,10 +1976,11 @@ def main() -> int:
 
     with open(out_jsonl_path, "w", encoding="utf-8") as jsonl_fh:
         for spec in args.model:
-            label, model_dir = spec.split("=", 1)
+            label, model_dir, artifact_path = parse_model_spec(spec, args.artifact)
             entry = run_model_cold_matrix(
                 model_label=label,
                 model_dir=model_dir,
+                artifact_path=artifact_path,
                 serve_bin=args.serve_bin,
                 metallib_dir=args.metallib_dir,
                 cpp_bench_bin=args.cpp_bench_bin,
@@ -1957,11 +2011,12 @@ def main() -> int:
             raise SystemExit("--run-ppl requires --cpp-bench-bin PATH")
         logits_dir = Path(args.logits_dir) if args.logits_dir else None
         for spec in args.model:
-            label, model_dir = spec.split("=", 1)
+            label, model_dir, artifact_path = parse_model_spec(spec, args.artifact)
             ppl_res = run_cpp_ppl_eval(
                 cpp_bench_bin=args.cpp_bench_bin,
                 model_label=label,
                 model_dir=model_dir,
+                artifact_path=artifact_path,
                 metallib_dir=args.metallib_dir,
                 kv_dtype=args.kv_dtype,
                 ppl_lengths=ppl_lengths,

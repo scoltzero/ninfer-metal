@@ -1579,6 +1579,12 @@ static inline void paged_flash_prefill_sage2_hd256_impl(
       const uint nk_blocks = tg_mem.meta[1];
       if ((step & ((WM == 2u) ? 15u : 7u)) == 0u) {
         if constexpr (SparseMInference) {
+          // Ensure all simdgroups finished reading tg_mem.fac[0..15] from
+          // step-1 PV rescaling before flat_tid < 16 reuses tg_mem.fac as
+          // tg_act16 (which stores 0xffffffffu = float NaN for padded tail slots!).
+          if (step > 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
           if (flat_tid < 16u) {
             const uint s_idx = step + flat_tid;
             uint kb_b = 0xffffffffu;
