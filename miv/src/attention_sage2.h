@@ -78,6 +78,7 @@ struct Sage2Tier {
 
 inline Sage2Tier select_sage2_tier(U32 tokens, U32 query_heads, U32 kv_heads,
                                    U32 forced_wm = 0u) {
+  (void)tokens;
   const U32 repeat = (kv_heads > 0u && query_heads >= kv_heads)
                          ? (query_heads / kv_heads)
                          : 1u;
@@ -91,13 +92,11 @@ inline Sage2Tier select_sage2_tier(U32 tokens, U32 query_heads, U32 kv_heads,
     }
   }
   if (wm == 0u) {
-    if (tokens > 96u) {
-      wm = 8u;
-    } else if (tokens > 16u) {
-      wm = 6u;
-    } else {
-      wm = 4u;
-    }
+    // Real Apple10 M5 Ultra calibration: WM=4 (256 threads, M_TILE=64) keeps
+    // Q_i8 100% resident in 16 KiB threadgroup SRAM with NUM_WAVES=1 (zero wave
+    // serialization, 100% SG active, 6 barriers/block vs 24 for WM=8).
+    // Override via OMLX_M5_SAGE2_WM=4|6|8 for A/B diagnostics.
+    wm = 4u;
   }
   if (wm != 4u && wm != 6u && wm != 8u) {
     wm = 6u;

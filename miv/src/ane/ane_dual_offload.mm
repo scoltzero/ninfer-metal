@@ -530,6 +530,7 @@ constexpr std::uint32_t kBlobDtypeInt8 = 4u;
 
 struct MilProcedureOffsets {
   bool fused_swiglu = false;
+  bool fp16_weights = false;
   std::uint32_t in_features = 0;
   std::uint32_t out_features = 0;
   std::uint64_t w0_data_off = 0;
@@ -540,8 +541,9 @@ struct MilProcedureOffsets {
   std::uint64_t w1_offset_off = 0;
 };
 
-// Emit multi-procedure MIL program(1.3) using 2D G=64 constexpr_blockwise_shift_scale
-// + reshape to 4D conv weight, with fused silu(gate)*up for MlpGateUpSwiGlu!
+// Emit multi-procedure MIL program(1.3) using either direct FP16 weights or
+// 2D G=64 constexpr_blockwise_shift_scale + reshape to 4D conv weight, with
+// fused silu(gate)*up for MlpGateUpSwiGlu!
 NSString *build_g64_bank_mil(std::span<const MilProcedureOffsets> procs,
                              std::uint32_t chunk_tokens) {
   NSMutableString *mil = [NSMutableString
@@ -555,28 +557,63 @@ NSString *build_g64_bank_mil(std::span<const MilProcedureOffsets> procs,
     const std::uint32_t N = p.out_features;
     const std::uint32_t ng = K / kAneGroupSize;
     if (!p.fused_swiglu) {
+      if (p.fp16_weights) {
+        [mil appendFormat:
+                 @"  func procedure%03zu<ios18>(tensor<fp16, [1, %u, 1, %u]> x) {\n"
+                  "    tensor<fp16, [%u, %u, 1, 1]> w = const()[name=string(\"w\"), val=tensor<fp16, [%u, %u, 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
+                  "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
+                  "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
+                  "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+                  "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
+                  "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+                  "    tensor<fp16, [1, %u, 1, %u]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
+                  "  } -> (y);\n",
+             idx, K, chunk_tokens,
+             N, K, N, K, static_cast<unsigned long long>(p.w0_data_off),
+             N, chunk_tokens];
+      } else {
+        [mil appendFormat:
+                 @"  func procedure%03zu<ios18>(tensor<fp16, [1, %u, 1, %u]> x) {\n"
+                  "    tensor<fp16, [%u, %u]> w2d = constexpr_blockwise_shift_scale("
+                  "data=tensor<int8, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))), "
+                  "scale=tensor<fp16, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))), "
+                  "offset=tensor<int8, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))))"
+                  "[name=string(\"dq\")];\n"
+                  "    tensor<int32, [4]> wsh = const()[name=string(\"wsh\"), val=tensor<int32, [4]>([%u, %u, 1, 1])];\n"
+                  "    tensor<fp16, [%u, %u, 1, 1]> w = reshape(shape=wsh, x=w2d)[name=string(\"w4d\")];\n"
+                  "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
+                  "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
+                  "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+                  "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
+                  "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+                  "    tensor<fp16, [1, %u, 1, %u]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
+                  "  } -> (y);\n",
+             idx, K, chunk_tokens,
+             N, K,
+             N, K, static_cast<unsigned long long>(p.w0_data_off),
+             N, ng, static_cast<unsigned long long>(p.w0_scale_off),
+             N, ng, static_cast<unsigned long long>(p.w0_offset_off),
+             N, K, N, K, N, chunk_tokens];
+      }
+    } else if (p.fp16_weights) {
       [mil appendFormat:
                @"  func procedure%03zu<ios18>(tensor<fp16, [1, %u, 1, %u]> x) {\n"
-                "    tensor<fp16, [%u, %u]> w2d = constexpr_blockwise_shift_scale("
-                "data=tensor<int8, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))), "
-                "scale=tensor<fp16, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))), "
-                "offset=tensor<int8, [%u, %u]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu))))"
-                "[name=string(\"dq\")];\n"
-                "    tensor<int32, [4]> wsh = const()[name=string(\"wsh\"), val=tensor<int32, [4]>([%u, %u, 1, 1])];\n"
-                "    tensor<fp16, [%u, %u, 1, 1]> w = reshape(shape=wsh, x=w2d)[name=string(\"w4d\")];\n"
+                "    tensor<fp16, [%u, %u, 1, 1]> gw = const()[name=string(\"gw\"), val=tensor<fp16, [%u, %u, 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
+                "    tensor<fp16, [%u, %u, 1, 1]> uw = const()[name=string(\"uw\"), val=tensor<fp16, [%u, %u, 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
                 "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
                 "    tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"
                 "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
                 "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"
                 "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
-                "    tensor<fp16, [1, %u, 1, %u]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
+                "    tensor<fp16, [1, %u, 1, %u]> gate = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=gw, x=x)[name=string(\"gate\")];\n"
+                "    tensor<fp16, [1, %u, 1, %u]> up = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x)[name=string(\"up\")];\n"
+                "    tensor<fp16, [1, %u, 1, %u]> silu_out = silu(x=gate)[name=string(\"silu\")];\n"
+                "    tensor<fp16, [1, %u, 1, %u]> y = mul(x=silu_out, y=up)[name=string(\"swiglu\")];\n"
                 "  } -> (y);\n",
            idx, K, chunk_tokens,
-           N, K,
-           N, K, static_cast<unsigned long long>(p.w0_data_off),
-           N, ng, static_cast<unsigned long long>(p.w0_scale_off),
-           N, ng, static_cast<unsigned long long>(p.w0_offset_off),
-           N, K, N, K, N, chunk_tokens];
+           N, K, N, K, static_cast<unsigned long long>(p.w0_data_off),
+           N, K, N, K, static_cast<unsigned long long>(p.w1_data_off),
+           N, chunk_tokens, N, chunk_tokens, N, chunk_tokens, N, chunk_tokens];
     } else {
       // Qwen SwiGLU convention: SiLU(gate) * up fused inside MIL procedure!
       [mil appendFormat:
@@ -835,6 +872,7 @@ std::unique_ptr<CompiledAneBank> compile_or_load_bank(
     std::uint32_t shard_idx,
     int ane_instance,
     std::uint32_t chunk_tokens,
+    bool use_fp16_weights,
     std::span<const AneOffloadOpSpec *const> shard_specs,
     std::span<const AneCompiledOpInfo> shard_infos) {
   auto bank = std::make_unique<CompiledAneBank>();
@@ -916,35 +954,59 @@ std::unique_ptr<CompiledAneBank> compile_or_load_bank(
 
         MilProcedureOffsets off{};
         off.fused_swiglu = (spec.role == AneProjectionRole::MlpGateUpSwiGlu);
+        off.fp16_weights = use_fp16_weights;
         off.in_features = info.in_features;
         off.out_features = info.split.die_rows;
 
-        const auto q0 =
-            extract_miv_weight_slice_g64_int8(spec.weight, row_start, row_count);
-        off.w0_data_off = append_mil_blob_chunk(
-            mutable_blob, q0.data.data(), q0.data.size(), kBlobDtypeInt8);
-        off.w0_scale_off = append_mil_blob_chunk(
-            mutable_blob, q0.scale.data(),
-            q0.scale.size() * sizeof(std::uint16_t), kBlobDtypeFp16);
-        off.w0_offset_off = append_mil_blob_chunk(
-            mutable_blob, q0.offset.data(), q0.offset.size(), kBlobDtypeInt8);
-        total_chunks += 3u;
-
-        if (off.fused_swiglu) {
-          if (!spec.up_weight.has_value()) {
-            throw std::invalid_argument(
-                "MlpGateUpSwiGlu requires both gate and up weights");
+        if (use_fp16_weights) {
+          auto pack_fp16 = [&](const MaterializedWeightView &w) {
+            const auto f32 = dequantize_miv_weight_slice_f32(w, row_start, row_count);
+            std::vector<std::uint16_t> fp16(f32.size());
+            for (std::size_t k = 0; k < f32.size(); ++k) {
+              fp16[k] = float_to_f16_bits(f32[k]);
+            }
+            return append_mil_blob_chunk(mutable_blob, fp16.data(),
+                                         fp16.size() * sizeof(std::uint16_t),
+                                         kBlobDtypeFp16);
+          };
+          off.w0_data_off = pack_fp16(spec.weight);
+          total_chunks += 1u;
+          if (off.fused_swiglu) {
+            if (!spec.up_weight.has_value()) {
+              throw std::invalid_argument(
+                  "MlpGateUpSwiGlu requires both gate and up weights");
+            }
+            off.w1_data_off = pack_fp16(*spec.up_weight);
+            total_chunks += 1u;
           }
-          const auto q1 = extract_miv_weight_slice_g64_int8(
-              *spec.up_weight, row_start, row_count);
-          off.w1_data_off = append_mil_blob_chunk(
-              mutable_blob, q1.data.data(), q1.data.size(), kBlobDtypeInt8);
-          off.w1_scale_off = append_mil_blob_chunk(
-              mutable_blob, q1.scale.data(),
-              q1.scale.size() * sizeof(std::uint16_t), kBlobDtypeFp16);
-          off.w1_offset_off = append_mil_blob_chunk(
-              mutable_blob, q1.offset.data(), q1.offset.size(), kBlobDtypeInt8);
+        } else {
+          const auto q0 =
+              extract_miv_weight_slice_g64_int8(spec.weight, row_start, row_count);
+          off.w0_data_off = append_mil_blob_chunk(
+              mutable_blob, q0.data.data(), q0.data.size(), kBlobDtypeInt8);
+          off.w0_scale_off = append_mil_blob_chunk(
+              mutable_blob, q0.scale.data(),
+              q0.scale.size() * sizeof(std::uint16_t), kBlobDtypeFp16);
+          off.w0_offset_off = append_mil_blob_chunk(
+              mutable_blob, q0.offset.data(), q0.offset.size(), kBlobDtypeInt8);
           total_chunks += 3u;
+
+          if (off.fused_swiglu) {
+            if (!spec.up_weight.has_value()) {
+              throw std::invalid_argument(
+                  "MlpGateUpSwiGlu requires both gate and up weights");
+            }
+            const auto q1 = extract_miv_weight_slice_g64_int8(
+                *spec.up_weight, row_start, row_count);
+            off.w1_data_off = append_mil_blob_chunk(
+                mutable_blob, q1.data.data(), q1.data.size(), kBlobDtypeInt8);
+            off.w1_scale_off = append_mil_blob_chunk(
+                mutable_blob, q1.scale.data(),
+                q1.scale.size() * sizeof(std::uint16_t), kBlobDtypeFp16);
+            off.w1_offset_off = append_mil_blob_chunk(
+                mutable_blob, q1.offset.data(), q1.offset.size(), kBlobDtypeInt8);
+            total_chunks += 3u;
+          }
         }
         proc_offsets.push_back(off);
       }
@@ -2190,6 +2252,10 @@ std::string AneDualOffloadEngine::compute_cache_key(
       << "|alpha=" << alpha_permille
       << "|dies=" << active_dies
       << "|max_bank=" << config.max_bank_bytes_per_die
+      << "|max_procs=" << config.max_procedures_per_bank
+      << "|fp16=" << (config.use_fp16_weights ? 1 : 0)
+      << "|swiglu_only=" << (config.mlp_swiglu_only ? 1 : 0)
+      << "|max_k=" << config.max_in_features
       << "|os=" << os_build
       << "|ops=" << specs.size();
   for (const auto &s : specs) {
@@ -2292,6 +2358,10 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
   std::uint64_t total_per_die_bytes = 0u;
 
   for (const auto &spec : specs) {
+    if (config.mlp_swiglu_only &&
+        spec.role != AneProjectionRole::MlpGateUpSwiGlu) {
+      continue;
+    }
     if (!ane_weight_view_supported(spec.weight)) {
       continue;
     }
@@ -2302,6 +2372,9 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
     const auto out_features = static_cast<std::uint32_t>(spec.weight.row_count);
     const auto in_features =
         static_cast<std::uint32_t>(spec.weight.in_features);
+    if (config.max_in_features > 0u && in_features > config.max_in_features) {
+      continue;
+    }
     const AneChannelSplit split = compute_ane_channel_split(
         out_features, target_alpha, active_dies, config.max_alpha);
     if (!split.enabled()) {
@@ -2312,8 +2385,10 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
         (spec.role == AneProjectionRole::MlpGateUpSwiGlu) ? 2u : 1u;
     const std::uint64_t ng = in_features / kAneGroupSize;
     const std::uint64_t single_w_bytes =
-        static_cast<std::uint64_t>(split.die_rows) * in_features +
-        static_cast<std::uint64_t>(split.die_rows) * ng * 3u + 3u * 128u;
+        config.use_fp16_weights
+            ? (static_cast<std::uint64_t>(split.die_rows) * in_features * 2u + 128u)
+            : (static_cast<std::uint64_t>(split.die_rows) * in_features +
+               static_cast<std::uint64_t>(split.die_rows) * ng * 3u + 3u * 128u);
     const std::uint64_t op_bytes = single_w_bytes * mult;
 
     // Respect per-die total resident cap (< 4.0 GiB ANE address window).
@@ -2391,7 +2466,7 @@ std::unique_ptr<AneDualOffloadEngine> AneDualOffloadEngine::build(
         auto bank = compile_or_load_bank(
             cache_dir, config.enable_disk_cache, cache_key, hw.os_build, die,
             static_cast<std::uint32_t>(s), ane_inst, config.chunk_tokens,
-            shards[s].specs, shards[s].infos);
+            config.use_fp16_weights, shards[s].specs, shards[s].infos);
         if (bank->disk_cache_hit) {
           ++impl->stats_.disk_cache_hits;
         } else {

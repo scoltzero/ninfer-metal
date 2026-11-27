@@ -149,16 +149,18 @@ static inline float4 load_k_vec4_safe(
 
 template <bool IsAffine4>
 MINF_ALWAYS_INLINE
-static inline void probe_prepare_k_int8(
+static inline void probe_prepare_k_and_delta_int8(
     device const uchar *cache_key, uint phys_page, uint sub_off,
     uint page_tokens, ulong page_bytes, ulong kvh_code_base,
     ulong all_codes_bytes, ulong bf16_kv_stride, uint kvh, short valid_k,
-    uint flat_tid, threadgroup uint4 *tg_stage, threadgroup float *tg_mu_k,
-    threadgroup float *tg_sk) {
+    uint flat_tid, uint row_group, uint d_part, uint q_r_in16, uint q_half,
+    const threadgroup uchar *tg_q_i8_b, threadgroup uint4 *tg_work,
+    threadgroup float *tg_mu_k, threadgroup float *tg_sk,
+    threadgroup float *tg_delta) {
   threadgroup float4 *tg_mu_tmp =
-      reinterpret_cast<threadgroup float4 *>(tg_stage) + 512u; // offset 8192 B
+      reinterpret_cast<threadgroup float4 *>(tg_work); // [0 .. 4095]
   threadgroup char4 *tg_k_i8_v4 =
-      reinterpret_cast<threadgroup char4 *>(tg_stage); // offset 0 B
+      reinterpret_cast<threadgroup char4 *>(tg_work); // [0 .. 8191]
 
   float4 k_reg[8];
   const uint r_chunk = flat_tid >> 6u; // 0..3 (256 threads)
@@ -167,16 +169,51 @@ static inline void probe_prepare_k_int8(
   const uint col_v4 = v4_id & 31u;     // 0..31 (= lane)
 
   float4 sum4(0.0f);
-  MINF_UNROLL
-  for (uint rr = 0u; rr < 8u; ++rr) {
-    const uint r = r_chunk * 8u + rr;
-    k_reg[rr] = load_k_vec4_safe<IsAffine4>(
-        cache_key, phys_page, sub_off, page_tokens, page_bytes, kvh_code_base,
-        all_codes_bytes, bf16_kv_stride, kvh, p_g, r, col_v4, valid_k);
-    sum4 += k_reg[rr];
+  if constexpr (IsAffine4) {
+    device const uchar *page_ptr = cache_key + ulong(phys_page) * page_bytes;
+    device const ushort *codes = reinterpret_cast<device const ushort *>(
+        page_ptr + kvh_code_base + ulong(p_g) * (64ul * 64ul));
+    device const KvAffine4VecMeta *meta =
+        reinterpret_cast<device const KvAffine4VecMeta *>(page_ptr +
+                                                          all_codes_bytes) +
+        ulong(kvh) * page_tokens;
+    MINF_UNROLL
+    for (uint rr = 0u; rr < 8u; ++rr) {
+      const uint r = r_chunk * 8u + rr;
+      if (short(r) < valid_k) {
+        const uint within = sub_off + r;
+        const ushort pk = codes[within * 32u + col_v4];
+        const float s = float(meta[within].scale[p_g]);
+        const float z = float(meta[within].zero[p_g]);
+        const float4 q4 =
+            float4(float(pk & 0xFu), float((pk >> 4u) & 0xFu),
+                   float((pk >> 8u) & 0xFu), float(pk >> 12u));
+        k_reg[rr] = clean_f4(fma(q4, float4(s), float4(z)));
+      } else {
+        k_reg[rr] = float4(0.0f);
+      }
+      sum4 += k_reg[rr];
+    }
+  } else {
+    device const bfloat *cache_bf =
+        reinterpret_cast<device const bfloat *>(cache_key);
+    const ulong base_row = ulong(phys_page) * page_tokens + sub_off;
+    const ulong head_off = ulong(kvh) * 256ul + p_g * 128u;
+    MINF_UNROLL
+    for (uint rr = 0u; rr < 8u; ++rr) {
+      const uint r = r_chunk * 8u + rr;
+      if (short(r) < valid_k) {
+        device const bfloat4 *row_v4 = reinterpret_cast<device const bfloat4 *>(
+            cache_bf + (base_row + r) * bf16_kv_stride + head_off);
+        k_reg[rr] = float4(clean_bf4(row_v4[col_v4]));
+      } else {
+        k_reg[rr] = float4(0.0f);
+      }
+      sum4 += k_reg[rr];
+    }
   }
   tg_mu_tmp[r_chunk * 64u + v4_id] = sum4;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #1
 
   if (flat_tid < 64u) {
     const float inv_vk = 1.0f / float(max(int(valid_k), 1));
@@ -186,7 +223,7 @@ static inline void probe_prepare_k_int8(
                           tg_mu_tmp[3u * 64u + flat_tid]);
     reinterpret_cast<threadgroup float4 *>(tg_mu_k)[flat_tid] = total * inv_vk;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #2
 
   const float4 mu4 = reinterpret_cast<threadgroup float4 *>(tg_mu_k)[v4_id];
   MINF_UNROLL
@@ -206,10 +243,32 @@ static inline void probe_prepare_k_int8(
                    char(int(qf.w)));
     tg_k_i8_v4[p_g * 1024u + r * 32u + col_v4] = kq;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Fused exact Delta = dot(float(q_i8), mu_{K,b,p}) using resident tg_q_i8!
+  {
+    const threadgroup char4 *q_src =
+        reinterpret_cast<const threadgroup char4 *>(
+            tg_q_i8_b + (row_group * 2u + d_part) * (16u * 128u) +
+            q_r_in16 * 128u + q_half * 64u);
+    const threadgroup float4 *mu_src =
+        reinterpret_cast<const threadgroup float4 *>(
+            tg_mu_k + d_part * 128u + q_half * 64u);
+    float d_acc = 0.0f;
+    MINF_UNROLL
+    for (uint k = 0u; k < 16u; ++k) {
+      const char4 q4 = q_src[k];
+      const float4 qf(float(q4.x), float(q4.y), float(q4.z), float(q4.w));
+      d_acc += dot(qf, mu_src[k]);
+    }
+    d_acc += simd_shuffle_xor(d_acc, ushort(1));
+    if (q_half == 0u) {
+      tg_delta[d_part * 64u + row_group * 16u + q_r_in16] = d_acc;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #3
 }
 
-// Unified INT8 Q_probe x K^T probe engine (WM=4, 256 threads, <= 24.5 KiB SRAM).
+// Unified INT8 Q_probe x K^T probe engine (WM=4, NUM_WAVES=1, 256 threads, <= 27.25 KiB SRAM).
 // PassMode == 0: compute per-split (max_s, sum_s) -> probe_m_split, probe_l_split.
 // PassMode == 1: read global (M_global, inv_Z), pool GQA max_{g=0..G-1}, atomic-add
 //                normalized probabilities into V_score and D_score.
@@ -221,16 +280,14 @@ static inline void minference_probe_impl(
     device float *probe_m_split, device float *probe_l_split,
     device const float *probe_m_global, device const float *probe_inv_z,
     device atomic<float> *v_score, device atomic<float> *d_score,
-    constant MInferenceParams &mp, threadgroup uint4 *tg_stage,
-    threadgroup float *tg_scores, threadgroup float *tg_mu_k,
+    constant MInferenceParams &mp, threadgroup uint4 *tg_q_i8,
+    threadgroup uint4 *tg_work, threadgroup float *tg_mu_k,
     threadgroup float *tg_sk, threadgroup float *tg_sq,
     threadgroup float *tg_delta, threadgroup uint *tg_q_pos,
     threadgroup float *tg_pool_buf, ushort lane, ushort sg, uint3 tg) {
   constexpr uint BD = 256u;
   constexpr uint BK = 32u;
   constexpr uint M_TILE = 64u;
-  constexpr uint STAGE_RG = 2u;
-  constexpr uint NUM_WAVES = 2u;
 
   const PagedAttentionParams p = mp.base;
   if (p.tokens == 0u || mp.w_probe == 0u || p.query_heads == 0u ||
@@ -274,8 +331,6 @@ static inline void minference_probe_impl(
 
   const uint row_group = uint(sg >> 1u); // 0..3
   const uint d_part = uint(sg & 1u);     // 0..1
-  const uint my_wave = row_group / STAGE_RG;
-  const uint rg_local = row_group - my_wave * STAGE_RG;
   const uint tm = row_group * 16u;
   const uint d_offset = d_part * 128u;
 
@@ -304,8 +359,8 @@ static inline void minference_probe_impl(
     return;
   }
 
-  // Quantize probe Q once into 16 char4 registers.
-  char4 q_i8_reg[16];
+  // Quantize probe Q ONCE directly into 100% resident tg_q_i8 [4][2][16][128] (16 KiB)!
+  threadgroup uchar *tg_q_i8_b = reinterpret_cast<threadgroup uchar *>(tg_q_i8);
   {
     float4 q_f4[16];
     float lmax = 0.0f;
@@ -332,12 +387,15 @@ static inline void minference_probe_impl(
     if (q_half == 0u) {
       tg_sq[d_part * M_TILE + r_m] = sq;
     }
+    threadgroup char4 *q_dst = reinterpret_cast<threadgroup char4 *>(
+        tg_q_i8_b + (row_group * 2u + d_part) * (16u * 128u) +
+        q_r_in16 * 128u + q_half * 64u);
     MINF_UNROLL
     for (uint k = 0u; k < 16u; ++k) {
       const float4 qf =
           clamp(rint(q_f4[k] * inv_sq), float4(-127.0f), float4(127.0f));
-      q_i8_reg[k] = char4(char(int(qf.x)), char(int(qf.y)), char(int(qf.z)),
-                          char(int(qf.w)));
+      q_dst[k] = char4(char(int(qf.x)), char(int(qf.y)), char(int(qf.z)),
+                       char(int(qf.w)));
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -367,13 +425,14 @@ static inline void minference_probe_impl(
   const ulong kvh_code_base = ulong(kvh) * head_code_bytes;
   const ulong bf16_kv_stride = ulong(p.key_value_heads) * BD;
 
-  threadgroup uchar *stage_b = reinterpret_cast<threadgroup uchar *>(tg_stage);
+  threadgroup uchar *work_b = reinterpret_cast<threadgroup uchar *>(tg_work);
+  threadgroup int8_t *my_tg_q = reinterpret_cast<threadgroup int8_t *>(
+      tg_q_i8_b + (row_group * 2u + d_part) * (16u * 128u));
   threadgroup int8_t *tg_k_i8_part =
-      reinterpret_cast<threadgroup int8_t *>(stage_b) + d_part * (32u * 128u);
-  threadgroup int8_t *tg_q_stage_base =
-      reinterpret_cast<threadgroup int8_t *>(stage_b + 8192u);
-  threadgroup float *tg_v_row = tg_pool_buf;         // [64]
-  threadgroup float *tg_dhi_row = tg_pool_buf + 64u; // [64]
+      reinterpret_cast<threadgroup int8_t *>(work_b) + d_part * (32u * 128u);
+  threadgroup float *tg_scores = reinterpret_cast<threadgroup float *>(work_b);
+  threadgroup float *tg_v_row = tg_pool_buf;          // [64]
+  threadgroup float *tg_dhi_row = tg_pool_buf + 64u;  // [64]
   threadgroup float *tg_dlo_row = tg_pool_buf + 128u; // [64]
 
   for (uint kb = kb_start; kb < kb_end; ++kb) {
@@ -383,168 +442,140 @@ static inline void minference_probe_impl(
     const uint kb_col_base = kb * BK;
     const short valid_k = short(min(BK, max_valid_kv - kb_col_base));
 
-    probe_prepare_k_int8<IsAffine4>(
+    // Barriers #1, #2, #3 inside probe_prepare_k_and_delta_int8!
+    probe_prepare_k_and_delta_int8<IsAffine4>(
         cache_key, phys_page, sub_off, p.page_tokens, page_bytes, kvh_code_base,
-        all_codes_bytes, bf16_kv_stride, kvh, valid_k, flat_tid, tg_stage,
-        tg_mu_k, tg_sk);
+        all_codes_bytes, bf16_kv_stride, kvh, valid_k, flat_tid, row_group,
+        d_part, q_r_in16, q_half, tg_q_i8_b, tg_work, tg_mu_k, tg_sk,
+        tg_delta);
 
-    MINF_UNROLL
-    for (uint wave = 0u; wave < NUM_WAVES; ++wave) {
-      const bool in_wave = (my_wave == wave);
-      if (in_wave) {
-        threadgroup char4 *q_dst = reinterpret_cast<threadgroup char4 *>(
-            tg_q_stage_base + (rg_local * 2u + d_part) * (16u * 128u) +
-            q_r_in16 * 128u + q_half * 64u);
-        const threadgroup float4 *mu_src =
-            reinterpret_cast<const threadgroup float4 *>(
-                tg_mu_k + d_part * 128u + q_half * 64u);
-        float d_acc = 0.0f;
-        MINF_UNROLL
-        for (uint k = 0u; k < 16u; ++k) {
-          const char4 q4 = q_i8_reg[k];
-          q_dst[k] = q4;
-          const float4 qf(float(q4.x), float(q4.y), float(q4.z), float(q4.w));
-          d_acc += dot(qf, mu_src[k]);
-        }
-        d_acc += simd_shuffle_xor(d_acc, ushort(1));
-        if (q_half == 0u) {
-          tg_delta[d_part * (STAGE_RG * 16u) + rg_local * 16u + q_r_in16] =
-              d_acc;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+    // All 8 SGs execute INT8 16x32x128 Q x K^T concurrently (ZERO wave serialization!).
+    tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tQ(
+        my_tg_q, dextents<int32_t, 2>(128, 16));
+    tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tK(
+        tg_k_i8_part, dextents<int32_t, 2>(128, 32));
+    auto ct_s = qk_op.template get_destination_cooperative_tensor<
+        decltype(tQ), decltype(tK), int32_t>();
+    qk_op.run(tQ, tK, ct_s);
+    threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #4
 
-      threadgroup int8_t *my_tg_q =
-          tg_q_stage_base + (rg_local * 2u + d_part) * (16u * 128u);
-      tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tQ(
-          my_tg_q, dextents<int32_t, 2>(128, 16));
-      tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> tK(
-          tg_k_i8_part, dextents<int32_t, 2>(128, 32));
-      auto ct_s = qk_op.template get_destination_cooperative_tensor<
-          decltype(tQ), decltype(tK), int32_t>();
-
-      if (in_wave) {
-        qk_op.run(tQ, tK, ct_s);
-        if (d_part == 1u) {
-          MINF_UNROLL
-          for (ushort i = 0; i < ct_s.get_capacity(); ++i) {
-            if (ct_s.is_valid_element(i)) {
-              const auto idx = ct_s.get_multidimensional_index(i);
-              const uint col = uint(idx[0]);
-              const uint row = uint(idx[1]);
-              const float sq = tg_sq[1u * M_TILE + tm + row];
-              const float sk = tg_sk[1u * 32u + col];
-              const float del =
-                  tg_delta[1u * (STAGE_RG * 16u) + rg_local * 16u + row];
-              tg_scores[rg_local * 512u + row * 32u + col] =
-                  sq * fma(float(ct_s[i]), sk, del);
-            }
-          }
+    if (d_part == 1u) {
+      MINF_UNROLL
+      for (ushort i = 0; i < ct_s.get_capacity(); ++i) {
+        if (ct_s.is_valid_element(i)) {
+          const auto idx = ct_s.get_multidimensional_index(i);
+          const uint col = uint(idx[0]);
+          const uint row = uint(idx[1]);
+          const float sq = tg_sq[1u * M_TILE + tm + row];
+          const float sk = tg_sk[1u * 32u + col];
+          const float del = tg_delta[1u * M_TILE + tm + row];
+          tg_scores[row_group * 512u + row * 32u + col] =
+              sq * fma(float(ct_s[i]), sk, del);
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      if (in_wave && d_part == 0u) {
-        MINF_UNROLL
-        for (ushort i = 0; i < ct_s.get_capacity(); ++i) {
-          if (ct_s.is_valid_element(i)) {
-            const auto idx = ct_s.get_multidimensional_index(i);
-            const uint col = uint(idx[0]);
-            const uint row = uint(idx[1]);
-            const float sq = tg_sq[0u * M_TILE + tm + row];
-            const float sk = tg_sk[0u * 32u + col];
-            const float del =
-                tg_delta[0u * (STAGE_RG * 16u) + rg_local * 16u + row];
-            tg_scores[rg_local * 512u + row * 32u + col] +=
-                sq * fma(float(ct_s[i]), sk, del);
-          }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        const threadgroup float4 *s_row4 =
-            reinterpret_cast<const threadgroup float4 *>(
-                tg_scores + rg_local * 512u + q_r_in16 * 32u + q_half * 16u);
-        const uint c_base = kb_col_base + q_half * 16u;
-        const uint4 c0 = uint4(c_base) + uint4(0u, 1u, 2u, 3u);
-        const uint4 c1 = c0 + uint4(4u);
-        const uint4 c2 = c0 + uint4(8u);
-        const uint4 c3 = c0 + uint4(12u);
-        const bool4 ok0 = qv && (c0 < max_valid_kv) && (c0 <= qpos_l);
-        const bool4 ok1 = qv && (c1 < max_valid_kv) && (c1 <= qpos_l);
-        const bool4 ok2 = qv && (c2 < max_valid_kv) && (c2 <= qpos_l);
-        const bool4 ok3 = qv && (c3 < max_valid_kv) && (c3 <= qpos_l);
-        const float4 s0 = select(float4(kNegInf), s_row4[0] * scale2, ok0);
-        const float4 s1 = select(float4(kNegInf), s_row4[1] * scale2, ok1);
-        const float4 s2 = select(float4(kNegInf), s_row4[2] * scale2, ok2);
-        const float4 s3 = select(float4(kNegInf), s_row4[3] * scale2, ok3);
-
-        if constexpr (PassMode == 0u) {
-          const float4 m4 = max(max(s0, s1), max(s2, s3));
-          float m_loc = max(max(m4.x, m4.y), max(m4.z, m4.w));
-          m_loc = max(m_loc, simd_shuffle_xor(m_loc, ushort(1)));
-          const float new_m = max(max_s, m_loc);
-          const float fac =
-              (max_s <= kNegInfHalf) ? 0.0f : fast::exp2(max_s - new_m);
-          max_s = new_m;
-          sum_s *= fac;
-          const bool emp = (new_m <= kNegInfHalf);
-          const float4 p0 = select(fast::exp2(s0 - new_m), float4(0.0f),
-                                   emp || (s0 <= kNegInfHalf));
-          const float4 p1 = select(fast::exp2(s1 - new_m), float4(0.0f),
-                                   emp || (s1 <= kNegInfHalf));
-          const float4 p2 = select(fast::exp2(s2 - new_m), float4(0.0f),
-                                   emp || (s2 <= kNegInfHalf));
-          const float4 p3 = select(fast::exp2(s3 - new_m), float4(0.0f),
-                                   emp || (s3 <= kNegInfHalf));
-          const float4 ps = (p0 + p1) + (p2 + p3);
-          float tsum = (ps.x + ps.y) + (ps.z + ps.w);
-          tsum += simd_shuffle_xor(tsum, ushort(1));
-          sum_s += tsum;
-        } else {
-          // PassMode == 1: Exact normalized probabilities -> block & 2-bin slash sums!
-          const bool emp = (g_m_row <= kNegInfHalf) || !(g_invz_row > 0.0f);
-          const float4 p0 = select(fast::exp2(s0 - g_m_row) * g_invz_row,
-                                   float4(0.0f), emp || (s0 <= kNegInfHalf));
-          const float4 p1 = select(fast::exp2(s1 - g_m_row) * g_invz_row,
-                                   float4(0.0f), emp || (s1 <= kNegInfHalf));
-          const float4 p2 = select(fast::exp2(s2 - g_m_row) * g_invz_row,
-                                   float4(0.0f), emp || (s2 <= kNegInfHalf));
-          const float4 p3 = select(fast::exp2(s3 - g_m_row) * g_invz_row,
-                                   float4(0.0f), emp || (s3 <= kNegInfHalf));
-
-          const uint split_c =
-              (qpos_l >= kb_col_base) ? (((qpos_l - kb_col_base) & 31u) + 1u)
-                                      : 0u;
-          const uint j_base = q_half * 16u;
-          const uint4 j0 = uint4(j_base) + uint4(0u, 1u, 2u, 3u);
-          const uint4 j1 = j0 + uint4(4u);
-          const uint4 j2 = j0 + uint4(8u);
-          const uint4 j3 = j0 + uint4(12u);
-
-          const float4 hi_s = select(float4(0.0f), p0, j0 < split_c) +
-                              select(float4(0.0f), p1, j1 < split_c) +
-                              select(float4(0.0f), p2, j2 < split_c) +
-                              select(float4(0.0f), p3, j3 < split_c);
-          const float4 lo_s = select(float4(0.0f), p0, j0 >= split_c) +
-                              select(float4(0.0f), p1, j1 >= split_c) +
-                              select(float4(0.0f), p2, j2 >= split_c) +
-                              select(float4(0.0f), p3, j3 >= split_c);
-
-          float dhi = (hi_s.x + hi_s.y) + (hi_s.z + hi_s.w);
-          float dlo = (lo_s.x + lo_s.y) + (lo_s.z + lo_s.w);
-          dhi += simd_shuffle_xor(dhi, ushort(1));
-          dlo += simd_shuffle_xor(dlo, ushort(1));
-          if (q_half == 0u) {
-            tg_v_row[r_m] = dhi + dlo;
-            tg_dhi_row[r_m] = dhi;
-            tg_dlo_row[r_m] = dlo;
-          }
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #5
+
+    if (d_part == 0u) {
+      MINF_UNROLL
+      for (ushort i = 0; i < ct_s.get_capacity(); ++i) {
+        if (ct_s.is_valid_element(i)) {
+          const auto idx = ct_s.get_multidimensional_index(i);
+          const uint col = uint(idx[0]);
+          const uint row = uint(idx[1]);
+          const float sq = tg_sq[0u * M_TILE + tm + row];
+          const float sk = tg_sk[0u * 32u + col];
+          const float del = tg_delta[0u * M_TILE + tm + row];
+          tg_scores[row_group * 512u + row * 32u + col] +=
+              sq * fma(float(ct_s[i]), sk, del);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      const threadgroup float4 *s_row4 =
+          reinterpret_cast<const threadgroup float4 *>(
+              tg_scores + row_group * 512u + q_r_in16 * 32u + q_half * 16u);
+      const uint c_base = kb_col_base + q_half * 16u;
+      const uint4 c0 = uint4(c_base) + uint4(0u, 1u, 2u, 3u);
+      const uint4 c1 = c0 + uint4(4u);
+      const uint4 c2 = c0 + uint4(8u);
+      const uint4 c3 = c0 + uint4(12u);
+      const bool4 ok0 = qv && (c0 < max_valid_kv) && (c0 <= qpos_l);
+      const bool4 ok1 = qv && (c1 < max_valid_kv) && (c1 <= qpos_l);
+      const bool4 ok2 = qv && (c2 < max_valid_kv) && (c2 <= qpos_l);
+      const bool4 ok3 = qv && (c3 < max_valid_kv) && (c3 <= qpos_l);
+      const float4 s0 = select(float4(kNegInf), s_row4[0] * scale2, ok0);
+      const float4 s1 = select(float4(kNegInf), s_row4[1] * scale2, ok1);
+      const float4 s2 = select(float4(kNegInf), s_row4[2] * scale2, ok2);
+      const float4 s3 = select(float4(kNegInf), s_row4[3] * scale2, ok3);
+
+      if constexpr (PassMode == 0u) {
+        const float4 m4 = max(max(s0, s1), max(s2, s3));
+        float m_loc = max(max(m4.x, m4.y), max(m4.z, m4.w));
+        m_loc = max(m_loc, simd_shuffle_xor(m_loc, ushort(1)));
+        const float new_m = max(max_s, m_loc);
+        const float fac =
+            (max_s <= kNegInfHalf) ? 0.0f : fast::exp2(max_s - new_m);
+        max_s = new_m;
+        sum_s *= fac;
+        const bool emp = (new_m <= kNegInfHalf);
+        const float4 p0 = select(fast::exp2(s0 - new_m), float4(0.0f),
+                                 emp || (s0 <= kNegInfHalf));
+        const float4 p1 = select(fast::exp2(s1 - new_m), float4(0.0f),
+                                 emp || (s1 <= kNegInfHalf));
+        const float4 p2 = select(fast::exp2(s2 - new_m), float4(0.0f),
+                                 emp || (s2 <= kNegInfHalf));
+        const float4 p3 = select(fast::exp2(s3 - new_m), float4(0.0f),
+                                 emp || (s3 <= kNegInfHalf));
+        const float4 ps = (p0 + p1) + (p2 + p3);
+        float tsum = (ps.x + ps.y) + (ps.z + ps.w);
+        tsum += simd_shuffle_xor(tsum, ushort(1));
+        sum_s += tsum;
+      } else {
+        // PassMode == 1: Exact normalized probabilities -> block & 2-bin slash sums!
+        const bool emp = (g_m_row <= kNegInfHalf) || !(g_invz_row > 0.0f);
+        const float4 p0 = select(fast::exp2(s0 - g_m_row) * g_invz_row,
+                                 float4(0.0f), emp || (s0 <= kNegInfHalf));
+        const float4 p1 = select(fast::exp2(s1 - g_m_row) * g_invz_row,
+                                 float4(0.0f), emp || (s1 <= kNegInfHalf));
+        const float4 p2 = select(fast::exp2(s2 - g_m_row) * g_invz_row,
+                                 float4(0.0f), emp || (s2 <= kNegInfHalf));
+        const float4 p3 = select(fast::exp2(s3 - g_m_row) * g_invz_row,
+                                 float4(0.0f), emp || (s3 <= kNegInfHalf));
+
+        const uint split_c =
+            (qpos_l >= kb_col_base) ? (((qpos_l - kb_col_base) & 31u) + 1u)
+                                    : 0u;
+        const uint j_base = q_half * 16u;
+        const uint4 j0 = uint4(j_base) + uint4(0u, 1u, 2u, 3u);
+        const uint4 j1 = j0 + uint4(4u);
+        const uint4 j2 = j0 + uint4(8u);
+        const uint4 j3 = j0 + uint4(12u);
+
+        const float4 hi_s = select(float4(0.0f), p0, j0 < split_c) +
+                            select(float4(0.0f), p1, j1 < split_c) +
+                            select(float4(0.0f), p2, j2 < split_c) +
+                            select(float4(0.0f), p3, j3 < split_c);
+        const float4 lo_s = select(float4(0.0f), p0, j0 >= split_c) +
+                            select(float4(0.0f), p1, j1 >= split_c) +
+                            select(float4(0.0f), p2, j2 >= split_c) +
+                            select(float4(0.0f), p3, j3 >= split_c);
+
+        float dhi = (hi_s.x + hi_s.y) + (hi_s.z + hi_s.w);
+        float dlo = (lo_s.x + lo_s.y) + (lo_s.z + lo_s.w);
+        dhi += simd_shuffle_xor(dhi, ushort(1));
+        dlo += simd_shuffle_xor(dlo, ushort(1));
+        if (q_half == 0u) {
+          tg_v_row[r_m] = dhi + dlo;
+          tg_dhi_row[r_m] = dhi;
+          tg_dlo_row[r_m] = dlo;
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #6
 
     // PassMode == 1: GQA max_{g=0..G-1} pooling across the repeat heads for each token!
+    // (No extra Barrier #7 needed: next kb's Barrier #1..#5 separate these reads from next tg_pool_buf write!)
     if constexpr (PassMode == 1u) {
       if (flat_tid < active_tok) {
         const uint pos_w = tg_q_pos[flat_tid];
@@ -575,7 +606,6 @@ static inline void minference_probe_impl(
           }
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
 
@@ -608,17 +638,17 @@ static inline void minference_probe_impl(
       ushort lane [[thread_index_in_simdgroup]],                               \
       ushort sg [[simdgroup_index_in_threadgroup]],                            \
       uint3 tg [[threadgroup_position_in_grid]]) {                             \
-    threadgroup uint4 tg_stage[16384u / 16u];                                  \
-    threadgroup float tg_scores[2u * 16u * 32u];                               \
+    threadgroup uint4 tg_q_i8[16384u / 16u];                                   \
+    threadgroup uint4 tg_work[8192u / 16u];                                    \
     threadgroup float tg_mu_k[2u * 128u];                                      \
     threadgroup float tg_sk[2u * 32u];                                         \
     threadgroup float tg_sq[2u * 64u];                                         \
-    threadgroup float tg_delta[2u * 32u];                                      \
+    threadgroup float tg_delta[2u * 64u];                                      \
     threadgroup uint tg_q_pos[64u];                                            \
     threadgroup float tg_pool_unused[1u];                                      \
     minf::minference_probe_impl<IS_AFF4, 0u>(                                  \
         query, cache_key, page_table, positions, probe_m_split, probe_l_split, \
-        nullptr, nullptr, nullptr, nullptr, mp, tg_stage, tg_scores, tg_mu_k,  \
+        nullptr, nullptr, nullptr, nullptr, mp, tg_q_i8, tg_work, tg_mu_k,     \
         tg_sk, tg_sq, tg_delta, tg_q_pos, tg_pool_unused, lane, sg, tg);       \
   }
 
@@ -687,19 +717,18 @@ kernel void omlx_m5_minference_probe_reduce_and_clear(
       ushort lane [[thread_index_in_simdgroup]],                               \
       ushort sg [[simdgroup_index_in_threadgroup]],                            \
       uint3 tg [[threadgroup_position_in_grid]]) {                             \
-    threadgroup uint4 tg_stage[16384u / 16u];                                  \
-    threadgroup float tg_scores[2u * 16u * 32u];                               \
+    threadgroup uint4 tg_q_i8[16384u / 16u];                                   \
+    threadgroup uint4 tg_work[8192u / 16u];                                    \
     threadgroup float tg_mu_k[2u * 128u];                                      \
     threadgroup float tg_sk[2u * 32u];                                         \
     threadgroup float tg_sq[2u * 64u];                                         \
-    threadgroup float tg_delta[2u * 32u];                                      \
+    threadgroup float tg_delta[2u * 64u];                                      \
     threadgroup uint tg_q_pos[64u];                                            \
     threadgroup float tg_pool_buf[3u * 64u];                                   \
     minf::minference_probe_impl<IS_AFF4, 1u>(                                  \
         query, cache_key, page_table, positions, nullptr, nullptr,             \
-        probe_m_global, probe_inv_z, v_score, d_score, mp, tg_stage,           \
-        tg_scores, tg_mu_k, tg_sk, tg_sq, tg_delta, tg_q_pos, tg_pool_buf,     \
-        lane, sg, tg);                                                         \
+        probe_m_global, probe_inv_z, v_score, d_score, mp, tg_q_i8, tg_work,   \
+        tg_mu_k, tg_sk, tg_sq, tg_delta, tg_q_pos, tg_pool_buf, lane, sg, tg); \
   }
 
 DEFINE_MINF_PROBE_SCORE(omlx_m5_minference_probe_score_affine4_g128_hd256, true)

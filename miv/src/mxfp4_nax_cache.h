@@ -503,11 +503,19 @@ inline void linear_mxfp4_nax_direct_f16(Encoder &e, const TiledMxfp4Weight &tw,
 }
 
 inline bool mxfp4_nax_swiglu_out64_enabled() noexcept {
+  // Real Apple10 M5 Ultra calibration: out64 stages As+Ws (27 KiB SRAM -> 1 TG/core
+  // + 2 barriers/K-block), regressing 64K prefill by +1.83s vs bm64_bn64_sk1
+  // (9 KiB SRAM, direct L1 x loads). Keep out64 for Dual-ANE row-slice calls
+  // (is_slice) and opt-in via OMLX_M5_ENABLE_SWIGLU_OUT64=1.
   if (const char *dis = std::getenv("OMLX_M5_DISABLE_SWIGLU_OUT64");
       dis != nullptr && std::string_view(dis) == "1") {
     return false;
   }
-  return true;
+  if (const char *en = std::getenv("OMLX_M5_ENABLE_SWIGLU_OUT64");
+      en != nullptr && std::string_view(en) == "1") {
+    return true;
+  }
+  return false;
 }
 
 inline void linear_mxfp4_nax(Encoder &e, const TiledMxfp4Weight &tw, Ref x,

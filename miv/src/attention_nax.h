@@ -787,9 +787,19 @@ inline void emit_paged_flash_prefill_affine4_g128(
     Encoder &e, const QwenModelConfig &c, U32 t, Ref query, Ref gate,
     Ref state_k, Ref state_v, Ref mixer, Ref page_table,
     Ref attention_positions, std::vector<std::byte> params) {
+  // Real Apple10 M5 Ultra calibration (27B QH=24/KVH=4, chunk=2048):
+  //   - LPT BQ=64 direct-L1 kernel (8.4 KiB SRAM, 2 TG/core): 64.0 TFLOPS (12.08ms @16K, 52.66ms @64K)
+  //   - GQA-packed Ping-Pong wm8 (29.0 KiB SRAM, 1 TG/core):  56.3 TFLOPS (13.74ms @16K, 58.48ms @64K)
+  // Route full chunks (t >= 64) to LPT BQ=64 unless GQA packing is explicitly forced via
+  // OMLX_M5_ENABLE_GQA_FLASH_PREFILL=1 or OMLX_M5_GQA_FLASH_TIER, while keeping GQA-packed
+  // Flash-NAX for short tail/HKVD chunks (t < 64) where BQ=64 underfills rows.
+  const bool force_gqa =
+      env_flag_enabled("OMLX_M5_ENABLE_GQA_FLASH_PREFILL") ||
+      (std::getenv("OMLX_M5_GQA_FLASH_TIER") != nullptr);
   if (gqa_flash_prefill_eligible(U32(c.num_attention_heads),
                                  U32(c.num_key_value_heads),
-                                 U32(c.head_dim))) {
+                                 U32(c.head_dim)) &&
+      (t < 64u || force_gqa)) {
     emit_paged_flash_prefill_gqa_affine4_g128(
         e, c, t, query, gate, state_k, state_v, mixer, page_table,
         attention_positions, std::move(params));

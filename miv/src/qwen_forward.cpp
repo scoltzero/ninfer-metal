@@ -1042,18 +1042,30 @@ public:
         context.capabilities().profile.probe.tensor_api;
 
     // Module 4b: Initialize Native Dual-ANE Co-Execution Engine on primary Dense slot.
-    // Preserves W4A8 orthogonally (alpha_bf16=0.25, alpha_w4a8=0.15).
+    // Calibrated for 80-core Apple M5 Ultra NAX GPU + Dual-ANE:
+    //   - On full-scale dense models (intermediate >= 8192, workspace >= 2048), match
+    //     T_chunk = 2048 (avoids 2x attention KV traffic penalty), use direct FP16 weights
+    //     (13.8 TFLOPS dual-die vs 8.1 TFLOPS G=64 INT8), offload fused MlpGateUpSwiGlu
+    //     only (avoids mlp.down_proj K=17408 6.4x ANE SRAM cliff & small-op dispatch lag),
+    //     and split at alpha_bf16=0.08 / alpha_w4a8=0.06 so Dual-ANE finishes inside GPU.
+    //   - Small synthetic models keep alpha_bf16=0.25 / alpha_w4a8=0.15 / T=1024 for tests.
     if (!shared_primary_ && prefill_options_.ane_offload && c.num_experts == 0) {
+      const bool large_m5_dense =
+          (c.intermediate_size >= 8192 && workspace_rows_ >= 2048U);
       ane::AneDualOffloadConfig ane_cfg;
-      ane_cfg.chunk_tokens = prefill_options_.ane_chunk_tokens
-                                 ? prefill_options_.ane_chunk_tokens
-                                 : ane::kAneDefaultChunkTokens;
+      ane_cfg.chunk_tokens =
+          prefill_options_.ane_chunk_tokens
+              ? prefill_options_.ane_chunk_tokens
+              : (large_m5_dense ? 2048U : ane::kAneDefaultChunkTokens);
       ane_cfg.linear_route =
           (prefill_options_.linear_mode == PrefillLinearMode::W4A8)
               ? ane::AneLinearRoute::W4A8
               : ane::AneLinearRoute::BF16;
-      ane_cfg.alpha_bf16 = ane::kAneDefaultAlphaBf16;
-      ane_cfg.alpha_w4a8 = ane::kAneDefaultAlphaW4A8;
+      ane_cfg.alpha_bf16 = large_m5_dense ? 0.045 : ane::kAneDefaultAlphaBf16;
+      ane_cfg.alpha_w4a8 = large_m5_dense ? 0.03 : ane::kAneDefaultAlphaW4A8;
+      ane_cfg.use_fp16_weights = large_m5_dense;
+      ane_cfg.mlp_swiglu_only = large_m5_dense;
+      ane_cfg.max_in_features = large_m5_dense ? 8192U : 0U;
       ane_cfg.artifact_digest = prefill_options_.artifact_digest;
       ane_cfg.metallib_path = libraries / "omlx_m5_ane_pack_unpack.metallib";
       ane_cfg.external_mtl_device = context.native_mtl_device();
@@ -1068,6 +1080,28 @@ public:
         const double parsed = std::strtod(env_alpha, nullptr);
         if (std::isfinite(parsed) && parsed > 0.0 && parsed <= ane::kAneMaxAlpha) {
           ane_cfg.alpha_override = parsed;
+        }
+      }
+      if (const char *env_fp16 = std::getenv("OMLX_M5_ANE_FP16")) {
+        ane_cfg.use_fp16_weights = (std::string_view(env_fp16) == "1");
+      }
+      if (const char *env_swiglu = std::getenv("OMLX_M5_ANE_SWIGLU_ONLY")) {
+        ane_cfg.mlp_swiglu_only = (std::string_view(env_swiglu) == "1");
+      }
+      if (const char *env_maxk = std::getenv("OMLX_M5_ANE_MAX_IN_FEATURES")) {
+        ane_cfg.max_in_features = static_cast<U32>(std::strtoul(env_maxk, nullptr, 10));
+      }
+      if (const char *env_procs = std::getenv("OMLX_M5_ANE_MAX_PROCS_PER_BANK")) {
+        const auto parsed = std::strtoul(env_procs, nullptr, 10);
+        if (parsed >= 1UL && parsed <= 250UL) {
+          ane_cfg.max_procedures_per_bank = static_cast<U32>(parsed);
+        }
+      }
+      if (const char *env_mib = std::getenv("OMLX_M5_ANE_MAX_BANK_MIB")) {
+        const auto parsed = std::strtoul(env_mib, nullptr, 10);
+        if (parsed >= 32UL && parsed <= 2560UL) {
+          ane_cfg.max_bank_bytes_per_die =
+              static_cast<U64>(parsed) * 1024ULL * 1024ULL;
         }
       }
       if (ane_cfg.chunk_tokens <= workspace_rows_ &&

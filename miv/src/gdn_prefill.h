@@ -51,11 +51,12 @@ inline constexpr U32 kGdnChunkNaxDefaultMinTokens = 64U;
   return kGdnChunkNaxDefaultMinTokens;
 }
 
-// Selects Lossless Base 1.1 Stage 2 slice width (`dv64` vs `dv32`):
+// Selects Stage 2 slice width (`dv64` vs `dv32`):
 //   - `OMLX_M5_GDN_STAGE2_SLICE=64|32` overrides the heuristic.
-//   - Default heuristic: `(Hv * 2 >= gpu_cores) ? dv64 : dv32` (default gpu_cores=80).
-//     * 27B (Hv=48): 96 >= 80 -> dv64 (96 TGs <= 160 slots = 1 single wave on 80-core!)
-//     * 35B (Hv=32): 64 >= 64 -> dv64 on 64-core; 64 < 80 -> dv32 (128 TGs) on 80-core.
+//   - Real 80-core Apple10 M5 Ultra calibration: on 27B (Hv=48), dv64 launches
+//     96 heavy TGs (2 waves with 64 idle cores on wave 2 + 2x register pressure),
+//     regressing 64K prefill by +0.46s vs dv32 (192 lightweight <=16 KiB TGs).
+//     Default to dv32 across Apple10 unless explicitly requested via `=64`.
 [[nodiscard]] inline bool gdn_stage2_use_dv64(U32 value_heads,
                                               U32 gpu_cores = 80U) noexcept {
   if (const char *env = std::getenv("OMLX_M5_GDN_STAGE2_SLICE")) {
@@ -67,8 +68,9 @@ inline constexpr U32 kGdnChunkNaxDefaultMinTokens = 64U;
       return false;
     }
   }
-  const U32 cores = gpu_cores == 0U ? 80U : gpu_cores;
-  return U64(value_heads) * 2ULL >= U64(cores);
+  (void)value_heads;
+  (void)gpu_cores;
+  return false;
 }
 
 struct GdnChunkWorkspaceLayout {

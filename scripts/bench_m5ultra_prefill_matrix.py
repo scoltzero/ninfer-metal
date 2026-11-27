@@ -61,19 +61,28 @@ QWEN38_USER_TO_ASSISTANT_NOTHINK: List[int] = [
     QWEN38_NL2,
 ]
 
-# Full Module 5 matrix preset definitions (Spec Section 5.2).
+# Full Module 5 matrix preset definitions (Spec Section 5.2 + Wave 3 ANE pairs).
 MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
     "M0": {
-        "label": "Baseline (BF16 + Exact NAX)",
+        "label": "Lossless Base Default (BF16 + Exact NAX, ANE=OFF)",
         "prefill_linear_mode": "bf16",
         "prefill_attention_mode": "exact_nax",
         "prefill_sparse_minference": False,
         "prefill_cache_blend": False,
         "prefill_ane_offload": False,
+        "prefix_cache_gb": 0.0,
+    },
+    "M0_ANE": {
+        "label": "Lossless Base + Dual-ANE (BF16 + Exact NAX, ANE=ON)",
+        "prefill_linear_mode": "bf16",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
         "prefix_cache_gb": 0.0,
     },
     "M1": {
-        "label": "Route A (W4A8 + Exact NAX)",
+        "label": "Route A (W4A8 + Exact NAX, ANE=OFF)",
         "prefill_linear_mode": "w4a8",
         "prefill_attention_mode": "exact_nax",
         "prefill_sparse_minference": False,
@@ -81,8 +90,17 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_ane_offload": False,
         "prefix_cache_gb": 0.0,
     },
+    "M1_ANE": {
+        "label": "Route A + Dual-ANE (W4A8 + Exact NAX, ANE=ON)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "exact_nax",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefix_cache_gb": 0.0,
+    },
     "M2a": {
-        "label": "Route B1 (BF16 + Sage2)",
+        "label": "Route B1 (BF16 + Sage2, MInf=OFF, ANE=OFF)",
         "prefill_linear_mode": "bf16",
         "prefill_attention_mode": "sage2",
         "prefill_sparse_minference": False,
@@ -90,8 +108,17 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_ane_offload": False,
         "prefix_cache_gb": 0.0,
     },
+    "M2a_ANE": {
+        "label": "Route B1 + Dual-ANE (BF16 + Sage2, MInf=OFF, ANE=ON)",
+        "prefill_linear_mode": "bf16",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefix_cache_gb": 0.0,
+    },
     "M2b": {
-        "label": "Route B2 (BF16 + Sage2 + MInference)",
+        "label": "Route B2 (BF16 + Sage2 + MInference, ANE=OFF)",
         "prefill_linear_mode": "bf16",
         "prefill_attention_mode": "sage2",
         "prefill_sparse_minference": True,
@@ -99,13 +126,58 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_ane_offload": False,
         "prefix_cache_gb": 0.0,
     },
+    "M2b_ANE": {
+        "label": "Route B2 + Dual-ANE (BF16 + Sage2 + MInference, ANE=ON)",
+        "prefill_linear_mode": "bf16",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefix_cache_gb": 0.0,
+    },
+    "M3a": {
+        "label": "Route A+B1 (W4A8 + Sage2, MInf=OFF, ANE=OFF)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": False,
+        "prefix_cache_gb": 0.0,
+    },
+    "M3a_ANE": {
+        "label": "Route A+B1 + Dual-ANE (W4A8 + Sage2, MInf=OFF, ANE=ON)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": False,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
+        "prefix_cache_gb": 0.0,
+    },
     "M3": {
-        "label": "Route A+B (W4A8 + Sage2 + MInference)",
+        "label": "Route A+B2 (W4A8 + Sage2 + MInference, ANE=OFF)",
         "prefill_linear_mode": "w4a8",
         "prefill_attention_mode": "sage2",
         "prefill_sparse_minference": True,
         "prefill_cache_blend": False,
         "prefill_ane_offload": False,
+        "prefix_cache_gb": 0.0,
+    },
+    "M3b": {
+        "label": "Route A+B2 (W4A8 + Sage2 + MInference, ANE=OFF)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": False,
+        "prefix_cache_gb": 0.0,
+    },
+    "M3b_ANE": {
+        "label": "Route A+B2 + Dual-ANE (W4A8 + Sage2 + MInference, ANE=ON)",
+        "prefill_linear_mode": "w4a8",
+        "prefill_attention_mode": "sage2",
+        "prefill_sparse_minference": True,
+        "prefill_cache_blend": False,
+        "prefill_ane_offload": True,
         "prefix_cache_gb": 0.0,
     },
     "M4a": {
@@ -142,7 +214,7 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_sparse_minference": False,
         "prefill_cache_blend": True,
         "prefill_ane_offload": False,
-        "prefix_cache_gb": 4.0,
+        "prefix_cache_gb": 24.0,
     },
     "M5b": {
         "label": "All-On Stack (W4A8 + Sage2 + MInf + CacheBlend + ANE)",
@@ -151,7 +223,7 @@ MATRIX_CELLS: Dict[str, Dict[str, Any]] = {
         "prefill_sparse_minference": True,
         "prefill_cache_blend": True,
         "prefill_ane_offload": True,
-        "prefix_cache_gb": 4.0,
+        "prefix_cache_gb": 24.0,
     },
 }
 
@@ -323,6 +395,36 @@ def query_server_phys_footprint(host: str, port: int) -> Optional[int]:
         return int(val) if val is not None else None
     except Exception:
         return None
+
+
+PREFILL_TELEMETRY_METRICS: Tuple[Tuple[str, str], ...] = (
+    ("w4a8_tokens", "ninfer_metal_prefill_w4a8_tokens_total"),
+    ("sage2_tokens", "ninfer_metal_prefill_sage2_tokens_total"),
+    ("minference_blocks_skipped", "ninfer_metal_prefill_minference_blocks_skipped_total"),
+    ("minference_blocks_total", "ninfer_metal_prefill_minference_blocks_total"),
+    ("cache_blend_hit_tokens", "ninfer_metal_prefill_cache_blend_hit_tokens_total"),
+    ("cache_blend_recomputed_tokens", "ninfer_metal_prefill_cache_blend_recomputed_tokens_total"),
+    ("ane_offload_tokens", "ninfer_metal_prefill_ane_offload_tokens_total"),
+    ("ane_fallback_tokens", "ninfer_metal_prefill_ane_fallback_tokens_total"),
+)
+
+
+def query_prefill_telemetry(host: str, port: int) -> Dict[str, int]:
+    out: Dict[str, int] = {k: 0 for k, _ in PREFILL_TELEMETRY_METRICS}
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/metrics", timeout=2.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        for key, prom_name in PREFILL_TELEMETRY_METRICS:
+            v = parse_prometheus_metric(body, prom_name)
+            if v is not None:
+                out[key] = int(v)
+    except Exception:
+        pass
+    return out
+
+
+def diff_prefill_telemetry(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    return {k: max(0, after.get(k, 0) - before.get(k, 0)) for k, _ in PREFILL_TELEMETRY_METRICS}
 
 
 def query_footprint_cli_bytes(pid: int) -> Optional[int]:
@@ -534,13 +636,92 @@ def build_exact_niah_prompt_tokens(
     return full_ids, passkey
 
 
+def build_exact_multi_needle_prompt_tokens(
+    tokenizer: TokenizerBridge,
+    haystack_pool: Sequence[int],
+    prompt_tokens: int,
+    tier: int,
+    depths: Sequence[int],
+    trial_idx: int,
+    nonce_tag: str,
+) -> Tuple[List[int], Dict[int, str]]:
+    """Build an EXACT `prompt_tokens`-length prompt embedding passkeys at all `depths` simultaneously."""
+    sorted_depths = sorted(set(int(d) for d in depths))
+    passkeys: Dict[int, str] = {
+        d: deterministic_passkey(tier, d, trial_idx) for d in sorted_depths
+    }
+    nonce_hex = hashlib.sha256(
+        f"{nonce_tag}:multi:tier={tier}:depths={sorted_depths}:trial={trial_idx}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    header_text = (
+        f"[BENCH_NONCE={nonce_hex} CONTEXT_TIER={tier} MULTI_DEPTHS={sorted_depths} TRIAL={trial_idx}]\n"
+        "You are reading a long technical archive containing three verification passkey records "
+        "(labeled DEPTH_10, DEPTH_50, DEPTH_90).\n\n"
+    )
+    needle_tokens: Dict[int, List[int]] = {}
+    for d in sorted_depths:
+        nt = (
+            f"\n>>> CRITICAL AUDIT RECORD (NONCE {nonce_hex}): "
+            f"VERIFICATION_PASSKEY_DEPTH_{d}: {passkeys[d]} <<<\n"
+        )
+        needle_tokens[d] = tokenizer.encode(nt)
+
+    footer_lines = [
+        "\n\n=== END OF ARCHIVE ===\n",
+        "Task:\n",
+        "1. On the first three lines, output the exact 6-digit passkeys in order:\n",
+    ]
+    for d in sorted_depths:
+        footer_lines.append(f"PASSKEY_{d}: <6-digit code>\n")
+    footer_lines.append(
+        "2. Immediately afterwards, write a detailed 200-word technical engineering summary "
+        "covering paged affine4 KV pools, Gated DeltaNet recurrent state sizing, partial RoPE "
+        "group alignment, and causal LPT attention dispatch.\n"
+    )
+    footer_text = "".join(footer_lines)
+
+    header_ids = QWEN38_USER_OPEN + tokenizer.encode(header_text)
+    footer_ids = tokenizer.encode(footer_text) + QWEN38_USER_TO_ASSISTANT_NOTHINK
+    total_needle_len = sum(len(v) for v in needle_tokens.values())
+    overhead = len(header_ids) + total_needle_len + len(footer_ids)
+    if overhead >= prompt_tokens:
+        raise ValueError(f"Multi-needle overhead ({overhead}) >= prompt_tokens ({prompt_tokens})")
+
+    filler_total = prompt_tokens - overhead
+    if filler_total > len(haystack_pool):
+        raise ValueError(
+            f"Haystack pool ({len(haystack_pool)}) smaller than needed filler ({filler_total})"
+        )
+    shift = (trial_idx * 1301 + tier * 7) % max(1, len(haystack_pool) - filler_total + 1)
+    filler = list(haystack_pool[shift : shift + filler_total])
+
+    full_ids = list(header_ids)
+    prev_cut = 0
+    for d in sorted_depths:
+        cut = max(prev_cut, min(filler_total, int(round(filler_total * (d / 100.0)))))
+        full_ids.extend(filler[prev_cut:cut])
+        full_ids.extend(needle_tokens[d])
+        prev_cut = cut
+    full_ids.extend(filler[prev_cut:])
+    full_ids.extend(footer_ids)
+    assert len(full_ids) == prompt_tokens, f"Expected {prompt_tokens}, got {len(full_ids)}"
+    return full_ids, passkeys
+
+
 def generate_permuted_rag_dataset(
     tokenizer: TokenizerBridge,
     num_docs: int = 8,
     doc_tokens: int = 4096,
     seed: int = 20261126,
+    sub_chunk_tokens: int = 2048,
 ) -> Dict[str, Any]:
-    """Generate deterministic multi-document 4K-chunk RAG QA dataset for CacheBlend testing."""
+    """Generate deterministic multi-document 4K-chunk RAG QA dataset for CacheBlend testing.
+
+    Each 4K document is cleanly structured into `<= sub_chunk_tokens` (2048) segments
+    bounded by Qwen3.8 `<|im_start|>`/`<|im_end|>` structural delimiters so `ChunkBlendCache`
+    achieves 100% deterministic chunk boundary hits under arbitrary document permutations.
+    """
     docs: List[Dict[str, Any]] = []
     pool = build_haystack_pool_tokens(tokenizer, doc_tokens * 2, seed_tag=f"rag_pool_{seed}")
     for i in range(num_docs):
@@ -555,9 +736,21 @@ def generate_permuted_rag_dataset(
         tail = f"\nSummary for {subsystem}: port={port}, token=RAG_TOKEN_{code}.\n</doc>\n\n"
         head_ids = tokenizer.encode(head)
         tail_ids = tokenizer.encode(tail)
-        fill_n = max(64, doc_tokens - len(head_ids) - len(tail_ids))
-        shift = (i * 409) % max(1, len(pool) - fill_n)
-        toks = head_ids + list(pool[shift : shift + fill_n]) + tail_ids
+        # Split into 1 or 2 `<= sub_chunk_tokens` delimiter-bounded chunks.
+        n_parts = max(1, (doc_tokens + sub_chunk_tokens - 1) // sub_chunk_tokens)
+        part_target = doc_tokens // n_parts
+        toks: List[int] = []
+        for p_idx in range(n_parts):
+            this_target = part_target if p_idx < n_parts - 1 else (doc_tokens - len(toks))
+            p_head = [QWEN38_IM_START] + (
+                head_ids if p_idx == 0 else tokenizer.encode(f'<doc id="D{i:02d}" part="{p_idx}">\n')
+            )
+            p_tail = (
+                tail_ids if p_idx == n_parts - 1 else tokenizer.encode(f"\n</part>\n")
+            ) + [QWEN38_IM_END]
+            fill_n = max(64, this_target - len(p_head) - len(p_tail))
+            shift = (i * 409 + p_idx * 977) % max(1, len(pool) - fill_n)
+            toks.extend(p_head + list(pool[shift : shift + fill_n]) + p_tail)
         docs.append(
             {
                 "doc_id": f"D{i:02d}",
@@ -571,22 +764,81 @@ def generate_permuted_rag_dataset(
 
     # Deterministic derangement permutation (every document moves to a new position).
     perm = [(i * 5 + 3) % num_docs for i in range(num_docs)]
-    if len(set(perm)) != num_docs:
+    if len(set(perm)) != num_docs or any(perm[i] == i for i in range(num_docs)):
         perm = list(reversed(range(num_docs)))
+        if num_docs % 2 == 1 and num_docs >= 3:
+            mid = num_docs // 2
+            perm[mid], perm[mid + 1] = perm[mid + 1], perm[mid]
+
+    # Deterministic >= 260-token shared system preamble (so segment[0] cleanly closes
+    # BEFORE doc 0's <|im_start|> delimiter under kBlendDefaultLMin=256!) and >= 140-token
+    # trailing instruction block (so the last document never overlaps kBlendDefaultDenseTail=128).
+    sys_preamble_text = (
+        "System Retrieval Policy (RAG-BLEND-v1): You are a deterministic technical auditor "
+        "analyzing a multi-document engineering corpus delimited by structured document segments. "
+        "Each document specifies a unique subsystem identifier, a dedicated TCP service port, "
+        "and a cryptographic release token prefixed with RAG_TOKEN_. "
+        "When documents are reordered across retrieval turns, preserve exact fidelity to every "
+        "subsystem specification regardless of document order or surrounding context length. "
+        "Always report exact numeric TCP ports and exact release tokens verbatim without "
+        "paraphrasing, rounding, or omitting digits. "
+        "Standard audit protocol covers unified memory page tables, affine4 group-128 KV storage, "
+        "Gated DeltaNet recurrent state transitions, partial RoPE frequency alignment, "
+        "block-sparse attention verification, and cross-chunk KV cache stitching fidelity across "
+        "16K, 32K, 64K, 128K, and 256K context windows. "
+        "Verify all cross-document references carefully before emitting your final structured response. "
+        "Do not invent ports or tokens that are not explicitly recorded in the provided corpus. "
+        "Maintain concise, deterministic formatting for automated downstream verification pipelines. "
+        "Begin document archive below.\n"
+    )
+    sys_preamble_ids = list(QWEN38_USER_OPEN) + tokenizer.encode(sys_preamble_text)
+    if len(sys_preamble_ids) < 272:
+        pad_needed = 272 - len(sys_preamble_ids)
+        sys_preamble_ids.extend(list(pool[:pad_needed]))
+    sys_preamble_ids.append(QWEN38_IM_END)
 
     target_a = docs[perm[1]]
     target_b = docs[perm[-2 if num_docs >= 3 else 0]]
     query_text = (
-        "Based strictly on the documents above, answer concisely:\n"
-        f"1. What is the TCP port and RAG_TOKEN for {target_a['subsystem']}?\n"
-        f"2. What is the TCP port and RAG_TOKEN for {target_b['subsystem']}?\n"
-        "Format your first two lines as:\n"
+        "\n=== MULTI-HOP VERIFICATION QUERY ===\n"
+        "Based strictly on the reordered engineering documents provided above, perform an exact "
+        "cross-document extraction and answer concisely following the mandatory output schema.\n"
+        f"1. Locate the exact TCP port and release token (RAG_TOKEN_...) for subsystem {target_a['subsystem']}.\n"
+        f"2. Locate the exact TCP port and release token (RAG_TOKEN_...) for subsystem {target_b['subsystem']}.\n"
+        "Format your first two lines strictly as:\n"
         f"{target_a['subsystem']}: <port> <token>\n"
         f"{target_b['subsystem']}: <port> <token>\n"
-        "Then summarize the architectural interaction between both subsystems."
+        "3. Immediately afterwards, provide a concise technical summary describing whether the "
+        "retrieved documents specify any direct architectural dependency, shared transport port, "
+        "or synchronization protocol between both subsystems, citing only verified facts present "
+        "in the retrieved archive without speculation.\n"
     )
-    query_ids = tokenizer.encode(query_text)
-    permuted_prompt: List[int] = list(QWEN38_USER_OPEN)
+    query_ids = [QWEN38_IM_START] + tokenizer.encode(query_text)
+    if len(query_ids) < 144:
+        query_ids.extend(tokenizer.encode(" Verify exact numeric fidelity before answering." * 12))
+    query_ids = query_ids[: max(len(query_ids), 144)]
+
+    cold_ack_ids = [QWEN38_IM_START] + tokenizer.encode(
+        "\n=== ARCHIVE INDEXING ACKNOWLEDGEMENT ===\n"
+        "All engineering specification documents in this archive have been provided for indexing. "
+        "Confirm receipt of the complete document set and state that the specifications are ready "
+        "for subsequent multi-hop retrieval queries across arbitrary document permutations. "
+        "Do not repeat the full documents; emit a brief confirmation acknowledging that all "
+        "subsystems, TCP ports, and release tokens have been ingested for exact verification.\n"
+        "Confirm indexing readiness concisely in one short paragraph covering archive integrity, "
+        "delimiter boundaries, and deterministic retrieval readiness.\n"
+    )
+    if len(cold_ack_ids) < 144:
+        cold_ack_ids.extend(tokenizer.encode(" Confirm deterministic archive indexing readiness." * 12))
+    cold_ack_ids = cold_ack_ids[: max(len(cold_ack_ids), 144)]
+
+    cold_order_prompt: List[int] = list(sys_preamble_ids)
+    for d in docs:
+        cold_order_prompt.extend(d["tokens"])
+    cold_order_prompt.extend(cold_ack_ids)
+    cold_order_prompt.extend(QWEN38_USER_TO_ASSISTANT_NOTHINK)
+
+    permuted_prompt: List[int] = list(sys_preamble_ids)
     for idx in perm:
         permuted_prompt.extend(docs[idx]["tokens"])
     permuted_prompt.extend(query_ids)
@@ -604,6 +856,7 @@ def generate_permuted_rag_dataset(
             str(target_b["port"]),
             target_b["token_code"],
         ],
+        "cold_order_prompt_tokens": cold_order_prompt,
         "permuted_prompt_tokens": permuted_prompt,
         "total_prompt_tokens": len(permuted_prompt),
     }
@@ -625,7 +878,8 @@ def detect_supported_prefill_flags(serve_bin: str) -> set:
         "--prefill-ane-offload",
         "--no-prefill-ane-offload",
     ):
-        if name in out:
+        alt = name.replace("--no-", "--[no-]", 1) if name.startswith("--no-") else name.replace("--", "--[no-]", 1)
+        if name in out or alt in out:
             flags.add(name)
     return flags
 
@@ -646,6 +900,7 @@ class IsolatedServeProcess:
         metallib_dir: Optional[str],
         cell_cfg: Dict[str, Any],
         log_path: Path,
+        extra_env: Optional[Dict[str, str]] = None,
     ):
         self.serve_bin = serve_bin
         self.model_dir = model_dir
@@ -658,11 +913,12 @@ class IsolatedServeProcess:
         self.metallib_dir = metallib_dir
         self.cell_cfg = cell_cfg
         self.log_path = log_path
+        self.extra_env = dict(extra_env or {})
         self.proc: Optional[subprocess.Popen] = None
         self.cmd: List[str] = []
         self._log_fh: Optional[Any] = None
 
-    def start(self, startup_timeout_s: float = 180.0) -> Dict[str, Any]:
+    def start(self, startup_timeout_s: float = 900.0) -> Dict[str, Any]:
         if check_port_open(self.host, self.port):
             raise RuntimeError(f"Isolated port {self.host}:{self.port} is already in use")
 
@@ -712,11 +968,14 @@ class IsolatedServeProcess:
         self.cmd = cmd
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_fh = open(self.log_path, "w", encoding="utf-8")
+        child_env = os.environ.copy()
+        child_env.update(self.extra_env)
         t0 = time.monotonic()
         self.proc = subprocess.Popen(
             cmd,
             stdout=self._log_fh,
             stderr=subprocess.STDOUT,
+            env=child_env,
             start_new_session=True,
         )
 
@@ -911,6 +1170,9 @@ def run_model_cold_matrix(
     cell_cfg: Dict[str, Any],
     jsonl_fh: Any,
     run_tag: str,
+    multi_needle: bool = False,
+    trials_per_tier: int = 1,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Run isolated cold-prefill + decode + NIAH sweep across all tiers for one model."""
     pre_8080 = verify_port_8080_idle()
@@ -924,7 +1186,7 @@ def run_model_cold_matrix(
         tokenizer, max_prompt + 4096, seed_tag=f"niah_pool_{run_tag}"
     )
 
-    log_path = Path(tempfile.gettempdir()) / f"ninfer_bench_{model_label}_{port}.log"
+    log_path = Path(tempfile.gettempdir()) / f"ninfer_bench_{model_label}_{cell_id}_{port}.log"
     server = IsolatedServeProcess(
         serve_bin=serve_bin,
         model_dir=model_dir,
@@ -937,6 +1199,7 @@ def run_model_cold_matrix(
         metallib_dir=metallib_dir,
         cell_cfg=cell_cfg,
         log_path=log_path,
+        extra_env=extra_env,
     )
 
     tier_summaries: List[Dict[str, Any]] = []
@@ -944,7 +1207,7 @@ def run_model_cold_matrix(
     try:
         print(
             f"[{model_label}] Starting isolated ninfer-metal-serve on {host}:{port} "
-            f"(max_context={max_context}, kv_dtype={kv_dtype}, spec={spec_backend})...",
+            f"(cell={cell_id}, max_context={max_context}, kv_dtype={kv_dtype}, spec={spec_backend})...",
             flush=True,
         )
         startup_info = server.start()
@@ -981,17 +1244,39 @@ def run_model_cold_matrix(
             assert prompt_len < max_context, f"prompt_len={prompt_len} >= max_context={max_context}"
             verify_port_8080_idle()
             trials: List[Dict[str, Any]] = []
+            trial_specs: List[Tuple[int, Optional[int]]] = (
+                [(i, None) for i in range(1, max(1, trials_per_tier) + 1)]
+                if multi_needle
+                else [(i, d) for i, d in enumerate(depths, start=1)]
+            )
 
-            for trial_idx, depth_pct in enumerate(depths, start=1):
-                prompt_ids, passkey = build_exact_niah_prompt_tokens(
-                    tokenizer,
-                    haystack_pool,
-                    prompt_tokens=prompt_len,
-                    tier=tier,
-                    depth_pct=depth_pct,
-                    trial_idx=trial_idx,
-                    nonce_tag=f"{run_tag}_{model_label}_{cell_id}",
-                )
+            for trial_idx, depth_pct in trial_specs:
+                if multi_needle:
+                    prompt_ids, passkeys_map = build_exact_multi_needle_prompt_tokens(
+                        tokenizer,
+                        haystack_pool,
+                        prompt_tokens=prompt_len,
+                        tier=tier,
+                        depths=depths,
+                        trial_idx=trial_idx,
+                        nonce_tag=f"{run_tag}_{model_label}_{cell_id}",
+                    )
+                    passkey_summary = ",".join(f"{d}%:{passkeys_map[d]}" for d in sorted(passkeys_map))
+                else:
+                    assert depth_pct is not None
+                    prompt_ids, single_pk = build_exact_niah_prompt_tokens(
+                        tokenizer,
+                        haystack_pool,
+                        prompt_tokens=prompt_len,
+                        tier=tier,
+                        depth_pct=depth_pct,
+                        trial_idx=trial_idx,
+                        nonce_tag=f"{run_tag}_{model_label}_{cell_id}",
+                    )
+                    passkeys_map = {depth_pct: single_pk}
+                    passkey_summary = single_pk
+
+                tel_before = query_prefill_telemetry(host, port)
                 sampler = FootprintSampler(host, port, srv_pid, interval_s=0.2)
                 sampler.start()
                 try:
@@ -1005,13 +1290,18 @@ def run_model_cold_matrix(
                     )
                 finally:
                     mem_stats = sampler.stop()
+                tel_after = query_prefill_telemetry(host, port)
+                tel_delta = diff_prefill_telemetry(tel_before, tel_after)
 
                 if cell_cfg.get("prefix_cache_gb", 0.0) == 0.0 and res["cached_tokens"] != 0:
                     raise RuntimeError(
                         f"Expected 0 cached_tokens on cold prefill, got {res['cached_tokens']}"
                     )
 
-                niah_hit = passkey in res["generated_text"]
+                depth_hits = {str(d): (pk in res["generated_text"]) for d, pk in passkeys_map.items()}
+                n_hits = sum(1 for v in depth_hits.values() if v)
+                n_total = len(depth_hits)
+                niah_hit = (n_hits == n_total)
                 trial_rec = {
                     "timestamp": utc_now_iso(),
                     "model_label": model_label,
@@ -1022,6 +1312,7 @@ def run_model_cold_matrix(
                     "requested_gen_tokens": gen_tokens,
                     "completion_tokens": res["completion_tokens"],
                     "cached_tokens": res["cached_tokens"],
+                    "multi_needle": multi_needle,
                     "depth_pct": depth_pct,
                     "trial_idx": trial_idx,
                     "ttft_s": round(res["ttft_s"], 5),
@@ -1034,7 +1325,11 @@ def run_model_cold_matrix(
                     "peak_phys_footprint_bytes": mem_stats["peak_phys_footprint_bytes"],
                     "peak_phys_footprint_gib": mem_stats["peak_phys_footprint_gib"],
                     "peak_rss_gib": mem_stats["peak_rss_gib"],
-                    "niah_expected_passkey": passkey,
+                    "prefill_telemetry": tel_delta,
+                    "niah_expected_passkey": passkey_summary,
+                    "niah_depth_hits": depth_hits,
+                    "niah_hits": n_hits,
+                    "niah_total": n_total,
                     "niah_hit": niah_hit,
                     "generated_sha256": res["generated_sha256"],
                     "generated_text": res["generated_text"],
@@ -1042,15 +1337,20 @@ def run_model_cold_matrix(
                 trials.append(trial_rec)
                 jsonl_fh.write(json.dumps(trial_rec, ensure_ascii=False) + "\n")
                 jsonl_fh.flush()
+                depth_lbl = f"multi({n_hits}/{n_total})" if multi_needle else f"depth={depth_pct:2d}%"
                 print(
-                    f"[{model_label}] tier={tier//1024}K depth={depth_pct:2d}% "
+                    f"[{model_label}][{cell_id}] tier={tier//1024}K {depth_lbl} "
                     f"TTFT={trial_rec['ttft_s']:7.3f}s ({trial_rec['prefill_tok_per_s']:7.1f} tok/s) "
                     f"decode={trial_rec['decode_tok_per_s']:5.1f} tok/s (n={trial_rec['completion_tokens']}) "
                     f"phys={trial_rec['peak_phys_footprint_gib']:5.2f} GiB "
-                    f"NIAH={'PASS' if niah_hit else 'FAIL'} ({passkey})",
+                    f"w4a8={tel_delta['w4a8_tokens']} sage2={tel_delta['sage2_tokens']} "
+                    f"ane={tel_delta['ane_offload_tokens']} minf_skip={tel_delta['minference_blocks_skipped']}/{tel_delta['minference_blocks_total']} "
+                    f"NIAH={'PASS' if niah_hit else 'FAIL'} ({n_hits}/{n_total})",
                     flush=True,
                 )
 
+            total_hits = sum(t["niah_hits"] for t in trials)
+            total_needles = sum(t["niah_total"] for t in trials)
             tier_summary = {
                 "context_tier": tier,
                 "context_label": f"{tier // 1024}K",
@@ -1071,11 +1371,10 @@ def run_model_cold_matrix(
                     max(t["peak_phys_footprint_gib"] for t in trials), 4
                 ),
                 "peak_rss_gib": round(max(t["peak_rss_gib"] for t in trials), 4),
-                "niah_hits": sum(1 for t in trials if t["niah_hit"]),
-                "niah_total": len(trials),
-                "niah_pass_rate": round(
-                    sum(1 for t in trials if t["niah_hit"]) / float(len(trials)), 4
-                ),
+                "niah_hits": total_hits,
+                "niah_total": total_needles,
+                "niah_pass_rate": round(total_hits / float(max(1, total_needles)), 4),
+                "prefill_telemetry_last": trials[-1]["prefill_telemetry"] if trials else {},
                 "trials": trials,
             }
             tier_summaries.append(tier_summary)
@@ -1109,6 +1408,7 @@ def run_cpp_ppl_eval(
     chunk_size: int,
     logits_dir: Optional[Path],
     cell_cfg: Dict[str, Any],
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run deterministic 4K / 16K teacher-forced PPL via C++ `omlx_m5_prefill_matrix_bench`."""
     verify_port_8080_idle()
@@ -1117,6 +1417,9 @@ def run_cpp_ppl_eval(
     corpus_text = generate_deterministic_corpus_text(
         max(int(max_len * 5.2), 64000), seed_tag="wikitext_code_ppl_v1"
     )
+    child_env = os.environ.copy()
+    if extra_env:
+        child_env.update(extra_env)
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
         tf.write(corpus_text)
         corpus_path = Path(tf.name)
@@ -1157,7 +1460,7 @@ def run_cpp_ppl_eval(
                 cmd.extend(["--logits-out", str(lpath)])
 
             print(f"[{model_label}] Running C++ teacher-forced PPL ({tok_len} tokens)...", flush=True)
-            proc = subprocess.run(cmd, text=True, capture_output=True)
+            proc = subprocess.run(cmd, text=True, capture_output=True, env=child_env)
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"omlx_m5_prefill_matrix_bench failed (rc={proc.returncode}):\n"
@@ -1277,13 +1580,19 @@ def run_cacheblend_rag_eval(
     gen_tokens: int,
     cell_id: str,
     cell_cfg: Dict[str, Any],
+    prefix_cache_gb_override: Optional[float] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Run multi-document permuted 4K-chunk RAG QA benchmark (Wave 3 CacheBlend gate)."""
     verify_port_8080_idle()
     tokenizer = TokenizerBridge(model_dir, cpp_bench_bin=cpp_bench_bin)
     dataset = generate_permuted_rag_dataset(tokenizer, num_docs=num_docs, doc_tokens=doc_tokens)
-    log_path = Path(tempfile.gettempdir()) / f"ninfer_rag_{model_label}_{port}.log"
-    prefix_gb = max(4.0, float(cell_cfg.get("prefix_cache_gb", 4.0)))
+    log_path = Path(tempfile.gettempdir()) / f"ninfer_rag_{model_label}_{cell_id}_{num_docs}_{port}.log"
+    prefix_gb = (
+        prefix_cache_gb_override
+        if prefix_cache_gb_override is not None
+        else max(24.0, float(cell_cfg.get("prefix_cache_gb", 24.0)))
+    )
     server = IsolatedServeProcess(
         serve_bin=serve_bin,
         model_dir=model_dir,
@@ -1296,20 +1605,32 @@ def run_cacheblend_rag_eval(
         metallib_dir=metallib_dir,
         cell_cfg=cell_cfg,
         log_path=log_path,
+        extra_env=extra_env,
     )
     try:
         startup = server.start()
         model_id = startup["health"].get("model", Path(model_dir).name)
         srv_pid = startup["pid"]
 
-        # Phase 1: pre-warm each document individually in isolation.
-        warm_times: List[float] = []
-        for doc in dataset["docs"]:
-            doc_prompt = list(QWEN38_USER_OPEN) + list(doc["tokens"]) + list(QWEN38_USER_TO_ASSISTANT_NOTHINK)
-            r = stream_completion_request(host, port, model_id, doc_prompt, max_tokens=4, temperature=0.0)
-            warm_times.append(round(r["ttft_s"], 4))
+        # Phase 1: Cold prime of all documents in original order [D0 .. D_{K-1}].
+        prime_tel_before = query_prefill_telemetry(host, port)
+        prime_sampler = FootprintSampler(host, port, srv_pid, interval_s=0.2)
+        prime_sampler.start()
+        try:
+            prime_res = stream_completion_request(
+                host,
+                port,
+                model_id,
+                dataset["cold_order_prompt_tokens"],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        finally:
+            prime_mem = prime_sampler.stop()
+        prime_tel_after = query_prefill_telemetry(host, port)
 
-        # Phase 2: evaluate permuted multi-document RAG prompt.
+        # Phase 2: Warm stitched evaluation of permuted multi-document RAG prompt.
+        warm_tel_before = query_prefill_telemetry(host, port)
         sampler = FootprintSampler(host, port, srv_pid, interval_s=0.2)
         sampler.start()
         try:
@@ -1323,28 +1644,56 @@ def run_cacheblend_rag_eval(
             )
         finally:
             mem_stats = sampler.stop()
+        warm_tel_after = query_prefill_telemetry(host, port)
+        warm_tel = diff_prefill_telemetry(warm_tel_before, warm_tel_after)
+        prime_tel = diff_prefill_telemetry(prime_tel_before, prime_tel_after)
 
         matched = [ans for ans in dataset["expected_answers"] if ans in rag_res["generated_text"]]
-        return {
+        speedup = (
+            prime_res["ttft_s"] / rag_res["ttft_s"]
+            if rag_res["ttft_s"] > 0.0
+            else 0.0
+        )
+        rec = {
             "model_label": model_label,
             "model_dir": model_dir,
             "cell_id": cell_id,
             "num_docs": num_docs,
             "doc_tokens": doc_tokens,
+            "context_label": f"{(num_docs * doc_tokens) // 1024}K",
+            "prefix_cache_gb": prefix_gb,
+            "cold_prime_tokens": prime_res["prompt_tokens"],
+            "cold_prime_ttft_s": round(prime_res["ttft_s"], 5),
+            "cold_prime_tok_per_s": round(prime_res["prefill_tok_per_s"], 2),
+            "cold_prime_peak_phys_gib": prime_mem["peak_phys_footprint_gib"],
+            "cold_prime_telemetry": prime_tel,
             "total_prompt_tokens": dataset["total_prompt_tokens"],
             "permutation": dataset["permutation"],
-            "warm_doc_ttft_s": warm_times,
             "permuted_ttft_s": round(rag_res["ttft_s"], 5),
             "permuted_prefill_tok_per_s": round(rag_res["prefill_tok_per_s"], 2),
             "permuted_decode_tok_per_s": round(rag_res["decode_tok_per_s"], 2),
+            "warm_vs_prime_speedup": round(speedup, 3),
             "cached_tokens": rag_res["cached_tokens"],
-            "peak_phys_footprint_gib": mem_stats["peak_phys_footprint_gib"],
+            "warm_telemetry": warm_tel,
+            "peak_phys_footprint_gib": max(
+                prime_mem["peak_phys_footprint_gib"], mem_stats["peak_phys_footprint_gib"]
+            ),
             "expected_answers": dataset["expected_answers"],
             "matched_answers": matched,
             "exact_qa_pass": len(matched) == len(dataset["expected_answers"]),
             "generated_sha256": rag_res["generated_sha256"],
             "generated_text": rag_res["generated_text"],
         }
+        print(
+            f"[RAG][{model_label}][{cell_id}] {rec['context_label']} ({num_docs}x{doc_tokens}): "
+            f"prime={rec['cold_prime_ttft_s']:.3f}s ({rec['cold_prime_tok_per_s']:.1f} tok/s) -> "
+            f"warm={rec['permuted_ttft_s']:.3f}s ({rec['permuted_prefill_tok_per_s']:.1f} tok/s, {speedup:.2f}x) "
+            f"hit={warm_tel['cache_blend_hit_tokens']} recomp={warm_tel['cache_blend_recomputed_tokens']} "
+            f"ane={warm_tel['ane_offload_tokens']} phys={rec['peak_phys_footprint_gib']:.2f} GiB "
+            f"QA={'PASS' if rec['exact_qa_pass'] else 'FAIL'} ({len(matched)}/{len(dataset['expected_answers'])})",
+            flush=True,
+        )
+        return rec
     finally:
         server.stop()
 
@@ -1394,6 +1743,29 @@ def parse_cli() -> argparse.Namespace:
     )
     ap.add_argument("--gen-tokens", type=int, default=128)
     ap.add_argument("--depths", default="10,50,90", help="Comma-separated NIAH depths (%%)")
+    ap.add_argument(
+        "--multi-needle",
+        action="store_true",
+        help="Embed all --depths passkeys in a single prompt per trial",
+    )
+    ap.add_argument(
+        "--trials-per-tier",
+        type=int,
+        default=1,
+        help="Trials per tier when --multi-needle is enabled (default: 1)",
+    )
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="Extra KEY=VALUE env override for server & C++ PPL child processes",
+    )
+    ap.add_argument(
+        "--prefix-cache-gb",
+        type=float,
+        default=None,
+        help="Optional override for --prefix-cache-gb (e.g. 24.0 for 256K CacheBlend RAG)",
+    )
     ap.add_argument("--warmup-tokens", type=int, default=2048)
     ap.add_argument("--run-ppl", action="store_true", help="Run C++ teacher-forced PPL")
     ap.add_argument("--ppl-lengths", default="4096,16384")
@@ -1403,13 +1775,25 @@ def parse_cli() -> argparse.Namespace:
     ap.add_argument("--out-jsonl", required=False, default=None)
     ap.add_argument("--out-md", required=False, default=None)
     ap.add_argument("--rag-docs", type=int, default=8)
+    ap.add_argument("--rag-docs-list", default=None, help="Comma-separated doc counts for multi-tier bench-rag (e.g. 4,8,16,32,63)")
     ap.add_argument("--rag-doc-tokens", type=int, default=4096)
     ap.add_argument("--run-tag", default="baseline_7336688")
     return ap.parse_args()
 
 
+def parse_env_list(entries: Sequence[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in entries:
+        if "=" not in item:
+            raise ValueError(f"--env entry must be KEY=VALUE: {item}")
+        k, v = item.split("=", 1)
+        out[k] = v
+    return out
+
+
 def main() -> int:
     args = parse_cli()
+    extra_env = parse_env_list(args.env)
 
     if args.action == "check-host":
         info = verify_port_8080_idle()
@@ -1443,12 +1827,17 @@ def main() -> int:
     if args.action == "bench-rag":
         if not args.model:
             raise SystemExit("--model label=path is required for bench-rag")
-        cell_cfg = MATRIX_CELLS[args.cell]
+        cell_cfg = dict(MATRIX_CELLS[args.cell])
+        doc_counts = (
+            [int(x.strip()) for x in args.rag_docs_list.split(",") if x.strip()]
+            if args.rag_docs_list
+            else [args.rag_docs]
+        )
         rag_results: List[Dict[str, Any]] = []
         for spec in args.model:
             label, model_dir = spec.split("=", 1)
-            rag_results.append(
-                run_cacheblend_rag_eval(
+            for ndocs in doc_counts:
+                rec = run_cacheblend_rag_eval(
                     model_label=label,
                     model_dir=model_dir,
                     serve_bin=args.serve_bin,
@@ -1459,16 +1848,18 @@ def main() -> int:
                     max_context=args.max_context,
                     kv_dtype=args.kv_dtype,
                     spec_backend=args.spec_backend,
-                    num_docs=args.rag_docs,
+                    num_docs=ndocs,
                     doc_tokens=args.rag_doc_tokens,
                     gen_tokens=args.gen_tokens,
                     cell_id=args.cell,
                     cell_cfg=cell_cfg,
+                    prefix_cache_gb_override=args.prefix_cache_gb,
+                    extra_env=extra_env,
                 )
-            )
-        if args.out_json:
-            Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.out_json).write_text(json.dumps(rag_results, indent=2), encoding="utf-8")
+                rag_results.append(rec)
+                if args.out_json:
+                    Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+                    Path(args.out_json).write_text(json.dumps(rag_results, indent=2), encoding="utf-8")
         print(json.dumps(rag_results, indent=2))
         return 0
 
@@ -1481,7 +1872,9 @@ def main() -> int:
     tiers = [int(x.strip()) for x in args.tiers.split(",") if x.strip()]
     depths = [int(x.strip()) for x in args.depths.split(",") if x.strip()]
     ppl_lengths = [int(x.strip()) for x in args.ppl_lengths.split(",") if x.strip()]
-    cell_cfg = MATRIX_CELLS[args.cell]
+    cell_cfg = dict(MATRIX_CELLS[args.cell])
+    if args.prefix_cache_gb is not None:
+        cell_cfg["prefix_cache_gb"] = args.prefix_cache_gb
 
     out_json_path = Path(args.out_json) if args.out_json else Path("bench_result.json")
     out_jsonl_path = (
@@ -1513,6 +1906,7 @@ def main() -> int:
             "cell_id": args.cell,
             "cell_label": cell_cfg["label"],
             "cell_config": cell_cfg,
+            "extra_env": extra_env,
             "max_context": args.max_context,
             "kv_dtype": args.kv_dtype,
             "spec_backend": args.spec_backend,
@@ -1520,6 +1914,8 @@ def main() -> int:
             "tiers": tiers,
             "gen_tokens": args.gen_tokens,
             "depths": depths,
+            "multi_needle": args.multi_needle,
+            "trials_per_tier": args.trials_per_tier,
         },
         "models": [],
         "ppl_evals": [],
@@ -1547,6 +1943,9 @@ def main() -> int:
                 cell_cfg=cell_cfg,
                 jsonl_fh=jsonl_fh,
                 run_tag=args.run_tag,
+                multi_needle=args.multi_needle,
+                trials_per_tier=args.trials_per_tier,
+                extra_env=extra_env,
             )
             report["models"].append(entry)
             # Persist incrementally after each model so partial progress is never lost.
@@ -1569,6 +1968,7 @@ def main() -> int:
                 chunk_size=args.ppl_chunk_size,
                 logits_dir=logits_dir,
                 cell_cfg=cell_cfg,
+                extra_env=extra_env,
             )
             report["ppl_evals"].extend(ppl_res)
             out_json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

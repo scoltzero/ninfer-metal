@@ -1062,12 +1062,12 @@ Json test_dv64_zero_ulp_parity(const MetalContext &ctx,
   // Verify heuristic and OMLX_M5_GDN_STAGE2_SLICE override first.
   {
     ScopedEnv clear_slice("OMLX_M5_GDN_STAGE2_SLICE", nullptr);
-    require(gdn_stage2_use_dv64(48U, 80U), "Hv=48 on 80-core must select dv64");
-    require(gdn_stage2_use_dv64(48U, 64U), "Hv=48 on 64-core must select dv64");
-    require(!gdn_stage2_use_dv64(32U, 80U), "Hv=32 on 80-core must select dv32");
-    require(gdn_stage2_use_dv64(32U, 64U), "Hv=32 on 64-core must select dv64");
-    require(gdn_stage2_use_dv64(48U, 0U), "default gpu_cores=80 must select dv64 for Hv=48");
-    require(!gdn_stage2_use_dv64(32U, 0U), "default gpu_cores=80 must select dv32 for Hv=32");
+    require(!gdn_stage2_use_dv64(48U, 80U), "Hv=48 on 80-core defaults to dv32");
+    require(!gdn_stage2_use_dv64(48U, 64U), "Hv=48 on 64-core defaults to dv32");
+    require(!gdn_stage2_use_dv64(32U, 80U), "Hv=32 on 80-core defaults to dv32");
+    require(!gdn_stage2_use_dv64(32U, 64U), "Hv=32 on 64-core defaults to dv32");
+    require(!gdn_stage2_use_dv64(48U, 0U), "default gpu_cores=80 defaults to dv32 for Hv=48");
+    require(!gdn_stage2_use_dv64(32U, 0U), "default gpu_cores=80 defaults to dv32 for Hv=32");
   }
   {
     ScopedEnv force_64("OMLX_M5_GDN_STAGE2_SLICE", "64");

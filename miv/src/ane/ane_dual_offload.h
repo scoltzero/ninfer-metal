@@ -22,10 +22,10 @@ inline constexpr std::uint32_t kAneDefaultChunkTokens = 1024u;
 inline constexpr std::uint32_t kAneRowAlign = 128u;
 inline constexpr std::uint32_t kAneGroupSize = 64u;
 inline constexpr std::uint64_t kAneDefaultMaxBankBytesPerDie =
-    2560ULL * 1024ULL * 1024ULL; // 2.5 GiB (safely < 4.0 GiB ANE address window)
+    320ULL * 1024ULL * 1024ULL; // 320 MiB per shard (~10 fast-compiling shards/die on 27B)
 inline constexpr std::uint64_t kAneDefaultMaxTotalBytesPerDie =
     3584ULL * 1024ULL * 1024ULL; // 3.5 GiB total resident cap per die
-inline constexpr std::uint32_t kAneMaxProceduresPerBank = 250u;
+inline constexpr std::uint32_t kAneMaxProceduresPerBank = 24u;
 inline constexpr double kAneDefaultAlphaBf16 = 0.25;
 inline constexpr double kAneDefaultAlphaW4A8 = 0.15;
 inline constexpr double kAneMaxAlpha = 0.30;
@@ -173,6 +173,14 @@ struct AneDualOffloadConfig {
   std::uint64_t max_bank_bytes_per_die = kAneDefaultMaxBankBytesPerDie;
   std::uint64_t max_total_bytes_per_die = kAneDefaultMaxTotalBytesPerDie;
   std::uint32_t max_procedures_per_bank = kAneMaxProceduresPerBank;
+  // Direct FP16 MIL weight blobs instead of G=64 INT8 blockwise dequant:
+  // ~1.7x higher ANE TFLOPS on Apple M5 Ultra with zero weight quantization loss.
+  bool use_fp16_weights = false;
+  // Exclude projections with in_features > max_in_features (0 = no cap).
+  // Avoids Apple ANE's C_in > 8192 input-SRAM spill cliff (e.g. mlp.down_proj K=17408).
+  std::uint32_t max_in_features = 0u;
+  // Offload only fused MlpGateUpSwiGlu projections (highest FLOP/dispatch ratio).
+  bool mlp_swiglu_only = false;
   // Optional overrides for single-die testing / dual-bank simulation on 1-die Macs.
   bool force_single_die = false;
   bool simulate_dual_banks_on_single_die = false;

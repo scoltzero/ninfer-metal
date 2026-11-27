@@ -2166,11 +2166,19 @@ static inline void paged_flash_prefill_affine4_hd256_core(
   constexpr uint BQ = 64u;
   constexpr uint BK = 32u;
 
-  if (query_heads == 0u) {
+  if (query_heads == 0u || tokens == 0u) {
     return;
   }
-  const uint q_blk = tg_y / query_heads;
-  const uint qh = tg_y - q_blk * query_heads;
+  // LPT Reverse q_blk + qh-minor scheduling (0 atomics, ICB-safe, 0-ULP identical):
+  // launches longest causal query blocks first while keeping sibling GQA heads
+  // adjacent on-chip for L2 KV reuse inside the 8.4 KiB (2 TG/core) kernel.
+  const uint n_q_blocks = (tokens + BQ - 1u) / BQ;
+  const uint q_blk_rev = tg_y / query_heads;
+  const uint qh = tg_y - q_blk_rev * query_heads;
+  if (q_blk_rev >= n_q_blocks) {
+    return;
+  }
+  const uint q_blk = (n_q_blocks - 1u) - q_blk_rev;
   const uint q_base = q_blk * BQ;
   if (q_base >= tokens) {
     return;

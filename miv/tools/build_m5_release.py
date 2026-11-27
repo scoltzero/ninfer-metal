@@ -30,6 +30,7 @@ REQUIRED_BINARIES = (
     "mseries_backendd",
     "ninfer-metal-serve",
     "m5rt_runner",
+    "omlx_m5_prefill_matrix_bench",
     "omlx_m5_probe",
     "omlx_m5_nax_qmm_probe",
     "omlx_m5_inspect_runtime",
@@ -65,6 +66,12 @@ REQUIRED_NAX_METALLIBS = (
     "omlx_m5_bf16_nax.metallib",
     "omlx_m5_moe_nax.metallib",
     "omlx_m5_gdn_chunk_nax.metallib",
+    "omlx_m5_w4a8_nax.metallib",
+    "omlx_m5_w4a8_moe_nax.metallib",
+    "omlx_m5_attention_sage2.metallib",
+    "omlx_m5_attention_minference.metallib",
+    "omlx_m5_cache_blend.metallib",
+    "omlx_m5_ane_pack_unpack.metallib",
 )
 
 FORBIDDEN_DYLIB_PREFIXES = (
@@ -599,7 +606,17 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as exc:
         raise SystemExit(f"Unable to read the packaged miv daemon's provider contract: {exc}")
     default_config = tomllib.loads(default_cfg_src.read_text(encoding="utf-8"))
-    for key in ("max_concurrency", "kv_dtype", "sampling_contract"):
+    for key in (
+        "max_concurrency",
+        "max_context",
+        "kv_dtype",
+        "sampling_contract",
+        "prefill_linear_mode",
+        "prefill_attention_mode",
+        "prefill_sparse_minference",
+        "prefill_cache_blend",
+        "prefill_ane_offload",
+    ):
         if default_config["engine"].get(key) != contract["load_defaults"][key]:
             raise SystemExit(f"Default TOML and miv daemon disagree on {key}")
     if default_config["speculative"].get("draft_tokens") != contract["load_defaults"]["draft_tokens"]:

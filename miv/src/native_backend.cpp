@@ -1476,7 +1476,7 @@ public:
     if (options.prefill_cache_blend) {
       const std::uint64_t blend_budget = std::min<std::uint64_t>(
           cache_budget_bytes > 0ULL ? cache_budget_bytes : (2ULL << 30),
-          4ULL << 30);
+          64ULL << 30);
       blend_cache = std::make_unique<detail::ChunkBlendCache>(blend_budget);
       blend_model_exec_hash = detail::compute_blend_model_exec_hash(
           model_digest, slot_kv_dtype,

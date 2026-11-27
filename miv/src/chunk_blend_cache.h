@@ -209,8 +209,8 @@ struct BlendSegmentConfig {
   // Structural delimiter sequences:
   // - prefix_delimiters: cut immediately BEFORE a matching sequence (e.g. <|im_start|>, <doc, ---)
   // - suffix_delimiters: cut immediately AFTER a matching sequence (e.g. <|im_end|>, </doc>)
-  std::vector<std::vector<std::uint32_t>> prefix_delimiters = {{151644U}};
-  std::vector<std::vector<std::uint32_t>> suffix_delimiters = {{151645U}};
+  std::vector<std::vector<std::uint32_t>> prefix_delimiters = {{151644U}, {248045U}};
+  std::vector<std::vector<std::uint32_t>> suffix_delimiters = {{151645U}, {248046U}};
 };
 
 struct BlendChunkSegment {
