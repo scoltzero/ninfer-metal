@@ -61,3 +61,7 @@ omlx/**/*.log
 /docs/p4/
 /docs/docs-reorg-blueprint.md
 /docs/backend/b0-completion-report.md
+
+# MIV SwiftPM development artifacts.
+/apps/miv-mac/.build/
+/apps/miv-mac/.swiftpm/

@@ -2664,6 +2664,18 @@ target_link_libraries(
   PUBLIC
   omlx_m5_utf8proc)
 
+# Embed the offline dashboard so copying the standalone server preserves its UI.
+set(_miv_web_dir "${CMAKE_CURRENT_SOURCE_DIR}/src/serve/web")
+set(_miv_logo "${CMAKE_CURRENT_SOURCE_DIR}/../docs/assets/logo.svg")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${_miv_web_dir}/index.html" "${_miv_web_dir}/dashboard.css"
+  "${_miv_web_dir}/dashboard.js" "${_miv_logo}")
+file(READ "${_miv_web_dir}/index.html" MIV_WEB_HTML)
+file(READ "${_miv_web_dir}/dashboard.css" MIV_WEB_CSS)
+file(READ "${_miv_web_dir}/dashboard.js" MIV_WEB_JS)
+file(READ "${_miv_logo}" MIV_WEB_LOGO)
+configure_file("${_miv_web_dir}/assets.h.in" generated/miv_dashboard.h @ONLY)
+
 add_library(
   omlx_m5_serve_lib
   STATIC
@@ -2682,7 +2694,9 @@ target_compile_features(omlx_m5_serve_lib PUBLIC cxx_std_20)
 target_include_directories(
   omlx_m5_serve_lib
   PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  PRIVATE
+  ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_include_directories(
   omlx_m5_serve_lib
   SYSTEM PUBLIC

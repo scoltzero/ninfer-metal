@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MIV · 控制台</title>
+  <link rel="icon" href="/miv/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/miv/dashboard.css">
+  <script src="/miv/dashboard.js" defer></script>
+</head>
+<body>
+  <header><div class="wrap bar">
+    <a class="brand" href="#status"><img src="/miv/logo.svg" width="34" height="34" alt="">MIV</a>
+    <nav aria-label="主导航"><a href="#status">概览</a><a href="#models">模型</a><a href="#chat">推理试用</a></nav>
+    <span id="health" role="status">连接中</span>
+  </div></header>
+  <main class="wrap">
+    <noscript>请启用 JavaScript 以读取服务数据。</noscript>
+    <section id="status">
+      <div class="heading"><h1>运行概览</h1><button type="button" id="refresh">刷新</button></div>
+      <p class="muted" id="server-version">正在读取核心状态…</p>
+      <h2>实时性能</h2>
+      <dl class="meters">
+        <div><dt>活动请求</dt><dd id="active">—</dd></div>
+        <div><dt>等待请求</dt><dd id="queued">—</dd></div>
+        <div><dt>核心进程内存</dt><dd id="memory">—</dd></div>
+        <div><dt>已加载模型</dt><dd id="count">—</dd></div>
+      </dl>
+      <p id="metrics-error" class="error" role="status"></p>
+      <div class="columns">
+        <article><h2>本次运行</h2><dl class="rows">
+          <div><dt>成功 / 总请求</dt><dd id="requests">—</dd></div>
+          <div><dt>输入 token</dt><dd id="input-tokens">—</dd></div>
+          <div><dt>输出 token</dt><dd id="output-tokens">—</dd></div>
+          <div><dt>采样期间输出速率</dt><dd id="rate">—</dd></div>
+          <div><dt>前缀缓存恢复 token</dt><dd id="cache">—</dd></div>
+        </dl></article>
+        <article><h2>服务连接</h2><dl class="rows">
+          <div><dt>API 基址</dt><dd id="base" class="mono"></dd></div>
+          <div><dt>核心版本</dt><dd id="version" class="mono">—</dd></div>
+          <div><dt>最大并发</dt><dd id="capacity">—</dd></div>
+          <div><dt>最近刷新</dt><dd id="updated">—</dd></div>
+        </dl></article>
+      </div>
+    </section>
+    <section id="models" hidden>
+      <h1>已加载模型</h1>
+      <p class="muted">当前服务实例及其生效的运行配置。</p>
+      <div id="model-list"></div>
+    </section>
+    <section id="chat" hidden>
+      <h1>推理试用</h1><p class="muted mono">POST /v1/chat/completions</p>
+      <form id="credentials" class="auth" hidden>
+        <label for="key">API 密钥</label>
+        <div class="controls"><input type="password" id="key" autocomplete="off" required><button>连接</button></div>
+        <small id="auth-hint" role="status">连接此服务后可以发送消息，密钥仅在本页有效。</small>
+      </form>
+      <p id="picker-hint" class="error" role="status"></p>
+      <form id="generate">
+        <div class="inputs">
+          <label>模型<select id="model" required></select></label>
+          <label>最大输出 token<input type="number" id="limit" min="1" value="256" required></label>
+        </div>
+        <label for="prompt">消息</label>
+        <textarea id="prompt" rows="4" placeholder="输入要发给模型的消息" required></textarea>
+        <div class="controls"><button class="primary" id="send" disabled>发送</button><button type="button" id="cancel" hidden>停止生成</button></div>
+      </form>
+      <section class="reply" id="reply" hidden>
+        <h2>模型回复</h2>
+        <details id="thinking" hidden><summary>思考过程</summary><pre id="reasoning"></pre></details>
+        <pre id="answer"></pre>
+        <p id="result-status" role="status"></p>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

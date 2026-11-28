@@ -1,0 +1,8 @@
+#pragma once
+
+namespace omlx::m5::serve::web {
+inline constexpr char index[] = R"MIV_WEB(@MIV_WEB_HTML@)MIV_WEB";
+inline constexpr char css[] = R"MIV_WEB(@MIV_WEB_CSS@)MIV_WEB";
+inline constexpr char js[] = R"MIV_WEB(@MIV_WEB_JS@)MIV_WEB";
+inline constexpr char logo[] = R"MIV_WEB(@MIV_WEB_LOGO@)MIV_WEB";
+} // namespace omlx::m5::serve::web

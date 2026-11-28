@@ -77,6 +77,17 @@ Launch the standalone C++ OpenAI server in one command (auto-loads shared defaul
 
 Full build flags, `.miv` weight conversion, multi-microkernel `ninfer-metal-serve --providers-dir` / `[[models]]` configs, and `oMLX-extend` hot-update instructions are in **[Getting Started & Config](docs/getting-started.md)**; for a screenshot walkthrough of the macOS app, see **[`oMLX-extend` Visual Guide](docs/omlx-extend-guide.md)**.
 
+### MIV for macOS
+
+Build and open the standalone Swift app on an Apple Silicon Mac with Xcode 27, CMake and Ninja:
+
+```bash
+./apps/miv-mac/build-app.sh
+open dist/MIV.app
+```
+
+In **服务设置**, choose a model directory containing a prepared `.miv` artifact or select a shared `ninfer-metal.toml` that declares models, then start the bundled core. You can also connect to an existing MIV server. The menu bar keeps the console accessible after closing the window. The bundled server serves its web console at `/` on the same port as its OpenAI API.
+
 ---
 
 ## Explore Further

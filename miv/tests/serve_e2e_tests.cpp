@@ -469,12 +469,35 @@ void test_http_server_e2e() {
         {"Authorization", "Bearer test-bearer-secret"},
     };
 
+    // The dashboard and its offline assets must work before API authentication.
+    {
+      const auto page = client.Get("/");
+      check(page && page->status == 200 &&
+                page->get_header_value("X-MIV-Dashboard") == "1" &&
+                page->body.find("id=\"chat\"") != std::string::npos,
+            "MIV dashboard route missing");
+      const auto head = client.Head("/");
+      check(head && head->status == 200 && head->get_header_value("X-MIV-Dashboard") == "1",
+            "App cannot discover dashboard via HEAD");
+      for (const auto *asset : {"/miv/dashboard.css", "/miv/dashboard.js", "/miv/logo.svg"}) {
+        const auto content = client.Get(asset);
+        check(content && content->status == 200 && !content->body.empty(),
+              std::string("missing dashboard asset: ") + asset);
+      }
+    }
+
     // 1) GET /health
     {
       auto res = client.Get("/health");
       check(res && res->status == 200, "/health should return 200");
       auto body = Json::parse(res->body);
       check(body.at("status") == "ok", "/health status must be ok");
+      const auto &active_model = body.at("models").at(0);
+      check(active_model.at("max_context") == load_opts.max_context &&
+                active_model.at("max_concurrency") == load_opts.max_concurrency &&
+                active_model.at("kv_dtype") == load_opts.kv_dtype &&
+                !active_model.contains("spec_backend"),
+            "dashboard model details do not reflect engine stats");
       check(body.at("model") == "qwen-e2e-fake", "/health model mismatch");
       check(body.at("version") == NINFER_METAL_DISPLAY_VERSION,
             "/health version mismatch");

@@ -1172,6 +1172,18 @@ StatsReport UdsSidecarBackend::stats() const {
   st.failed = read_u64_field(res, "failed");
   st.emitted_tokens = read_u64_field(res, "emitted_tokens");
   st.backend_kind = res.value("backend_kind", std::string("sidecar"));
+  if (const auto it = res.find("max_context"); it != res.end() && it->is_number_integer()) {
+    st.max_context = it->get<std::int32_t>();
+  }
+  if (const auto it = res.find("max_concurrency"); it != res.end() && it->is_number_integer()) {
+    st.max_concurrency = it->get<std::int32_t>();
+  }
+  if (const auto it = res.find("kv_dtype"); it != res.end() && it->is_string()) {
+    st.kv_dtype = it->get<std::string>();
+  }
+  if (const auto it = res.find("speculative_backend"); it != res.end() && it->is_string()) {
+    st.speculative_backend = it->get<std::string>();
+  }
   st.model_execution_kind =
       res.value("model_execution_kind", std::string("sidecar"));
   st.prefix_hits = read_u64_field(res, "prefix_hits");

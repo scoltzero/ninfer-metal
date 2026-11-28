@@ -77,6 +77,17 @@ cmake --build build/miv-v001
 
 完整编译参数、`.miv` 权重转换、多微内核 `ninfer-metal-serve --providers-dir` / `[[models]]` 配置及 `oMLX-extend` 热更新说明见 **[快速入门与配置](getting-started.md)**；macOS 应用界面图文指引见 **[`oMLX-extend` 可视化上手指南](omlx-extend-guide.md)**。
 
+### MIV 独立 macOS App
+
+在装有 Xcode 27、CMake 和 Ninja 的 Apple Silicon Mac 上，从仓库根目录运行：
+
+```bash
+./apps/miv-mac/build-app.sh
+open dist/MIV.app
+```
+
+在「服务设置」中选择含已转换 `.miv` 权重的模型目录，或选择已声明模型的共享配置 `ninfer-metal.toml`，即可启动随 App 附带的核心。也可以填写现有 MIV 服务地址。关闭窗口后可从菜单栏重新打开。随包核心的网页控制台位于同一服务地址的根路径 `/`。
+
 ---
 
 ## 深入阅读

@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "serve/output_parser.h"
+#include "miv_dashboard.h"
 
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
@@ -478,15 +479,44 @@ struct ServeHttpServer::Impl {
     register_routes();
   }
 
+  // These optional fields describe the active engine, including the result
+  // of automatic speculative backend selection. Older SPI providers may omit them.
+  static void add_runtime_settings(Json &model, const StatsReport &stats) {
+    if (!stats.kv_dtype.empty()) {
+      model["kv_dtype"] = stats.kv_dtype;
+    }
+    if (!stats.speculative_backend.empty()) {
+      model["spec_backend"] = stats.speculative_backend;
+    }
+    if (stats.max_context > 0) {
+      model["max_context"] = std::min(model.at("max_context").get<int>(), stats.max_context);
+    }
+  }
+
   Json model_object(const ModelInstance &m) const {
     std::string lora_adapter = m.lora_adapter;
     std::string lora_mode =
         m.lora_adapter.empty() ? std::string{} : m.lora_mode;
     std::uint64_t lora_buffer_bytes = 0;
     std::uint32_t lora_adapted_layers = 0;
+    Json result = {
+        {"id", m.id},
+        {"object", "model"},
+        {"created", created_ts},
+        {"owned_by", "ninfer-metal"},
+        {"max_model_len", m.max_context},
+        {"max_context", m.max_context},
+        {"max_concurrency", m.max_concurrency},
+        {"provider_id", m.provider_id},
+        {"backend_mode", m.backend_mode},
+    };
     if (m.router != nullptr && m.router->is_running()) {
       try {
         const auto st = m.router->stats();
+        add_runtime_settings(result, st);
+        if (st.max_concurrency > 0) {
+          result["max_concurrency"] = st.max_concurrency;
+        }
         lora_adapter = st.lora_adapter;
         lora_mode = st.lora_mode;
         lora_buffer_bytes = st.lora_buffer_bytes;
@@ -494,19 +524,11 @@ struct ServeHttpServer::Impl {
       } catch (...) {
       }
     }
-    return {
-        {"id", m.id},
-        {"object", "model"},
-        {"created", created_ts},
-        {"owned_by", "ninfer-metal"},
-        {"max_model_len", m.max_context},
-        {"provider_id", m.provider_id},
-        {"backend_mode", m.backend_mode},
-        {"lora_adapter", std::move(lora_adapter)},
-        {"lora_mode", std::move(lora_mode)},
-        {"lora_buffer_bytes", lora_buffer_bytes},
-        {"lora_adapted_layers", lora_adapted_layers},
-    };
+    result["lora_adapter"] = std::move(lora_adapter);
+    result["lora_mode"] = std::move(lora_mode);
+    result["lora_buffer_bytes"] = lora_buffer_bytes;
+    result["lora_adapted_layers"] = lora_adapted_layers;
+    return result;
   }
 
   std::shared_ptr<ModelInstance>
@@ -610,6 +632,23 @@ struct ServeHttpServer::Impl {
           }
         });
 
+    server.Get("/", [](const httplib::Request &, httplib::Response &res) {
+      res.set_header("X-MIV-Dashboard", "1");
+      res.set_header("Content-Security-Policy",
+                     "default-src 'self'; object-src 'none'; base-uri 'none'; "
+                     "form-action 'none'; frame-ancestors 'none'");
+      res.set_content(web::index, "text/html; charset=utf-8");
+    });
+    server.Get("/miv/dashboard.css", [](const httplib::Request &, httplib::Response &res) {
+      res.set_content(web::css, "text/css; charset=utf-8");
+    });
+    server.Get("/miv/dashboard.js", [](const httplib::Request &, httplib::Response &res) {
+      res.set_content(web::js, "text/javascript; charset=utf-8");
+    });
+    server.Get("/miv/logo.svg", [](const httplib::Request &, httplib::Response &res) {
+      res.set_content(web::logo, "image/svg+xml");
+    });
+
     server.Get("/health",
                [this](const httplib::Request &, httplib::Response &res) {
                  handle_health(res);
@@ -709,6 +748,7 @@ struct ServeHttpServer::Impl {
             {"provider_id", m->provider_id},
             {"backend_mode", m->backend_mode},
             {"status", "ok"},
+            {"max_context", m->max_context},
             {"backend", st.backend_kind},
             {"max_concurrency", cap.max_concurrency},
             {"active_requests", cap.active_requests},
@@ -718,6 +758,7 @@ struct ServeHttpServer::Impl {
             {"lora_buffer_bytes", st.lora_buffer_bytes},
             {"lora_adapted_layers", st.lora_adapted_layers},
         });
+        add_runtime_settings(models_json.back(), st);
       } catch (const std::exception &err) {
         ++unhealthy_count;
         std::uint64_t resident = 0;
