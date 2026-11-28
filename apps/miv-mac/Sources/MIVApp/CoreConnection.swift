@@ -14,7 +14,12 @@ struct CoreSettings: Codable, Equatable {
         get { lanEnabled == true }
         set { lanEnabled = newValue ? true : nil }
     }
-    var bindHost: String { allowLAN ? "0.0.0.0" : "127.0.0.1" }
+    private var ipv6Enabled: Bool?
+    var allowIPv6: Bool {
+        get { ipv6Enabled == true }
+        set { ipv6Enabled = newValue ? true : nil }
+    }
+    var bindHost: String { allowLAN ? (allowIPv6 ? "::" : "0.0.0.0") : "127.0.0.1" }
 
     var modelDirectory = ""
     var configPath = ""
@@ -28,7 +33,8 @@ struct CoreSettings: Codable, Equatable {
     func baseURL() throws -> URL {
         if mode == .managed {
             guard (1...65535).contains(port) else { throw CoreFailure("端口须在 1 至 65535 之间。") }
-            return URL(string: "http://127.0.0.1:\(port)")!
+            let clientHost = allowLAN && allowIPv6 ? "[::1]" : "127.0.0.1"
+            return URL(string: "http://\(clientHost):\(port)")!
         }
         let text = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var parts = URLComponents(string: text),
@@ -154,9 +160,44 @@ struct CoreConnection {
 
     func metrics() async throws -> [String: Double] {
         let (data, _) = try await request("metrics")
-        let result = Self.aggregateMetrics(String(decoding: data, as: UTF8.self))
-        guard !result.isEmpty else { throw CoreFailure("服务未返回 MIV 性能指标。") }
-        return result
+        return try Self.parseMetrics(data).total
+    }
+
+    typealias UsageCounters = [String: (requests: Double, output: Double)]
+    typealias MetricsSnapshot = (total: [String: Double], perModel: UsageCounters)
+
+    func metricsSnapshot() async throws -> MetricsSnapshot {
+        let (data, _) = try await request("metrics")
+        return try Self.parseMetrics(data)
+    }
+
+    private static func parseMetrics(_ data: Data) throws -> MetricsSnapshot {
+        let text = String(decoding: data, as: UTF8.self)
+        let total = aggregateMetrics(text)
+        guard !total.isEmpty else { throw CoreFailure("服务未返回 MIV 性能指标。") }
+        var models: UsageCounters = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let requests = line.hasPrefix("ninfer_metal_model_requests_total{")
+            guard requests || line.hasPrefix("ninfer_metal_model_generated_tokens_total{"),
+                  let label = line.range(of: "{model="),
+                  let space = line.lastIndex(of: " "),
+                  let count = Double(line[line.index(after: space)...]), count.isFinite else { continue }
+            // The server emits the model label first and uses JSON-compatible escapes.
+            let tail = line[label.upperBound...]
+            var escaped = false
+            guard tail.first == "\"" else { continue }
+            for index in tail.indices.dropFirst() {
+                if escaped { escaped = false; continue }
+                if tail[index] == "\\" { escaped = true; continue }
+                if tail[index] == "\"" {
+                    guard let id = try? JSONDecoder().decode(String.self, from: Data(tail[...index].utf8)) else { break }
+                    if requests { models[id, default: (0, 0)].requests = count }
+                    else { models[id, default: (0, 0)].output = count }
+                    break
+                }
+            }
+        }
+        return (total, models)
     }
 
     static func aggregateMetrics(_ text: String) -> [String: Double] {

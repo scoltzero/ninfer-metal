@@ -222,6 +222,8 @@ MultiModelHost::load_model(const ModelServeConfig &model_cfg,
 
   ModelInstance inst;
   inst.id = model_id;
+  inst.api_alias = model_cfg.api_alias;
+  inst.generation_defaults = model_cfg.generation_defaults;
   inst.provider_id = backend->provider_id();
   inst.backend_mode = backend->backend_mode();
   inst.router = std::move(router);
@@ -257,6 +259,11 @@ MultiModelHost::add_model(ModelInstance instance) {
     std::lock_guard lock(models_mutex_);
     if (models_by_id_.contains(shared->id)) {
       throw std::invalid_argument("duplicate model id: " + shared->id);
+    }
+    if (!shared->api_alias.empty() && shared->api_alias != shared->id) {
+      if (models_by_id_.contains(shared->api_alias))
+        throw std::invalid_argument("duplicate model alias: " + shared->api_alias);
+      models_by_id_.emplace(shared->api_alias, shared);
     }
     models_by_id_.emplace(shared->id, shared);
     model_order_.push_back(shared);

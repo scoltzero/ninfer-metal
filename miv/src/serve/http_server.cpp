@@ -12,13 +12,17 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <exception>
+#include <fstream>
+#include <cstdlib>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -124,6 +128,20 @@ std::int32_t parse_control_integer(
     throw invalid();
   }
   return static_cast<std::int32_t>(number);
+}
+
+void apply_generation_defaults(Json &body, const Json &defaults) {
+  for (const auto &[name, value] : defaults.items()) {
+    // The request can use either OpenAI spelling for the output-token limit.
+    if (name == "max_tokens" && body.contains("max_completion_tokens") &&
+        !body.at("max_completion_tokens").is_null()) continue;
+    if (!body.contains(name) || body.at(name).is_null()) {
+      body[name] = value;
+    } else if (name == "chat_template_kwargs" && body.at(name).is_object() && value.is_object()) {
+      for (const auto &[key, fallback] : value.items())
+        if (!body.at(name).contains(key)) body[name][key] = fallback;
+    }
+  }
 }
 
 SamplingSpec parse_sampling_spec(const Json &body) {
@@ -502,6 +520,7 @@ struct ServeHttpServer::Impl {
     Json result = {
         {"id", m.id},
         {"object", "model"},
+        {"alias", m.api_alias},
         {"created", created_ts},
         {"owned_by", "ninfer-metal"},
         {"max_model_len", m.max_context},
@@ -531,6 +550,29 @@ struct ServeHttpServer::Impl {
     return result;
   }
 
+  std::shared_ptr<ModelInstance> fallback_model() const {
+    if (config.model_fallback_file.empty()) return nullptr;
+    // Consult the App's atomically replaced policy only for missed inference
+    // routes. Explicit model lookups and valid requests retain their normal path.
+    std::ifstream stream(config.model_fallback_file);
+    if (!stream) return nullptr;
+    const Json policy = Json::parse(stream, nullptr, false);
+    if (!policy.is_object() || !policy.contains("enabled") || policy.at("enabled") != true)
+      return nullptr;
+    auto available = [](const std::shared_ptr<ModelInstance> &model) {
+      if (!model || !model->router || !model->router->is_running()) return false;
+      try { return model->router->capacity().accepting; }
+      catch (const std::exception &) { return false; }
+    };
+    if (const auto id = policy.find("preferred"); id != policy.end() && id->is_string()) {
+      const auto preferred = host_->find_model(id->get<std::string>());
+      if (available(preferred)) return preferred;
+    }
+    for (const auto &model : host_->models())
+      if (available(model)) return model;
+    return nullptr;
+  }
+
   std::shared_ptr<ModelInstance>
   resolve_target_model(const Json &body, httplib::Response &res) const {
     std::string requested;
@@ -554,6 +596,7 @@ struct ServeHttpServer::Impl {
     }
     auto found = host_->find_model(requested);
     if (found == nullptr) {
+      if (auto fallback = fallback_model()) return fallback;
       write_openai_error(res, 404, "Model '" + requested + "' not found",
                          "invalid_request_error", "model_not_found");
       return nullptr;
@@ -573,20 +616,63 @@ struct ServeHttpServer::Impl {
 
   bool authorize_request(const httplib::Request &req,
                          httplib::Response &res) const {
-    if (config.api_key.empty()) {
+    const auto auth = req.get_header_value("Authorization");
+    auto matches = [&auth](const std::string &key) {
+      return !key.empty() && auth == "Bearer " + key;
+    };
+    if (const char *file = std::getenv("MIV_ACCESS_FILE"); file && *file) {
+      // The app replaces its private policy file atomically. Revocation applies
+      // to the next request, including on an already-open HTTP connection.
+      try {
+        std::ifstream input(file);
+        const auto rules = Json::parse(input);
+        const auto mode = rules.at("mode").get<std::string>();
+        const auto master = rules.at("master").get<std::string>();
+        const auto &keys = rules.at("keys");
+        if (!keys.is_array()) throw std::invalid_argument("invalid key list");
+        if (mode == "open") return true;
+        if (mode == "inference" && (req.method == "POST" || req.path == "/v1/models")) return true;
+        if (mode != "required" && mode != "inherit" && mode != "inference")
+          throw std::invalid_argument("unknown access policy");
+        const auto &effective = master.empty() ? config.api_key : master;
+        if ((mode == "inherit" && effective.empty() && keys.empty()) || matches(effective)) return true;
+        for (const auto &item : keys) {
+          if (matches(item.at("key").get<std::string>())) return true;
+        }
+      } catch (const std::exception &) {
+        write_openai_error(res, 503, "Cannot read service authentication settings",
+                           "server_error", "authentication_unavailable");
+        return false;
+      }
+    } else if (config.api_key.empty() || matches(config.api_key)) {
       return true;
     }
-    const std::string expected = "Bearer " + config.api_key;
-    const auto auth = req.get_header_value("Authorization");
-    if (auth != expected) {
-      write_openai_error(res, 401, "Invalid or missing API key",
-                         "authentication_error", "invalid_api_key");
-      return false;
-    }
-    return true;
+    write_openai_error(res, 401, "Invalid or missing API key",
+                       "authentication_error", "invalid_api_key");
+    return false;
   }
 
   void register_routes() {
+    if (const char *path = std::getenv("MIV_LOG_LEVEL_FILE"); path && *path) {
+      server.set_logger([file = std::string(path)](const httplib::Request &req, const httplib::Response &res) {
+        static constexpr std::array<const char *, 5> levels = {"ERROR", "WARNING", "INFO", "DEBUG", "TRACE"};
+        const bool generation = req.path == "/v1/chat/completions" || req.path == "/v1/completions";
+        const int severity = res.status >= 500 ? 0 : res.status >= 400 ? 1 : generation ? 2 :
+                             req.path.starts_with("/v1/") ? 3 : 4;
+        std::ifstream setting(file);
+        std::string level;
+        setting >> level;
+        const auto found = std::find(levels.begin(), levels.end(), level);
+        const int threshold = found == levels.end() ? 2 : static_cast<int>(found - levels.begin());
+        if (severity > threshold) return;
+        // Never include authorization, bodies, query strings or caller-supplied paths.
+        const char *route = generation ? "generation" : req.path.starts_with("/v1/models") ? "models" :
+                            req.path == "/health" ? "health" : req.path == "/metrics" ? "metrics" : "web";
+        const auto line = std::string("[ninfer-metal-serve] ") + levels[severity] + " HTTP " +
+                          route + " " + std::to_string(res.status) + "\n";
+        std::clog << line;
+      });
+    }
     server.set_pre_routing_handler(
         [this](const httplib::Request &req, httplib::Response &res) {
           apply_cors_headers(res);
@@ -1125,6 +1211,7 @@ struct ServeHttpServer::Impl {
     if (target == nullptr) {
       return;
     }
+    apply_generation_defaults(body, target->generation_defaults);
     if (!body.contains("messages") || !body.at("messages").is_array() ||
         body.at("messages").empty()) {
       write_openai_error(res, 400, "messages must be a non-empty JSON array",
@@ -1583,6 +1670,7 @@ struct ServeHttpServer::Impl {
     if (target == nullptr) {
       return;
     }
+    apply_generation_defaults(body, target->generation_defaults);
     if (!body.contains("prompt") || body.at("prompt").is_null()) {
       write_openai_error(res, 400, "prompt is required",
                          "invalid_request_error", "missing_prompt");

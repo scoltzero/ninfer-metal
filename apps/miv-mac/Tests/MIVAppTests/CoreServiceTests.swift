@@ -197,3 +197,76 @@ extension CoreServiceTests {
         XCTAssertNil(service.serviceMessage)
     }
 }
+
+extension CoreServiceTests {
+    @MainActor func testManagedOutputFloodPreservesReadySignalAndFinalBytes() async throws {
+        let fm = FileManager.default, suite = UUID().uuidString
+        let dir = fm.temporaryDirectory.appendingPathComponent("MIV-output-" + suite)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: false)
+        let script = dir.appendingPathComponent("fixture.py")
+        let ready = dir.appendingPathComponent("fixture.py.ready")
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite); try? fm.removeItem(at: dir) }
+        let fixture = #"""
+        #!/usr/bin/python3
+        import argparse, http.server, json, os, pathlib, signal, stat, time
+        args = argparse.ArgumentParser(add_help=False)
+        args.add_argument('--port', type=int)
+        port = args.parse_known_args()[0].port
+        assert all(stat.S_ISFIFO(os.fstat(fd).st_mode) for fd in [1, 2])
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_HEAD(self):
+                self.send_response(200); self.send_header('Content-Type', 'text/html')
+                self.send_header('X-MIV-Dashboard','1'); self.end_headers()
+            def do_GET(self):
+                if self.path == '/health': body = '{"status":"ok","version":"log-fixture"}'
+                elif self.path == '/metrics': body = 'ninfer_metal_requests_total 0\n'
+                else: body = '{"data":[{"id":"log-fixture"}]}'
+                self.send_response(200); self.end_headers(); self.wfile.write(body.encode())
+
+        httpd = http.server.HTTPServer(('127.0.0.1',port), Handler)
+        def stop(signum, frame):
+            # Write more than one OS pipe capacity immediately before exit.
+            for i in range(48): os.write(2, b'E' * 8192)
+            os.write(1,b'FINAL-STDOUT\n'); os.write(2,b'FINAL-STDERR\n')
+            os._exit(0)
+        signal.signal(signal.SIGTERM, stop)
+        os.write(2,b'[ninfer-metal-serve] Listening ')
+        time.sleep(.05)
+        os.write(2,f'on http://127.0.0.1:{port} (fixture)\n'.encode())
+        # Flood both streams before letting the UI make its very first refresh.
+        for i in range(1024): os.write(1 if i % 2 == 0 else 2, b'X' * 8192)
+        os.write(2,b'AFTER-8-MIB\n')
+        pathlib.Path(__file__ + '.ready').touch()
+        httpd.serve_forever()
+        """#
+        try fixture.write(to: script, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        var settings = CoreSettings()
+        settings.port = Int.random(in: 49152...65535)
+        let service = CoreService(defaults: defaults, executable: script)
+        defer { service.shutdown() }
+        try service.apply(settings, apiKey: "")
+        try service.start()
+        let deadline = Date().addingTimeInterval(20)
+        while !fm.fileExists(atPath: ready.path) && service.isRunning && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(fm.fileExists(atPath: ready.path), service.serviceMessage ?? "log flood did not drain")
+        await service.refresh()
+        XCTAssertEqual(service.health?.version, "log-fixture")
+        XCTAssertEqual(service.logText.utf8.count, 48 * 1024)
+        XCTAssertTrue(service.logText.hasSuffix("AFTER-8-MIB\n"))
+        XCTAssertFalse(service.logText.contains("Listening on"))
+        service.stop()
+        let stopDeadline = Date().addingTimeInterval(4)
+        while service.isRunning && Date() < stopDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertFalse(service.isRunning)
+        XCTAssertNil(service.serviceMessage)
+        XCTAssertEqual(service.logText.utf8.count, 48 * 1024)
+        XCTAssertTrue(service.logText.hasSuffix("FINAL-STDOUT\nFINAL-STDERR\n"))
+        XCTAssertFalse(service.logText.contains("AFTER-8-MIB"))
+    }
+}

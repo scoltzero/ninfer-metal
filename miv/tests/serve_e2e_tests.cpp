@@ -1142,6 +1142,57 @@ void test_multi_model_config_and_aliases(
             resolved[1].memory_budget_bytes == (10ULL << 30),
         "second [[models]] entry mismatch");
 
+  // An App edit is local to one model, even when the external TOML already
+  // contains multiple models and the process has global command-line flags.
+  const auto overlay_path = tmp_dir / "app-models.json";
+  std::ofstream(overlay_path) << R"({
+    "defaults":{"max_tokens":17,"temperature":0},
+    "models":[{
+      "directory":"/tmp/models/qwen", "source_id":"qwen-main", "alias":"assistant",
+      "generation":{"max_tokens":3},
+      "engine":{"max_context":2048,"max_concurrency":1,"kv_dtype":"bf16",
+        "spec_backend":"mtp","draft_tokens":3,"mtp_artifact":"/tmp/head.miv",
+        "draft_dir":"/tmp/d","draft_artifact":"/tmp/d/m.miv","artifact":"/tmp/a.miv",
+        "metallib_dir":"/tmp/model-metallib","chat_template":"/tmp/chat.jinja",
+        "lora_adapter":"/tmp/l","lora_mode":"bypass","memory_budget_gb":2.5,
+        "prefill_linear_mode":"w4a8","prefill_attention_mode":"sage2",
+        "prefill_sparse_minference":true,"prefill_cache_blend":true,"prefill_ane_offload":true,
+        "rolling_prefix_cache":false,"prefix_cache_gb":2.5,"batch_mode":"off",
+        "sampling_contract":"legacy_rejection_v1"}
+    }]})";
+  auto overlay_args = args;
+  overlay_args.insert(overlay_args.end(), {"--model-overrides", overlay_path.string()});
+  std::vector<char *> overlay_argv;
+  for (auto &arg : overlay_args) overlay_argv.push_back(arg.data());
+  const auto layered = resolve_model_configs(parse_serve_config(
+      static_cast<int>(overlay_argv.size()), overlay_argv.data()));
+  check(layered.size() == 2 && layered[0].api_alias == "assistant" &&
+        layered[0].id == "qwen-main" && layered[1].id == "llama-sidecar" &&
+        layered[0].generation_defaults.at("max_tokens") == 3 &&
+        layered[1].generation_defaults.at("max_tokens") == 17 &&
+        layered[1].generation_defaults.at("temperature") == 0 &&
+        layered[1].max_context == 8192 && layered[1].kernel_dir == "/tmp/shaders-cli",
+        "model overlay polluted another model or lost generation precedence");
+  const auto &edited = layered[0];
+  const auto native = to_load_options(edited);
+  check(native.max_context == 2048 && native.max_concurrency == 1 &&
+        native.kv_dtype == "bf16" && native.speculative.draft_tokens == 3 &&
+        edited.spec_backend == omlx::m5::SpeculativeBackend::mtp &&
+        native.sampling_contract == "legacy_rejection_v1" &&
+        edited.generation_defaults.at("temperature") == 0 &&
+        native.path_overrides.at("artifact") == "/tmp/a.miv" &&
+        native.path_overrides.at("draft_artifact") == "/tmp/d/m.miv" &&
+        native.path_overrides.at("mtp_artifact") == "/tmp/head.miv" &&
+        native.path_overrides.at("kernel_directory") == "/tmp/model-metallib" &&
+        native.draft_dir == "/tmp/d" && edited.chat_template == "/tmp/chat.jinja" &&
+        native.lora_adapter == "/tmp/l" && native.lora_mode == "bypass" &&
+        native.prefill_linear_mode == omlx::m5::PrefillLinearMode::W4A8 &&
+        native.prefill_attention_mode == omlx::m5::PrefillAttentionMode::Sage2 &&
+        native.prefill_sparse_minference && native.prefill_cache_blend && native.prefill_ane_offload &&
+        edited.rolling_prefix_cache == false && edited.prefix_cache_gb == 2.5 &&
+        native.path_overrides.at("batch_mode") == "off" && edited.memory_budget_bytes == (5ULL << 29),
+        "a model page setting did not reach the native load plan");
+
   // Repeatable --model-dir CLI & --kernel-dir alias
   std::vector<std::string> cli_args = {
       "ninfer-metal-serve",
@@ -1430,6 +1481,7 @@ void test_multi_microkernel_parallel_e2e(
   }
 
   ServeConfig http_cfg;
+  http_cfg.model_fallback_file = (tmp_root / "miv-routing.json").string();
   http_cfg.host = "127.0.0.1";
   http_cfg.port = 0;
   http_cfg.cors = true;
@@ -1685,6 +1737,29 @@ void test_multi_microkernel_parallel_e2e(
           "expected at least 2 contention transitions (false->true->false), "
           "got " +
               std::to_string(host->contention_transitions()));
+    // Re-read the small App routing policy on misses so toggles apply without
+    // unloading models. Model metadata lookups and missing model arguments stay strict.
+    const auto fallback_request = [&](bool chat) {
+      Json body{{"model", "not-loaded"}, {"max_tokens", 1}, {"temperature", 0}};
+      if (chat) body["messages"] = {{{"role", "user"}, {"content", "hi"}}};
+      else body["prompt"] = "hi";
+      return client.Post(chat ? "/v1/chat/completions" : "/v1/completions", body.dump(), "application/json");
+    };
+    std::ofstream(http_cfg.model_fallback_file) << R"({"enabled":true,"preferred":"llama-sidecar"})";
+    auto fb_chat = fallback_request(true);
+    check(fb_chat && fb_chat->status == 200 && Json::parse(fb_chat->body).at("model") == "llama-sidecar",
+          "missing chat model should resolve to the selected loaded model");
+    auto metadata = client.Get("/v1/models/not-loaded");
+    check(metadata && metadata->status == 404, "fallback must not redirect model metadata");
+    std::ofstream(http_cfg.model_fallback_file) << R"({"enabled":true,"preferred":"not-loaded-either"})";
+    auto fb_text = fallback_request(false);
+    check(fb_text && fb_text->status == 200 && Json::parse(fb_text->body).at("model") == "qwen-inproc",
+          "absent preferred fallback should use the first available model");
+    std::ofstream(http_cfg.model_fallback_file) << R"({"enabled":false})";
+    for (const bool chat : {true, false}) {
+      auto miss = fallback_request(chat);
+      check(miss && miss->status == 404, "disabling fallback must restore 404 immediately");
+    }
   } catch (...) {
     cleanup();
     throw;

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,36 @@ int main(int argc, char **argv) {
     }
 
     const auto model_configs = omlx::m5::serve::resolve_model_configs(config);
+    if (config.describe_models) {
+      nlohmann::json list = nlohmann::json::array();
+      for (const auto &m : model_configs) {
+        nlohmann::json engine = {
+            {"max_context", m.max_context}, {"max_concurrency", m.max_concurrency},
+            {"kv_dtype", m.kv_dtype}, {"draft_tokens", m.draft_tokens},
+            {"spec_backend", omlx::m5::serve::spec_backend_name(m.spec_backend, m.spec_backend_auto)},
+            {"artifact", m.artifact}, {"draft_artifact", m.draft_artifact}, {"mtp_artifact", m.mtp_artifact},
+            {"draft_dir", m.draft_dir}, {"metallib_dir", m.kernel_dir}, {"chat_template", m.chat_template},
+            {"lora_adapter", m.lora_adapter}, {"lora_mode", m.lora_mode}, {"sampling_contract", m.sampling_contract},
+            {"prefill_linear_mode", omlx::m5::prefill_linear_mode_to_string(m.prefill_linear_mode)},
+            {"prefill_attention_mode", omlx::m5::prefill_attention_mode_to_string(m.prefill_attention_mode)},
+            {"prefill_sparse_minference", m.prefill_sparse_minference}, {"prefill_cache_blend", m.prefill_cache_blend},
+            {"prefill_ane_offload", m.prefill_ane_offload},
+        };
+        if (m.rolling_prefix_cache) engine["rolling_prefix_cache"] = *m.rolling_prefix_cache;
+        if (m.prefix_cache_gb) engine["prefix_cache_gb"] = *m.prefix_cache_gb;
+        if (m.memory_budget_gb) engine["memory_budget_gb"] = *m.memory_budget_gb;
+        if (m.batch_mode) engine["batch_mode"] = *m.batch_mode;
+        for (auto &[key, value] : engine.items()) {
+          if (!value.is_string()) value = value.dump();
+        }
+        list.push_back({{"engine", engine}, {"id", m.id}, {"directory", m.model_dir},
+                        {"max_context", m.max_context}, {"max_concurrency", m.max_concurrency},
+                        {"kv_dtype", m.kv_dtype}, {"spec_backend",
+                            omlx::m5::serve::spec_backend_name(m.spec_backend, m.spec_backend_auto)}});
+      }
+      std::cout << list.dump() << '\n';
+      return 0;
+    }
     if (model_configs.empty()) {
       std::cerr << "ninfer-metal-serve: --model-dir is required (or set "
                    "[model].model_dir / [[models]] in --config)\n"
@@ -57,7 +88,7 @@ int main(int argc, char **argv) {
     }
 
     const auto registry =
-        omlx::m5::serve::ProviderRegistry::discover(config.providers_dirs);
+        omlx::m5::serve::ProviderRegistry::discover(config.providers_dirs, !config.explicit_providers_only);
     if (!registry.providers().empty()) {
       std::cerr << "[ninfer-metal-serve] Discovered "
                 << registry.providers().size()
@@ -138,7 +169,7 @@ int main(int argc, char **argv) {
     std::cerr << "[ninfer-metal-serve] Listening on http://" << config.host
               << ':' << bound_port << " (" << host->model_count()
               << " model(s), auth="
-              << (config.api_key.empty() ? "none" : "bearer")
+              << (std::getenv("MIV_ACCESS_FILE") ? "app-policy" : (config.api_key.empty() ? "none" : "bearer"))
               << ", cors=" << (config.cors ? "on" : "off") << ")\n";
 
     http_server.listen_after_bind();

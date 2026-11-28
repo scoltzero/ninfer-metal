@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "MIV",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("27.0")],
     products: [.executable(name: "MIVApp", targets: ["MIVApp"])],
     targets: [
         .executableTarget(name: "MIVApp"),
