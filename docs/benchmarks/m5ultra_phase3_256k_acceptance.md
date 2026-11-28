@@ -1,5 +1,7 @@
 # M5 Ultra Phase 3 `1K–256K` Prefill Acceleration Full Hardware Acceptance Matrix (`miv-v0.05-p3-rc1` vs Phase 2 `miv-v0.04-p2-rc1`)
 
+> **Superseded by Phase 3.1 (`miv-v0.05-p3.1-rc1`)**: See [m5ultra_phase3_1_256k_acceptance.md](m5ultra_phase3_1_256k_acceptance.md) (and `.json`) for the subsequent Zero-LUT `B1_swar` MXFP4 + Zero-DRAM `128t BM=64 SWI8` Mode B acceptance report, sublayer GPU breakdown, and `ane_cal_v3_p31` canary results.
+
 - **Date (UTC)**: `2026-11-28T00:08:48Z`
 - **Host**: `scoltcdeMac-Studio.local` (`Apple M5 Ultra`, `36` CPU cores, **`80`-core Apple10 NAX GPU**, **Dual-ANE** `ane0`+`ane1`, **`256.0 GiB` UMA**, `macOS 27.2.1` Build `26B131`)
 - **Deployed Provider**: `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/versions/miv-v0.05-p3-rc1` (**`current` symlink atomically switched**; release tarball `dist/ninfer-metal-miv-v0.05-macos27-arm64.tar.gz`, SHA-256 `b5eaa95ef8d763b8e58a421bf1aab61ea27c40e30b770be7be6b91c7a96b9397`, `17` clean-Mac binaries + `48` `.metallib`s)
