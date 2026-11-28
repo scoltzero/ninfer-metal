@@ -1883,7 +1883,7 @@
                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
                                             <span x-show="modelHasMivArtifact(model)" x-cloak
-                                                  :class="modelRoutesToMiv(model) ? 'bg-blue-800 text-white border-blue-800' : 'bg-cyan-50 text-cyan-700 border-cyan-200'"
+                                                  :class="modelRoutesToMiv(model) ? 'badge-miv-routed' : 'bg-teal-50 text-teal-700 border-teal-200'"
                                                   :title="modelMivBadgeHelp(model)"
                                                   class="badge font-mono">
                                                 .miv

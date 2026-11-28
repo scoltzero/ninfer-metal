@@ -1398,8 +1398,7 @@ def test_model_weight_badges_distinguish_artifacts_from_routes():
     template = (root / "omlx_web/templates/dashboard/_settings.html").read_text()
     row = _section(template, "<!-- Main Row -->", "<!-- Type -->")
     assert 'x-show="modelHasMivArtifact(model)"' in row
-    assert "'bg-blue-800 text-white border-blue-800'" in row
-    assert "'bg-cyan-50 text-cyan-700 border-cyan-200'" in row
+    assert "modelRoutesToMiv(model) ? 'badge-miv-routed' : 'bg-teal-50 text-teal-700 border-teal-200'" in row
     assert ".filter(e => e.compatible && e.id !== 'm5rt')" in row
     assert 'model.model_format === \'gguf\'' in row
     script = """

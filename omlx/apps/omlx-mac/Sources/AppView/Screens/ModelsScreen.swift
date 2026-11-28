@@ -170,7 +170,7 @@ private struct ModelRowBadges: View {
 
     var body: some View {
         if let badge = model.listMivBadge {
-            WeightFormatPill(label: ".miv", kind: badge == .routed ? .mivRouted : .mivAvailable,
+            WeightFormatPill(label: ".miv", kind: badge == .routed ? .mivRouted : .miv,
                              tooltip: badge.help)
                 .fixedSize(horizontal: true, vertical: false)
         }

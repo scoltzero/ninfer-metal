@@ -380,6 +380,17 @@
         white-space: nowrap;
     }
 
+    /* The native miv engine pill uses the macOS blue accent and no stroke. */
+    .badge-miv-routed {
+        --miv-badge-accent: 0 122 255;
+        --miv-badge-fill: 0.16;
+        color: rgb(var(--miv-badge-accent));
+        background-color: rgb(var(--miv-badge-accent) / var(--miv-badge-fill));
+    }
+    [data-theme="dark"] .badge-miv-routed {
+        --miv-badge-fill: 0.22;
+    }
+
     /* === Sub-tab row === */
     /* Pins under the sticky navbar. <main> must not clip overflow, or it becomes
        the scroll container and nothing inside it sticks (see dashboard.html). */
