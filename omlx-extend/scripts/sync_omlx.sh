@@ -119,14 +119,10 @@ if [[ -z "${TARGET_TAG}" ]]; then
 fi
 
 if [[ -z "${PATCH_FILE}" ]]; then
-  if [[ "${EXPORT_PATCH}" -eq 1 ]]; then
-    PATCH_FILE="${EXTEND_DIR}/patches/omlx-${TARGET_TAG}-provider-spi.patch"
-  elif [[ -f "${EXTEND_DIR}/patches/omlx-${TARGET_TAG}-provider-spi.patch" ]]; then
-    PATCH_FILE="${EXTEND_DIR}/patches/omlx-${TARGET_TAG}-provider-spi.patch"
-  elif [[ -n "${CURRENT_UPSTREAM_TAG}" && -f "${EXTEND_DIR}/patches/omlx-${CURRENT_UPSTREAM_TAG}-provider-spi.patch" ]]; then
+  PATCH_FILE="${EXTEND_DIR}/patches/omlx-${TARGET_TAG}-provider-spi.patch"
+  if [[ "${EXPORT_PATCH}" -eq 0 && ! -f "${PATCH_FILE}" && -n "${CURRENT_UPSTREAM_TAG}" &&
+        -f "${EXTEND_DIR}/patches/omlx-${CURRENT_UPSTREAM_TAG}-provider-spi.patch" ]]; then
     PATCH_FILE="${EXTEND_DIR}/patches/omlx-${CURRENT_UPSTREAM_TAG}-provider-spi.patch"
-  else
-    PATCH_FILE="${EXTEND_DIR}/patches/omlx-v0.8.3-provider-spi.patch"
   fi
 fi
 
@@ -145,6 +141,7 @@ RSYNC_EXCLUDES=(
   --exclude='/packaging/_export/'
   --exclude='/packaging/_wheels/'
   --exclude='/apps/omlx-mac/.build/'
+  --exclude='/apps/omlx-mac/build/'
   --exclude='/apps/omlx-mac/.swiftpm/'
   --exclude='/apps/omlx-mac/DerivedData/'
   --exclude='/apps/omlx-mac/oMLX.xcodeproj/project.xcworkspace/xcshareddata/'

@@ -1130,6 +1130,42 @@
             "state" : "translated",
             "value" : "Cerca aggiornamenti"
           }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "检查更新"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "檢查更新"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nach Updates suchen"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "アップデートを確認"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "업데이트 확인"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проверить обновления"
+          }
         }
       }
     },
@@ -15431,6 +15467,54 @@
         }
       }
     },
+    "integrations.splash.max_concurrent" : {
+      "comment" : "Row label for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleichzeitige Anfragen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrent Requests"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Richieste simultanee"
+          }
+        }
+      }
+    },
+    "integrations.splash.max_concurrent.sub" : {
+      "comment" : "Sublabel for the Splash concurrent request limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viele Anfragen jedes Splash-Modell gleichzeitig bedient. Auto nutzt Splashs Standard von 4. Gilt ab Splash 1.7.1."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How many requests each Splash model serves at once. Auto uses Splash's default of 4. Applies to Splash 1.7.1 and later."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quante richieste ogni modello Splash gestisce contemporaneamente. Auto usa il valore predefinito di Splash, 4. Vale da Splash 1.7.1."
+          }
+        }
+      }
+    },
     "integrations.splash.max_memory" : {
       "comment" : "Row label for the Splash memory limit",
       "extractionState" : "manual",
@@ -26511,6 +26595,78 @@
         }
       }
     },
+    "quant.advanced.preserve_ngram.label" : {
+      "comment" : "Toggle row label: keep DeepSeek V4.1 Engram tables in FP8",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Originale Engram-Tabellen beibehalten"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep original Engram tables"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantieni le tabelle Engram originali"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохранять исходные таблицы Engram"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留原始 Engram 表"
+          }
+        }
+      }
+    },
+    "quant.advanced.preserve_ngram.sub" : {
+      "comment" : "Toggle row sublabel: effect of keeping the original Engram tables",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram-Tabellen in FP8 statt in 4 Bit behalten (mehr Speicherplatz auf dem Datenträger)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the Engram tables in FP8 instead of 4-bit (larger on disk)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantiene le tabelle Engram in FP8 anziché a 4 bit (più spazio su disco)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставить таблицы Engram в FP8 вместо 4 бит (больше места на диске)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engram 表保持 FP8，不量化为 4 位（占用更多磁盘空间）"
+          }
+        }
+      }
+    },
     "quant.advanced.text_only.label" : {
       "comment" : "Toggle row label: drop vision encoder weights when quantizing a VLM",
       "extractionState" : "manual",
@@ -36403,6 +36559,36 @@
             "state" : "translated",
             "value" : "Attivazioni Float16"
           }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16 の活性値"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16 활성값"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активации Float16"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16 激活值"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16 活化值"
+          }
         }
       }
     },
@@ -36426,6 +36612,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Converte in float16 al caricamento le scale, le norme e gli embedding bfloat16 di questo modello. Le GPU M1 e M2 emulano bfloat16, quindi prefill e decodifica risultano più veloci. L'output può differire leggermente da bfloat16."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "読み込み時にスケール、正規化パラメータ、埋め込みを bfloat16 から float16 に変換します。bfloat16 をエミュレートする M1・M2 GPU でプリフィルとデコードが速くなります。出力がわずかに変わる場合があります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "로딩 시 모델의 bfloat16 스케일, 정규화 매개변수, 임베딩을 float16으로 변환합니다. bfloat16을 에뮬레이션하는 M1과 M2 GPU에서는 프리필과 디코딩이 빨라지며 출력이 조금 달라질 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При загрузке коэффициенты масштабирования, параметры нормализации и эмбеддинги преобразуются из bfloat16 в float16. Это ускоряет предзаполнение и декодирование на GPU M1 и M2, где bfloat16 эмулируется. Вывод может незначительно измениться."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载时将模型的 bfloat16 缩放系数、归一化参数和嵌入转为 float16。M1 和 M2 的 GPU 需要模拟 bfloat16，转换后预填充和解码更快，输出可能略有差异。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "載入時將模型的 bfloat16 縮放係數、正規化參數和嵌入轉為 float16。M1 和 M2 的 GPU 需要模擬 bfloat16，轉換後預填充和解碼更快，輸出可能略有差異。"
           }
         }
       }
@@ -37027,6 +37243,36 @@
             "state" : "translated",
             "value" : "Audio"
           }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オーディオ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오디오"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аудио"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音訊"
+          }
         }
       }
     },
@@ -37232,6 +37478,18 @@
             "value" : "Download in corso…"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ダウンロード中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다운로드 중…"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37242,6 +37500,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "正在下载…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在下載…"
           }
         }
       }
@@ -37268,6 +37532,18 @@
             "value" : "Scarica %@"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ をダウンロード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 다운로드"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37278,6 +37554,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "下载 %@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下載 %@"
           }
         }
       }
@@ -37304,6 +37586,18 @@
             "value" : "I modelli GGUF girano solo su un motore esterno."
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF モデルには外部エンジンが必要です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF 모델은 외부 엔진이 필요합니다."
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37314,6 +37608,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "GGUF 模型只能在外部引擎上运行。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF 模型需要外部引擎。"
           }
         }
       }
@@ -37520,6 +37820,24 @@
             "value" : "Usa motore esterno"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部エンジンを使用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "외부 엔진 사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использовать внешний движок"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37555,6 +37873,36 @@
             "state" : "translated",
             "value" : "Queste impostazioni non si applicano finché il modello è eseguito da un motore esterno."
           }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "外部エンジンでモデルを実行する場合、これらの設定は適用されません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "외부 엔진으로 모델을 실행하는 동안에는 이 설정이 적용되지 않습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эти настройки не действуют, когда модель обслуживает внешний движок."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用外部引擎运行模型时，这些设置不生效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用外部引擎執行模型時，不會套用這些設定。"
+          }
         }
       }
     },
@@ -37578,6 +37926,24 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Esegue questo modello con un altro motore di inferenza in un processo dedicato, anziché con i motori MLX di oMLX."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このモデルを外部の推論エンジンで別プロセスとして実行します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델을 별도 프로세스에서 외부 추론 엔진으로 실행합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запускает модель на внешнем движке в отдельном процессе."
           }
         },
         "zh-Hans" : {
@@ -37706,6 +38072,18 @@
             "value" : "Nessun adattatore LoRA trovato. Metti una cartella dell'adattatore (con adapter_config.json) in una cartella dei modelli."
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA アダプタが見つかりません。adapter_config.json を含むアダプタのフォルダをモデルフォルダに置いてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 어댑터를 찾을 수 없습니다. adapter_config.json이 있는 어댑터 폴더를 모델 폴더에 넣으세요."
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37716,6 +38094,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "未找到 LoRA 适配器。请将适配器文件夹（含 adapter_config.json）放入模型文件夹。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "找不到 LoRA 適配器。請將含有 adapter_config.json 的適配器資料夾放入模型資料夾。"
           }
         }
       }
@@ -37742,6 +38126,18 @@
             "value" : "Addestrato su %1$@ · %2$@"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "学習元：%1$@ · %2$@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "학습 기반: %1$@ · %2$@"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37752,6 +38148,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "基于 %1$@ 训练 · %2$@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "訓練基底：%1$@ · %2$@"
           }
         }
       }
@@ -37778,6 +38180,18 @@
             "value" : "Adattatore"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "アダプタ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "어댑터"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37788,6 +38202,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "适配器"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "適配器"
           }
         }
       }
@@ -37814,6 +38234,18 @@
             "value" : "Nessuno"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "なし"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "없음"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37824,6 +38256,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無"
           }
         }
       }
@@ -37850,6 +38288,18 @@
             "value" : "Adattatore LoRA"
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA アダプタ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 어댑터"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37860,6 +38310,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "LoRA 适配器"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 適配器"
           }
         }
       }
@@ -37886,6 +38342,18 @@
             "value" : "Gli adattatori non compatibili con questo modello non sono elencati. Si applica dopo il ricaricamento del modello."
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このモデルと互換性のあるアダプタのみ表示します。設定はモデルの再読み込み後に適用されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델과 호환되는 어댑터만 표시합니다. 모델을 다시 로드하면 설정이 적용됩니다."
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37896,6 +38364,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "不适用于此模型的适配器不会列出。重新加载模型后生效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "僅列出與此模型相容的適配器。重新載入模型後生效。"
           }
         }
       }
@@ -37922,6 +38396,18 @@
             "value" : "Applica un adattatore LoRA dalle cartelle dei modelli sopra questi pesi."
           }
         },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデルフォルダにある LoRA アダプタをこの重みに適用します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 폴더의 LoRA 어댑터를 이 가중치에 적용합니다."
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37932,6 +38418,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在这些权重之上应用模型文件夹中的 LoRA 适配器。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "將模型資料夾中的 LoRA 適配器套用至這些權重。"
           }
         }
       }
@@ -40224,6 +40716,150 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "DSA 模型的稀疏注意力索引缓存。THUDM/IndexCache。"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.label" : {
+      "comment" : "Row label for the LoopCD toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.label" : {
+      "comment" : "Row label for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thinking-Blöcke ausnehmen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exclude Thinking Blocks"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escludi i blocchi di ragionamento"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Исключить блоки thinking"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排除思考块"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.skip_thinking.sub" : {
+      "comment" : "Sublabel for the toggle that keeps LoopCD out of thinking blocks",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoopCD nur auf Antwort und Tool-Aufrufe anwenden. Von den Autoren für Coding-Agenten empfohlen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applica LoopCD solo a risposta e chiamate agli strumenti. Consigliato dagli autori per gli agenti di programmazione."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Применять LoopCD только к ответу и вызовам инструментов. Авторы рекомендуют для агентов-программистов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅对回答和工具调用应用 LoopCD。作者建议编程智能体使用。"
+          }
+        }
+      }
+    },
+    "settings.experimental.loopcd.sub" : {
+      "comment" : "Sublabel describing LoopCD",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vergleicht bei der Tokenwahl den letzten Schleifendurchlauf mit dem ersten. Kann Antworten verbessern, ist aber langsamer und braucht mehr Speicher."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confronta l'ultimo passaggio del ciclo con il primo per scegliere i token. Può migliorare le risposte, ma è più lento e usa più memoria."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сопоставляет последний проход цикла с первым при выборе токенов. Может улучшить ответы, но медленнее и требует больше памяти."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择 token 时将最后一次循环与第一次对比。可能改善回答，但更慢且占用更多内存。"
           }
         }
       }
@@ -60091,10 +60727,40 @@
       "comment" : "Short suffix indicating automatic external-engine routing",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Auto"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatico"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Авто"
           }
         },
         "zh-Hans" : {
@@ -60115,10 +60781,40 @@
       "comment" : "Compact badge label for miv Core Backend on model rows",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv-Kern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "miv Core"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Core miv"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv コア"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv 코어"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ядро miv"
           }
         },
         "zh-Hans" : {
@@ -60139,10 +60835,40 @@
       "comment" : "Display name for the built-in miv Core Backend (m5rt) engine",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv-Kern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "miv Core Backend"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Core di inferenza miv"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv コアバックエンド"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv 코어 백엔드"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бэкенд miv"
           }
         },
         "zh-Hans" : {
@@ -60163,10 +60889,40 @@
       "comment" : "Display label when running on Stock MLX",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard-MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Stock MLX"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLX standard"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "標準 MLX"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 MLX"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Стандартный MLX"
           }
         },
         "zh-Hans" : {
@@ -60187,10 +60943,40 @@
       "comment" : "Tooltip for an auto-routed external engine badge; placeholder is engine name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (automatisch zugewiesen)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ (auto-routed)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (selezione automatica)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@（自動選択）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@(자동 선택)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (автовыбор)"
           }
         },
         "zh-Hans" : {
@@ -61037,10 +61823,40 @@
       "comment" : "Popup option representing automatic external-engine routing; placeholder is engine name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (automatisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ (Auto)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (automatico)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@（自動）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@(자동)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (авто)"
           }
         },
         "zh-Hans" : {
@@ -61061,10 +61877,40 @@
       "comment" : "Sublabel when an adapted model is automatically routed to an external engine; placeholder is engine name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Für dieses Modell wurde %@ automatisch ausgewählt. Ausschalten, um Standard-MLX zu verwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Auto-routed to %@ for this adapted model. Turn off to use Stock MLX."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per questo modello è stato selezionato automaticamente %@. Disattiva l’opzione per usare MLX standard."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このモデルには %@ が自動選択されました。オフにすると標準 MLX を使います。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델에는 %@ 엔진이 자동으로 선택되었습니다. 기본 MLX를 사용하려면 끄세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для этой модели автоматически выбран движок %@. Отключите переключатель, чтобы использовать стандартный MLX."
           }
         },
         "zh-Hans" : {
@@ -61085,10 +61931,40 @@
       "comment" : "Hint shown when an adapted model is overridden back to Stock MLX",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard-MLX wird verwendet (automatische Auswahl übersteuert)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Using Stock MLX (auto-route overridden)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "È in uso MLX standard (selezione automatica ignorata)."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動選択を上書きして標準 MLX を使用中"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 선택 대신 기본 MLX 사용 중"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используется стандартный MLX (автовыбор переопределён)."
           }
         },
         "zh-Hans" : {
@@ -61181,10 +62057,40 @@
       "comment" : "Tooltip when repacked .miv weights sit alongside original .safetensors; placeholder is format name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neu gepackte .%@-Gewichte für den Metal-4-Mikrokernel im selben Ordner wie die ursprünglichen .safetensors-Gewichte."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Repacked .%@ Metal 4 microkernel weights (co-located alongside original .safetensors)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pesi .%@ riconfezionati per il microkernel Metal 4, nella stessa cartella dei pesi .safetensors originali."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Metal 4 マイクロカーネル用に再パックした .%@ の重みが、元の .safetensors と同じフォルダにあります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Metal 4 마이크로커널용으로 다시 패킹한 .%@ 가중치가 원본 .safetensors와 같은 폴더에 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переупакованные веса .%@ для микроядра Metal 4 находятся в одной папке с исходными весами .safetensors."
           }
         },
         "zh-Hans" : {
@@ -61205,10 +62111,40 @@
       "comment" : "Tooltip for a pure .miv microkernel weight folder; placeholder is format name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Ordner enthält nur .%@-Gewichte für den Metal-4-Mikrokernel und keine .safetensors-Dateien."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Pure .%@ Metal 4 microkernel weights (no .safetensors in folder)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La cartella contiene solo pesi .%@ per il microkernel Metal 4, senza file .safetensors."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このフォルダには Metal 4 マイクロカーネル用の .%@ の重みだけがあり、.safetensors はありません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 폴더에는 Metal 4 마이크로커널용 .%@ 가중치만 있고 .safetensors 파일은 없습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В папке есть только веса .%@ для микроядра Metal 4, без файлов .safetensors."
           }
         },
         "zh-Hans" : {
@@ -61229,10 +62165,40 @@
       "comment" : "Tooltip when a convertible .safetensors model will auto-repack on first Load; placeholder is target format",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Derzeit .safetensors. Beim ersten Laden wird neben den ursprünglichen Gewichten eine .%@-Datei erstellt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Currently .safetensors; first Load automatically repacks .%@ alongside original weights."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Al momento sono presenti pesi .safetensors. Al primo caricamento verrà creato un file .%@ nella stessa cartella."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在の重みは .safetensors です。初回読み込み時に元の重みと同じフォルダに .%@ を作成します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 .safetensors 형식입니다. 처음 로드할 때 원본 가중치와 같은 폴더에 .%@ 파일이 생성됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сейчас используются веса .safetensors. При первой загрузке рядом с ними будет создан файл .%@."
           }
         },
         "zh-Hans" : {
@@ -61253,10 +62219,40 @@
       "comment" : "Tooltip for standard .safetensors model format badge",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardgewichte im Format .safetensors"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Standard .safetensors weights"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pesi standard in formato .safetensors"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "標準の .safetensors の重み"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "표준 .safetensors 가중치"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Стандартные веса .safetensors"
           }
         },
         "zh-Hans" : {
@@ -61277,10 +62273,40 @@
       "comment" : "Tooltip when a model runs on .safetensors while .miv also exists in the directory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die ursprünglichen .safetensors-Gewichte werden verwendet. Der Ordner enthält auch .miv-Gewichte."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Running on original .safetensors weights (.miv weights are also present in this folder)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sono in uso i pesi .safetensors originali. La cartella contiene anche i pesi .miv."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "元の .safetensors の重みで実行中です。同じフォルダには .miv の重みもあります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "원본 .safetensors 가중치로 실행 중입니다. 같은 폴더에 .miv 가중치도 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используются исходные веса .safetensors. В этой же папке также есть веса .miv."
           }
         },
         "zh-Hans" : {
@@ -61301,10 +62327,40 @@
       "comment" : "Sublabel when a convertible .safetensors model will auto-repack to .miv on first Load; placeholder is engine name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ wurde automatisch ausgewählt. Beim ersten Laden entsteht eine .miv-Datei neben den ursprünglichen .safetensors-Gewichten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Auto-routed to %@. First Load automatically repacks .miv alongside original .safetensors."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "È stato selezionato automaticamente %@. Al primo caricamento viene creato un file .miv accanto ai pesi .safetensors originali."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ が自動選択されました。初回の読み込み時に、元の .safetensors と同じフォルダに .miv を作成します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 엔진이 자동으로 선택되었습니다. 처음 로드할 때 원본 .safetensors와 같은 폴더에 .miv 파일이 생성됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Автоматически выбран движок %@. При первой загрузке рядом с исходными весами .safetensors будет создан файл .miv."
           }
         },
         "zh-Hans" : {
@@ -61325,10 +62381,40 @@
       "comment" : "Action that repacks .safetensors weights to .miv alongside original weights",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In .miv konvertieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Convert to .miv"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Converti in .miv"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv に変換"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv로 변환"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Преобразовать в .miv"
           }
         },
         "zh-Hans" : {
@@ -61349,10 +62435,40 @@
       "comment" : "Status badge while repacking .safetensors weights to .miv",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv wird gepackt…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Repacking .miv…"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Creazione del file .miv…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv に変換中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv로 변환 중…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Упаковка .miv…"
           }
         },
         "zh-Hans" : {
@@ -61373,10 +62489,40 @@
       "comment" : "Sublabel for the external engine toggle of a pure .miv model without Stock MLX .safetensors weights",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle, die nur .miv-Gewichte enthalten, benötigen einen Metal-4-Mikrokernel."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Pure .miv models run on a Metal 4 microkernel only."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I modelli con soli pesi .miv richiedono un microkernel Metal 4."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv の重みだけを含むモデルには Metal 4 マイクロカーネルが必要です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : ".miv 가중치만 있는 모델은 Metal 4 마이크로커널이 필요합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для моделей только с весами .miv требуется микроядро Metal 4."
           }
         },
         "zh-Hans" : {
@@ -61397,10 +62543,40 @@
       "comment" : "Section header above the per-model miv Prefill Acceleration card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Beschleunigung (miv)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Prefill Acceleration (miv)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Accelerazione del prefill (miv)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プリフィル高速化（miv）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프리필 가속(miv)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ускорение предзаполнения (miv)"
           }
         },
         "zh-Hans" : {
@@ -61421,10 +62597,40 @@
       "comment" : "Subtitle for the miv Prefill Acceleration card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vier Prefill-Modi; CacheBlend und ANE lassen sich separat einstellen. Änderungen werden sofort gespeichert und das Modell wird neu geladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Four orthogonal prefill modes plus independent CacheBlend & ANE collaboration — changes save immediately and reload the model."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quattro modalità di prefill, con impostazioni separate per CacheBlend e ANE. Le modifiche vengono salvate subito e il modello viene ricaricato."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プリフィルは4つのモードから選択できます。CacheBlend と ANE は個別に設定できます。変更はすぐに保存され、モデルが再読み込みされます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프리필 모드는 네 가지이며 CacheBlend와 ANE는 따로 설정할 수 있습니다. 변경 사항은 즉시 저장되고 모델을 다시 로드합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Четыре режима предзаполнения. CacheBlend и ANE настраиваются отдельно. Изменения сразу сохраняются, после чего модель загружается заново."
           }
         },
         "zh-Hans" : {
@@ -61445,10 +62651,40 @@
       "comment" : "Preset pill for lossless exact miv prefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verlustfrei (Standard)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Lossless Default"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Senza perdita (predefinito)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無損失（標準）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무손실(기본값)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без потерь (по умолчанию)"
           }
         },
         "zh-Hans" : {
@@ -61469,10 +62705,40 @@
       "comment" : "Preset pill for W4A8 linear + exact attention prefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 ausgewogen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "W4A8 Balanced"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 bilanciato"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 バランス"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 균형"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сбалансированный W4A8"
           }
         },
         "zh-Hans" : {
@@ -61493,10 +62759,40 @@
       "comment" : "Preset pill enabling all GPU prefill accelerations (W4A8 + Sage2 + MInference + CacheBlend, Dual-ANE off)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle GPU-Optionen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "GPU Full"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tutte le opzioni GPU"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 高速化をすべて使用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 가속 모두 사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все ускорения GPU"
           }
         },
         "zh-Hans" : {
@@ -61517,10 +62813,40 @@
       "comment" : "Preset pill for W4A8 + CacheBlend multi-chunk prefill reuse",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG-Wiederverwendung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "RAG Reuse"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Riuso per RAG"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG キャッシュ再利用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG 캐시 재사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторное использование в RAG"
           }
         },
         "zh-Hans" : {
@@ -61541,10 +62867,40 @@
       "comment" : "Short label for universal W4A8 prefill linear acceleration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lineare Schichten mit W4A8"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "W4A8 Linear"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strati lineari W4A8"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 線形層"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 선형층"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Линейные слои W4A8"
           }
         },
         "zh-Hans" : {
@@ -61565,10 +62921,40 @@
       "comment" : "Short switch title for SageAttention2 low-bit prefill attention",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2-Attention"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Sage2 Attention"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attenzione Sage2"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2 アテンション"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sage2 어텐션"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Механизм внимания Sage2"
           }
         },
         "zh-Hans" : {
@@ -61589,10 +62975,40 @@
       "comment" : "Short switch title for MInference dynamic block sparsity under Sage2",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sparse Attention mit MInference"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "MInference Dynamic Sparse"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attenzione sparsa MInference"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MInference 疎アテンション"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MInference 희소 어텐션"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разреженное внимание MInference"
           }
         },
         "zh-Hans" : {
@@ -61613,10 +63029,40 @@
       "comment" : "Short switch title for cross-chunk KV cache blend reuse",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend-Wiederverwendung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "CacheBlend Cross-Chunk Reuse"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Riuso con CacheBlend"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend 再利用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CacheBlend 재사용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторное использование CacheBlend"
           }
         },
         "zh-Hans" : {
@@ -61637,10 +63083,40 @@
       "comment" : "Short switch title for GPU + Dual-ANE hybrid prefill offload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auslagerung auf Dual-ANE"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Dual-ANE Offload"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delega alla doppia ANE"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デュアル ANE へオフロード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "듀얼 ANE 오프로딩"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выгрузка на два ANE"
           }
         },
         "zh-Hans" : {
@@ -61661,10 +63137,40 @@
       "comment" : "Subtle trade-off note under universal W4A8 prefill linear acceleration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 verwendet INT8 für Matrixmultiplikationen beim Prefill. down_proj und die Dekodierung bleiben bei W4A16."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Universal W4A8 INT8 prefill matmul (down_proj stays W4A16; decode stays exact W4A16)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 usa INT8 per le moltiplicazioni di matrici nel prefill. down_proj e la decodifica restano in W4A16."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 はプリフィルの行列積に INT8 を使います。down_proj とデコードには引き続き W4A16 を使います。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8은 프리필 행렬 곱셈에 INT8을 사용합니다. down_proj와 디코딩은 W4A16을 유지합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "W4A8 использует INT8 для матричного умножения при предзаполнении. Для down_proj и декодирования сохраняется W4A16."
           }
         },
         "zh-Hans" : {
@@ -61685,10 +63191,40 @@
       "comment" : "Subtle trade-off note under the Sage2 Attention prefill switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attention mit INT8 für QK und FP16 für PV. Dynamische Sparsität mit MInference lässt sich separat zuschalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Low-bit INT8 QK + FP16 PV attention; pairs independently with MInference dynamic sparsity below."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attenzione con QK in INT8 e PV in FP16. La sparsità dinamica di MInference si attiva separatamente."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "QK に INT8、PV に FP16 を使うアテンションです。MInference による動的スパース化は個別に設定できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "QK는 INT8, PV는 FP16으로 계산합니다. MInference 동적 희소화는 별도로 켤 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Внимание с QK в INT8 и PV в FP16. Динамическая разреженность MInference включается отдельно."
           }
         },
         "zh-Hans" : {
@@ -61709,10 +63245,40 @@
       "comment" : "Subtle trade-off note under the MInference Dynamic Sparse prefill switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus: dichte Sage2-Attention über den gesamten Kontext. Ein: dynamisch blockweise ausgedünnte Attention mit Sage2 und MInference."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Off = dense full-receptive-field Sage2; On = dynamic block-sparse Sage2 + MInference."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disattivata: attenzione Sage2 densa su tutto il contesto. Attivata: Sage2 con attenzione dinamica a blocchi sparsi tramite MInference."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフでは全コンテキストに密な Sage2 アテンションを適用し、オンでは MInference でブロックを動的に選択します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끄면 전체 컨텍스트에 밀집 Sage2 어텐션을 사용합니다. 켜면 MInference로 블록을 동적으로 선택합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выкл.: плотное внимание Sage2 по всему контексту. Вкл.: Sage2 с динамической блочной разреженностью MInference."
           }
         },
         "zh-Hans" : {
@@ -61733,10 +63299,40 @@
       "comment" : "Subtle note under MInference when Sage2 is currently off",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wähle oben Pfad B oder A+B, um zwischen dichter Sage2-Attention und dynamischer Blocksparsität mit MInference zu wechseln."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Select Route B or Route A+B above to configure dense Sage2 vs dynamic block-sparse Sage2 + MInference."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scegli il percorso B o A+B per passare dall’attenzione Sage2 densa a quella dinamica a blocchi sparsi con MInference."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "経路 B または A+B を選ぶと、密な Sage2 と MInference を使う動的ブロックスパース方式を切り替えられます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 B 또는 A+B를 선택하면 밀집 Sage2와 MInference 동적 블록 희소 어텐션 중에서 선택할 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите путь B или A+B, чтобы переключаться между плотным вниманием Sage2 и динамической блочной разреженностью MInference."
           }
         },
         "zh-Hans" : {
@@ -61757,10 +63353,40 @@
       "comment" : "Subtle trade-off note under the CacheBlend Reuse prefill switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzt getrennte KV-Blöcke für RAG und mehrere Dokumente erneut. Rund 15 % werden neu berechnet. Geringe Qualitätseinbußen sind möglich; der erste Start wird nicht schneller."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Reuses non-contiguous KV chunks for RAG/multi-doc (~15% recompute); minor quality trade-off, no cold-start speedup."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Riutilizza blocchi KV non contigui per RAG o più documenti, ricalcolandone circa il 15%. Può ridurre leggermente la qualità; non accelera l’avvio a freddo."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG や複数文書の離れた KV ブロックを再利用し、約 15% を再計算します。品質が少し変わる場合があります。コールドスタートは高速化されません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RAG와 다중 문서에서 떨어져 있는 KV 블록을 재사용하며 약 15%를 다시 계산합니다. 품질이 약간 낮아질 수 있고 콜드 스타트는 빨라지지 않습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторно использует несмежные блоки KV для RAG и нескольких документов, пересчитывая около 15%. Возможна небольшая потеря качества; холодный старт не ускоряется."
           }
         },
         "zh-Hans" : {
@@ -61781,10 +63407,40 @@
       "comment" : "Subtle trade-off note under the Dual-ANE Offload prefill switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Führt den Prefill dichter MLP-Schichten auf zwei ANE parallel zur GPU aus. Mit W4A8/Sage2 kombinierbar. Die ANE-Teile werden beim ersten Laden kompiliert; MoE-Modelle werden übersprungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Co-runs dense MLP prefill on Dual-ANE (stacks with W4A8/Sage2). First load compiles ANE shards; skipped on MoE."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esegue il prefill degli MLP densi su due ANE insieme alla GPU, anche con W4A8/Sage2. I segmenti ANE vengono compilati al primo caricamento. L’opzione non si applica ai MoE."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "密な MLP のプリフィルを GPU とデュアル ANE で並列実行します。W4A8/Sage2 と併用できます。初回読み込み時に ANE 部分をコンパイルし、MoE ではスキップします。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "밀집 MLP 프리필을 듀얼 ANE와 GPU에서 병렬로 실행합니다. W4A8/Sage2와 함께 쓸 수 있습니다. 처음 로드할 때 ANE 조각을 컴파일하며 MoE에서는 건너뜁니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предзаполнение плотных MLP выполняется на двух ANE параллельно с GPU. Совместимо с W4A8/Sage2. Части для ANE компилируются при первой загрузке; для MoE этот этап пропускается."
           }
         },
         "zh-Hans" : {
@@ -61805,10 +63461,40 @@
       "comment" : "Subtle note under ANE Collaboration Mode for MoE models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur für dichte MLP-Schichten. Dieses MoE-Modell bleibt auf der GPU. W4A8 und Sage2 lassen sich weiterhin kombinieren."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Dense MLP only — automatically skipped on MoE models (stacks orthogonally with Route A/B & CacheBlend)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Solo per MLP densi. Questo modello MoE resta sulla GPU; W4A8 e Sage2 restano combinabili."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "密な MLP 専用です。この MoE モデルは GPU のままで、W4A8 と Sage2 は引き続き併用できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "밀집 MLP 전용입니다. 이 MoE 모델은 GPU에 남으며 W4A8과 Sage2는 계속 함께 사용할 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только для плотных MLP. Эта MoE-модель продолжает работу на GPU; W4A8 и Sage2 можно сочетать."
           }
         },
         "zh-Hans" : {
@@ -61829,10 +63515,40 @@
       "comment" : "Row label for the 4-tier Prefill Acceleration Mode selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Beschleunigung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Prefill Acceleration Mode"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modalità di accelerazione del prefill"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プリフィル高速化モード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프리필 가속 모드"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Режим ускорения предзаполнения"
           }
         },
         "zh-Hans" : {
@@ -61853,10 +63569,40 @@
       "comment" : "Subtitle explaining the 4-tier Prefill Acceleration Mode selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kombiniert die Beschleunigung der linearen Schichten (Pfad A) und der Attention (Pfad B). CacheBlend und der ANE-Modus bleiben unverändert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Orthogonal 2×2 selector over Linear (Route A) and Attention (Route B); never changes CacheBlend or ANE mode."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Combina l’accelerazione dei livelli lineari (percorso A) e dell’attenzione (percorso B). CacheBlend e modalità ANE si impostano separatamente."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "線形層（経路 A）とアテンション（経路 B）の高速化を組み合わせます。CacheBlend と ANE モードの設定は変わりません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선형 연산(경로 A)과 어텐션(경로 B) 가속을 조합합니다. CacheBlend와 ANE 모드 설정은 그대로 유지됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сочетает ускорение линейных слоёв (путь A) и механизма внимания (путь B). Настройки CacheBlend и ANE при этом не меняются."
           }
         },
         "zh-Hans" : {
@@ -61877,10 +63623,40 @@
       "comment" : "4-tier prefill mode pill for lossless exact miv prefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verlustfrei (Standard)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Lossless Default"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Senza perdita (predefinito)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無損失（標準）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무손실(기본값)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без потерь (по умолчанию)"
           }
         },
         "zh-Hans" : {
@@ -61901,10 +63677,40 @@
       "comment" : "4-tier prefill mode pill for Route A linear acceleration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad A (lineare Schichten)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Route A (Linear)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Percorso A (livelli lineari)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "経路 A（線形層）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 A (선형 연산)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь A (линейные слои)"
           }
         },
         "zh-Hans" : {
@@ -61925,10 +63731,40 @@
       "comment" : "4-tier prefill mode pill for Route B Sage2 attention acceleration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad B (Attention)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Route B (Attention)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Percorso B (attenzione)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "経路 B（アテンション）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 B (어텐션)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь B (внимание)"
           }
         },
         "zh-Hans" : {
@@ -61949,10 +63785,40 @@
       "comment" : "4-tier prefill mode pill combining Route A linear and Route B attention acceleration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad A+B (volle Geschwindigkeit)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Route A+B (Full Speed)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Percorso A+B (massima velocità)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "経路 A+B（最高速）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 A+B (최대 속도)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь A+B (полная скорость)"
           }
         },
         "zh-Hans" : {
@@ -61973,10 +63839,40 @@
       "comment" : "ANE collaboration mode option: disabled / pure GPU",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus (nur GPU)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Off (GPU Only)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disattivata (solo GPU)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフ（GPU のみ）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끔 (GPU만 사용)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выкл. (только GPU)"
           }
         },
         "zh-Hans" : {
@@ -61997,10 +63893,40 @@
       "comment" : "ANE collaboration mode option: automatic topology policy",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Auto"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatico"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Авто"
           }
         },
         "zh-Hans" : {
@@ -62021,10 +63947,40 @@
       "comment" : "ANE collaboration mode option: G=64 compact INT8 shift-scale",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kompaktes INT8"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Compact INT8"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "INT8 compatto"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コンパクト INT8"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컴팩트 INT8"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Компактный INT8"
           }
         },
         "zh-Hans" : {
@@ -62045,7 +64001,37 @@
       "comment" : "ANE collaboration mode option: Ultra direct FP16 SwiGLU Dual-ANE",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
         "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
+        "ru" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Ultra FP16 SwiGLU"
@@ -62069,10 +64055,40 @@
       "comment" : "Row label for the 4-way ANE collaboration mode selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE-Kooperationsmodus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "ANE Collaboration Mode"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modalità di collaborazione ANE"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 協調モード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 협업 모드"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Режим совместной работы с ANE"
           }
         },
         "zh-Hans" : {
@@ -62093,10 +64109,40 @@
       "comment" : "Subtle trade-off note under the ANE Collaboration Mode selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Zusammenarbeit von GPU und Dual-ANE wird separat gesteuert: automatisch, kompaktes INT8 (G=64) oder Ultra FP16 SwiGLU."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Orthogonal GPU + Dual-ANE collaboration (Auto policy, Compact INT8 G=64, or Ultra FP16 SwiGLU)."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Configura separatamente la collaborazione tra GPU e Dual-ANE: automatica, INT8 compatto (G=64) o Ultra FP16 SwiGLU."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU とデュアル ANE の協調動作を個別に設定します。自動、コンパクト INT8（G=64）、Ultra FP16 SwiGLU から選べます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU와 듀얼 ANE의 협업 방식을 별도로 설정합니다. 자동, 컴팩트 INT8(G=64), Ultra FP16 SwiGLU 중 선택할 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Совместная работа GPU и двух ANE настраивается отдельно: автоматический выбор, компактный INT8 (G=64) или Ultra FP16 SwiGLU."
           }
         },
         "zh-Hans" : {
@@ -62109,6 +64155,1649 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "獨立正交 GPU + 雙 ANE 協同（自動策略、均衡省存 INT8 G=64 或 Ultra 極速 FP16 SwiGLU）。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.max_concurrency" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Parallele Anfragen (B/C)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrency (B/C)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Richieste simultanee (B/C)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同時実行数（B/C）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "동시 요청 수(B/C)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Параллельные запросы (B/C)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "并发槽位数（B/C）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "並行槽位數（B/C）"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.max_context" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Kontextlänge"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Context Window"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lunghezza massima del contesto"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大コンテキスト長"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최대 컨텍스트 길이"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальная длина контекста"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大上下文长度"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大上下文長度"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.rolling_prefix_cache" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rollierender Präfix-Cache"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rolling Prefix Cache"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache progressiva dei prefissi"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ローリングプレフィックスキャッシュ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "롤링 접두사 캐시"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скользящий кэш префиксов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "滚动前缀缓存"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "滾動前綴快取"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.prefix_cache_gb" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speicherbudget für Präfix-Cache (GiB)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefix Cache Budget (GiB)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Memoria per la cache dei prefissi (GiB)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プレフィックスキャッシュ容量（GiB）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "접두사 캐시 용량(GiB)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит кэша префиксов (ГиБ)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "前缀缓存容量（GiB）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "前綴快取容量（GiB）"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.speculative_backend" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend für spekulative Dekodierung"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speculative Decoding Backend"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backend di decodifica speculativa"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "投機的デコードのバックエンド"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "추측 디코딩 백엔드"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бэкенд спекулятивного декодирования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "推测解码后端"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "推測解碼後端"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.sampling_contract" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling-Verfahren"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling Contract"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Metodo di campionamento"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "サンプリング方式"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "샘플링 방식"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Метод сэмплирования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "采样策略"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取樣策略"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.artifact_path" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad zur Modelldatei"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Artifact Path"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Percorso del file del modello"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデルの重みファイルのパス"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 가중치 파일 경로"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь к файлу весов модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型权重文件路径"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型權重檔案路徑"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.opt.draft_artifact_path" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad zur Entwurfsmodelldatei"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft Artifact Path"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Percorso del file del modello di bozza"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ドラフトモデルの重みファイルのパス"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초안 모델 가중치 파일 경로"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь к файлу весов черновой модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "草稿模型权重文件路径"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "草稿模型權重檔案路徑"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.hint.max_context" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Höchstlänge einer Sequenz in Token. Unterstützte Modelle erlauben 256K (262144) Token oder mehr."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum sequence length in tokens. Models that support it can use 256K tokens (262144) or more."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lunghezza massima di una sequenza in token. I modelli compatibili possono usare 256K token (262144) o più."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 シーケンスの最大トークン数です。対応モデルでは 256K（262144）以上に設定できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한 시퀀스의 최대 토큰 수입니다. 지원하는 모델에서는 256K(262144) 이상으로 설정할 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальное число токенов в последовательности. Если модель поддерживает длинный контекст, можно задать 256K (262144) токенов и более."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "单个序列可容纳的最大词元数。支持长上下文的模型可设为 256K（262144）或更高。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "單一序列可容納的最大詞元數。支援長上下文的模型可設為 256K（262144）或更高。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.hint.sampling_contract" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beim positionsgekoppelten Sampling prüft die GPU die Entwürfe, ohne Logits zur CPU zurückzukopieren. Das ältere Rejection-Sampling ist langsamer und für die Fehlersuche gedacht."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Position-coupled sampling verifies drafts on the GPU without copying logits back to the CPU. Legacy rejection sampling is slower and is intended for debugging."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il campionamento accoppiato per posizione verifica le bozze sulla GPU senza riportare i logit sulla CPU. Il precedente metodo per rigetto è più lento e serve al debug."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "位置連動サンプリングは logits を CPU に戻さず、GPU 上でドラフトを検証します。従来の棄却サンプリングは低速で、デバッグ用です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "위치 연동 샘플링은 로짓을 CPU로 복사하지 않고 GPU에서 초안 토큰을 검증합니다. 기존 거부 샘플링은 더 느리며 디버깅용입니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При позиционно-связанном сэмплировании черновые токены проверяются на GPU без копирования логитов на CPU. Прежний метод с отклонением медленнее и предназначен для отладки."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按位置耦合采样时，GPU 直接验证草稿词元，无需将 logits 传回 CPU。旧版拒绝采样较慢，用于调试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按位置耦合取樣時，GPU 直接驗證草稿詞元，不必將 logits 傳回 CPU。舊版拒絕取樣較慢，供除錯使用。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.choice.no_speculation" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disattivata"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끔"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выкл."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.choice.position_coupled" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Positionsgekoppelt v1 (GPU)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Position-coupled v1 (GPU)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Accoppiato per posizione v1 (GPU)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "位置連動 v1（GPU）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "위치 연동 v1(GPU)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Позиционно-связанный v1 (GPU)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按位置耦合 v1（GPU）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按位置耦合 v1（GPU）"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.choice.legacy_rejection" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Klassisches Rejection-Sampling v1 (Debug)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Legacy rejection v1 (debug)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per rigetto v1 (debug)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "従来の棄却方式 v1（デバッグ）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기존 거부 샘플링 v1(디버깅)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Прежний метод с отклонением v1 (отладка)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "旧版拒绝采样 v1（调试）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "舊版拒絕取樣 v1（除錯）"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_mode.label" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA-Modus"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA Mode"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modalità LoRA"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA モード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 모드"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Режим LoRA"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 模式"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LoRA 模式"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_mode.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Modus „Zusammenführen“ wird LoRA beim Laden in 8-Bit-NAX-Kacheln integriert. „Bypass“ wendet BF16-Projektionen niedrigen Rangs zur Laufzeit an."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Merge fuses LoRA into 8-bit NAX tiles at load time; Bypass injects BF16 low-rank projections at runtime."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La fusione integra LoRA nei blocchi NAX a 8 bit al caricamento. Il bypass applica proiezioni BF16 a basso rango durante l’inferenza."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "マージは読み込み時に LoRA を 8 ビット NAX タイルへ統合します。バイパスは実行時に BF16 の低ランク射影を適用します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "병합 모드는 로딩할 때 LoRA를 8비트 NAX 타일에 통합합니다. 우회 모드는 추론 중에 BF16 저랭크 투영을 적용합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При слиянии LoRA встраивается в 8-битные блоки NAX при загрузке. В обходном режиме низкоранговые проекции BF16 применяются во время вычислений."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "合并模式在加载时将 LoRA 融入 8 位 NAX 权重块。旁路模式在推理时计算 BF16 低秩投影。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "合併模式在載入時將 LoRA 融入 8 位元 NAX 權重區塊。旁路模式在推論時計算 BF16 低秩投影。"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_mode.merge" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zusammenführen (beim Laden in den gemeinsamen Speicher)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Merge (Load-Time UMA Fusion)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fusione (al caricamento in memoria unificata)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "マージ（読み込み時にユニファイドメモリ上で統合）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "병합(로딩 시 통합 메모리에서 결합)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Слияние (при загрузке в общую память)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "合并（加载时融入统一内存权重）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "合併（載入時融入統一記憶體權重）"
+          }
+        }
+      }
+    },
+    "settings.advanced.lora_mode.bypass" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bypass (BF16-Projektion zur Laufzeit)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bypass (Runtime BF16 Low-Rank)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bypass (proiezione BF16 a basso rango in esecuzione)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "バイパス（実行時の BF16 低ランク射影）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "우회(실행 시 BF16 저랭크 투영)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обход (низкоранговая проекция BF16 при вычислениях)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "旁路（推理时进行 BF16 低秩投影）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "旁路（推論時進行 BF16 低秩投影）"
+          }
+        }
+      }
+    },
+    "settings.miv.legend" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● An den miv-Kern übermittelte Einstellungen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● Sent to the miv core"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● Impostazioni inviate al core miv"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● miv コアに渡す設定"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● miv 코어에 전달되는 설정"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● Параметры, передаваемые ядру miv"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● 发送到 miv 核心的设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "● 傳送至 miv 核心的設定"
+          }
+        }
+      }
+    },
+    "settings.miv.loaded" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Von miv geladen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loaded by miv"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caricato da miv"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv の読み込み設定"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv에서 로드함"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загружено ядром miv"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv 已加载"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "miv 已載入"
+          }
+        }
+      }
+    },
+    "settings.miv.source.model" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "model"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "modello"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデル設定"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 설정"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "модель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型設定"
+          }
+        }
+      }
+    },
+    "settings.miv.source.model_toml" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell-TOML"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "model TOML"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML del modello"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデルの TOML"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 TOML"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型 TOML"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型 TOML"
+          }
+        }
+      }
+    },
+    "settings.miv.source.shared_toml" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "gemeinsame TOML"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "shared TOML"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML condiviso"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共有 TOML"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공유 TOML"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "общий TOML"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共享 TOML"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共用 TOML"
+          }
+        }
+      }
+    },
+    "settings.miv.source.global" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "globale Einstellung"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "global setting"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "impostazione globale"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全体設定"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전역 설정"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "общая настройка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全局设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全域設定"
+          }
+        }
+      }
+    },
+    "settings.miv.source.default" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardwert"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "default"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "predefinito"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "既定値"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "по умолчанию"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认值"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預設值"
+          }
+        }
+      }
+    },
+    "settings.miv.kv" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgeschaltet wird BF16 verwendet, eingeschaltet ein affin quantisierter 4-Bit-KV-Cache."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use BF16 when off and 4-bit affine KV when on."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se disattivato usa BF16. Se attivato usa una cache KV con quantizzazione affine a 4 bit."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オフでは BF16、オンでは 4 ビットのアフィン量子化 KV キャッシュを使います。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끄면 BF16을, 켜면 4비트 아핀 양자화 KV 캐시를 사용합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В выключенном состоянии используется BF16, во включённом — KV-кэш с 4-битным аффинным квантованием."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭时使用 BF16，开启时使用 4 位仿射量化 KV 缓存。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉時使用 BF16，開啟時使用 4 位元仿射量化 KV 快取。"
+          }
+        }
+      }
+    },
+    "settings.miv.forwarded" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird bei Auswahl oder Vererbung vom miv-Kern verwendet."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used by miv when selected or inherited"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il core miv usa questa impostazione quando viene selezionata o ereditata."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選択または継承された値を miv コアが使います。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택하거나 상속한 값을 miv 코어가 사용합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ядро miv использует выбранное или унаследованное значение."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选中或继承该设置时，miv 核心会使用它。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選取或繼承這個設定時，miv 核心會使用它。"
+          }
+        }
+      }
+    },
+    "settings.miv.context_tokens" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld Token"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tokens"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld token"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld トークン"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "토큰 %lld개"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "токенов: %lld"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个词元"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 個詞元"
+          }
+        }
+      }
+    },
+    "settings.miv.ane_idle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE (inaktiv)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE (idle)"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE (inattivo)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE（待機中）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE(유휴)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE (простой)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE（空闲）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE（閒置）"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill_summary" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill: %@"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill: %@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill: %@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プリフィル：%@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프리필: %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предзаполнение: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充：%@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預填充：%@"
+          }
+        }
+      }
+    },
+    "models.format.miv_routed.help" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell enthält .miv-Gewichte und verwendet die MIV-Engine."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model has .miv weights and is routed to the MIV engine."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo modello contiene pesi .miv e usa il motore MIV."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このモデルには .miv の重みがあり、MIV エンジンを使用します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델에는 .miv 가중치가 있으며 MIV 엔진을 사용합니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "У модели есть веса .miv, и она использует движок MIV."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型含有 .miv 权重，当前使用 MIV 引擎。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型含有 .miv 權重，目前使用 MIV 引擎。"
+          }
+        }
+      }
+    },
+    "models.format.miv_available.help" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell enthält .miv-Gewichte. Die Weiterleitung an MIV ist deaktiviert."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model has .miv weights. MIV routing is off."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo modello contiene pesi .miv. L’instradamento verso MIV è disattivato."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このモデルには .miv の重みがあります。MIV へのルーティングはオフです。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 모델에는 .miv 가중치가 있습니다. MIV 라우팅은 꺼져 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "У модели есть веса .miv. Маршрутизация в MIV отключена."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型含有 .miv 权重，当前未启用 MIV 路由。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型含有 .miv 權重，目前未啟用 MIV 路由。"
           }
         }
       }

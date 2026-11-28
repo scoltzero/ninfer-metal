@@ -235,11 +235,11 @@ When `--config` is omitted, `ninfer-metal-serve` auto-loads [`omlx-extend/config
 This monorepo tracks the patched `omlx/` host directly alongside `omlx-extend/` (synced to upstream `jundot/omlx` via [`omlx-extend/patches/`](../omlx-extend/patches/)).
 
 ```bash
-# Verify or apply the Provider SPI patch on ./omlx and run pytest
-./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
+# Check the Provider SPI patch against a separate clean checkout of the pinned upstream tag
+./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir /path/to/upstream-omlx --check-only
 
-# Sync ./omlx to a specific upstream jundot/omlx tag
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
+# Sync the vendored ./omlx tree to the latest upstream jundot/omlx release
+./omlx-extend/scripts/sync_omlx.sh
 ```
 
 Once `io.ninfer.metal/current/` is installed, `oMLX-extend` auto-discovers **`miv Core Backend`** (`mseries_backendd`, falling back to `com.omlx.mseries/current/`, `PATH`, or `build/*/miv/`) and displays installed Path A and Path B microkernels under **`Integrations → External Engines`**. Any model directory containing `model.miv` (or legacy `model.omlxm5`), `model_pack.json`, `omlxm5-manifest.json`, or convertible Qwen `.safetensors` routes lazily to **`miv Core Backend`** (auto-repacking `.safetensors → model.miv` on first Load); unadapted models stay on Stock MLX unchanged. Because `io.ninfer.metal` declares `"lora"` in `capabilities` and `"lora_adapter"` in `supported_standard_settings` (with `lora_mode` `"merge" | "bypass"`, `reload_required: true` exposed in `options_schema` under `external_engine_options`), standard `oMLX` LoRA selection works directly on `miv Core Backend` while external providers that do not declare `"lora_adapter"` preserve conflict checks. Flip **`Use External Engine`** off in **`Model Settings → Advanced Settings`** (writes `external_engine: "stock"`) to force Stock MLX for an adapted model.

@@ -140,19 +140,7 @@ private struct ActiveModelsSection: View {
                                 ModelAliasText(alias: alias)
                             }
                             Spacer(minLength: 8)
-                            if m.virtual != true {
-                                WeightFormatPill(
-                                    label: m.weightFormatBadgeLabel,
-                                    kind: m.weightFormatPillKind,
-                                    tooltip: m.weightFormatTooltip
-                                )
-                                .fixedSize(horizontal: true, vertical: false)
-                                EngineBadgePill(
-                                    engineId: m.resolvedEngineId,
-                                    label: m.compactEngineBadgeLabel,
-                                    tooltip: m.activeEngineTooltip
-                                )
-                            }
+                            ModelRowBadges(model: m, inActiveModels: true)
                             ActiveBadge(model: m)
                             Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
                                 .font(.omlxMono(DesignTokens.FontSize.subheadline))
@@ -172,6 +160,30 @@ private struct ActiveModelsSection: View {
                     }
                 }
             }
+        }
+    }
+}
+
+private struct ModelRowBadges: View {
+    let model: ModelDTO
+    let inActiveModels: Bool
+
+    var body: some View {
+        if let badge = model.listMivBadge {
+            WeightFormatPill(label: ".miv", kind: badge == .routed ? .mivRouted : .miv,
+                             tooltip: badge.help)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        if model.showsOtherListWeightFormat {
+            WeightFormatPill(label: model.weightFormatBadgeLabel, kind: model.weightFormatPillKind,
+                             tooltip: model.weightFormatTooltip)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        if model.showsListEngineBadge(inActiveModels: inActiveModels) {
+            EngineBadgePill(engineId: model.resolvedEngineId,
+                            label: inActiveModels ? model.compactEngineBadgeLabel : model.libraryEngineBadgeLabel,
+                            tooltip: model.activeEngineTooltip)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 }
@@ -348,8 +360,7 @@ private struct LibraryRow: View {
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    weightFormatBadge
-                    activeEngineBadge
+                    ModelRowBadges(model: model, inActiveModels: false)
                     convertingBadge
                     updateBadge
                 }
@@ -438,7 +449,8 @@ private struct LibraryRow: View {
         }
         let highlightedEngineId = (model.resolvedEngineId != "mlx") ? model.resolvedEngineId : nil
         for engine in (model.externalEngines ?? []).filter(\.compatible) {
-            if engine.id == highlightedEngineId { continue }
+            if engine.id == highlightedEngineId ||
+                (model.listMivBadge != nil && ModelDTO.isBuiltinMivEngine(engine.id)) { continue }
             let engineName = ModelDTO.localizedEngineLabel(id: engine.id, fallback: engine.label)
             tags.append((engineName,
                          String(localized: "models.library.external_engine.help",
@@ -472,18 +484,6 @@ private struct LibraryRow: View {
     }
 
     @ViewBuilder
-    private var weightFormatBadge: some View {
-        if model.virtual != true {
-            WeightFormatPill(
-                label: model.weightFormatBadgeLabel,
-                kind: model.weightFormatPillKind,
-                tooltip: model.weightFormatTooltip
-            )
-            .fixedSize(horizontal: true, vertical: false)
-        }
-    }
-
-    @ViewBuilder
     private var convertingBadge: some View {
         if convertingID == model.id {
             HStack(spacing: 4) {
@@ -494,18 +494,6 @@ private struct LibraryRow: View {
                     .font(.omlxText(DesignTokens.FontSize.caption, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
             }
-            .fixedSize(horizontal: true, vertical: false)
-        }
-    }
-
-    @ViewBuilder
-    private var activeEngineBadge: some View {
-        if model.virtual != true && (model.resolvedEngineId != "mlx" || model.isStockEngineOverride) {
-            EngineBadgePill(
-                engineId: model.resolvedEngineId,
-                label: model.libraryEngineBadgeLabel,
-                tooltip: model.activeEngineTooltip
-            )
             .fixedSize(horizontal: true, vertical: false)
         }
     }

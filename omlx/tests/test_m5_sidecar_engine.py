@@ -1371,7 +1371,11 @@ class TestLiveDaemonAndFastAPIE2E:
         ms = ModelSettings(
             external_engine=M5RT_ENGINE_ID,
             m5rt_artifact_path=str(artifact_file),
-            m5rt_options={"metallib_dir": str(LIVE_METALLIB_DIR), "max_context": 1024},
+            m5rt_options={
+                "metallib_dir": str(LIVE_METALLIB_DIR),
+                "max_context": 1024,
+                "max_concurrency": 1,
+            },
         )
         target, reason = resolve_m5rt_target(staged, str(LIVE_DAEMON_PATH), ms)
         assert target is not None, reason
@@ -2083,10 +2087,11 @@ class TestMivV001SettingsCoexistenceAndUI:
             )
             enforcer._running = True
             ceiling = 200 * 1024 * 1024  # soft = 160 MiB
-            usage_samples = iter([180 * 1024 * 1024, 150 * 1024 * 1024])
             enforcer._get_hard_limit_bytes = lambda: ceiling  # type: ignore[method-assign]
             enforcer._get_abort_limit_bytes = lambda: ceiling  # type: ignore[method-assign]
-            enforcer._current_usage_bytes = lambda: next(usage_samples, 150 * 1024 * 1024)  # type: ignore[method-assign]
+            # An intermediate remeasurement can follow CPU image-cache cleanup.
+            # This fixture's sidecar memory drops only after the trim RPC.
+            enforcer._current_usage_bytes = lambda: (150 if srv_v2.trim_calls else 180) * 1024**2  # type: ignore[method-assign]
             enforcer._propagate_memory_limit = lambda: None  # type: ignore[method-assign]
             enforcer._request_scheduler_cache_reclaim = lambda _b: 0  # type: ignore[method-assign]
             enforcer._walk_store_cache_caps = lambda: None  # type: ignore[method-assign]
@@ -2831,21 +2836,30 @@ class TestPathBMultiMicrokernelSidecars:
         # Auto-routed miv Core Backend model
         assert by_id["Qwen3.5-Auto"]["auto_external_engine"] == "m5rt"
         assert by_id["Qwen3.5-Auto"]["active_engine_id"] == "m5rt"
+        assert by_id["Qwen3.5-Auto"]["miv_route_enabled"] is True
+        assert by_id["Qwen3.5-Auto"]["miv_artifact_format"] == "omlxm5"
         assert by_id["Qwen3.5-Auto"]["active_engine_label"] == "miv Core Backend"
 
         # Adapted model overridden to "stock" MUST still report auto_external_engine="m5rt"
         assert by_id["Qwen3.5-StockOverride"]["auto_external_engine"] == "m5rt"
         assert by_id["Qwen3.5-StockOverride"]["active_engine_id"] == "mlx"
+        assert by_id["Qwen3.5-StockOverride"]["miv_route_enabled"] is False
+        assert by_id["Qwen3.5-StockOverride"]["miv_artifact_format"] == "omlxm5"
         assert by_id["Qwen3.5-StockOverride"]["active_engine_label"] == "MLX"
+        for model in by_id.values():
+            assert model["mxfp4_w4a4_supported"] == (model["quant_format"] == "mxfp4")
 
         # Auto-routed Path B microkernel model
         assert by_id["Llama3-PathB"]["auto_external_engine"] == "llama-metal"
         assert by_id["Llama3-PathB"]["active_engine_id"] == "llama-metal"
+        assert by_id["Llama3-PathB"]["miv_route_enabled"] is False
+        assert by_id["Llama3-PathB"]["miv_artifact_format"] is None
         assert by_id["Llama3-PathB"]["active_engine_label"] == "Llama Metal 4 (Path B)"
 
         # Unadapted model stays 100% Stock MLX
         assert by_id["Plain-MLX"]["auto_external_engine"] is None
         assert by_id["Plain-MLX"]["active_engine_id"] == "mlx"
+        assert by_id["Plain-MLX"]["miv_artifact_format"] is None
         assert by_id["Plain-MLX"]["active_engine_label"] == "MLX"
 
     def test_shared_default_ninfer_metal_toml_reuse_and_precedence(
@@ -3147,6 +3161,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_before["weight_format"] == "safetensors"
+        assert fmt_before["miv_artifact_format"] is None
         assert fmt_before["pending_auto_repack"] is True
         assert fmt_before["repack_target_format"] == "miv"
 
@@ -3164,6 +3179,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_after["weight_format"] == "miv"
+        assert fmt_after["miv_artifact_format"] == "miv"
         assert fmt_after["has_miv_weights"] is True
         assert fmt_after["pending_auto_repack"] is False
 
@@ -3172,10 +3188,35 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="stock", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_stock["weight_format"] == "safetensors"
+        assert fmt_stock["miv_artifact_format"] == "miv"
         assert fmt_stock["has_miv_weights"] is True
 
         ok_after, _ = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
         assert ok_after is False
+
+    def test_stock_format_badge_recognizes_cached_target_but_not_mtp_companion(
+        self, tmp_path, monkeypatch
+    ):
+        model = tmp_path / "Model"
+        model.mkdir()
+        (model / "model.safetensors").touch()
+        (model / "mtp.miv").touch()
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setenv("OMLX_M5RT_ARTIFACT_DIR", str(cache))
+        monkeypatch.setattr(m5_mod, "_REPO_ROOT", tmp_path)
+        assert m5_mod.detect_model_weight_format_info(
+            model, active_external_engine="stock"
+        )["miv_artifact_format"] is None
+
+        (cache / "Model.miv").touch()
+        info = m5_mod.detect_model_weight_format_info(model, active_external_engine="stock")
+        assert info["miv_artifact_format"] == "miv"
+        assert info["weight_format"] == "safetensors"
+        assert info["quant_format"] == "unknown"
+        assert info["mxfp4_w4a4_supported"] is False
+        # A cached badge must not change the pre-existing on-disk weights signal.
+        assert info["has_miv_weights"] is False
 
     async def test_auto_repack_on_first_load_and_foundry_path_b_converter(
         self, tmp_path: Path, monkeypatch
@@ -4697,6 +4738,22 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
     assert eff["prefill_ane_offload_tokens"] == 4096
 
 
+@pytest.mark.parametrize("kind", ["gguf", "missing", "not-a-directory"])
+def test_weight_format_badges_have_a_complete_empty_contract(tmp_path, kind):
+    path = {"gguf": tmp_path, "missing": None, "not-a-directory": tmp_path / "absent"}[kind]
+    gguf = kind == "gguf"
+    info = m5_mod.detect_model_weight_format_info(path, model_format="gguf" if gguf else None)
+    assert info == {
+        "weight_format": "gguf" if gguf else "safetensors",
+        "quant_format": "gguf" if gguf else "unknown",
+        "mxfp4_w4a4_supported": False,
+        "miv_artifact_format": None,
+        "has_miv_weights": False,
+        "pending_auto_repack": False,
+        "repack_target_format": None,
+    }
+
+
 def test_detect_model_weight_format_info_quant_format_and_mxfp4_w4a4_support(
     tmp_path: Path,
 ) -> None:
@@ -4751,6 +4808,7 @@ def test_detect_model_weight_format_info_quant_format_and_mxfp4_w4a4_support(
         ],
     )
     info_mxfp4 = m5_mod.detect_model_weight_format_info(mxfp4_dir, active_external_engine="m5rt")
+    assert info_mxfp4["miv_artifact_format"] == "miv"
     assert info_mxfp4["quant_format"] == "mxfp4"
     assert info_mxfp4["mxfp4_w4a4_supported"] is True
 

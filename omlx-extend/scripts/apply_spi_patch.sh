@@ -9,16 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTEND_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${EXTEND_DIR}/.." && pwd)"
 
-UPSTREAM_VERSION_FILE="${EXTEND_DIR}/UPSTREAM_VERSION"
-DEFAULT_UPSTREAM_TAG="v0.8.3"
-if [[ -f "${UPSTREAM_VERSION_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${UPSTREAM_VERSION_FILE}"
-  DEFAULT_UPSTREAM_TAG="${UPSTREAM_TAG:-${DEFAULT_UPSTREAM_TAG}}"
-fi
-
 OMLX_DIR="${REPO_ROOT}/omlx"
-PATCH_FILE="${EXTEND_DIR}/patches/omlx-${DEFAULT_UPSTREAM_TAG}-provider-spi.patch"
+PATCH_FILE=""
 CHECK_ONLY=0
 RUN_TESTS=0
 
@@ -50,6 +42,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "${PATCH_FILE}" ]]; then
+  UPSTREAM_VERSION_FILE="${EXTEND_DIR}/UPSTREAM_VERSION"
+  UPSTREAM_TAG=""
+  if [[ -f "${UPSTREAM_VERSION_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${UPSTREAM_VERSION_FILE}"
+  fi
+  if [[ -z "${UPSTREAM_TAG}" ]]; then
+    echo "ERROR: UPSTREAM_TAG missing from ${UPSTREAM_VERSION_FILE}; pass --patch FILE." >&2
+    exit 1
+  fi
+  PATCH_FILE="${EXTEND_DIR}/patches/omlx-${UPSTREAM_TAG}-provider-spi.patch"
+fi
 
 if [[ ! -d "${OMLX_DIR}" ]]; then
   echo "ERROR: oMLX directory not found: ${OMLX_DIR}" >&2

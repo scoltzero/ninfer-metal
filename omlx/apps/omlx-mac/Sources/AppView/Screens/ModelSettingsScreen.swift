@@ -61,8 +61,9 @@ struct ModelSettingsScreen: View {
                 let backend = config.speculativeBackend == "none"
                     ? "AR" : "\(config.speculativeBackend.uppercased()) K=\(config.maxDraftTokens)"
                 let prefillSuffix = mivPrefillSummary(config)
+                let context = String(localized: "settings.miv.context_tokens", defaultValue: "\(config.maxContext) tokens")
                 Text(String(localized: "settings.miv.loaded", defaultValue: "Loaded by miv")
-                     + ": \(backend) · \(config.kvDtype) · \(config.maxContext) tokens"
+                     + ": \(backend) · \(config.kvDtype) · \(context)"
                      + " · B=\(config.maxConcurrency) (\(mivConcurrencySource(config.concurrencySource)))"
                      + " · \(config.samplingContractId)"
                      + prefillSuffix)
@@ -100,7 +101,8 @@ struct ModelSettingsScreen: View {
             tags.append("ANE(idle)")
         }
         guard !tags.isEmpty else { return "" }
-        return " · Prefill: " + tags.joined(separator: "+")
+        let modes = tags.joined(separator: "+")
+        return " · " + String(localized: "settings.miv.prefill_summary", defaultValue: "Prefill: \(modes)")
     }
 
     private func mivConcurrencySource(_ source: String) -> String {
@@ -2256,7 +2258,7 @@ private struct ExternalEngineOptionsRows: View {
     var body: some View {
         ForEach(vm.externalEngineGeneralOptions) { opt in
             Row(label: vm.externalEngineOptionDisplayLabel(opt),
-                sublabel: opt.description ?? "",
+                sublabel: vm.externalEngineOptionDetail(opt),
                 mivSetting: vm.usesMiv) {
                 control(for: opt)
             }
@@ -2284,7 +2286,7 @@ private struct ExternalEngineOptionsRows: View {
                     }
                 ),
                 width: .controlWide,
-                options: opt.options.map { ($0, opt.optionLabels[$0] ?? $0) }
+                options: opt.options.map { ($0, vm.externalEngineOptionChoice($0, for: opt)) }
             )
         case "int" where (opt.minValue != nil && opt.maxValue != nil && (opt.maxValue! - opt.minValue!) <= 16):
             let lo = Int(opt.minValue!.rounded())
@@ -2326,7 +2328,7 @@ private struct ExternalEngineOptionsRows: View {
                     get: { draftTexts[opt.key] ?? vm.externalEngineStringOption(opt) },
                     set: { draftTexts[opt.key] = $0 }
                 ),
-                placeholder: "(Auto)",
+                placeholder: String(localized: "external_engine.auto.short", defaultValue: "Auto"),
                 mono: true,
                 width: .controlWide
             )
@@ -3398,6 +3400,27 @@ private struct ExperimentalSection: View {
                                       placeholder: "4", mono: true, width: .controlNarrow)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.indexCacheEnabled))
+                    }
+                }
+            }
+
+            if vm.loopcdSupported {
+                Row(label: String(localized: "settings.experimental.loopcd.label",
+                                  defaultValue: "LoopCD",
+                                  comment: "Row label for the LoopCD toggle"),
+                    sublabel: String(localized: "settings.experimental.loopcd.sub",
+                                     defaultValue: "Contrast the last loop pass with the first to choose tokens. Can improve answers, but is slower and uses more memory.",
+                                     comment: "Sublabel describing LoopCD")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.loopcdEnabled))
+                }
+                if vm.loopcdEnabled {
+                    Row(label: String(localized: "settings.experimental.loopcd.skip_thinking.label",
+                                      defaultValue: "Exclude Thinking Blocks",
+                                      comment: "Row label for the toggle that keeps LoopCD out of thinking blocks"),
+                        sublabel: String(localized: "settings.experimental.loopcd.skip_thinking.sub",
+                                         defaultValue: "Apply LoopCD only to the answer and tool calls. Recommended by its authors for coding agents.",
+                                         comment: "Sublabel for the toggle that keeps LoopCD out of thinking blocks")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.loopcdSkipThinking))
                     }
                 }
             }

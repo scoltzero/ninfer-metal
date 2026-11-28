@@ -231,11 +231,11 @@ Lorsque `--config` est omis, `ninfer-metal-serve` charge automatiquement [`omlx-
 Ce monorepo suit directement l'hôte `omlx/` patché aux côtés d'`omlx-extend/` (synchronisé avec l'upstream `jundot/omlx` via [`omlx-extend/patches/`](../../../omlx-extend/patches/)).
 
 ```bash
-# Verify or apply the Provider SPI patch on ./omlx and run pytest
-./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
+# Check the Provider SPI patch against a separate clean checkout of the pinned upstream tag
+./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir /path/to/upstream-omlx --check-only
 
-# Sync ./omlx to a specific upstream jundot/omlx tag
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
+# Sync the vendored ./omlx tree to the latest upstream jundot/omlx release
+./omlx-extend/scripts/sync_omlx.sh
 ```
 
 Une fois `io.ninfer.metal/current/` installé, `oMLX-extend` détecte automatiquement **`miv Core Backend`** (`mseries_backendd`, avec repli sur `com.omlx.mseries/current/`, `PATH` ou `build/*/miv/`) et affiche les microkernels Voie A et Voie B installés sous **`Integrations → External Engines`**. Tout répertoire de modèle contenant `model.miv` / `model.omlxm5`, `model_pack.json` ou `omlxm5-manifest.json` est routé à la demande vers **`miv Core Backend`** ; les modèles non adaptés restent sur Stock MLX sans modification. Désactive **`Use External Engine`** dans **`Model Settings → Advanced Settings`** (écrit `external_engine: "stock"`) pour forcer Stock MLX sur un modèle adapté.

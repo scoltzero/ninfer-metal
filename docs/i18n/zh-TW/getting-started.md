@@ -213,11 +213,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 本單一儲存庫在 `omlx-extend/` 旁直接追蹤已套用修補檔的 `omlx/` 宿主程式碼，並透過 [`omlx-extend/patches/`](../../../omlx-extend/patches/) 與上游 `jundot/omlx` 保持同步。
 
 ```bash
-# Verify or apply the Provider SPI patch on ./omlx and run pytest
-./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
+# Check the Provider SPI patch against a separate clean checkout of the pinned upstream tag
+./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir /path/to/upstream-omlx --check-only
 
-# Sync ./omlx to a specific upstream jundot/omlx tag
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
+# Sync the vendored ./omlx tree to the latest upstream jundot/omlx release
+./omlx-extend/scripts/sync_omlx.sh
 ```
 
 安裝完成 `io.ninfer.metal/current/` 後，`oMLX-extend` 會自動偵測 **`miv 核心後端`**（`mseries_backendd`，依序退回搜尋 `com.omlx.mseries/current/`、`PATH` 或 `build/*/miv/`），並於 **整合 → 外部引擎**（`Integrations → External Engines`）顯示已安裝的路徑 A 與路徑 B 微核心卡片。只要模型目錄含 `model.miv` / `model.omlxm5`、`model_pack.json` 或 `omlxm5-manifest.json`，系統即會在首次請求時延遲路由至 **`miv 核心後端`**，未適配模型維持原版 MLX 執行。若要讓已適配模型強制改回原版 MLX，在 **模型設定 → 進階設定** 關閉 **`Use External Engine`** 開關（寫入 `external_engine: "stock"`）即可。

@@ -29,7 +29,7 @@
 - **Python 非依存・MLX 非依存**: ネイティブの `ninfer-metal-serve` および `mseries_backendd` を含む 16 本の Mach-O バイナリと 38 本の事前コンパイル済み `.metallib` シェーダを収録する。リンク先は macOS システムフレームワークのみであり、Xcode・Python・Homebrew dylib のないクリーンな Mac でそのまま動作する。
 - **単体 OpenAI サーバー（`ninfer-metal-serve`）**: 単一の C++20 バイナリでインプロセス `miv` と並列ルート B SPI v2 マイクロカーネルを 1 つの HTTP/SSE ポート（`/v1/chat/completions`、`/v1/completions`、`/v1/models`、`/health`、`/metrics`）にホストし、C++ BPE トークナイザ、Jinja チャットテンプレート、`<think>` の `reasoning_content` 分離、Qwen XML/JSON `<tool_call>` パーサを内蔵する。Open WebUI、Cursor、Cline、NewAPI、各種 OpenAI SDK からそのまま接続できる。
 - **単一常駐 NAX ウェイト & `0-ULP` 完全一致**: オフライン NAX プリタイリング（`.miv`）により、Prefill・`T=1` AR デコード・投機検証のすべてを単一の常駐ウェイトコピー（成果物サイズ `1.0×`）から供給する。ベースライン **`miv-v0.01`** は Qwen3.5 / Qwen3.6 / Qwen3.8 ハイブリッドモデル（Dense 27B および 35B-A3B MoE）を `MXFP4` および `oQ` Affine（`q3–q8`）で実行し、`affine4_g128` KV キャッシュ、Native MTP / DFlash2、マルチユーザーバッチ処理（`B/C = 1..8`）、ローリング UMA プレフィックス再利用に対応する。
-- **ドロップイン `oMLX-extend` 共存**: AF_UNIX Provider SPI v2 サイドカー経由で **`miv Core Backend`** を公開する `oMLX-extend`（`jundot/omlx` 上の `omlx-extend-v0.8.3`）を同梱する。変換済み `.miv` モデルは O(1) で自動ルーティングされ、未変換モデルは Stock MLX 上でそのまま動作し、サイドカーモデルと MLX モデルは単一のメモリ上限のもとで UMA を共有する。
+- **ドロップイン `oMLX-extend` 共存**: AF_UNIX Provider SPI v2 サイドカー経由で **`miv Core Backend`** を公開する `oMLX-extend`（`jundot/omlx` `v0.8.4` ベースのソースコード）を同梱する。変換済み `.miv` モデルは O(1) で自動ルーティングされ、未変換モデルは Stock MLX 上でそのまま動作し、サイドカーモデルと MLX モデルは単一のメモリ上限のもとで UMA を共有する。
 
 ---
 

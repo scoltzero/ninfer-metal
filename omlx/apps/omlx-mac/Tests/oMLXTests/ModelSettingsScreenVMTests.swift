@@ -887,6 +887,15 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLoopCDIsSentOnlyForLoopedModels() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "inkling2")
+        XCTAssertNil(vm.workingSettingsBody()[ProfileSettingsKey.loopcdEnabled])
+        vm.model = makeModel(id: "m", configModelType: "inkling2_loop")
+        vm.loopcdEnabled = true
+        XCTAssertEqual(vm.workingSettingsBody()[ProfileSettingsKey.loopcdEnabled]?.value as? Bool, true)
+    }
+
     func testGPUPowerLimitSendsZeroWhenOff() throws {
         let vm = ModelSettingsScreenVM()
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)
@@ -1233,6 +1242,40 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.externalEngineEnumOption(general[2]), "position_coupled_v1")
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["max_concurrency"]?.value as? Int, 1)
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
+    }
+
+    func testThirdPartyOptionsKeepProviderLabelsAndWireValues() throws {
+        let vm = ModelSettingsScreenVM()
+        var model = makeModel(id: "custom-model", configModelType: "custom")
+        model.externalEngines = [
+            ExternalEngineOption(id: "custom", label: "Custom", compatible: true, reason: nil,
+                optionsSchema: [[
+                    "key": AnyCodable("sampling_contract"), "type": AnyCodable("enum"),
+                    "label": AnyCodable("Provider policy"), "description": AnyCodable("Provider detail"),
+                    "options": AnyCodable([AnyCodable("position_coupled_v1")]),
+                    "option_labels": AnyCodable(["position_coupled_v1": AnyCodable("Provider choice")]),
+                ], [
+                    "key": AnyCodable("prefill_linear_mode"), "type": AnyCodable("enum"),
+                    "options": AnyCodable([AnyCodable("w4a4")]),
+                    "label": AnyCodable("Provider prefill"),
+                ]])
+        ]
+        vm.model = model
+        vm.externalEngine = "custom"
+        XCTAssertEqual(vm.externalEngineGeneralOptions.map(\.key), ["sampling_contract", "prefill_linear_mode"])
+        let option = try XCTUnwrap(vm.externalEngineGeneralOptions.first)
+        XCTAssertEqual(vm.externalEngineOptionDisplayLabel(option), "Provider policy")
+        XCTAssertEqual(vm.externalEngineOptionDetail(option), "Provider detail")
+        XCTAssertEqual(vm.externalEngineOptionChoice("position_coupled_v1", for: option), "Provider choice")
+        vm.setExternalEngineEnumOption(option, "position_coupled_v1")
+        XCTAssertEqual(vm.externalEngineEnumOption(option), "position_coupled_v1")
+
+        let prefill = try XCTUnwrap(vm.externalEngineGeneralOptions.last)
+        vm.externalEngineOptions["custom"] = ["prefill_linear_mode": AnyCodable("w4a4")]
+        XCTAssertEqual(vm.normalizeMivPrefillOptionsForCurrentModel(), [])
+        XCTAssertEqual(vm.externalEngineEnumOption(prefill), "w4a4")
+        vm.setExternalEngineEnumOption(prefill, "w4a4")
+        XCTAssertEqual(vm.externalEngineEnumOption(prefill), "w4a4")
     }
 
     func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportModesA4GatingAndTelemetry() throws {

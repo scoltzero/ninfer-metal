@@ -429,6 +429,9 @@ final class ModelSettingsScreenVM {
     /// when it is outside the UI range, as the web admin does.
     private var loadedMoeResidentFraction: Double = 0.25
 
+    var loopcdEnabled: Bool = false
+    var loopcdSkipThinking: Bool = false
+
     // Chat-template kwargs — entries are the editor's view of the
     // (chat_template_kwargs, forced_ct_kwargs) server pair.
     var chatTemplateEntries: [ChatTemplateKwargEntry] = []
@@ -673,6 +676,8 @@ final class ModelSettingsScreenVM {
                comment: "Error shown when the MoE resident expert percent is outside 5-95")
     }
 
+    var loopcdSupported: Bool { model?.configModelType == "inkling2_loop" }
+
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
     var gpuPowerLimitSupported: Bool { model?.gpuPowerLimitSupported == true }
     /// The watt value when it is in the range the server accepts.
@@ -898,6 +903,8 @@ final class ModelSettingsScreenVM {
                 self.guidedGrammar = s?.guidedGrammar ?? ""
                 self.moeExpertOffloadEnabled = m.moeExpertOffloadSupported == true
                     && (s?.moeExpertOffloadEnabled ?? false)
+                self.loopcdEnabled = s?.loopcdEnabled ?? false
+                self.loopcdSkipThinking = s?.loopcdSkipThinking ?? false
                 self.loadedMoeResidentFraction = s?.moeExpertOffloadResidentFraction ?? 0.25
                 self.moeExpertOffloadResidentPercent = Self.formatPct(self.loadedMoeResidentFraction * 100)
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
@@ -1526,7 +1533,7 @@ final class ModelSettingsScreenVM {
     }
 
     var showsExternalEngineLoraMode: Bool {
-        guard externalEngineSupports("lora_adapter"), !effectiveExternalEngine.isEmpty else {
+        guard usesMiv, externalEngineSupports("lora_adapter") else {
             return false
         }
         guard let row = model?.externalEngines?.first(where: { $0.id == effectiveExternalEngine }),
@@ -1701,11 +1708,11 @@ final class ModelSettingsScreenVM {
         return model.id.localizedCaseInsensitiveContains("mxfp4")
     }
 
-    /// Unconditionally normalizes any saved `"w4a4"` back to `"w4a8"` across all models.
+    /// Normalize the retired MIV control without changing another provider’s schema values.
     @discardableResult
     func normalizeMivPrefillOptionsForCurrentModel() -> [String] {
         let active = effectiveExternalEngine
-        guard !active.isEmpty else { return [] }
+        guard ModelDTO.isBuiltinMivEngine(active) else { return [] }
         var normalized = false
         for key in optionLookupKeys(for: active) {
             if let raw = externalEngineOptions[key]?["prefill_linear_mode"]?.value as? String,
@@ -1731,7 +1738,7 @@ final class ModelSettingsScreenVM {
         let supportedTypes: Set<String> = ["int", "bool", "bytes_gb", "enum", "string", "float", "number"]
         return schema.compactMap { entry in
             guard let key = entry["key"]?.value as? String, !key.isEmpty,
-                  key != "lora_mode",
+                  (!usesMiv || key != "lora_mode"),
                   let type = entry["type"]?.value as? String,
                   supportedTypes.contains(type) else {
                 return nil
@@ -1787,8 +1794,10 @@ final class ModelSettingsScreenVM {
     }
 
     var externalEngineGeneralOptions: [ExternalEngineSchemaOption] {
+        let options = allExternalEngineSchemaOptions()
+        guard usesMiv else { return options }
         let prefillSet = Set(Self.externalEnginePrefillOptionKeys)
-        return allExternalEngineSchemaOptions().filter { !prefillSet.contains($0.key) }
+        return options.filter { !prefillSet.contains($0.key) }
     }
 
     var activeMivLinearMode: String {
@@ -1927,6 +1936,7 @@ final class ModelSettingsScreenVM {
     }
 
     func externalEngineOptionDisplayLabel(_ opt: ExternalEngineSchemaOption) -> String {
+        guard usesMiv else { return opt.label }
         switch opt.key {
         case "prefill_linear_mode":
             return String(localized: "settings.miv.prefill.opt.linear",
@@ -1952,6 +1962,12 @@ final class ModelSettingsScreenVM {
             return String(localized: "settings.advanced.external_engine.opt.max_concurrency",
                           defaultValue: "Concurrency (B/C)",
                           comment: "External engine option label for max concurrent slots")
+        case "max_context":
+            return String(localized: "settings.advanced.external_engine.opt.max_context",
+                          defaultValue: "Maximum Context Window")
+        case "speculative_backend":
+            return String(localized: "settings.advanced.external_engine.opt.speculative_backend",
+                          defaultValue: "Speculative Decoding Backend")
         case "rolling_prefix_cache":
             return String(localized: "settings.advanced.external_engine.opt.rolling_prefix_cache",
                           defaultValue: "Rolling Prefix Cache",
@@ -1974,6 +1990,41 @@ final class ModelSettingsScreenVM {
                           comment: "External engine option label for custom draft artifact path")
         default:
             return opt.label
+        }
+    }
+
+    func externalEngineOptionDetail(_ opt: ExternalEngineSchemaOption) -> String {
+        guard usesMiv else { return opt.description ?? "" }
+        switch opt.key {
+        case "max_context":
+            return String(localized: "settings.advanced.external_engine.hint.max_context",
+                          defaultValue: "Maximum sequence length in tokens. Models that support it can use 256K tokens (262144) or more.")
+        case "sampling_contract":
+            return String(localized: "settings.advanced.external_engine.hint.sampling_contract",
+                          defaultValue: "Position-coupled sampling verifies drafts on the GPU without copying logits back to the CPU. Legacy rejection sampling is slower and is intended for debugging.")
+        default:
+            return opt.description ?? ""
+        }
+    }
+
+    func externalEngineOptionChoice(_ value: String, for opt: ExternalEngineSchemaOption) -> String {
+        let fallback = opt.optionLabels[value] ?? value
+        guard usesMiv else { return fallback }
+        switch (opt.key, value) {
+        case ("speculative_backend", "auto"):
+            return String(localized: "external_engine.auto.short", defaultValue: "Auto")
+        case ("speculative_backend", "none"):
+            return String(localized: "settings.advanced.external_engine.choice.no_speculation",
+                          defaultValue: "Off")
+        case ("speculative_backend", "mtp"): return "MTP"
+        case ("speculative_backend", "dflash2"): return "DFlash2"
+        case ("sampling_contract", "position_coupled_v1"):
+            return String(localized: "settings.advanced.external_engine.choice.position_coupled",
+                          defaultValue: "Position-coupled v1 (GPU)")
+        case ("sampling_contract", "legacy_rejection_v1"):
+            return String(localized: "settings.advanced.external_engine.choice.legacy_rejection",
+                          defaultValue: "Legacy rejection v1 (debug)")
+        default: return fallback
         }
     }
 
@@ -2058,7 +2109,9 @@ final class ModelSettingsScreenVM {
     }
 
     func setExternalEngineEnumOption(_ opt: ExternalEngineSchemaOption, _ value: String) {
-        let resolved = (opt.key == "prefill_linear_mode" && value.lowercased() == "w4a4") ? "w4a8" : value
+        let retiredMivValue = ModelDTO.isBuiltinMivEngine(effectiveExternalEngine)
+            && opt.key == "prefill_linear_mode" && value.lowercased() == "w4a4"
+        let resolved = retiredMivValue ? "w4a8" : value
         writeExternalEngineOptionValue(resolved, forKey: opt.key)
     }
 
@@ -2543,6 +2596,11 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "IndexCache",
                                     comment: "Row label for the DSA IndexCache toggle"))
             }
+            if loopcdSupported && loopcdEnabled {
+                items.append(String(localized: "settings.experimental.loopcd.label",
+                                    defaultValue: "LoopCD",
+                                    comment: "Row label for the LoopCD toggle"))
+            }
             if specprefillEnabled {
                 items.append(String(localized: "settings.experimental.specprefill.label",
                                     defaultValue: "SpecPrefill",
@@ -2669,6 +2727,10 @@ final class ModelSettingsScreenVM {
                 if let fraction = moeExpertOffloadResidentFraction {
                     out[ProfileSettingsKey.moeExpertOffloadResidentFraction] = AnyCodable(fraction)
                 }
+            }
+            if loopcdSupported {
+                putBool(ProfileSettingsKey.loopcdEnabled, loopcdEnabled)
+                putBool(ProfileSettingsKey.loopcdSkipThinking, loopcdSkipThinking)
             }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled {

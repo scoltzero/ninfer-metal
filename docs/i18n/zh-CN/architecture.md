@@ -14,7 +14,7 @@ flowchart LR
         OAI["Open WebUI / Cursor / Cline<br/>NewAPI / OpenAI SDK"]
     end
 
-    subgraph Host["oMLX-extend (omlx-extend-v0.8.3, Provider SPI v2)"]
+    subgraph Host["oMLX-extend (jundot/omlx v0.8.4, Provider SPI v2)"]
         Router["O(1) Auto Model Router<br/>detect_adapted()"]
         Stock["Stock oMLX MLX<br/>(Unadapted models untouched)"]
         Enforcer["ProcessMemoryEnforcer<br/>& EnginePool"]
@@ -108,7 +108,7 @@ flowchart LR
 | 轨道 | 路径 | 标签格式 | 工作流 |
 |---|---|---|---|
 | **推理核心** | `miv/` | `miv-v0.01`（`<codename>-vX.YZ`） | [`.github/workflows/release-ninfer-metal.yml`](../../../.github/workflows/release-ninfer-metal.yml) |
-| **宿主扩展** | `omlx/` + `omlx-extend/` | `omlx-extend-v0.8.3`（`omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mix1..9`） | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
+| **宿主扩展** | `omlx/` + `omlx-extend/` | `omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mixN` | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
 
 核心发布包并排解压至 `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/versions/<tag>/`，通过原子切换 `current` 符号链接生效——升级和单命令回滚都不触动 oMLX 的 Python 环境。
 

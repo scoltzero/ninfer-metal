@@ -67,6 +67,9 @@ class _FakePool:
     def _engine_runtime_signature(self, model_id, runtime_settings=None):
         return ()
 
+    def external_engine_id(self, model_id, model_settings):
+        return None  # The fixture serves model-a with the stock batched engine.
+
     def splash_target(self, model_id, model_settings):
         return None, ""
 

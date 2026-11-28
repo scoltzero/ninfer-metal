@@ -208,6 +208,7 @@
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',
+                    macos_say_enabled: false,
                     web_search_provider: 'ddgs',
                     web_search_brave_api_key: '',
                     web_search_searxng_url: '',
@@ -222,6 +223,7 @@
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
+                    splash_max_concurrent_requests: null,
                 },
                 external_engines: {
                     splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
@@ -265,8 +267,8 @@
             managerSortOrder: localStorage.getItem('omlx_manager_sort_order') || MANAGER_SORT_DEFAULT.order,
             managerSearch: '',
 
-            // Auth UI state
             showApiKey: false,
+            revealedStoredApiKey: '',
             // Sub key management
             newSubKeyValue: '',
             newSubKeyName: '',
@@ -394,7 +396,7 @@
                 total_requests: 0,
                 host: '127.0.0.1',
                 port: 8000,
-                api_key: '',
+                api_key_set: false,
                 engines: {},
                 active_models: {
                     models: [],
@@ -705,9 +707,14 @@
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
-            // bench is running" banner + disables Start so the user doesn't
-            // race a 409 on the server.
+            // bench is running" banner.
             benchOtherActive: null,
+            benchQueue: [],
+            // One follow loop at a time; a second would double-poll.
+            benchFollowing: false,
+            // Config of the run on screen; the form may already describe a queued one.
+            benchRun: null,
+            benchCompleted: [],
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -1315,7 +1322,7 @@
                             usage: { ...this.globalSettings.usage, ...data.usage },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
-                            auth: { ...this.globalSettings.auth, ...data.auth },
+                            auth: { ...this.globalSettings.auth, ...data.auth, api_key: '' },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             external_engines: { ...this.globalSettings.external_engines, ...data.external_engines },
@@ -1323,6 +1330,8 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        this.showApiKey = false;
+                        this.revealedStoredApiKey = '';
                         const layoutLib = this._dashLayoutLib();
                         this.dashLayout = layoutLib
                             ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
@@ -2359,6 +2368,8 @@
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
+                    loopcd_enabled: s.loopcd_enabled === true,
+                    loopcd_skip_thinking: s.loopcd_skip_thinking === true,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -2370,7 +2381,7 @@
                         if (s.m5rt_options && typeof s.m5rt_options === 'object') {
                             ext.m5rt = { ...(ext.m5rt || {}), ...JSON.parse(JSON.stringify(s.m5rt_options)) };
                         }
-                        this.normalizeExternalEnginePrefillOptionsMap(ext, model);
+                        this.normalizeExternalEnginePrefillOptionsMap(ext);
                         return ext;
                     })(),
                     external_engines: model?.external_engines || [],
@@ -3761,13 +3772,15 @@
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
                     lora_adapter: ms.lora_adapter || null,
+                    loopcd_enabled: !!ms.loopcd_enabled,
+                    loopcd_skip_thinking: !!ms.loopcd_skip_thinking,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
                 if (!isDiffusion && ms.external_engine_options && typeof ms.external_engine_options === 'object' && Object.keys(ms.external_engine_options).length > 0) {
                     const extCopy = JSON.parse(JSON.stringify(ms.external_engine_options));
                     if (!ms._skipPrefillNormalize) {
-                        this.normalizeExternalEnginePrefillOptionsMap(extCopy, this.selectedModel);
+                        this.normalizeExternalEnginePrefillOptionsMap(extCopy);
                     }
                     payload.external_engine_options = extCopy;
                 }
@@ -4360,15 +4373,13 @@
                 return `${name}=${this.shellQuote(value)}`;
             },
 
-            get claudeCodeCommand() {
-                return this._claudeCodeCommand(this.stats.api_key);
+            async claudeCodeCommand() {
+                const authToken = this.stats.api_key_set ? await this.fetchStoredApiKey() : '';
+                return this._claudeCodeCommand(authToken);
             },
 
-            // On-screen variant with the auth token masked (sub-key style), so
-            // the rendered dashboard never exposes the API key; the copy
-            // button still copies the real claudeCodeCommand.
             get claudeCodeCommandDisplay() {
-                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+                return this._claudeCodeCommand(this.stats.api_key_set ? '••••••••' : '');
             },
 
             _claudeCodeCommand(authToken) {
@@ -4395,6 +4406,35 @@
                 // re-prefills the whole conversation on a caching server (#2349).
                 parts.push('claude --disallowedTools LSP');
                 return parts.join(' ');
+            },
+
+            async fetchStoredApiKey() {
+                const response = await fetch('/admin/api/auth/api-key', { method: 'POST' });
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return '';
+                }
+                if (!response.ok) {
+                    throw new Error('Failed to fetch API key');
+                }
+                const data = await response.json();
+                return data.api_key;
+            },
+
+            async toggleShowApiKey() {
+                if (this.showApiKey) {
+                    this.showApiKey = false;
+                    this.revealedStoredApiKey = '';
+                    return;
+                }
+                if (!this.globalSettings.auth.api_key && this.globalSettings.auth.api_key_set) {
+                    this.revealedStoredApiKey = await this.fetchStoredApiKey();
+                }
+                this.showApiKey = true;
+            },
+
+            get apiKeyInputDisplay() {
+                return this.globalSettings.auth.api_key || (this.showApiKey ? this.revealedStoredApiKey : '');
             },
 
             async saveClaudeCodeSettings() {
@@ -4860,6 +4900,7 @@
                             markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
                             markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
                             markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
+                            macos_say_enabled: this.globalSettings.integrations.macos_say_enabled,
                             web_search_provider: this.globalSettings.integrations.web_search_provider,
                             web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
                             web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
@@ -4874,6 +4915,7 @@
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
+                            splash_max_concurrent_requests: this.globalSettings.integrations.splash_max_concurrent_requests,
                         }),
                     });
                     if (!response.ok) {
@@ -4915,16 +4957,38 @@
                 return engines.some(e => e.can_convert);
             },
 
-            modelWeightFormatLabel(model) {
-                if (!model || model.virtual) return '';
-                if (model.pending_auto_repack) {
-                    const target = model.repack_target_format || 'miv';
-                    return `safetensors → .${target}`;
+            modelHasMivArtifact(model) {
+                if (model.virtual) return false;
+                if (model.miv_artifact_format !== undefined || typeof model.miv_route_enabled === 'boolean') {
+                    return ['miv', 'omlxm5'].includes(model.miv_artifact_format);
                 }
-                const fmt = (model.weight_format || model.model_format || 'safetensors').toLowerCase();
-                if (fmt === 'gguf') return 'GGUF';
-                if (fmt === 'safetensors') return 'safetensors';
-                return fmt.startsWith('.') ? fmt : `.${fmt}`;
+                const format = model.weight_format || model.model_format || 'safetensors';
+                return model.has_miv_weights !== false && (
+                    ['miv', 'omlxm5'].includes(format) || (format === 'safetensors' && model.has_miv_weights === true)
+                );
+            },
+
+            modelWeightFormatLabel(model) {
+                if (model.virtual || model.pending_auto_repack) return '';
+                const format = (model.weight_format || model.model_format || 'safetensors').toLowerCase().replace(/^\./, '');
+                if (['gguf', 'safetensors', 'miv'].includes(format)) return '';
+                if (format === 'omlxm5' && this.modelHasMivArtifact(model)) return '';
+                return `.${format}`;
+            },
+
+            modelRoutesToMiv(model) {
+                if (typeof model.miv_route_enabled === 'boolean') return model.miv_route_enabled;
+                const configured = model.settings?.external_engine;
+                const route = configured && configured !== 'auto'
+                    ? configured
+                    : model.active_engine_id ?? model.auto_external_engine;
+                return ['m5rt', 'io.ninfer.metal', 'ninfer-metal', 'com.omlx.mseries'].includes(route);
+            },
+
+            modelMivBadgeHelp(model) {
+                return window.t(this.modelRoutesToMiv(model)
+                    ? 'settings.models.table.miv_routed'
+                    : 'settings.models.table.miv_available');
             },
 
             async convertModelOmlxm5() {
@@ -4936,10 +5000,12 @@
                     });
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        alert(data.detail || 'Failed to convert model to .miv');
+                        alert(data.detail || window.t('modal.model_settings.miv_convert_failed'));
                         return;
                     }
-                    if (data.message) alert(data.message);
+                    if (data.message) {
+                        alert(window.t('modal.model_settings.miv_convert_reload').replace('{format}', data.artifact_format || 'miv'));
+                    }
                     await this.loadModels();
                     const updated = (this.models || []).find(m => m.id === this.selectedModel.id);
                     if (updated) this.openModelSettings(updated);
@@ -5028,6 +5094,7 @@
             },
 
             externalEnginePrefillOptionKeys() {
+                if (this.effectiveExternalEngine() !== 'm5rt') return [];
                 return [
                     'prefill_linear_mode',
                     'prefill_attention_mode',
@@ -5086,33 +5153,16 @@
                 );
             },
 
-            isExternalEngineZh() {
-                return (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-            },
-
             isMoeExternalEngineModel() {
                 const type = String(this.selectedModel?.config_model_type || '').toLowerCase();
                 return type.includes('moe');
             },
 
-            isMxfp4ExternalEngineModel(model = this.selectedModel) {
-                if (!model || typeof model !== 'object') return false;
-                if (model.mxfp4_w4a4_supported !== undefined && model.mxfp4_w4a4_supported !== null) {
-                    return Boolean(model.mxfp4_w4a4_supported);
-                }
-                const fmt = String(
-                    model.quant_format || model.miv_effective_settings?.model_quant_format || ''
-                ).trim().toLowerCase();
-                if (fmt) {
-                    return fmt === 'mxfp4';
-                }
-                return /mxfp4/i.test(String(model.id || ''));
-            },
-
             normalizeExternalEnginePrefillOptionsMap(ext) {
                 if (!ext || typeof ext !== 'object') return false;
                 let changed = false;
-                for (const engineOpts of Object.values(ext)) {
+                for (const key of this.externalEngineOptionKeys('m5rt')) {
+                    const engineOpts = ext[key];
                     if (!engineOpts || typeof engineOpts !== 'object') continue;
                     if (String(engineOpts.prefill_linear_mode || '').toLowerCase() === 'w4a4') {
                         engineOpts.prefill_linear_mode = 'w4a8';
@@ -5140,52 +5190,31 @@
             },
 
             externalEnginePrefillCardTitle() {
-                return this.isExternalEngineZh() ? 'Prefill 预填加速' : 'Prefill Acceleration';
+                return window.t('modal.model_settings.miv_prefill_title');
             },
 
             externalEnginePrefillCardSubtitle() {
-                return this.isExternalEngineZh()
-                    ? '四档加速模式与 CacheBlend / ANE 协同完全正交（解码阶段保持全精度 W4A16）。'
-                    : 'Four orthogonal prefill tiers plus independent CacheBlend & ANE collaboration (decode stays exact W4A16).';
+                return window.t('modal.model_settings.miv_prefill_subtitle');
             },
 
             externalEnginePrefillModeLabel() {
-                return this.isExternalEngineZh() ? 'Prefill 加速模式' : 'Prefill Acceleration Mode';
+                return window.t('modal.model_settings.miv_prefill_mode_label');
             },
 
             externalEnginePrefillModeHint() {
-                return this.isExternalEngineZh()
-                    ? '按线性计算（路线 A）与注意力（路线 B）正交组合，不影响下方 CacheBlend 与 ANE 协同设置。'
-                    : 'Orthogonal 2×2 selector over Linear (Route A) and Attention (Route B); never changes CacheBlend or ANE mode.';
+                return window.t('modal.model_settings.miv_prefill_mode_hint');
             },
 
             externalEnginePrefillTiers() {
-                const zh = this.isExternalEngineZh();
+                const tier = (id, linearActive, attentionMode) => ({
+                    id, linearActive, attentionMode,
+                    label: window.t(`modal.model_settings.miv_prefill_${id}`),
+                });
                 return [
-                    {
-                        id: 'lossless',
-                        label: zh ? '无损默认' : 'Lossless Default',
-                        linearActive: false,
-                        attentionMode: 'exact_nax',
-                    },
-                    {
-                        id: 'route_a',
-                        label: zh ? '路线 A（线性加速）' : 'Route A (Linear)',
-                        linearActive: true,
-                        attentionMode: 'exact_nax',
-                    },
-                    {
-                        id: 'route_b',
-                        label: zh ? '路线 B（注意力加速）' : 'Route B (Attention)',
-                        linearActive: false,
-                        attentionMode: 'sage2',
-                    },
-                    {
-                        id: 'route_ab',
-                        label: zh ? '路线 A+B（全速）' : 'Route A+B (Full Speed)',
-                        linearActive: true,
-                        attentionMode: 'sage2',
-                    },
+                    tier('lossless', false, 'exact_nax'),
+                    tier('route_a', true, 'exact_nax'),
+                    tier('route_b', false, 'sage2'),
+                    tier('route_ab', true, 'sage2'),
                 ];
             },
 
@@ -5213,97 +5242,31 @@
                 this.setExternalEngineOption(attnItem, tier.attentionMode);
             },
 
-            externalEngineAneModeLabel(choice) {
-                const zh = this.isExternalEngineZh();
-                const map = zh
-                    ? {
-                        off: '关闭',
-                        auto: '自动',
-                        compact_int8: '均衡省存 INT8',
-                        ultra_fp16_swiglu: 'Ultra 极速 FP16 SwiGLU',
-                    }
-                    : {
-                        off: 'Off (GPU Only)',
-                        auto: 'Auto',
-                        compact_int8: 'Compact INT8',
-                        ultra_fp16_swiglu: 'Ultra FP16 SwiGLU',
-                    };
-                return map[choice] || choice;
+            mivOptionText(item, field) {
+                if (this.effectiveExternalEngine() !== 'm5rt' || !item?.key) return '';
+                const key = `modal.model_settings.miv_option_${item.key}_${field}`;
+                const text = window.t(key);
+                return text === key ? '' : text;
             },
 
             externalEngineOptionLabel(item) {
-                if (!item || !item.key) return '';
-                if (this.isExternalEngineZh()) {
-                    const zhLabels = {
-                        max_concurrency: '并发槽位 (B/C)',
-                        max_context: '最大上下文长度 (Tokens)',
-                        rolling_prefix_cache: '滚动前缀缓存',
-                        prefix_cache_gb: '前缀缓存预算 (GiB)',
-                        prefill_linear_mode: '线性预填模式',
-                        prefill_attention_mode: 'Sage2 注意力',
-                        prefill_sparse_minference: '↳ MInference 动态稀疏',
-                        prefill_cache_blend: 'CacheBlend 跨块复用',
-                        prefill_ane_mode: 'ANE 协同模式',
-                        prefill_ane_offload: 'ANE 协同模式',
-                        sampling_contract: '采样协议 (Sampling Contract)',
-                        artifact_path: '权重产物路径 (.miv)',
-                        draft_artifact_path: '草稿产物路径 (.miv)',
-                    };
-                    if (zhLabels[item.key]) return zhLabels[item.key];
-                }
-                const enLabels = {
-                    max_context: 'Max Context Window',
-                    prefill_linear_mode: 'Linear Prefill Mode',
-                    prefill_attention_mode: 'Sage2 Attention',
-                    prefill_sparse_minference: '↳ MInference Dynamic Sparse',
-                    prefill_cache_blend: 'CacheBlend Cross-Chunk Reuse',
-                    prefill_ane_mode: 'ANE Collaboration Mode',
-                    prefill_ane_offload: 'ANE Collaboration Mode',
-                };
-                if (enLabels[item.key]) return enLabels[item.key];
-                return item.label || item.key;
+                return this.mivOptionText(item, 'label') || item?.label || item?.key || '';
             },
 
             externalEngineOptionHint(item) {
-                if (!item || !item.key) return '';
-                if (this.isExternalEngineZh()) {
-                    const zhHints = {
-                        prefill_linear_mode: '仅加速预填线性层（down_proj 默认保留 W4A16 防掉点），解码阶段无损。',
-                        prefill_attention_mode: '低位宽 INT8 QK 注意力；可独立搭配下方 MInference 动态稀疏。',
-                        prefill_sparse_minference: '关闭 = 稠密全感受野 Sage2；开启 = 动态块稀疏 Sage2 + MInference（长上下文自动跳过低权 KV 块）。',
-                        prefill_cache_blend: '多文档/RAG 非连续分块 KV+GDN 跨块复用（乱序命中提速 4.3x–4.5x）；长文档建议调大前缀缓存预算（如 16–32 GiB）。',
-                        prefill_ane_mode: '独立正交开关（与上方路线 A/B 及 CacheBlend 自由叠加）：自动按拓扑切换，均衡省存 INT8（G=64）或 Ultra 极速 FP16 SwiGLU 双 ANE 协同。',
-                        prefill_ane_offload: '独立正交开关，仅对 Dense 生效并自动跳过 GDN 递归层。',
-                    };
-                    if (zhHints[item.key]) {
-                        if ((item.key === 'prefill_ane_mode' || item.key === 'prefill_ane_offload') && this.isMoeExternalEngineModel()) {
-                            return zhHints[item.key] + ' 当前为 MoE 模型，ANE 协同自动跳过。';
-                        }
-                        return zhHints[item.key];
-                    }
+                const hint = this.mivOptionText(item, 'hint');
+                if (!hint) return item?.description || '';
+                if ((item.key === 'prefill_ane_mode' || item.key === 'prefill_ane_offload') && this.isMoeExternalEngineModel()) {
+                    return hint + ' ' + window.t('modal.model_settings.miv_prefill_moe_gpu');
                 }
-                const enHints = {
-                    prefill_linear_mode: 'Low-bit prefill linear matmul (down_proj stays W4A16). Decode remains exact.',
-                    prefill_attention_mode: 'Low-bit INT8 QK attention; pairs independently with MInference dynamic sparsity below.',
-                    prefill_sparse_minference: 'Off = dense full-receptive-field Sage2; On = dynamic block-sparse Sage2 + MInference (skips low-weight KV blocks on long prompts).',
-                    prefill_cache_blend: 'Non-contiguous RAG chunk KV+GDN reuse (4.3x–4.5x warmer TTFT). Raise Prefix Cache Budget (e.g. 16–32 GiB) for long docs.',
-                    prefill_ane_mode: 'Orthogonal GPU + Dual-ANE co-execution (stacks freely with Route A/B and CacheBlend): Auto policy, Compact INT8 (G=64), or Ultra FP16 SwiGLU.',
-                    prefill_ane_offload: 'Orthogonal Dual-ANE co-execution; Dense-only and skips GDN recurrence.',
-                };
-                if (enHints[item.key]) {
-                    if ((item.key === 'prefill_ane_mode' || item.key === 'prefill_ane_offload') && this.isMoeExternalEngineModel()) {
-                        return enHints[item.key] + ' MoE models stay GPU-only.';
-                    }
-                    return enHints[item.key];
-                }
-                return item.description || '';
+                return hint;
             },
 
             externalEngineOptionIsToggle(item) {
                 if (!item) return false;
                 if (item.type === 'bool') return true;
                 if (item.type === 'enum' && Array.isArray(item.options) && item.options.length === 2) {
-                    return item.key === 'prefill_attention_mode';
+                    return this.effectiveExternalEngine() === 'm5rt' && item.key === 'prefill_attention_mode';
                 }
                 return false;
             },
@@ -5330,11 +5293,11 @@
             },
 
             externalEngineOptionIndented(item) {
-                return Boolean(item && item.key === 'prefill_sparse_minference');
+                return this.effectiveExternalEngine() === 'm5rt' && item?.key === 'prefill_sparse_minference';
             },
 
             externalEngineOptionDisabled(item) {
-                if (!item || item.key !== 'prefill_sparse_minference') return false;
+                if (!this.externalEngineOptionIndented(item)) return false;
                 const attnItem = this.externalEnginePrefillOptionByKey('prefill_attention_mode')
                     || { key: 'prefill_attention_mode', type: 'enum', default: 'exact_nax' };
                 return this.getExternalEngineOption(attnItem) !== 'sage2';
@@ -5342,9 +5305,7 @@
 
             externalEngineOptionTooltip(item) {
                 if (!this.externalEngineOptionDisabled(item)) return '';
-                return this.isExternalEngineZh()
-                    ? '选择上方「路线 B」或「路线 A+B」启用 Sage2 注意力后可用'
-                    : 'Active when Sage2 Attention (Route B or Route A+B) is selected';
+                return window.t('modal.model_settings.miv_prefill_minference_requires_sage2');
             },
 
             externalEngineOptionContainerClass(item) {
@@ -5379,19 +5340,22 @@
                     else if (aneEff === 'compact_int8') badges.push('ANE(INT8)');
                     else badges.push('ANE');
                 } else if (aneMode !== 'off' || eff.prefill_ane_offload) {
-                    badges.push('ANE(off)');
+                    badges.push(window.t('modal.model_settings.miv_prefill_ane_off'));
                 }
                 return badges;
             },
 
             externalEngineEnumOptionLabel(item, opt) {
-                if (item && item.key === 'prefill_ane_mode') {
-                    return this.externalEngineAneModeLabel(opt);
+                if (item?.key === 'speculative_backend' && this.effectiveExternalEngine() === 'm5rt') {
+                    const label = {
+                        auto: window.t('settings.resource.auto'),
+                        none: window.t('modal.model_settings.miv_option_speculative_backend_none'),
+                        mtp: 'MTP',
+                        dflash2: 'DFlash2',
+                    }[opt];
+                    if (label) return label;
                 }
-                if (item && item.option_labels && typeof item.option_labels === 'object' && item.option_labels[opt]) {
-                    return item.option_labels[opt];
-                }
-                return opt;
+                return this.mivOptionText(item, opt) || item?.option_labels?.[opt] || opt;
             },
 
             getExternalEngineOption(item) {
@@ -5408,7 +5372,7 @@
                         found = opts[key][item.key];
                     }
                 }
-                if (found === undefined && item.key === 'prefill_ane_mode') {
+                if (active === 'm5rt' && found === undefined && item.key === 'prefill_ane_mode') {
                     let legacyFound = undefined;
                     for (const key of this.externalEngineOptionKeys(active)) {
                         if (opts[key] && typeof opts[key] === 'object' && opts[key].prefill_ane_offload !== undefined && opts[key].prefill_ane_offload !== null) {
@@ -5451,7 +5415,7 @@
                 } else {
                     value = rawValue === null || rawValue === undefined ? '' : String(rawValue);
                 }
-                if (item.key === 'prefill_linear_mode' && String(value).toLowerCase() === 'w4a4') {
+                if (active === 'm5rt' && item.key === 'prefill_linear_mode' && String(value).toLowerCase() === 'w4a4') {
                     value = 'w4a8';
                 }
                 if (!this.modelSettings.external_engine_options || typeof this.modelSettings.external_engine_options !== 'object') {
@@ -5462,22 +5426,14 @@
                     if (key !== active && opts[key] && typeof opts[key] === 'object' && (item.key in opts[key])) {
                         opts[key] = { ...opts[key], [item.key]: value };
                     }
-                    if (item.key === 'prefill_ane_mode' && opts[key] && typeof opts[key] === 'object' && ('prefill_ane_offload' in opts[key])) {
+                    if (active === 'm5rt' && item.key === 'prefill_ane_mode' && opts[key] && typeof opts[key] === 'object' && ('prefill_ane_offload' in opts[key])) {
                         opts[key] = { ...opts[key], prefill_ane_offload: value !== 'off' };
                     }
                 }
                 opts[active] = { ...(opts[active] || {}), [item.key]: value };
-                if (item.key === 'prefill_ane_mode' && ('prefill_ane_offload' in opts[active])) {
+                if (active === 'm5rt' && item.key === 'prefill_ane_mode' && ('prefill_ane_offload' in opts[active])) {
                     opts[active] = { ...opts[active], prefill_ane_offload: value !== 'off' };
                 }
-            },
-
-            externalEngineLoraModeOptionLabel(opt) {
-                const schema = this.externalEngineLoraModeSchema();
-                if (schema && schema.option_labels && typeof schema.option_labels === 'object' && schema.option_labels[opt]) {
-                    return schema.option_labels[opt];
-                }
-                return opt;
             },
 
             getExternalEngineLoraMode() {
@@ -6120,6 +6076,50 @@
                     this.loadBenchDeviceInfo();
                 }
 
+                const body = JSON.stringify({
+                    model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                    context_profile: this.benchContextProfile,
+                    align_prompt_to_ane: this.benchAlignPromptToAne,
+                    prompt_lengths: promptLengths,
+                    generation_length: 128,
+                    batch_sizes: batchSizes,
+                    force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                    external: this.benchExternalEnabled ? this.externalRequestBody() : null,
+                });
+
+                if (this.benchRunning) {
+                    try {
+                        const response = await fetch('/admin/api/bench/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body,
+                        });
+                        if (response.status === 401) {
+                            window.location.href = '/admin';
+                            return;
+                        }
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.detail || window.t('js.error.start_benchmark_failed'));
+                        if (data.status === 'queued') {
+                            this.benchQueue = data.queue || [];
+                        } else {
+                            // Nothing was running any more, so the server started this one.
+                            this.benchOtherActive = {
+                                bench_id: data.bench_id,
+                                model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                                context_profile: this.benchContextProfile,
+                                force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                                external: this.benchExternalEnabled,
+                            };
+                            this.acceptOtherBench(true);
+                        }
+                    } catch (err) {
+                        this.benchError = err.message;
+                    }
+                    return;
+                }
+
+                this._benchArchive();
                 // Reset state
                 this.benchRunning = true;
                 this.benchProgress = null;
@@ -6135,21 +6135,17 @@
                 this.benchRunExternal = this.benchExternalEnabled
                     ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
                     : null;
+                this.benchRun = {
+                    model_id: this.benchModelId,
+                    force_lm_engine: this.benchForceLmEngine,
+                    context_profile: this.benchContextProfile,
+                };
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
-                            context_profile: this.benchContextProfile,
-                            align_prompt_to_ane: this.benchAlignPromptToAne,
-                            prompt_lengths: promptLengths,
-                            generation_length: 128,
-                            batch_sizes: batchSizes,
-                            force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
-                            external: this.benchExternalEnabled ? this.externalRequestBody() : null,
-                        }),
+                        body,
                     });
 
                     if (response.status === 401) {
@@ -6165,12 +6161,75 @@
                     }
 
                     const data = await response.json();
+                    if (data.status === 'queued') {
+                        // Another tab started a run first; attach to it.
+                        this.benchRunning = false;
+                        this.benchQueue = data.queue || [];
+                        await this.loadBenchState();
+                        // The previous run may still be uploading, so the
+                        // queued run has no SSE stream yet; follow it here.
+                        if (!this.benchRunning) this._benchFollowQueue();
+                        return;
+                    }
                     this.benchBenchId = data.bench_id;
                     this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to start benchmark:', err);
                     this.benchError = window.t('js.error.start_benchmark_error').replace('{message}', err.message);
                     this.benchRunning = false;
+                }
+            },
+
+            _benchArchive() {
+                if (!this.benchSingleResults.length && !this.benchBatchResults.length) return;
+                let text;
+                try {
+                    text = this.benchBuildText();
+                } catch (e) {
+                    console.error('Failed to archive benchmark results:', e);
+                    return;
+                }
+                const model = this.benchRunExternal?.model || this.benchRun?.model_id || this.benchModelId;
+                this.benchCompleted = [{ model_id: model, text }, ...this.benchCompleted].slice(0, 10);
+            },
+
+            async _benchFollowQueue() {
+                if (this.benchFollowing) return;
+                this.benchFollowing = true;
+                try {
+                    for (let i = 0; i < 240; i++) {
+                        await new Promise(r => setTimeout(r, 500));
+                        let data;
+                        try {
+                            const resp = await fetch('/admin/api/bench/active');
+                            if (!resp.ok) return;
+                            data = await resp.json();
+                        } catch (err) {
+                            return;
+                        }
+                        this.benchQueue = data.queue || [];
+                        if (data.running && data.bench_id && data.bench_id !== this.benchBenchId) {
+                            this.benchOtherActive = data;
+                            // Keep the form: the user may be editing the next request.
+                            this.acceptOtherBench(true);
+                            return;
+                        }
+                        if (!data.running && this.benchQueue.length === 0) return;
+                    }
+                } finally {
+                    this.benchFollowing = false;
+                }
+            },
+
+            async removeFromBenchQueue(queueId) {
+                try {
+                    const resp = await fetch(
+                        `/admin/api/bench/queue/${encodeURIComponent(queueId)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (resp.ok) this.benchQueue = (await resp.json()).queue || [];
+                } catch (err) {
+                    this.benchError = err.message;
                 }
             },
 
@@ -6240,6 +6299,7 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                            this._benchFollowQueue();
                         } else if (data.type === 'upload_skipped') {
                             this.benchUploadSkipped = {
                                 reason: data.reason || 'external_endpoint',
@@ -6251,6 +6311,7 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                            this._benchFollowQueue();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -6258,6 +6319,7 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                            this._benchFollowQueue();
                         }
 
                     } catch (err) {
@@ -6280,6 +6342,7 @@
                 if (!this.benchBenchId) return;
                 try {
                     await fetch(`/admin/api/bench/${this.benchBenchId}/cancel`, { method: 'POST' });
+                    this.benchQueue = [];
                 } catch (err) {
                     console.error('Failed to cancel benchmark:', err);
                 }
@@ -6544,6 +6607,11 @@
             },
 
             benchBuildText() {
+                const run = this.benchRun || {
+                    model_id: this.benchModelId,
+                    force_lm_engine: this.benchForceLmEngine,
+                    context_profile: this.benchContextProfile,
+                };
                 const pad = (s, w) => s.toString().padStart(w);
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
@@ -6563,15 +6631,15 @@
                 } else {
                     lines.push(
                         window.t('bench.results.text_export.benchmark_model')
-                            .replace('{model}', () => this.benchModelId)
+                            .replace('{model}', () => run.model_id)
                     );
-                    lines.push(this.benchForceLmEngine
+                    lines.push(run.force_lm_engine
                         ? window.t('bench.results.text_export.engine_force_lm')
                         : window.t('bench.results.text_export.engine_auto'));
                 }
                 lines.push(
                     window.t('bench.results.text_export.context')
-                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                        .replace('{context}', this.benchContextLabel(run.context_profile))
                 );
                 lines.push('='.repeat(80));
 
@@ -6643,10 +6711,9 @@
                 return lines.join('\n');
             },
 
-            benchCopyText() {
-                const text = this.benchBuildText();
+            benchCopyText(text = this.benchBuildText(), key = true) {
                 const onSuccess = () => {
-                    this.benchCopied = true;
+                    this.benchCopied = key;
                     setTimeout(() => { this.benchCopied = false; }, 2000);
                 };
                 if (navigator.clipboard && window.isSecureContext) {
@@ -6687,6 +6754,7 @@
                     const resp = await fetch('/admin/api/bench/active');
                     if (!resp.ok) return;
                     const data = await resp.json();
+                    this.benchQueue = data.queue || [];
 
                     if (!data.running || !data.bench_id) {
                         this.benchOtherActive = null;
@@ -6731,21 +6799,29 @@
             // Restore the config UI from an active run discovered via
             // /api/bench/active. External model ids aren't in the local
             // dropdown, so the external flag drives which controls light up.
-            _restoreBenchRunSource(data) {
-                this.benchContextProfile = data.context_profile || 'code_python';
-                if (data.external) {
-                    this.benchExternalEnabled = true;
-                    this.benchRunExternal = {
+            _restoreBenchRunSource(data, keepForm = false) {
+                const profile = data.context_profile || 'code_python';
+                this.benchRun = {
+                    model_id: data.model_id,
+                    force_lm_engine: !!data.force_lm_engine,
+                    context_profile: profile,
+                };
+                this.benchRunExternal = data.external
+                    ? {
                         // base_url is intentionally not exposed by the API;
                         // fall back to this browser's stored setting.
                         base_url: this.externalBaseUrl.trim(),
                         model: data.model_id,
-                    };
+                    }
+                    : null;
+                if (keepForm) return;
+                this.benchContextProfile = profile;
+                if (data.external) {
+                    this.benchExternalEnabled = true;
                 } else {
                     this.benchModelId = data.model_id;
                     this.benchForceLmEngine = !!data.force_lm_engine;
                     this.benchExternalEnabled = false;
-                    this.benchRunExternal = null;
                 }
             },
 
@@ -6775,12 +6851,13 @@
             // result display, attach to the active run. The replay-on-
             // subscribe stream re-delivers every event so the new bench
             // populates its table from the start.
-            acceptOtherBench() {
+            acceptOtherBench(keepForm = false) {
                 if (!this.benchOtherActive) return;
                 const other = this.benchOtherActive;
                 this.benchOtherActive = null;
+                this._benchArchive();
                 this.benchBenchId = other.bench_id;
-                this._restoreBenchRunSource(other);
+                this._restoreBenchRunSource(other, keepForm);
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];
@@ -6927,7 +7004,7 @@
             // Local runs unload the resident models, so they ask first. External
             // endpoints and additions to a running accuracy queue do not.
             requestBenchConfirm(kind) {
-                if (kind === 'throughput' && this.benchExternalEnabled) return this.startBenchmark();
+                if (kind === 'throughput' && (this.benchExternalEnabled || this.benchRunning)) return this.startBenchmark();
                 if (kind === 'accuracy' && (this.accExternalEnabled || this.accRunning)) return this.addToAccQueue();
                 this.benchConfirm = kind;
             },
@@ -8901,6 +8978,20 @@
                 }
             },
 
+            oqOutputOptions() {
+                return {
+                    model_path: this.oqSelectedModelPath,
+                    oq_level: this.oqLevel,
+                    group_size: 64,
+                    text_only: this.oqTextOnly,
+                    dtype: this.oqDtype,
+                    preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp,
+                    mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                        ? this.oqMtpAssistantPath : '',
+                    preserve_ngram_table: this.oqPreservesNgram(),
+                };
+            },
+
             async startOQQuantization() {
                 if (!this.oqSelectedModelPath || this.oqStarting) return;
                 this.oqError = '';
@@ -8908,16 +8999,8 @@
                 this.oqStarting = true;
                 try {
                     const payload = {
-                        model_path: this.oqSelectedModelPath,
-                        oq_level: this.oqLevel,
-                        group_size: 64,
+                        ...this.oqOutputOptions(),
                         sensitivity_model_path: this.oqSensitivityModelPath,
-                        text_only: this.oqTextOnly,
-                        dtype: this.oqDtype,
-                        preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
-                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
-                            ? this.oqMtpAssistantPath : '',
-                        preserve_ngram_table: this.oqPreservesNgram(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -9129,6 +9212,7 @@
             },
 
             oqEstimate: null,
+            oqEstimateError: '',
             _oqEstimateTimer: null,
 
             oqEstimatedBpw() {
@@ -9139,27 +9223,30 @@
                 return this.oqEstimate?.output_size_formatted || '';
             },
 
-            oqRefreshEstimate() {
+            oqRefreshEstimate(options = this.oqOutputOptions()) {
                 // Debounce: wait 300ms after last change
                 if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
-                if (!this.oqSelectedModelPath) {
-                    this.oqEstimate = null;
-                    return;
-                }
+                const revision = (this._oqEstimateRevision || 0) + 1;
+                this._oqEstimateRevision = revision;
+                this.oqEstimate = null;
+                this.oqEstimateError = '';
+                if (!options.model_path) return;
+                const params = new URLSearchParams(options);
                 this._oqEstimateTimer = setTimeout(async () => {
                     try {
-                        const params = new URLSearchParams({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
-                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
-                        });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
+                        const result = await resp.json();
+                        if (this._oqEstimateRevision !== revision) return;
                         if (resp.ok) {
-                            this.oqEstimate = await resp.json();
+                            this.oqEstimate = result;
+                        } else {
+                            this.oqEstimateError = result.detail || resp.statusText
+                                || window.t('js.error.connection_error');
                         }
                     } catch (e) {
-                        console.error('Failed to estimate oQ:', e);
+                        if (this._oqEstimateRevision === revision) {
+                            this.oqEstimateError = window.t('js.error.connection_error');
+                        }
                     }
                 }, 300);
             },

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from omlx.engine.m5_sidecar import M5RT_DEFAULT_OPTIONS_SCHEMA
+
 
 def _model_settings_template() -> str:
     root = Path(__file__).resolve().parents[1]
@@ -1267,8 +1269,10 @@ def test_external_engine_prefill_switches_orthogonality_labels_and_minference_ga
         """
 const assert = require('node:assert/strict');
 globalThis.localStorage = {getItem: () => null};
-globalThis.window = {t: key => key};
-globalThis.document = {documentElement: {lang: 'en'}};
+const fs = require('node:fs');
+const readLocale = lang => JSON.parse(fs.readFileSync(`omlx_web/i18n/${lang}.json`));
+let locale = readLocale('en');
+globalThis.window = {t: key => locale[key] ?? key};
 """
         + _dashboard_script()
         + """
@@ -1318,7 +1322,7 @@ assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_linear_mode,
 assert.deepEqual(app.externalEngineGeneralOptionsSchema().map(o => o.key), ['max_context']);
 
 // 2) ZH labels for 4-Tier selector and 4-option ANE dropdown
-globalThis.document.documentElement.lang = 'zh-CN';
+locale = readLocale('zh');
 const zhTiers = app.externalEnginePrefillTiers();
 assert.deepEqual(zhTiers.map(t => t.label), [
     '无损默认',
@@ -1331,7 +1335,7 @@ assert.deepEqual(
     aneItem.options.map(c => app.externalEngineEnumOptionLabel(aneItem, c)),
     ['关闭', '自动', '均衡省存 INT8', 'Ultra 极速 FP16 SwiGLU']
 );
-globalThis.document.documentElement.lang = 'en';
+locale = readLocale('en');
 
 // 3) MXFP4 model: pre-saved historical w4a4 ALSO normalizes unconditionally to w4a8 on load & save;
 //    4-tier route_a & route_ab always map to w4a8 and NEVER modify MInference, CacheBlend, or ANE mode!
@@ -1455,3 +1459,130 @@ assert.deepEqual(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_model_weight_badges_distinguish_artifacts_from_routes():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    template = (root / "omlx_web/templates/dashboard/_settings.html").read_text()
+    row = _section(template, "<!-- Main Row -->", "<!-- Type -->")
+    assert 'x-show="modelHasMivArtifact(model)"' in row
+    assert "modelRoutesToMiv(model) ? 'badge-miv-routed' : 'bg-teal-50 text-teal-700 border-teal-200'" in row
+    assert ".filter(e => e.compatible && e.id !== 'm5rt')" in row
+    assert 'model.model_format === \'gguf\'' in row
+    script = """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+""" + _dashboard_script() + """
+const app = dashboard();
+const pending = {weight_format: 'safetensors', pending_auto_repack: true, miv_route_enabled: true, miv_artifact_format: null};
+assert.equal(app.modelHasMivArtifact(pending), false);
+assert.equal(app.modelWeightFormatLabel(pending), '');
+assert.equal(app.modelWeightFormatLabel({weight_format: 'safetensors'}), '');
+
+const stock = {weight_format: 'safetensors', miv_artifact_format: 'miv', miv_route_enabled: false, active_engine_id: 'm5rt', settings: {external_engine: 'stock'}};
+assert.equal(app.modelHasMivArtifact(stock), true);
+assert.equal(app.modelRoutesToMiv(stock), false);
+assert.equal(app.modelMivBadgeHelp(stock), 'settings.models.table.miv_available');
+assert.equal(app.modelWeightFormatLabel(stock), '');
+
+const enabled = {weight_format: 'miv', miv_artifact_format: 'miv', miv_route_enabled: true, active_engine_id: 'mlx'};
+assert.equal(app.modelHasMivArtifact(enabled), true);
+assert.equal(app.modelRoutesToMiv(enabled), true);
+assert.equal(app.modelMivBadgeHelp(enabled), 'settings.models.table.miv_routed');
+assert.equal(app.modelWeightFormatLabel(enabled), '');
+
+const foreign = {weight_format: 'omlxm5', miv_artifact_format: null, miv_route_enabled: false, has_miv_weights: true};
+assert.equal(app.modelHasMivArtifact(foreign), false);
+assert.equal(app.modelWeightFormatLabel(foreign), '.omlxm5');
+const stale = {model_format: 'miv', miv_artifact_format: null, miv_route_enabled: true};
+assert.equal(app.modelHasMivArtifact(stale), false);
+assert.equal(app.modelWeightFormatLabel(stale), '');
+const mixed = {weight_format: 'pathb', miv_artifact_format: 'omlxm5', miv_route_enabled: false};
+assert.equal(app.modelHasMivArtifact(mixed), true);
+assert.equal(app.modelWeightFormatLabel(mixed), '.pathb');
+
+const legacy = {weight_format: 'safetensors', has_miv_weights: true, active_engine_id: 'm5rt', settings: {external_engine: 'stock'}};
+assert.equal(app.modelHasMivArtifact(legacy), true);
+assert.equal(app.modelRoutesToMiv(legacy), false);
+for (const alias of ['m5rt', 'io.ninfer.metal', 'ninfer-metal', 'com.omlx.mseries']) {
+    assert.equal(app.modelRoutesToMiv({settings: {external_engine: alias}}), true);
+    assert.equal(app.modelRoutesToMiv({active_engine_id: alias}), true);
+}
+"""
+    result = subprocess.run(
+        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_miv_advanced_labels_translate_in_every_locale():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = """
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+let locale = JSON.parse(fs.readFileSync('omlx_web/i18n/en.json'));
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => locale[key] ?? key};
+""" + _dashboard_script() + "\nconst schema = " + json.dumps(M5RT_DEFAULT_OPTIONS_SCHEMA) + ";\n" + """
+const app = dashboard();
+app.modelSettings = {external_engine: 'm5rt'};
+const prefix = 'modal.model_settings.miv_';
+for (const file of fs.readdirSync('omlx_web/i18n').filter(file => file.endsWith('.json'))) {
+    locale = JSON.parse(fs.readFileSync(`omlx_web/i18n/${file}`));
+    for (const item of schema) {
+        const key = `${prefix}option_${item.key}`;
+        assert.ok(locale[`${key}_label`], `${file}: ${key}_label`);
+        assert.equal(app.externalEngineOptionLabel(item), locale[`${key}_label`]);
+        if (item.description) {
+            assert.ok(locale[`${key}_hint`], `${file}: ${key}_hint`);
+            assert.equal(app.externalEngineOptionHint(item), locale[`${key}_hint`]);
+        }
+        for (const option of Object.keys(item.option_labels ?? {})) {
+            assert.ok(locale[`${key}_${option}`], `${file}: ${key}_${option}`);
+            assert.equal(app.externalEngineEnumOptionLabel(item, option), locale[`${key}_${option}`]);
+        }
+    }
+    assert.equal(app.externalEnginePrefillCardTitle(), locale[prefix + 'prefill_title']);
+    assert.equal(app.externalEnginePrefillCardSubtitle(), locale[prefix + 'prefill_subtitle']);
+    assert.equal(app.externalEnginePrefillModeLabel(), locale[prefix + 'prefill_mode_label']);
+    assert.equal(app.externalEnginePrefillModeHint(), locale[prefix + 'prefill_mode_hint']);
+    assert.deepEqual(app.externalEnginePrefillTiers().map(t => t.label),
+        ['lossless','route_a','route_b','route_ab'].map(id => locale[prefix + 'prefill_' + id]));
+    assert.deepEqual(app.mivEffectivePrefillBadges({prefill_ane_mode: 'auto', prefill_ane_active: false}),
+        [locale[prefix + 'prefill_ane_off']]);
+    assert.equal(app.externalEngineEnumOptionLabel({key: 'speculative_backend'}, 'auto'), locale['settings.resource.auto']);
+    assert.equal(app.externalEngineEnumOptionLabel({key: 'speculative_backend'}, 'none'), locale[prefix + 'option_speculative_backend_none']);
+    for (const name of ['miv', 'Splash']) {
+        assert.ok(locale['modal.model_settings.external_engine_select_hint'].includes(name), file);
+    }
+}
+app.modelSettings = {external_engine: 'path-b'};
+const thirdParty = {key: 'lora_mode', label: 'Third-party mode', description: 'Third-party help', option_labels: {merge: 'Custom merge'}};
+assert.equal(app.externalEngineOptionLabel(thirdParty), 'Third-party mode');
+assert.equal(app.externalEngineOptionHint(thirdParty), 'Third-party help');
+assert.equal(app.externalEngineEnumOptionLabel(thirdParty, 'merge'), 'Custom merge');
+// Providers can reuse MIV's keys with their own types, values and dependencies.
+const custom = [{key:'prefill_attention_mode', type:'enum', options:['full','fast']},
+                {key:'prefill_linear_mode', type:'enum', options:['w4a4','other']},
+                {key:'prefill_sparse_minference', type:'bool'}];
+app.modelSettings.external_engines = [{id:'path-b', options_schema:custom}];
+app.modelSettings.external_engine_options = {'path-b': {prefill_linear_mode:'w4a4'}, 'io.ninfer.metal': {prefill_linear_mode:'w4a4'}};
+assert.deepEqual(app.externalEnginePrefillOptionsSchema(), []);
+assert.deepEqual(app.externalEngineGeneralOptionsSchema(), custom);
+assert.equal(app.externalEngineOptionIsToggle(custom[0]), false);
+assert.equal(app.externalEngineOptionDisabled(custom[2]), false);
+app.setExternalEngineOption(custom[1], 'w4a4');
+app.normalizeExternalEnginePrefillOptionsMap(app.modelSettings.external_engine_options);
+assert.equal(app.modelSettings.external_engine_options['path-b'].prefill_linear_mode, 'w4a4');
+assert.equal(app.modelSettings.external_engine_options['io.ninfer.metal'].prefill_linear_mode, 'w4a8');
+
+"""
+    result = subprocess.run(
+        [node], input=script, cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

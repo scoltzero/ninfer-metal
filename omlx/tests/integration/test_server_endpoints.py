@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -138,9 +139,8 @@ class MockTokenizer:
         self.eos_token_id = 2
         self.bos_token_id = 1
 
-    def encode(self, text: str, add_special_tokens: bool | None = None) -> list[int]:
-        # Simple simulation: split by words
-        ids = [100 + i for i, _ in enumerate(text.split())]
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        ids = [100 + i for i, _ in enumerate(re.findall(r"\n|\S+", text))]
         return [self.bos_token_id, *ids] if add_special_tokens else ids
 
     def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
@@ -1180,41 +1180,39 @@ class TestCompletionEndpoint:
         assert response.status_code == 200
         assert captured.get("thinking_budget") == 300
 
-    def test_completion_thinking_budget_from_model_settings(
-        self, client, mock_llm_engine
+    @pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream_generate"])
+    @pytest.mark.parametrize(("requested", "expected"), [(None, 256), (0, 0)])
+    def test_completion_path_resolves_the_budget(
+        self, client, mock_llm_engine, monkeypatch, tmp_path, stream, requested, expected
     ):
-        """A model-level thinking budget (admin settings) applies to
-        /v1/completions even when the request omits the parameter, matching
-        /v1/chat/completions."""
-        from omlx.model_settings import ModelSettings
-        from omlx.server import _server_state
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
 
-        class StubSettingsManager:
-            def get_settings(self, model_id):
-                return ModelSettings(
-                    thinking_budget_enabled=True,
-                    thinking_budget_tokens=256,
-                )
-
-        mock_llm_engine.generate = AsyncMock(
-            return_value=MockGenerationOutput(text="Generated response.")
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "test-model", ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=256)
         )
+        monkeypatch.setattr("omlx.server._server_state.settings_manager", manager)
 
-        original_settings_manager = _server_state.settings_manager
-        _server_state.settings_manager = StubSettingsManager()
-        try:
-            response = client.post(
-                "/v1/completions",
-                json={
-                    "model": "test-model",
-                    "prompt": "Explain why the sky is blue.",
-                },
-            )
-        finally:
-            _server_state.settings_manager = original_settings_manager
+        seen = []
 
-        assert response.status_code == 200
-        assert mock_llm_engine.generate.call_args.kwargs["thinking_budget"] == 256
+        async def generate(prompt, **kwargs):
+            seen.append(kwargs["thinking_budget"])
+            return MockGenerationOutput(text="Hi", new_text="Hi", finished=True)
+
+        async def stream_generate(prompt, **kwargs):
+            yield await generate(prompt, **kwargs)
+
+        mock_llm_engine.generate = generate
+        mock_llm_engine.stream_generate = stream_generate
+        body = {"model": "test-model", "prompt": "Hi", "stream": stream}
+        if requested is not None:
+            body["thinking_budget"] = requested
+        response = client.post("/v1/completions", json=body)
+
+        assert response.status_code == 200, response.text
+        if stream:
+            assert "data: [DONE]" in response.text
+        assert seen == [expected]
 
 
 class TestChatCompletionEndpoint:
@@ -1570,13 +1568,19 @@ class TestChatCompletionEndpoint:
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
-    "text,reasoning_tokens",
-    [("<think>Need to reason.</think>Hello!", 3), ("Just an answer.", 0)],
+    "text,completion_tokens,reasoning_tokens",
+    [
+        ("<think>\nNeed to reason.</think>Hello!", 5, 3),
+        ("<think>\nNeed to reason.</think>Hello!", 2, 2),
+        ("Just an answer.", 5, 0),
+    ],
 )
 def test_chat_usage_reports_reasoning_tokens(
-    client, mock_llm_engine, stream, text, reasoning_tokens
+    client, mock_llm_engine, stream, text, completion_tokens, reasoning_tokens
 ):
-    output = MockGenerationOutput(text=text, new_text=text)
+    output = MockGenerationOutput(
+        text=text, new_text=text, completion_tokens=completion_tokens
+    )
     payload = {
         "model": "test-model",
         "messages": [{"role": "user", "content": "Hello"}],
@@ -3082,7 +3086,10 @@ class TestErrorHandling:
             },
         )
 
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 400
+        body = response.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
 
     def test_empty_messages(self, client):
         """Test error when messages is empty."""
