@@ -1482,6 +1482,10 @@ for (const file of fs.readdirSync('omlx_web/i18n').filter(file => file.endsWith(
     assert.equal(app.externalEnginePrefillCardTitle(), locale[prefix + 'prefill_title']);
     assert.equal(app.externalEnginePrefillCardSubtitle(), locale[prefix + 'prefill_subtitle']);
     assert.equal(app.externalEngineEnumOptionLabel({key: 'speculative_backend'}, 'auto'), locale['settings.resource.auto']);
+    assert.equal(app.externalEngineEnumOptionLabel({key: 'speculative_backend'}, 'none'), locale[prefix + 'option_speculative_backend_none']);
+    for (const name of ['miv', 'Splash']) {
+        assert.ok(locale['modal.model_settings.external_engine_select_hint'].includes(name), file);
+    }
 }
 app.modelSettings = {external_engine: 'path-b'};
 const thirdParty = {key: 'lora_mode', label: 'Third-party mode', description: 'Third-party help', option_labels: {merge: 'Custom merge'}};

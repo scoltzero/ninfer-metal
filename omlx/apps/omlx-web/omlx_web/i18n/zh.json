@@ -1334,6 +1334,7 @@
   "modal.model_settings.miv_option_prefill_ane_offload_label": "双 ANE 协同",
   "modal.model_settings.miv_option_lora_mode_label": "LoRA 模式",
   "modal.model_settings.miv_option_speculative_backend_label": "推测解码后端",
+  "modal.model_settings.miv_option_speculative_backend_none": "关闭",
   "modal.model_settings.miv_option_sampling_contract_label": "采样协议",
   "modal.model_settings.miv_option_artifact_path_label": "权重产物路径 (.miv)",
   "modal.model_settings.miv_option_draft_artifact_path_label": "草稿产物路径 (.miv)",

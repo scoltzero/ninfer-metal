@@ -5296,7 +5296,7 @@
                 if (item?.key === 'speculative_backend' && this.effectiveExternalEngine() === 'm5rt') {
                     const label = {
                         auto: window.t('settings.resource.auto'),
-                        none: window.t('modal.model_settings.lora_adapter_none'),
+                        none: window.t('modal.model_settings.miv_option_speculative_backend_none'),
                         mtp: 'MTP',
                         dflash2: 'DFlash2',
                     }[opt];

@@ -1334,6 +1334,7 @@
   "modal.model_settings.miv_option_prefill_ane_offload_label": "Dual-ANE Offload",
   "modal.model_settings.miv_option_lora_mode_label": "LoRA Mode",
   "modal.model_settings.miv_option_speculative_backend_label": "Speculative Backend",
+  "modal.model_settings.miv_option_speculative_backend_none": "Off",
   "modal.model_settings.miv_option_sampling_contract_label": "Sampling Contract",
   "modal.model_settings.miv_option_artifact_path_label": "Artifact Path (.miv)",
   "modal.model_settings.miv_option_draft_artifact_path_label": "Draft Artifact Path (.miv)",
