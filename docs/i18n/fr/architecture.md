@@ -14,7 +14,7 @@ flowchart LR
         OAI["Open WebUI / Cursor / Cline<br/>NewAPI / OpenAI SDK"]
     end
 
-    subgraph Host["oMLX-extend (omlx-extend-v0.8.3, Provider SPI v2)"]
+    subgraph Host["oMLX-extend (jundot/omlx v0.8.4, Provider SPI v2)"]
         Router["O(1) Auto Model Router<br/>detect_adapted()"]
         Stock["Stock oMLX MLX<br/>(Unadapted models untouched)"]
         Enforcer["ProcessMemoryEnforcer<br/>&amp; EnginePool"]
@@ -104,7 +104,7 @@ Les deux pistes cohabitent dans un seul dépôt avec des tags de version et des 
 | Piste | Chemin | Format de tag | Workflow |
 |---|---|---|---|
 | **Cœur d'inférence** | `miv/` | `miv-v0.01` (`<codename>-vX.YZ`) | [`.github/workflows/release-ninfer-metal.yml`](../../../.github/workflows/release-ninfer-metal.yml) |
-| **Extension hôte** | `omlx/` + `omlx-extend/` | `omlx-extend-v0.8.3` (`omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mix1..9`) | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
+| **Extension hôte** | `omlx/` + `omlx-extend/` | `omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mixN` | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
 
 Les archives du cœur s'installent côte à côte sous `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/versions/<tag>/` et s'activent par bascule atomique du lien symbolique `current`, autorisant mises à jour et retours arrière en une commande sans toucher à l'environnement Python d'oMLX.
 

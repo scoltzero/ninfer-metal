@@ -1,6 +1,6 @@
 # Documentation Index
 
-Current baseline: **`ninfer-metal` `miv-v0.01`** (`codename: miv` · `semver: 0.0.1` · `core_abi: 1` · `protocol_version: 2`, with native C++20 `ninfer-metal-serve`) + **`oMLX-extend` `omlx-extend-v0.8.3`**.
+Current baseline: **`ninfer-metal` `miv-v0.01`** (`codename: miv` · `semver: 0.0.1` · `core_abi: 1` · `protocol_version: 2`, with native C++20 `ninfer-metal-serve`) + **`oMLX-extend`** built from the [pinned upstream source](../omlx-extend/UPSTREAM_VERSION), `jundot/omlx` `v0.8.4`.
 
 All seven primary user-facing guides (`README`, `oMLX-extend` Visual Guide, Getting Started, Architecture, Microkernel Foundry, `miv-v0.01` Release Notes, and Roadmap) ship in **8 languages**: English at the canonical paths below, plus full mirrors under `docs/i18n/<lang>/` for `zh-CN`, `zh-TW`, `ja`, `ko`, `es`, `fr`, and `de`:
 

@@ -66,6 +66,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omlx._version import __version__
 
@@ -245,13 +246,20 @@ from .exceptions import (
     RequestAbortedError,
     SchedulerQueueFullError,
 )
-from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .model_settings import (
+    forced_ct_keys,
+    merge_chat_template_request_kwargs,
+    specprefill_draft,
+)
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.grammar import compile_answer_grammar
+from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .utils import gpu_power
+from .utils import gpu_power, macos_say
 from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
@@ -1004,6 +1012,23 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+def _is_anthropic_route(request: FastAPIRequest) -> bool:
+    return request.url.path.startswith("/v1/messages")
+
+
+def _error_body_for(
+    request: FastAPIRequest, message, status_code: int, *, param=None, code=None
+) -> dict:
+    if not _is_api_route(request):
+        return {"detail": message}
+    content = _openai_error_body(message, status_code, param=param, code=code)
+    if _is_anthropic_route(request):
+        content["type"] = "error"
+        if status_code >= 500:
+            content["error"]["type"] = "api_error"
+    return content
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -1022,12 +1047,19 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(
-            exc.detail, exc.status_code, code=getattr(exc, "code", None)
-        )
-    else:
-        content = {"detail": exc.detail}
+    content = _error_body_for(
+        request, exc.detail, exc.status_code, code=getattr(exc, "code", None)
+    )
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(
+    request: FastAPIRequest, exc: StarletteHTTPException
+):
+    content = _error_body_for(request, exc.detail, exc.status_code)
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
     )
@@ -1037,11 +1069,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
 async def validation_exception_handler(
     request: FastAPIRequest, exc: RequestValidationError
 ):
-    """Log request validation errors (422) before returning the response."""
+    """Log request validation errors (422, or 400 on Anthropic routes)."""
+    status_code = 400 if _is_anthropic_route(request) else 422
     logger.warning(
-        "%s %s → 422: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         exc.errors(),
     )
     if _is_api_route(request):
@@ -1053,27 +1087,24 @@ async def validation_exception_handler(
             parts.append(f"{loc}: {msg}" if loc else msg)
         detail_str = "; ".join(parts)
         param = errors[0].get("loc", [None])[-1] if errors else None
-        content = _openai_error_body(detail_str, 422, param=param)
+        content = _error_body_for(request, detail_str, status_code, param=param)
     else:
         content = {"detail": jsonable_encoder(exc.errors())}
-    return JSONResponse(status_code=422, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(InvalidRequestError)
 async def invalid_request_error_handler(
     request: FastAPIRequest, exc: InvalidRequestError
 ):
-    """Map internal request validation failures to OpenAI-compatible 400s."""
+    """Map internal request validation failures to the route's 400 envelope."""
     logger.warning(
         "%s %s -> 400: %s",
         request.method,
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 400, param=exc.field)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 400, param=exc.field)
     return JSONResponse(status_code=400, content=content)
 
 
@@ -1100,10 +1131,7 @@ async def scheduler_queue_full_handler(
         f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
         f"Try again shortly."
     )
-    if _is_api_route(request):
-        content = _openai_error_body(detail, 503)
-    else:
-        content = {"detail": detail}
+    content = _error_body_for(request, detail, 503)
     return JSONResponse(
         status_code=503,
         content=content,
@@ -1129,10 +1157,7 @@ async def distributed_unavailable_handler(
         request.url.path,
         exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body(str(exc), 503)
-    else:
-        content = {"detail": str(exc)}
+    content = _error_body_for(request, str(exc), 503)
     return JSONResponse(status_code=503, content=content)
 
 
@@ -1252,10 +1277,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         exc,
         exc_info=exc,
     )
-    if _is_api_route(request):
-        content = _openai_error_body("Internal server error", 500)
-    else:
-        content = {"detail": "Internal server error"}
+    content = _error_body_for(request, "Internal server error", 500)
     return JSONResponse(status_code=500, content=content)
 
 
@@ -2137,6 +2159,25 @@ def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
 
 def _ignore_eos_kwargs(request) -> dict[str, bool]:
     return {"ignore_eos": True} if getattr(request, "ignore_eos", False) else {}
+
+
+def _specprefill_kwargs(
+    engine: BaseEngine, model_id: str, resolved_model: str
+) -> dict[str, bool | float]:
+    """Return the SpecPrefill values of the requested model or exposed profile.
+
+    The attached draft serves requests with different values, so each one carries its own.
+    """
+    sm = _server_state.settings_manager
+    if sm is None or not getattr(engine, "specprefill_draft_path", None):
+        return {}
+    runtime = sm.get_exposed_profile_runtime_settings_for_request(model_id)
+    settings = runtime[1] if runtime else sm.get_settings(resolved_model)
+    return {
+        "specprefill": specprefill_draft(settings) == engine.specprefill_draft_path,
+        "specprefill_keep_pct": settings.specprefill_keep_pct or DEFAULT_KEEP_RATE,
+        "specprefill_threshold": settings.specprefill_threshold or DEFAULT_THRESHOLD,
+    }
 
 
 # `off` keeps a one-shot request out of the prefix cache; lookups still run.
@@ -3331,6 +3372,15 @@ async def _with_json_keepalive(
                 )
             )
             return
+        except Exception as e:
+            handler = next(
+                app.exception_handlers[cls]
+                for cls in type(e).__mro__
+                if cls in app.exception_handlers
+            )
+            response = await handler(http_request, e)
+            yield response.body.decode()
+            return
         if result is not None:
             yield result
     finally:
@@ -3829,9 +3879,7 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model=None)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
-    """List all available models with load status."""
+async def _list_visible_models() -> list[ModelInfo]:
     models = []
     favorite_ids: set[str] = set()
 
@@ -3981,9 +4029,22 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
             ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
         )
 
+    if macos_say.enabled(_server_state.global_settings):
+        models.append(
+            ModelInfo(id=macos_say.MODEL_ID, owned_by="omlx", model_type="audio_tts")
+        )
+
     # Favorites first; stable sort keeps alphabetical order within groups.
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
+
+    return models
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
+    """List all available models with load status."""
+    models = await _list_visible_models()
 
     # Serialize explicitly: FastAPI's jsonable_encoder and the
     # ``ModelsResponse`` container both serialize items as the base
@@ -4049,6 +4110,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id:path}", response_model=None)
+async def retrieve_model(
+    model_id: str, _: bool = Depends(verify_inference_api_key)
+) -> JSONResponse:
+    """Return one visible model, matching an OpenAI retrieve call."""
+    for model in await _list_visible_models():
+        if model.id == model_id:
+            return JSONResponse(content=model.model_dump())
+    raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -4568,6 +4640,9 @@ async def _chat_model_decisions(
     multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
         engine, "supports_multimodal_fallback", False
     )
+    chat_kwargs = _specprefill_kwargs(
+        engine, request.model, _serving_model_id(lease, request.model)
+    )
 
     def _prepare_readout(messages):
         try:
@@ -4584,7 +4659,9 @@ async def _chat_model_decisions(
                 ) from e
             raise
         validate_context_window(num_prompt_tokens, request.model)
-        return {} if prepared is None else {"_prepared_prompt": prepared}
+        if prepared is None:
+            return chat_kwargs
+        return {**chat_kwargs, "_prepared_prompt": prepared}
 
     async def _decide():
         await _raise_if_llm_lease_abort_requested(lease)
@@ -4642,7 +4719,9 @@ async def _decisions_body(
 # =============================================================================
 
 
-def _completion_generation_options(request: CompletionRequest) -> dict[str, Any]:
+def _completion_generation_options(
+    request: CompletionRequest, engine: BaseEngine, resolved_model: str
+) -> dict[str, Any]:
     values = get_sampling_params(
         request.temperature,
         request.top_p,
@@ -4671,6 +4750,7 @@ def _completion_generation_options(request: CompletionRequest) -> dict[str, Any]
         options["repetition_context_size"] = repetition_context_size
     options.update(_no_repeat_ngram_kwargs(request))
     options.update(_ignore_eos_kwargs(request))
+    options.update(_specprefill_kwargs(engine, request.model, resolved_model))
     return options
 
 
@@ -4699,7 +4779,7 @@ async def create_completion(
         model_load_duration = time.perf_counter() - load_start
         lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
         resolved_model = _serving_model_id(lease, request.model)
-        generation_options = _completion_generation_options(request)
+        generation_options = _completion_generation_options(request, engine, resolved_model)
         control_warnings = _preflight_miv_request_controls(
             engine, request, generation_options
         )
@@ -5261,6 +5341,7 @@ async def create_chat_completion(
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
         chat_kwargs.update(_ignore_eos_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5497,10 +5578,8 @@ async def create_chat_completion(
                 if tool_calls and output.finish_reason != "length"
                 else output.finish_reason
             )
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(cleaned_thinking))
-                if cleaned_thinking
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, cleaned_thinking, output.completion_tokens
             )
 
             return ChatCompletionResponse(
@@ -5606,6 +5685,15 @@ def _normalize_structured_outputs(
     if guided_grammar:
         return {"grammar": guided_grammar}
     return None
+
+
+def _estimate_reasoning_tokens(
+    tokenizer, reasoning_text: str, completion_tokens: int
+) -> int:
+    if not reasoning_text:
+        return 0
+    token_ids = tokenizer.encode(reasoning_text.strip(), add_special_tokens=False)
+    return min(len(token_ids), completion_tokens)
 
 
 def _choice_logprobs(entries) -> ChoiceLogprobs:
@@ -5829,6 +5917,8 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in INKLING2_MODEL_TYPES:
+        return "inkling2"
     return reasoning_parser
 
 
@@ -5847,6 +5937,10 @@ def _compile_with_structural_tag(
     import xgrammar as xgr
 
     ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "inkling2":
+        return compile_answer_grammar(
+            compiler, fmt, ct_kwargs, max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT
+        )
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
@@ -6124,7 +6218,7 @@ async def stream_completion(
     )
 
     gen_kwargs = (
-        _completion_generation_options(request)
+        _completion_generation_options(request, engine, resolved_model or request.model)
         if generation_options is None else dict(generation_options)
     )
     if inference_request_id is not None:
@@ -7275,10 +7369,8 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(accumulated_reasoning))
-                if accumulated_reasoning
-                else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, accumulated_reasoning, ct
             )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
@@ -8109,6 +8201,7 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
@@ -8950,6 +9043,7 @@ async def create_response(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_specprefill_kwargs(engine, request.model, resolved_model))
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
@@ -9138,8 +9232,8 @@ async def create_response(
                         )
                     )
 
-            reasoning_token_count = (
-                len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            reasoning_token_count = _estimate_reasoning_tokens(
+                engine.tokenizer, reasoning_text, output.completion_tokens
             )
             usage = build_response_usage(
                 input_tokens=output.prompt_tokens,
@@ -9944,8 +10038,8 @@ async def stream_responses_api(
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
             f"({tokens_per_sec:.1f} tok/s)"
         )
-        reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+        reasoning_token_count = _estimate_reasoning_tokens(
+            engine.tokenizer, reasoning_text, last_output.completion_tokens
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
@@ -10117,7 +10211,7 @@ model and sampling defaults are managed via the admin page.
     # setup form crashing with a 500 (#2282). Passing api_key keeps the
     # two entry points enforcing the same auth. Scheduler/cache wiring
     # stays CLI-only on purpose; this entry point remains minimal.
-    from .settings import init_settings
+    from .settings import GRACEFUL_SHUTDOWN_TIMEOUT_S, init_settings
 
     settings = init_settings()
     if args.host is not None:
@@ -10151,7 +10245,12 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=settings.server.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=args.port,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    )
 
 
 if __name__ == "__main__":

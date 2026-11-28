@@ -271,6 +271,10 @@ class TestThreeWaySyncCarriesMixForward:
         png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRmix1binary"
         logo_png.write_bytes(png_bytes)
 
+        native_cache = live_omlx / "apps/omlx-mac/build/CompilationCache.noindex/local-record"
+        native_cache.parent.mkdir(parents=True)
+        native_cache.write_text("local Xcode build cache\n", encoding="utf-8")
+
         xc_live = live_omlx / "apps" / "omlx-mac" / "Resources" / "Localizable.xcstrings"
         xc_data = json.loads(xc_live.read_text(encoding="utf-8"))
         xc_data["strings"]["extend.mix1.label"] = {
@@ -314,6 +318,22 @@ class TestThreeWaySyncCarriesMixForward:
         assert "upstream.v084.feature" in merged_xc["strings"]
         assert "extend.mix1.label" in merged_xc["strings"]
         assert not (live_omlx / ".git").exists()
+        assert native_cache.read_text(encoding="utf-8") == "local Xcode build cache\n"
+
+        exported = tmp_path / "exported.patch"
+        subprocess.run(
+            [
+                "bash", str(SYNC_SCRIPT), "--export-patch", "--tag", "v0.8.4",
+                "--omlx-dir", str(live_omlx), "--upstream", str(upstream_dir),
+                "--patch", str(exported),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        patch = exported.read_text(encoding="utf-8")
+        assert "microkernel_manager.py" in patch
+        assert "CompilationCache.noindex" not in patch
 
     def test_sync_fails_cleanly_on_real_code_conflict_without_touching_live_dir(
         self, tmp_path: Path
@@ -355,7 +375,13 @@ class TestThreeWaySyncCarriesMixForward:
         assert '__version__ = "0.8.3"' in (live_omlx / "omlx" / "_version.py").read_text(encoding="utf-8")
 
     def test_exported_spi_patch_matches_live_omlx_and_applies_cleanly(self, tmp_path: Path):
-        patch_file = REPO_ROOT / "omlx-extend" / "patches" / "omlx-v0.8.3-provider-spi.patch"
+        extend_dir = REPO_ROOT / "omlx-extend"
+        upstream_tag = next(
+            line.split("=", 1)[1]
+            for line in (extend_dir / "UPSTREAM_VERSION").read_text(encoding="utf-8").splitlines()
+            if line.startswith("UPSTREAM_TAG=")
+        )
+        patch_file = extend_dir / "patches" / f"omlx-{upstream_tag}-provider-spi.patch"
         apply_script = SCRIPTS_DIR / "apply_spi_patch.sh"
         assert patch_file.is_file() and patch_file.stat().st_size > 0
         patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
@@ -363,8 +389,7 @@ class TestThreeWaySyncCarriesMixForward:
         assert "estimate_sidecar_lora_bytes" in patch_text
         assert "lora_mode" in patch_text
 
-        # Copy tracked omlx/ files into a clean git repo, reverse-apply the SPI patch to
-        # reconstruct upstream v0.8.3, and verify apply_spi_patch.sh applies cleanly forward!
+        # Reconstruct the pinned upstream from the live source and verify its default patch applies.
         stage = tmp_path / "omlx_stage"
         subprocess.run(
             [
@@ -384,6 +409,7 @@ class TestThreeWaySyncCarriesMixForward:
                 "--exclude=/packaging/_export/",
                 "--exclude=/packaging/_wheels/",
                 "--exclude=/apps/omlx-mac/.build/",
+                "--exclude=/apps/omlx-mac/build/",
                 "--exclude=/apps/omlx-mac/.swiftpm/",
                 "--exclude=/apps/omlx-mac/DerivedData/",
                 "--exclude=/apps/omlx-mac/oMLX.xcodeproj/project.xcworkspace/xcshareddata/",
@@ -411,15 +437,16 @@ class TestThreeWaySyncCarriesMixForward:
         _git(stage, "config", "user.email", "test@example.com")
         _git(stage, "add", "-A")
         _git(stage, "commit", "-q", "-m", "live omlx-extend state")
+        live_tree = _git(stage, "rev-parse", "HEAD^{tree}")
 
-        # Reverse-apply the exported patch to reach exact upstream v0.8.3 base
+        # Reverse-apply the exported patch to reach the pinned upstream base.
         subprocess.run(
             ["git", "-C", str(stage), "apply", "--index", "--reverse", "--binary", str(patch_file)],
             check=True,
             capture_output=True,
             text=True,
         )
-        _git(stage, "commit", "-q", "-m", "upstream v0.8.3 base")
+        _git(stage, "commit", "-q", "-m", f"upstream {upstream_tag} base")
 
         # Forward check & apply via apply_spi_patch.sh
         chk = subprocess.run(
@@ -428,8 +455,6 @@ class TestThreeWaySyncCarriesMixForward:
                 str(apply_script),
                 "--omlx-dir",
                 str(stage),
-                "--patch",
-                str(patch_file),
                 "--check-only",
             ],
             capture_output=True,
@@ -452,7 +477,6 @@ class TestThreeWaySyncCarriesMixForward:
             check=True,
         )
         assert "Patch applied successfully" in app.stdout
-        assert (stage / "omlx" / "engine" / "m5_sidecar.py").read_bytes() == (
-            REPO_ROOT / "omlx" / "omlx" / "engine" / "m5_sidecar.py"
-        ).read_bytes()
+        _git(stage, "add", "-A")
+        assert _git(stage, "write-tree") == live_tree
 

@@ -1,6 +1,6 @@
 # oMLX-extend — Thin External Provider SPI & `miv Core Backend (ninfer-metal)` Adapter
 
-`oMLX-extend` is the upstream-synced extension layer over [`jundot/omlx`](https://github.com/jundot/omlx) (tagged `omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mix1..9`, currently `omlx-extend-v0.8.3`) that integrates the pure-Metal-4 **`miv Core Backend (ninfer-metal)`** inference core (first codename **`miv`**, `miv-v0.01`, `semver: 0.0.1`, `core_abi: 1`, `protocol_version: 2`) while keeping stock oMLX **100% untouched** for unadapted models and keeping the oMLX UI minimal and clean.
+`oMLX-extend` is the upstream-synced extension layer over [`jundot/omlx`](https://github.com/jundot/omlx) (this tree is based on upstream `v0.8.4`, recorded in [`UPSTREAM_VERSION`](UPSTREAM_VERSION)) that integrates the pure-Metal-4 **`miv Core Backend (ninfer-metal)`** inference core (first codename **`miv`**, `miv-v0.01`, `semver: 0.0.1`, `core_abi: 1`, `protocol_version: 2`) while keeping stock oMLX **100% untouched** for unadapted models and keeping the oMLX UI minimal and clean.
 
 ## 1. Architecture: Thin Provider SPI + Zero Stock Regression
 
@@ -117,15 +117,14 @@ Both modes share the same pure C++20/ObjC++/Metal 4 `libomlx_m5_core_runtime.a` 
 `omlx/` is tracked directly inside this monorepo (no external fork or git submodule required). Upstream provenance is recorded in [`UPSTREAM_VERSION`](UPSTREAM_VERSION) (`UPSTREAM_REPO`, `UPSTREAM_TAG`, `UPSTREAM_COMMIT`), and the thin Provider SPI diff against upstream is maintained in [`patches/`](patches/).
 
 ```bash
-# Sync a new upstream jundot/omlx release tag vX.Y.Z directly into monorepo omlx/,
-# apply omlx-extend/patches/, update omlx-extend/UPSTREAM_VERSION, and run pytest:
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3
+# Sync the monorepo omlx/ tree to the latest upstream jundot/omlx release and run pytest:
+./omlx-extend/scripts/sync_omlx.sh
 
 # After editing omlx/ directly in the monorepo, regenerate the upstream SPI patch:
 ./omlx-extend/scripts/sync_omlx.sh --export-patch
 
 # Build the complete drag-to-install macOS oMLX-extend .dmg (oMLX.app + embedded Python/MLX + custom kernels):
-./omlx-extend/scripts/build_omlx_extend_dmg.sh --extend-tag omlx-extend-v0.8.3 --upstream-tag v0.8.3
+./omlx-extend/scripts/build_omlx_extend_dmg.sh
 ```
 
-On 6-hour scheduled CI runs ([`.github/workflows/sync-omlx-extend.yml`](../.github/workflows/sync-omlx-extend.yml)), clean upstream `jundot/omlx` releases are automatically 3-way merged into `omlx/` (carrying forward every prior `oMLX-extend` and `-mix1..9` update, plus deterministic 3-way JSON merge for `Localizable.xcstrings`), re-exported to a binary-safe SPI patch, verified with `pytest`, packaged into an installable macOS **`oMLX-extend-vX.Y.Z-macos26-27.dmg`** (+ `.sha256`), pushed to `main` (or opened as a `chore/omlx-sync-vX.Y.Z` PR if branch-protected), and published immediately as **`omlx-extend-vX.Y.Z`**. When you ship extend-only updates on the same upstream version, run the workflow with `release_mode: mix` to refresh the SPI patch and publish **`omlx-extend-vX.Y.Z-mix1`**..**`mix9`** (with its `.dmg` + `.sha256`) without overwriting prior tags; any upstream merge conflict opens a `chore/omlx-sync-conflict-vX.Y.Z` PR without touching `main`. See [`.github/workflows/release-ninfer-metal.yml`](../.github/workflows/release-ninfer-metal.yml) for the parallel `ninfer-metal` core release pipeline.
+The 6-hour sync workflow merges new upstream releases into `omlx/` while carrying forward the extension, including any `-mixN` updates. It refreshes the binary-safe SPI patch, runs pytest, and builds **`oMLX-extend-vX.Y.Z-macos26-27.dmg`** with a checksum. A clean sync publishes **`omlx-extend-vX.Y.Z`** after the changes reach `main`. If a merge conflicts, the workflow records a report on `chore/omlx-sync-conflict-vX.Y.Z` and attempts to open a PR when repository permissions allow it. For extension-only updates against the same upstream version, use `release_mode: mix` to publish the next **`omlx-extend-vX.Y.Z-mixN`** tag. [Extension sync](../.github/workflows/sync-omlx-extend.yml) · [Core release](../.github/workflows/release-ninfer-metal.yml)

@@ -231,11 +231,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 本モノレポは、パッチ適用済みの `omlx/` ホストを `omlx-extend/` と並置して追跡する（[`omlx-extend/patches/`](../../../omlx-extend/patches/) 経由でアップストリーム `jundot/omlx` と同期）。
 
 ```bash
-# Verify or apply the Provider SPI patch on ./omlx and run pytest
-./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
+# Check the Provider SPI patch against a separate clean checkout of the pinned upstream tag
+./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir /path/to/upstream-omlx --check-only
 
-# Sync ./omlx to a specific upstream jundot/omlx tag
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
+# Sync the vendored ./omlx tree to the latest upstream jundot/omlx release
+./omlx-extend/scripts/sync_omlx.sh
 ```
 
 `io.ninfer.metal/current/` がインストール済みであれば、`oMLX-extend` は **`miv Core Backend`**（`mseries_backendd`、フォールバック先：`com.omlx.mseries/current/`、`PATH`、`build/*/miv/`）を自動検出し、導入済みのルート A およびルート B マイクロカーネルを **`Integrations → External Engines`** に表示する。`model.miv` / `model.omlxm5`、`model_pack.json`、または `omlxm5-manifest.json` を含むモデルディレクトリは初回リクエスト時に遅延で **`miv Core Backend`** へルーティングされ、未変換モデルは Stock MLX のまま動作する。変換済みモデルに対して Stock MLX を強制する場合は、**`Model Settings → Advanced Settings`** で **`Use External Engine`** をオフにする（`external_engine: "stock"` を書き込む）。

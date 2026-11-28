@@ -29,7 +29,7 @@
 - **零 Python，零 MLX**：包含 16 個 Mach-O 二進位檔（含原生 `ninfer-metal-serve` 與 `mseries_backendd`）以及 38 個預先編譯的 `.metallib` 著色器，僅連結 macOS 系統框架——在未安裝 Xcode、Python 或 Homebrew 動態函式庫的潔淨 Mac 上即可直接執行。
 - **獨立 OpenAI 伺服器（`ninfer-metal-serve`）**：單一 C++20 二進位檔，在同一 HTTP/SSE 連接埠平行託管程序內 `miv` 與路徑 B SPI v2 微核心（`/v1/chat/completions`、`/v1/completions`、`/v1/models`、`/health`、`/metrics`），內建 C++ BPE 分詞器、Jinja 聊天範本、`<think>` `reasoning_content` 拆分與 Qwen XML/JSON `<tool_call>` 解析，可直接介接 Open WebUI、Cursor、Cline、NewAPI 與各類 OpenAI SDK。
 - **單副本 NAX 權重與 `0-ULP` 一致性**：離線 NAX 預先磚塊化重排（`.miv`）讓 Prefill、`T=1` 自回歸解碼與推測驗證共用同一份常駐權重（檔案體積 `1.0×`）。基線版本 **`miv-v0.01`** 支援 Qwen3.5 / Qwen3.6 / Qwen3.8 混合架構模型（Dense 27B 與 35B-A3B MoE），涵蓋 `MXFP4` 與 `oQ` Affine（`q3–q8`）量化，並提供 `affine4_g128` KV 快取、Native MTP / DFlash2、多使用者並發批次處理（`B/C = 1..8`）及滾動 UMA 前綴重用。
-- **`oMLX-extend` 即插即用共存**：隨附 `oMLX-extend`（基於 `jundot/omlx` 的 `omlx-extend-v0.8.3`），透過 AF_UNIX Provider SPI v2 Sidecar 接入 **`miv 核心後端`**——已適配的 `.miv` 模型以 O(1) 自動路由，未適配模型維持原版 MLX 執行不變，Sidecar 與 MLX 模型在同一記憶體上限下共享 UMA。
+- **`oMLX-extend` 即插即用共存**：隨附 `oMLX-extend`（儲存庫原始碼基於 `jundot/omlx` `v0.8.4`），透過 AF_UNIX Provider SPI v2 Sidecar 接入 **`miv 核心後端`**——已適配的 `.miv` 模型以 O(1) 自動路由，未適配模型維持原版 MLX 執行不變，Sidecar 與 MLX 模型在同一記憶體上限下共享 UMA。
 
 ---
 

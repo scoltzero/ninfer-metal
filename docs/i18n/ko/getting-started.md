@@ -231,11 +231,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 이 모노레포는 패치된 `omlx/` 호스트를 `omlx-extend/`와 함께 추적하며, [`omlx-extend/patches/`](../../../omlx-extend/patches/)를 통해 업스트림 `jundot/omlx`와 동기화합니다.
 
 ```bash
-# Verify or apply the Provider SPI patch on ./omlx and run pytest
-./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir ./omlx --test
+# Check the Provider SPI patch against a separate clean checkout of the pinned upstream tag
+./omlx-extend/scripts/apply_spi_patch.sh --omlx-dir /path/to/upstream-omlx --check-only
 
-# Sync ./omlx to a specific upstream jundot/omlx tag
-./omlx-extend/scripts/sync_omlx.sh --tag v0.8.3 --omlx-dir ./omlx
+# Sync the vendored ./omlx tree to the latest upstream jundot/omlx release
+./omlx-extend/scripts/sync_omlx.sh
 ```
 
 `io.ninfer.metal/current/`가 설치되어 있으면 `oMLX-extend`가 **`miv Core Backend`**(`mseries_backendd`, 폴백 경로: `com.omlx.mseries/current/`, `PATH`, `build/*/miv/`)를 자동 탐지하고 설치된 경로 A 및 경로 B 마이크로커널을 **`Integrations → External Engines`**에 표시합니다. `model.miv` / `model.omlxm5`, `model_pack.json`, `omlxm5-manifest.json` 중 하나가 있는 모델 디렉터리는 첫 요청 시 지연 방식으로 **`miv Core Backend`**에 라우팅되며, 미변환 모델은 Stock MLX에서 그대로 실행됩니다. 변환된 모델에 Stock MLX를 강제하려면 **`Model Settings → Advanced Settings`**에서 **`Use External Engine`** 스위치를 끄세요(`external_engine: "stock"` 기록).

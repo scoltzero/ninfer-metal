@@ -14,7 +14,7 @@ flowchart LR
         OAI["Open WebUI / Cursor / Cline<br/>NewAPI / OpenAI SDK"]
     end
 
-    subgraph Host["oMLX-extend (omlx-extend-v0.8.3, Provider SPI v2)"]
+    subgraph Host["oMLX-extend (jundot/omlx v0.8.4, Provider SPI v2)"]
         Router["O(1) Auto Model Router<br/>detect_adapted()"]
         Stock["Stock oMLX MLX<br/>(Unadapted models untouched)"]
         Enforcer["ProcessMemoryEnforcer<br/>&amp; EnginePool"]
@@ -104,7 +104,7 @@ flowchart LR
 | 트랙 | 경로 | 태그 패턴 | 워크플로 |
 |---|---|---|---|
 | **추론 코어** | `miv/` | `miv-v0.01` (`<codename>-vX.YZ`) | [`.github/workflows/release-ninfer-metal.yml`](../../../.github/workflows/release-ninfer-metal.yml) |
-| **호스트 확장** | `omlx/` + `omlx-extend/` | `omlx-extend-v0.8.3` (`omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mix1..9`) | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
+| **호스트 확장** | `omlx/` + `omlx-extend/` | `omlx-extend-vX.Y.Z` / `omlx-extend-vX.Y.Z-mixN` | [`.github/workflows/sync-omlx-extend.yml`](../../../.github/workflows/sync-omlx-extend.yml) |
 
 코어 타르볼은 `~/Library/Application Support/oMLX/Providers/io.ninfer.metal/versions/<tag>/` 아래 병렬 설치되며, `current` 심볼릭 링크를 원자적으로 전환해 활성화합니다. oMLX의 Python 환경을 건드리지 않고 업그레이드와 단일 명령 롤백을 처리합니다.
 

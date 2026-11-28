@@ -127,6 +127,7 @@ from ..model_settings import (
     resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
+    specprefill_draft,
     validate_ane_prefill,
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
@@ -148,6 +149,7 @@ from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
+    SPLASH_MAX_CONCURRENT_REQUESTS,
     ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
@@ -194,6 +196,8 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
+from .benchmark import get_active_run as get_active_throughput_run
+from .benchmark import get_queue as get_throughput_queue
 from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
@@ -582,6 +586,8 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
     lora_adapter: str | None = None
+    loopcd_enabled: bool | None = None
+    loopcd_skip_thinking: bool | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -958,6 +964,7 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
     markitdown_pdf_processing_engine: str | None = None
+    macos_say_enabled: bool | None = None
     web_search_provider: str | None = None
     web_search_brave_api_key: str | None = None
     web_search_searxng_url: str | None = None
@@ -975,6 +982,7 @@ class GlobalSettingsRequest(BaseModel):
     splash_ane_prefill: bool | None = None
     m5rt_path: str | None = None
     disabled_microkernels: list[str] | None = None
+    splash_max_concurrent_requests: int | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -2333,6 +2341,15 @@ async def setup_api_key(
     return {"success": True, "message": "API key configured successfully"}
 
 
+@router.post("/api/auth/api-key")
+async def reveal_api_key(is_admin: bool = Depends(require_admin)):
+    """Return the main API key for an explicit copy or reveal action."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return {"api_key": global_settings.auth.api_key or ""}
+
+
 @router.post("/api/logout")
 async def logout(response: Response):
     """
@@ -3496,6 +3513,7 @@ async def update_model_settings(
     prev_spec_toggles = (current_settings.mtp_enabled, current_settings.dflash_enabled)
     prev_ext_options = copy.deepcopy(current_settings.external_engine_options)
     prev_m5rt_options = copy.deepcopy(current_settings.m5rt_options)
+    prev_specprefill_draft = specprefill_draft(current_settings)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
@@ -4088,6 +4106,12 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+    if "loopcd_enabled" in sent:
+        current_settings.loopcd_enabled = bool(
+            request.loopcd_enabled and entry.config_model_type == "inkling2_loop"
+        )
+    if "loopcd_skip_thinking" in sent:
+        current_settings.loopcd_skip_thinking = bool(request.loopcd_skip_thinking)
     touched = set(sent)
     if "lora_adapter" in sent:
         new_adapter = None if is_diffusion_model else request.lora_adapter or None
@@ -4231,7 +4255,8 @@ async def update_model_settings(
     )
     lora_changed = prev_lora_adapter != current_settings.lora_adapter
 
-    # For miv, only changes to the resolved load plan make the process stale.
+    # MIV folds provider settings into its load signature. Other engines also
+    # reload when the client sends one of the stock construction-time fields.
     stock_load_fields = {
         "index_cache_freq", "dflash_enabled", "dflash_draft_model",
         "dflash_draft_quant_enabled", "dflash_draft_quant_weight_bits",
@@ -4241,6 +4266,13 @@ async def update_model_settings(
     requires_reload = entry.engine is not None and (
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
         or prev_load_signature != current_load_signature
+        # Only an unload releases a SpecPrefill draft that is no longer used.
+        or (
+            prev_specprefill_draft
+            and prev_specprefill_draft != specprefill_draft(current_settings)
+            and prev_specprefill_draft
+            == getattr(entry.engine, "specprefill_draft_path", None)
+        )
         or (
             active_ext_engine != M5RT_ENGINE_ID
             and (lora_changed or ext_options_changed or bool(stock_load_fields & sent))
@@ -5677,7 +5709,6 @@ def _global_settings_response(global_settings):
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
-            "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "allow_unauthenticated_inference": (
                 global_settings.auth.allow_unauthenticated_inference
@@ -5706,6 +5737,7 @@ def _global_settings_response(global_settings):
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
+            "macos_say_enabled": global_settings.integrations.macos_say_enabled,
             "web_search_provider": global_settings.integrations.web_search_provider,
             "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
             "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
@@ -5724,6 +5756,7 @@ def _global_settings_response(global_settings):
             "disabled_microkernels": list(
                 getattr(global_settings.integrations, "disabled_microkernels", ()) or ()
             ),
+            "splash_max_concurrent_requests": global_settings.integrations.splash_max_concurrent_requests,
         },
         "external_engines": _external_engines_status(global_settings),
         "system": {
@@ -5780,6 +5813,16 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    concurrent = request.splash_max_concurrent_requests
+    if concurrent is not None and not (
+        1 <= concurrent <= SPLASH_MAX_CONCURRENT_REQUESTS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="splash_max_concurrent_requests must be between 1 and "
+            f"{SPLASH_MAX_CONCURRENT_REQUESTS}",
+        )
 
     # Infinity would persist and break JSON encoding of the settings response.
     for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
@@ -6701,9 +6744,17 @@ async def update_global_settings(
             if str(x).strip()
         ]
         integrations_changed = True
+    if "splash_max_concurrent_requests" in request.model_fields_set:
+        global_settings.integrations.splash_max_concurrent_requests = concurrent
+        integrations_changed = True
     if "markitdown_enabled" in request.model_fields_set:
         global_settings.integrations.markitdown_enabled = bool(
             request.markitdown_enabled
+        )
+        integrations_changed = True
+    if "macos_say_enabled" in request.model_fields_set:
+        global_settings.integrations.macos_say_enabled = bool(
+            request.macos_say_enabled
         )
         integrations_changed = True
     if "markitdown_expose_model" in request.model_fields_set:
@@ -7893,7 +7944,7 @@ async def get_server_stats(
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
     port = global_settings.server.port if global_settings else 8000
-    api_key = global_settings.auth.api_key if global_settings else ""
+    api_key_set = bool(global_settings and global_settings.auth.api_key)
 
     from ..utils.install import get_cli_prefix
 
@@ -7908,7 +7959,7 @@ async def get_server_stats(
         **snapshot,
         "host": host,
         "port": port,
-        "api_key": api_key or "",
+        "api_key_set": api_key_set,
         "cli_prefix": get_cli_prefix(),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
@@ -10003,6 +10054,11 @@ async def start_ane_tuning(
             status_code=409,
             detail=f"A throughput benchmark is already running ({throughput.bench_id}).",
         )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
+        )
     context = get_active_context_run()
     if context is not None:
         raise HTTPException(
@@ -10147,6 +10203,11 @@ async def start_context_benchmark(
                 f"(bench_id={throughput_active.bench_id}, "
                 f"model_id={throughput_active.request.model_id})."
             ),
+        )
+    if get_throughput_queue():
+        raise HTTPException(
+            status_code=409,
+            detail="Throughput benchmarks are waiting in the queue.",
         )
     from .ane_tuning import get_active_run as get_active_ane_tuning
 
@@ -10340,14 +10401,14 @@ async def get_context_benchmark_results(
 
 @router.get("/api/bench/active")
 async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
-    """Return the currently-running throughput benchmark, if any.
+    """Return the currently-running throughput benchmark and the queue.
 
     Symmetric to `/api/bench/accuracy/queue/status` — lets a fresh page
     load or a second tab discover an in-flight run so it can attach to
     the SSE stream. Combined with the replay-on-subscribe stream this
     is what makes the multi-tab + page-refresh story actually work.
     """
-    from .benchmark import get_active_run
+    from .benchmark import get_active_run, get_queue
 
     run = get_active_run()
     if run is None:
@@ -10356,9 +10417,12 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
             "bench_id": None,
             "model_id": None,
             "context_profile": None,
+            "queue": get_queue(),
         }
     return {
         "running": True,
+        "queue": get_queue(),
+        "queue_id": run.queue_id,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
         "context_profile": run.request.context_profile.value,
@@ -10375,36 +10439,27 @@ async def start_benchmark(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Start a benchmark run.
+    """Start a benchmark run, or queue it behind the running one.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task. Rejects with 409 if another
-    throughput bench is already running — two concurrent runs on
-    the same engine produce mutually-corrupted measurements.
+    as an asyncio background task. Two concurrent runs on the same
+    engine produce mutually-corrupted measurements, so a request that
+    arrives while a throughput bench is running waits in the queue.
     """
     from .benchmark import (
         BenchmarkRequest,
+        add_to_queue,
         cleanup_old_runs,
         create_run,
         get_active_run,
-        run_benchmark,
+        get_queue,
+        queue_busy,
+        run_queue,
     )
 
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    # One throughput bench at a time. The replay-on-subscribe stream lets
-    # clients attach to the already-running one if that's what they want.
-    active = get_active_run()
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A throughput benchmark is already running "
-                f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
-            ),
-        )
 
     from .context_benchmark import get_active_run as get_active_context_run
 
@@ -10451,6 +10506,14 @@ async def start_benchmark(
                 detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
             )
 
+    if queue_busy() or get_active_run() is not None:
+        queue_id = add_to_queue(bench_request)
+        return {
+            "status": "queued",
+            "queue_id": queue_id,
+            "queue": get_queue(),
+        }
+
     # Cleanup old runs
     cleanup_old_runs()
 
@@ -10459,7 +10522,9 @@ async def start_benchmark(
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
     _drop_idle_gpu_power_cap()
-    run.task = asyncio.create_task(run_benchmark(run, engine_pool))
+    run.task = asyncio.create_task(
+        run_queue(run, engine_pool, on_start=_drop_idle_gpu_power_cap)
+    )
 
     logger.info(
         f"Benchmark started: {run.bench_id} model={bench_request.model_id} "
@@ -10471,6 +10536,21 @@ async def start_benchmark(
         "status": "started",
         "total_tests": total_tests,
     }
+
+
+@router.delete("/api/bench/queue/{queue_id}")
+async def remove_from_benchmark_queue(
+    queue_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove a request from the throughput benchmark queue by its id."""
+    from .benchmark import get_queue, remove_from_queue
+
+    if not remove_from_queue(queue_id):
+        raise HTTPException(
+            status_code=404, detail=f"Queue entry {queue_id} not found"
+        )
+    return {"queue": get_queue()}
 
 
 @router.get("/api/bench/{bench_id}/stream")
@@ -10535,12 +10615,17 @@ async def cancel_benchmark(
     bench_id: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Cancel a running benchmark."""
-    from .benchmark import get_run
+    """Cancel a running benchmark and clear the queue behind it."""
+    from .benchmark import clear_queue, get_run
 
     run = get_run(bench_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    uploading = run.task is not None and not run.task.done()
+    if run.status == "completed" and uploading and get_active_throughput_run() is None:
+        clear_queue()
+        return {"status": "cancelled", "bench_id": bench_id}
 
     if run.status != "running":
         raise HTTPException(
@@ -10548,6 +10633,7 @@ async def cancel_benchmark(
             detail=f"Benchmark is not running (status: {run.status})",
         )
 
+    clear_queue()
     if run.task and not run.task.done():
         run.task.cancel()
 
@@ -10725,6 +10811,9 @@ async def estimate_oq(
     oq_level: float,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -10735,9 +10824,11 @@ async def estimate_oq(
             estimate_bpw_and_size,
             model_path,
             oq_level,
-            64,  # group_size (default)
-            preserve_mtp,
-            preserve_ngram_table,
+            preserve_mtp=preserve_mtp,
+            preserve_ngram_table=preserve_ngram_table,
+            text_only=text_only,
+            dtype=dtype,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         return result
     except Exception as e:
