@@ -29,15 +29,21 @@ inline constexpr U32 kW4A4DefaultMinTokens = 32U;
   return kW4A4DefaultMinTokens;
 }
 
-// Optional hybrid policy: when OMLX_M5_W4A4_KEEP_QK_A8=1, keep full-attention
-// q_proj and k_proj on W4A8 while keeping MLP / GDN / o_proj / v_proj on W4A4
-// (allows direct 4K/16K PPL & 256K NIAH A/B on M5 Ultra).
+// Default-ON hybrid W4A4 policy (promoted by Phase 3 M5 Ultra precision gate):
+// keep full-attention q_proj and k_proj on W4A8 while keeping MLP / GDN /
+// o_proj / v_proj on W4A4. Cuts 16K PPL 6.96x (37.73 -> 5.42 Exact, 15.28 ->
+// 7.76 Sage2+MInf) while running +0.4% to +0.8% faster at 16K/256K.
+// Set OMLX_M5_W4A4_KEEP_QK_A8=0 to explicitly force Pure W4A4 for A/B studies.
 [[nodiscard]] inline bool w4a4_keep_qk_a8_enabled() noexcept {
   if (const char *env = std::getenv("OMLX_M5_W4A4_KEEP_QK_A8")) {
     const std::string_view sv(env);
-    return sv == "1" || sv == "true" || sv == "TRUE" || sv == "on" || sv == "ON";
+    if (sv == "0" || sv == "false" || sv == "FALSE" || sv == "off" ||
+        sv == "OFF") {
+      return false;
+    }
+    return true;
   }
-  return false;
+  return true;
 }
 
 [[nodiscard]] inline bool w4a4_nax_runtime_eligible(

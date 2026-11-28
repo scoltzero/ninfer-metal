@@ -494,6 +494,8 @@ public:
     conv = 2 * gk + gv;
 
     const bool affine4_kv = (kv_format_ == KvStorageFormat::Affine4Group128);
+    // Hybrid QK-A8 W4A4 is default-ON (w4a4_keep_qk_a8_enabled() defaults true;
+    // set OMLX_M5_W4A4_KEEP_QK_A8=0 to opt into Pure W4A4).
     const bool w4a4_keep_qk_a8 =
         (prefill_options_.linear_mode == PrefillLinearMode::W4A4 &&
          w4a4_keep_qk_a8_enabled());

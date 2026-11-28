@@ -1064,10 +1064,10 @@ public:
     const bool w4a4_keep_qk_a8 = []() {
       const char *v = std::getenv("OMLX_M5_W4A4_KEEP_QK_A8");
       if (!v)
-        return false;
+        return true;
       const std::string_view sv(v);
-      return sv == "1" || sv == "true" || sv == "TRUE" || sv == "on" ||
-             sv == "ON";
+      return !(sv == "0" || sv == "false" || sv == "FALSE" || sv == "off" ||
+               sv == "OFF");
     }();
     const bool enable_w4a4_ws =
         (effective_linear_mode == PrefillLinearMode::W4A4);

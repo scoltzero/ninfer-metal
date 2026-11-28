@@ -1449,7 +1449,7 @@ def run_model_cold_matrix(
                     f"TTFT={trial_rec['ttft_s']:7.3f}s ({trial_rec['prefill_tok_per_s']:7.1f} tok/s) "
                     f"decode={trial_rec['decode_tok_per_s']:5.1f} tok/s (n={trial_rec['completion_tokens']}) "
                     f"phys={trial_rec['peak_phys_footprint_gib']:5.2f} GiB "
-                    f"w4a8={tel_delta['w4a8_tokens']} sage2={tel_delta['sage2_tokens']} "
+                    f"w4a8={tel_delta['w4a8_tokens']} w4a4={tel_delta['w4a4_tokens']} sage2={tel_delta['sage2_tokens']} "
                     f"ane={tel_delta['ane_offload_tokens']} minf_skip={tel_delta['minference_blocks_skipped']}/{tel_delta['minference_blocks_total']} "
                     f"NIAH={'PASS' if niah_hit else 'FAIL'} ({n_hits}/{n_total})",
                     flush=True,
@@ -1927,7 +1927,7 @@ def parse_model_spec(spec: str, default_artifact: Optional[str] = None) -> Tuple
 
 
 def _resolve_cell_cfg(args: argparse.Namespace) -> Dict[str, Any]:
-    cell_cfg = _resolve_cell_cfg(args)
+    cell_cfg = dict(MATRIX_CELLS[args.cell])
     if args.prefill_linear_mode is not None:
         cell_cfg["prefill_linear_mode"] = args.prefill_linear_mode
     if args.prefill_ane_mode is not None:
