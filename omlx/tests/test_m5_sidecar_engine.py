@@ -2087,10 +2087,11 @@ class TestMivV001SettingsCoexistenceAndUI:
             )
             enforcer._running = True
             ceiling = 200 * 1024 * 1024  # soft = 160 MiB
-            usage_samples = iter([180 * 1024 * 1024, 150 * 1024 * 1024])
             enforcer._get_hard_limit_bytes = lambda: ceiling  # type: ignore[method-assign]
             enforcer._get_abort_limit_bytes = lambda: ceiling  # type: ignore[method-assign]
-            enforcer._current_usage_bytes = lambda: next(usage_samples, 150 * 1024 * 1024)  # type: ignore[method-assign]
+            # An intermediate remeasurement can follow CPU image-cache cleanup.
+            # This fixture's sidecar memory drops only after the trim RPC.
+            enforcer._current_usage_bytes = lambda: (150 if srv_v2.trim_calls else 180) * 1024**2  # type: ignore[method-assign]
             enforcer._propagate_memory_limit = lambda: None  # type: ignore[method-assign]
             enforcer._request_scheduler_cache_reclaim = lambda _b: 0  # type: ignore[method-assign]
             enforcer._walk_store_cache_caps = lambda: None  # type: ignore[method-assign]

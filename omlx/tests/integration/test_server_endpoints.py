@@ -1180,41 +1180,39 @@ class TestCompletionEndpoint:
         assert response.status_code == 200
         assert captured.get("thinking_budget") == 300
 
-    def test_completion_thinking_budget_from_model_settings(
-        self, client, mock_llm_engine
+    @pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream_generate"])
+    @pytest.mark.parametrize(("requested", "expected"), [(None, 256), (0, 0)])
+    def test_completion_path_resolves_the_budget(
+        self, client, mock_llm_engine, monkeypatch, tmp_path, stream, requested, expected
     ):
-        """A model-level thinking budget (admin settings) applies to
-        /v1/completions even when the request omits the parameter, matching
-        /v1/chat/completions."""
-        from omlx.model_settings import ModelSettings
-        from omlx.server import _server_state
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
 
-        class StubSettingsManager:
-            def get_settings(self, model_id):
-                return ModelSettings(
-                    thinking_budget_enabled=True,
-                    thinking_budget_tokens=256,
-                )
-
-        mock_llm_engine.generate = AsyncMock(
-            return_value=MockGenerationOutput(text="Generated response.")
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "test-model", ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=256)
         )
+        monkeypatch.setattr("omlx.server._server_state.settings_manager", manager)
 
-        original_settings_manager = _server_state.settings_manager
-        _server_state.settings_manager = StubSettingsManager()
-        try:
-            response = client.post(
-                "/v1/completions",
-                json={
-                    "model": "test-model",
-                    "prompt": "Explain why the sky is blue.",
-                },
-            )
-        finally:
-            _server_state.settings_manager = original_settings_manager
+        seen = []
 
-        assert response.status_code == 200
-        assert mock_llm_engine.generate.call_args.kwargs["thinking_budget"] == 256
+        async def generate(prompt, **kwargs):
+            seen.append(kwargs["thinking_budget"])
+            return MockGenerationOutput(text="Hi", new_text="Hi", finished=True)
+
+        async def stream_generate(prompt, **kwargs):
+            yield await generate(prompt, **kwargs)
+
+        mock_llm_engine.generate = generate
+        mock_llm_engine.stream_generate = stream_generate
+        body = {"model": "test-model", "prompt": "Hi", "stream": stream}
+        if requested is not None:
+            body["thinking_budget"] = requested
+        response = client.post("/v1/completions", json=body)
+
+        assert response.status_code == 200, response.text
+        if stream:
+            assert "data: [DONE]" in response.text
+        assert seen == [expected]
 
 
 class TestChatCompletionEndpoint:

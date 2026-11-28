@@ -36,7 +36,7 @@
                                 + ' (' + t('modal.model_settings.miv_source_' + selectedModel?.miv_effective_settings?.concurrency_source) + ')'"></span>
                             <span x-text="selectedModel?.miv_effective_settings?.sampling_contract_id"></span>
                             <template x-for="badge in mivEffectivePrefillBadges(selectedModel?.miv_effective_settings)" :key="badge">
-                                <span class="px-1.5 py-0.5 text-[11px] font-mono font-medium rounded bg-neutral-200/80 text-neutral-800" x-text="badge"></span>
+                                <span class="px-1.5 py-0.5 text-caption font-mono font-medium rounded bg-neutral-200/80 text-neutral-800" x-text="badge"></span>
                             </template>
                         </div>
                     </div>
