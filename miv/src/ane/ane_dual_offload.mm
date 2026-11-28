@@ -1776,7 +1776,7 @@ std::string compute_calibration_cache_key(
     double bypass_ratio,
     std::optional<double> alpha_override) {
   std::ostringstream oss;
-  oss << "ane_cal_v2_p3"
+  oss << "ane_cal_v3_p31"
       << "|os=" << os_build
       << "|gc=" << gpu_cores
       << "|dies=" << ane_dies
