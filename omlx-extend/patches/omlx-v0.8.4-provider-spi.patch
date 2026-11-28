@@ -24414,10 +24414,10 @@ index 0000000..5d204d8
 +
 diff --git a/tests/test_m5_sidecar_engine.py b/tests/test_m5_sidecar_engine.py
 new file mode 100644
-index 0000000..6d16da9
+index 0000000..490d33f
 --- /dev/null
 +++ b/tests/test_m5_sidecar_engine.py
-@@ -0,0 +1,4792 @@
+@@ -0,0 +1,4796 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Comprehensive unit, plugin, live `mseries_backendd` (fake + Metal `.omlxm5`),
 +and real FastAPI `server.py` E2E tests for `M5SidecarEngine` on oMLX v0.8.0.
@@ -25791,7 +25791,11 @@ index 0000000..6d16da9
 +        ms = ModelSettings(
 +            external_engine=M5RT_ENGINE_ID,
 +            m5rt_artifact_path=str(artifact_file),
-+            m5rt_options={"metallib_dir": str(LIVE_METALLIB_DIR), "max_context": 1024},
++            m5rt_options={
++                "metallib_dir": str(LIVE_METALLIB_DIR),
++                "max_context": 1024,
++                "max_concurrency": 1,
++            },
 +        )
 +        target, reason = resolve_m5rt_target(staged, str(LIVE_DAEMON_PATH), ms)
 +        assert target is not None, reason

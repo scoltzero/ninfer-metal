@@ -1371,7 +1371,11 @@ class TestLiveDaemonAndFastAPIE2E:
         ms = ModelSettings(
             external_engine=M5RT_ENGINE_ID,
             m5rt_artifact_path=str(artifact_file),
-            m5rt_options={"metallib_dir": str(LIVE_METALLIB_DIR), "max_context": 1024},
+            m5rt_options={
+                "metallib_dir": str(LIVE_METALLIB_DIR),
+                "max_context": 1024,
+                "max_concurrency": 1,
+            },
         )
         target, reason = resolve_m5rt_target(staged, str(LIVE_DAEMON_PATH), ms)
         assert target is not None, reason
