@@ -103,6 +103,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var weightFormat: String? = nil
     /// True when repacked microkernel weights (`.miv` / `.omlxm5`) exist in the model directory.
     var hasMivWeights: Bool? = nil
+    /// Built-in artifact present on disk or in the artifact cache, independent of the selected engine.
+    var mivArtifactFormat: String? = nil
+    /// Effective MIV routing from the backend, including provider enablement and model overrides.
+    var mivRouteEnabled: Bool? = nil
     /// True when the model currently has `.safetensors` and will auto-repack to `.miv` on first Load.
     var pendingAutoRepack: Bool? = nil
     /// Target format suffix when `pendingAutoRepack` is true (e.g. `"miv"`).
@@ -143,6 +147,61 @@ extension ModelDTO {
             return mf.lowercased()
         }
         return "safetensors"
+    }
+
+    enum ListMivBadge: Equatable {
+        case available, routed
+
+        var help: String {
+            switch self {
+            case .available:
+                return String(localized: "models.format.miv_available.help",
+                              defaultValue: "This model has .miv weights. MIV routing is off.")
+            case .routed:
+                return String(localized: "models.format.miv_routed.help",
+                              defaultValue: "This model has .miv weights and is routed to the MIV engine.")
+            }
+        }
+    }
+
+    static func isBuiltinMivEngine(_ id: String?) -> Bool {
+        switch id {
+        case "m5rt", "io.ninfer.metal", "ninfer-metal", "com.omlx.mseries": return true
+        default: return false
+        }
+    }
+
+    var listMivBadge: ListMivBadge? {
+        guard virtual != true else { return nil }
+        if let format = mivArtifactFormat {
+            guard format == "miv" || format == "omlxm5" else { return nil }
+        } else {
+            // New servers send an explicit route flag even when the artifact is absent.
+            // Only older servers need the fallback; their boolean also counts Path B artifacts.
+            let format = effectiveWeightFormat
+            guard mivRouteEnabled == nil, hasMivWeights != false,
+                  format == "miv" || format == "omlxm5" || (format == "safetensors" && hasMivWeights == true)
+            else { return nil }
+        }
+        if let mivRouteEnabled { return mivRouteEnabled ? .routed : .available }
+        // Older servers can still report the previous live engine while it unloads.
+        let saved = settings?.externalEngine ?? ""
+        let route = saved.isEmpty || saved == "auto" ? activeEngineId ?? autoExternalEngine : saved
+        return Self.isBuiltinMivEngine(route) ? .routed : .available
+    }
+
+    var showsOtherListWeightFormat: Bool {
+        guard virtual != true, pendingAutoRepack != true else { return false }
+        switch effectiveWeightFormat {
+        case "safetensors", "miv": return false
+        case "omlxm5": return mivRouteEnabled != nil && mivArtifactFormat != "omlxm5"
+        default: return true
+        }
+    }
+
+    func showsListEngineBadge(inActiveModels: Bool) -> Bool {
+        guard virtual != true, !Self.isBuiltinMivEngine(resolvedEngineId) else { return false }
+        return inActiveModels || resolvedEngineId != "mlx" || isStockEngineOverride
     }
 
     var weightFormatBadgeLabel: String {

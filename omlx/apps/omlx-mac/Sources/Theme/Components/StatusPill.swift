@@ -150,6 +150,8 @@ struct MicrokernelTagPill: View {
 struct WeightFormatPill: View {
     enum StyleKind {
         case miv
+        case mivAvailable
+        case mivRouted
         case pendingRepack
         case neutral
     }
@@ -177,10 +179,18 @@ struct WeightFormatPill: View {
                     .strokeBorder(style.border, lineWidth: 0.5)
             )
             .help(tooltip ?? label)
+            .accessibilityHint(Text(tooltip ?? ""))
     }
 
     private var palette: (text: Color, bg: Color, border: Color) {
         switch kind {
+        case .mivAvailable:
+            return (Color(hex: theme.isDark ? 0xb3e8f6 : 0x18586e),
+                    Color(hex: theme.isDark ? 0x254854 : 0xd5f1f8),
+                    Color(hex: theme.isDark ? 0x477685 : 0x96d2e2))
+        case .mivRouted:
+            return (.white, Color(hex: theme.isDark ? 0x23558e : 0x18467e),
+                    Color(hex: theme.isDark ? 0x5b89b8 : 0x18467e))
         case .miv:
             let teal = Color(nsColor: .systemTeal)
             return (teal, teal.opacity(0.14), teal.opacity(0.35))

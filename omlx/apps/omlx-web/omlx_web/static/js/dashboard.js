@@ -4941,16 +4941,38 @@
                 return engines.some(e => e.can_convert);
             },
 
-            modelWeightFormatLabel(model) {
-                if (!model || model.virtual) return '';
-                if (model.pending_auto_repack) {
-                    const target = model.repack_target_format || 'miv';
-                    return `safetensors → .${target}`;
+            modelHasMivArtifact(model) {
+                if (model.virtual) return false;
+                if (model.miv_artifact_format !== undefined || typeof model.miv_route_enabled === 'boolean') {
+                    return ['miv', 'omlxm5'].includes(model.miv_artifact_format);
                 }
-                const fmt = (model.weight_format || model.model_format || 'safetensors').toLowerCase();
-                if (fmt === 'gguf') return 'GGUF';
-                if (fmt === 'safetensors') return 'safetensors';
-                return fmt.startsWith('.') ? fmt : `.${fmt}`;
+                const format = model.weight_format || model.model_format || 'safetensors';
+                return model.has_miv_weights !== false && (
+                    ['miv', 'omlxm5'].includes(format) || (format === 'safetensors' && model.has_miv_weights === true)
+                );
+            },
+
+            modelWeightFormatLabel(model) {
+                if (model.virtual || model.pending_auto_repack) return '';
+                const format = (model.weight_format || model.model_format || 'safetensors').toLowerCase().replace(/^\./, '');
+                if (['gguf', 'safetensors', 'miv'].includes(format)) return '';
+                if (format === 'omlxm5' && this.modelHasMivArtifact(model)) return '';
+                return `.${format}`;
+            },
+
+            modelRoutesToMiv(model) {
+                if (typeof model.miv_route_enabled === 'boolean') return model.miv_route_enabled;
+                const configured = model.settings?.external_engine;
+                const route = configured && configured !== 'auto'
+                    ? configured
+                    : model.active_engine_id ?? model.auto_external_engine;
+                return ['m5rt', 'io.ninfer.metal', 'ninfer-metal', 'com.omlx.mseries'].includes(route);
+            },
+
+            modelMivBadgeHelp(model) {
+                return window.t(this.modelRoutesToMiv(model)
+                    ? 'settings.models.table.miv_routed'
+                    : 'settings.models.table.miv_available');
             },
 
             async convertModelOmlxm5() {
@@ -4962,10 +4984,12 @@
                     });
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        alert(data.detail || 'Failed to convert model to .miv');
+                        alert(data.detail || window.t('modal.model_settings.miv_convert_failed'));
                         return;
                     }
-                    if (data.message) alert(data.message);
+                    if (data.message) {
+                        alert(window.t('modal.model_settings.miv_convert_reload').replace('{format}', data.artifact_format || 'miv'));
+                    }
                     await this.loadModels();
                     const updated = (this.models || []).find(m => m.id === this.selectedModel.id);
                     if (updated) this.openModelSettings(updated);
@@ -5087,31 +5111,24 @@
                 );
             },
 
-            isExternalEngineZh() {
-                return (typeof document !== 'undefined' && document?.documentElement?.lang || '').toLowerCase().startsWith('zh');
-            },
-
             isMoeExternalEngineModel() {
                 const type = String(this.selectedModel?.config_model_type || '').toLowerCase();
                 return type.includes('moe');
             },
 
             externalEnginePrefillCardTitle() {
-                return this.isExternalEngineZh() ? 'Prefill 预填加速' : 'Prefill Acceleration';
+                return window.t('modal.model_settings.miv_prefill_title');
             },
 
             externalEnginePrefillCardSubtitle() {
-                return this.isExternalEngineZh()
-                    ? '长上下文冷启动加速项，支持自由正交组合（解码阶段保持全精度 W4A16）。'
-                    : 'Orthogonal long-context prefill switches (decode stays exact W4A16).';
+                return window.t('modal.model_settings.miv_prefill_subtitle');
             },
 
             externalEnginePrefillPresets() {
-                const zh = this.isExternalEngineZh();
                 return [
                     {
                         id: 'lossless',
-                        label: zh ? '无损默认' : 'Lossless',
+                        label: window.t('modal.model_settings.miv_prefill_lossless'),
                         values: {
                             prefill_linear_mode: 'bf16',
                             prefill_attention_mode: 'exact_nax',
@@ -5122,7 +5139,7 @@
                     },
                     {
                         id: 'w4a8',
-                        label: zh ? 'W4A8 均衡' : 'W4A8',
+                        label: window.t('modal.model_settings.miv_prefill_w4a8'),
                         values: {
                             prefill_linear_mode: 'w4a8',
                             prefill_attention_mode: 'exact_nax',
@@ -5133,7 +5150,7 @@
                     },
                     {
                         id: 'gpu_full',
-                        label: zh ? 'GPU 全速' : 'GPU Full',
+                        label: window.t('modal.model_settings.miv_prefill_gpu_full'),
                         values: {
                             prefill_linear_mode: 'w4a8',
                             prefill_attention_mode: 'sage2',
@@ -5144,7 +5161,7 @@
                     },
                     {
                         id: 'rag_blend',
-                        label: zh ? 'RAG 复用' : 'RAG Reuse',
+                        label: window.t('modal.model_settings.miv_prefill_rag_blend'),
                         values: {
                             prefill_linear_mode: 'w4a8',
                             prefill_attention_mode: 'exact_nax',
@@ -5184,68 +5201,24 @@
                 }
             },
 
+            mivOptionText(item, field) {
+                if (this.effectiveExternalEngine() !== 'm5rt' || !item?.key) return '';
+                const key = `modal.model_settings.miv_option_${item.key}_${field}`;
+                const text = window.t(key);
+                return text === key ? '' : text;
+            },
+
             externalEngineOptionLabel(item) {
-                if (!item || !item.key) return '';
-                if (this.isExternalEngineZh()) {
-                    const zhLabels = {
-                        max_concurrency: '并发槽位 (B/C)',
-                        max_context: '最大上下文长度 (Tokens)',
-                        rolling_prefix_cache: '滚动前缀缓存',
-                        prefix_cache_gb: '前缀缓存预算 (GiB)',
-                        prefill_linear_mode: 'W4A8 线性',
-                        prefill_attention_mode: 'Sage2 注意力',
-                        prefill_sparse_minference: '↳ MInference 稀疏',
-                        prefill_cache_blend: 'CacheBlend 复用',
-                        prefill_ane_offload: '双 ANE 协同',
-                        sampling_contract: '采样协议 (Sampling Contract)',
-                        artifact_path: '权重产物路径 (.miv)',
-                        draft_artifact_path: '草稿产物路径 (.miv)',
-                    };
-                    if (zhLabels[item.key]) return zhLabels[item.key];
-                }
-                const enLabels = {
-                    max_context: 'Max Context Window',
-                    prefill_linear_mode: 'W4A8 Linear',
-                    prefill_attention_mode: 'Sage2 Attention',
-                    prefill_sparse_minference: '↳ MInference Sparse',
-                    prefill_cache_blend: 'CacheBlend Reuse',
-                    prefill_ane_offload: 'Dual-ANE Offload',
-                };
-                if (enLabels[item.key]) return enLabels[item.key];
-                return item.label || item.key;
+                return this.mivOptionText(item, 'label') || item?.label || item?.key || '';
             },
 
             externalEngineOptionHint(item) {
-                if (!item || !item.key) return '';
-                if (this.isExternalEngineZh()) {
-                    const zhHints = {
-                        prefill_linear_mode: '仅加速预填线性层（oQ4e 收益明显，down_proj 默认保留 W4A16 防掉点），解码阶段无损。',
-                        prefill_attention_mode: '低位宽 INT8 QK 注意力；开启时默认联动下方 MInference，单开不选稀疏会明显掉速。',
-                        prefill_sparse_minference: '64K–256K 动态跳过无关 KV 块（提速 2.1x–2.35x）；有些许精度损失，但在 Sage2 下不开会严重掉速。',
-                        prefill_cache_blend: '多文档/RAG 非连续分块 KV+GDN 复用（乱序命中提速 4.3x–4.5x）；长文档建议调大前缀缓存预算（如 16–32 GiB）。',
-                        prefill_ane_offload: '独立正交开关（不强制关 W4A8/Sage2），仅对 Dense 生效并自动跳过 GDN 递归层；80 核 M5 Ultra 上纯 GPU 更快。',
-                    };
-                    if (zhHints[item.key]) {
-                        if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
-                            return zhHints[item.key] + ' 当前为 MoE 模型，此项自动跳过。';
-                        }
-                        return zhHints[item.key];
-                    }
+                const hint = this.mivOptionText(item, 'hint');
+                if (!hint) return item?.description || '';
+                if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
+                    return `${hint} ${window.t('modal.model_settings.miv_prefill_moe_gpu')}`;
                 }
-                const enHints = {
-                    prefill_linear_mode: 'INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). Decode remains exact.',
-                    prefill_attention_mode: 'Low-bit INT8 QK attention; auto-enables MInference below (dense Sage2 alone is slower on affine4 KV).',
-                    prefill_sparse_minference: 'Skips low-weight KV blocks (2.1x–2.35x faster at 64K–256K). Slight quality loss, but turning it off under Sage2 causes severe slowdown.',
-                    prefill_cache_blend: 'Non-contiguous RAG chunk KV+GDN reuse (4.3x–4.5x warmer TTFT). Raise Prefix Cache Budget (e.g. 16–32 GiB) for long docs.',
-                    prefill_ane_offload: 'Orthogonal (never disables W4A8/Sage2); Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra.',
-                };
-                if (enHints[item.key]) {
-                    if (item.key === 'prefill_ane_offload' && this.isMoeExternalEngineModel()) {
-                        return enHints[item.key] + ' MoE models stay GPU-only.';
-                    }
-                    return enHints[item.key];
-                }
-                return item.description || '';
+                return hint;
             },
 
             externalEngineOptionIsToggle(item) {
@@ -5292,9 +5265,7 @@
 
             externalEngineOptionTooltip(item) {
                 if (!this.externalEngineOptionDisabled(item)) return '';
-                return this.isExternalEngineZh()
-                    ? '开启上方「Sage2 注意力」后可用'
-                    : 'Active when Sage2 Attention is enabled';
+                return window.t('modal.model_settings.miv_prefill_minference_requires_sage2');
             },
 
             externalEngineOptionContainerClass(item) {
@@ -5317,15 +5288,21 @@
                 }
                 if (eff.prefill_cache_blend) badges.push('BLEND');
                 if (eff.prefill_ane_active) badges.push('ANE');
-                else if (eff.prefill_ane_offload) badges.push('ANE(off)');
+                else if (eff.prefill_ane_offload) badges.push(window.t('modal.model_settings.miv_prefill_ane_off'));
                 return badges;
             },
 
             externalEngineEnumOptionLabel(item, opt) {
-                if (item && item.option_labels && typeof item.option_labels === 'object' && item.option_labels[opt]) {
-                    return item.option_labels[opt];
+                if (item?.key === 'speculative_backend' && this.effectiveExternalEngine() === 'm5rt') {
+                    const label = {
+                        auto: window.t('settings.resource.auto'),
+                        none: window.t('modal.model_settings.lora_adapter_none'),
+                        mtp: 'MTP',
+                        dflash2: 'DFlash2',
+                    }[opt];
+                    if (label) return label;
                 }
-                return opt;
+                return this.mivOptionText(item, opt) || item?.option_labels?.[opt] || opt;
             },
 
             getExternalEngineOption(item) {
@@ -5393,14 +5370,6 @@
                         this.setExternalEngineOption(minfItem, true, { autoCouple: false });
                     }
                 }
-            },
-
-            externalEngineLoraModeOptionLabel(opt) {
-                const schema = this.externalEngineLoraModeSchema();
-                if (schema && schema.option_labels && typeof schema.option_labels === 'object' && schema.option_labels[opt]) {
-                    return schema.option_labels[opt];
-                }
-                return opt;
             },
 
             getExternalEngineLoraMode() {

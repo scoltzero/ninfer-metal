@@ -2362,14 +2362,16 @@ def _search_artifact_cache(model_dir: Path) -> Path | None:
         cache_dirs.append(Path(env_cache).expanduser())
     cache_dirs.append(_REPO_ROOT / _DEFAULT_ARTIFACT_CACHE_RELPATH)
 
+    cache_dirs = [directory for directory in cache_dirs if directory.is_dir()]
+    if not cache_dirs:
+        return None
+
     config_path = model_dir / "config.json"
     config_sha = _sha256_file(config_path) if config_path.is_file() else None
     model_slug = _normalize_slug(model_dir.name)
 
     slug_match: Path | None = None
     for cache_dir in cache_dirs:
-        if not cache_dir.is_dir():
-            continue
         for ext in M5RT_ARTIFACT_EXTENSIONS:
             for art in sorted(cache_dir.glob(f"*{ext}")):
                 if not art.is_file() or art.name.startswith("."):
@@ -9846,29 +9848,19 @@ def detect_model_weight_format_info(
     model_settings: object | None = None,
     configured_m5rt_binary: str | None = None,
 ) -> dict[str, Any]:
-    """Return O(1) weight-format metadata for `/admin/api/models` UI badges."""
-    if model_format == "gguf":
-        return {
-            "weight_format": "gguf",
-            "has_miv_weights": False,
-            "pending_auto_repack": False,
-            "repack_target_format": None,
-        }
-    if not model_path:
-        return {
-            "weight_format": model_format or "safetensors",
-            "has_miv_weights": False,
-            "pending_auto_repack": False,
-            "repack_target_format": None,
-        }
+    """Return the active weight format and the converted artifact available for this model."""
+    info = {
+        "weight_format": model_format or "safetensors",
+        "miv_artifact_format": None,
+        "has_miv_weights": False,
+        "pending_auto_repack": False,
+        "repack_target_format": None,
+    }
+    if model_format == "gguf" or not model_path:
+        return info
     mdir = Path(str(model_path)).expanduser()
     if not mdir.is_dir():
-        return {
-            "weight_format": model_format or "safetensors",
-            "has_miv_weights": False,
-            "pending_auto_repack": False,
-            "repack_target_format": None,
-        }
+        return info
 
     has_safetensors = False
     has_miv_file = False
@@ -9901,11 +9893,32 @@ def detect_model_weight_format_info(
                 out_p = _converter_output_path(mdir, p_manifest, is_builtin=False)
                 repack_target_fmt = out_p.suffix.lstrip(".").lower() or "miv"
 
-    has_microkernel_weights = bool(has_miv_file or has_omlxm5_file or custom_art_fmt)
-    on_disk_microkernel_fmt = (
-        custom_art_fmt
-        or ("miv" if has_miv_file else ("omlxm5" if has_omlxm5_file else None))
-    )
+    local_format = "omlxm5" if has_omlxm5_file else None
+    if has_miv_file:
+        local_format = "miv"
+    miv_format = "miv" if has_miv_file else None
+    if miv_format is None:
+        explicit = getattr(model_settings, "m5rt_artifact_path", None) or (
+            _explicit_m5rt_model_options(model_settings).get("artifact_path")
+        )
+        artifact = Path(str(explicit)).expanduser() if explicit else None
+        if artifact is None and (
+            has_omlxm5_file
+            or (mdir / "model_pack.json").is_file()
+            or (mdir / "omlxm5-manifest.json").is_file()
+        ):
+            artifact = detect_adapted(mdir, model_settings).artifact_path
+        if artifact is None or not artifact.is_file():
+            artifact = _search_artifact_cache(mdir)
+        if (
+            artifact is not None
+            and artifact.name.lower() not in ("mtp.miv", "mtp.omlxm5")
+            and artifact.suffix.lower() in M5RT_ARTIFACT_EXTENSIONS
+        ):
+            miv_format = artifact.suffix.lower().lstrip(".")
+    info["miv_artifact_format"] = miv_format
+    on_disk_microkernel_fmt = custom_art_fmt or local_format
+    info["has_miv_weights"] = bool(on_disk_microkernel_fmt or miv_format)
 
     # Companion DFlash2 helper checkpoints are not routed as standalone engines
     # (`active_external_engine` is None unless overridden to `"stock"`), so surface
@@ -9918,69 +9931,36 @@ def detect_model_weight_format_info(
                 cfg_local, _builtin_m5rt_manifest(), is_builtin=True
             )
             if ok_df:
-                if on_disk_microkernel_fmt is not None:
-                    return {
-                        "weight_format": on_disk_microkernel_fmt,
-                        "has_miv_weights": True,
-                        "pending_auto_repack": False,
-                        "repack_target_format": None,
-                    }
-                cached_df = _search_artifact_cache(mdir)
-                if cached_df is not None:
-                    return {
-                        "weight_format": cached_df.suffix.lstrip(".").lower() or "miv",
-                        "has_miv_weights": True,
-                        "pending_auto_repack": False,
-                        "repack_target_format": None,
-                    }
+                if local_format or miv_format:
+                    info["miv_artifact_format"] = local_format or miv_format
+                    info["weight_format"] = info["miv_artifact_format"]
+                    info["has_miv_weights"] = True
+                    return info
                 if _can_convert_dflash2_draft_fast(mdir, configured_m5rt_binary):
-                    return {
-                        "weight_format": "safetensors",
-                        "has_miv_weights": False,
-                        "pending_auto_repack": True,
-                        "repack_target_format": "miv",
-                    }
+                    info.update(
+                        weight_format="safetensors", pending_auto_repack=True, repack_target_format="miv"
+                    )
+                    return info
 
-    # When running on Stock MLX (or explicitly overridden to "stock"), the active format is safetensors
     if not active_external_engine or active_external_engine in ("stock", "splash"):
-        active_fmt = (
-            "safetensors"
-            if has_safetensors
-            else (on_disk_microkernel_fmt or model_format or "safetensors")
-        )
-        return {
-            "weight_format": active_fmt,
-            "has_miv_weights": has_microkernel_weights,
-            "pending_auto_repack": False,
-            "repack_target_format": None,
-        }
+        if has_safetensors:
+            info["weight_format"] = "safetensors"
+        elif on_disk_microkernel_fmt:
+            info["weight_format"] = on_disk_microkernel_fmt
+        return info
 
-    # Active engine is m5rt or a Path B microkernel
     if on_disk_microkernel_fmt is not None:
-        return {
-            "weight_format": on_disk_microkernel_fmt,
-            "has_miv_weights": True,
-            "pending_auto_repack": False,
-            "repack_target_format": None,
-        }
+        info["weight_format"] = on_disk_microkernel_fmt
+        return info
 
-    # Check `.cache/b0/artifacts` hit for m5rt
     if active_external_engine == M5RT_ENGINE_ID:
-        cached = _search_artifact_cache(mdir)
-        if cached is not None:
-            return {
-                "weight_format": cached.suffix.lstrip(".").lower() or "miv",
-                "has_miv_weights": True,
-                "pending_auto_repack": False,
-                "repack_target_format": None,
-            }
+        if miv_format:
+            info["weight_format"] = miv_format
+            return info
         if can_auto_convert_m5rt_fast(mdir, configured_m5rt_binary, model_settings):
-            return {
-                "weight_format": "safetensors",
-                "has_miv_weights": False,
-                "pending_auto_repack": True,
-                "repack_target_format": "miv",
-            }
+            info.update(
+                weight_format="safetensors", pending_auto_repack=True, repack_target_format="miv"
+            )
     elif repack_target_fmt is not None:
         plugin = get_external_engine_plugin(active_external_engine)
         if plugin is not None:
@@ -9990,16 +9970,9 @@ def detect_model_weight_format_info(
             elif callable(plugin.can_convert):
                 ok_conv, _ = plugin.can_convert(mdir, model_settings)
             if ok_conv:
-                return {
-                    "weight_format": "safetensors",
-                    "has_miv_weights": False,
-                    "pending_auto_repack": True,
-                    "repack_target_format": repack_target_fmt,
-                }
-
-    return {
-        "weight_format": "safetensors" if has_safetensors else (model_format or "safetensors"),
-        "has_miv_weights": has_microkernel_weights,
-        "pending_auto_repack": False,
-        "repack_target_format": None,
-    }
+                info.update(
+                    weight_format="safetensors", pending_auto_repack=True, repack_target_format=repack_target_fmt
+                )
+    if has_safetensors:
+        info["weight_format"] = "safetensors"
+    return info

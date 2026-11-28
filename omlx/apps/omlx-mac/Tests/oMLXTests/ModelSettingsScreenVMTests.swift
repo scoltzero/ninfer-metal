@@ -1244,6 +1244,32 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.externalEngineOptions["m5rt"]?["sampling_contract"]?.value as? String, "position_coupled_v1")
     }
 
+    func testThirdPartyOptionsKeepProviderLabelsAndWireValues() throws {
+        let vm = ModelSettingsScreenVM()
+        var model = makeModel(id: "custom-model", configModelType: "custom")
+        model.externalEngines = [
+            ExternalEngineOption(id: "custom", label: "Custom", compatible: true, reason: nil,
+                optionsSchema: [[
+                    "key": AnyCodable("sampling_contract"), "type": AnyCodable("enum"),
+                    "label": AnyCodable("Provider policy"), "description": AnyCodable("Provider detail"),
+                    "options": AnyCodable([AnyCodable("position_coupled_v1")]),
+                    "option_labels": AnyCodable(["position_coupled_v1": AnyCodable("Provider choice")]),
+                ], [
+                    "key": AnyCodable("prefill_linear_mode"), "type": AnyCodable("bool"),
+                    "label": AnyCodable("Provider prefill"),
+                ]])
+        ]
+        vm.model = model
+        vm.externalEngine = "custom"
+        XCTAssertEqual(vm.externalEngineGeneralOptions.map(\.key), ["sampling_contract", "prefill_linear_mode"])
+        let option = try XCTUnwrap(vm.externalEngineGeneralOptions.first)
+        XCTAssertEqual(vm.externalEngineOptionDisplayLabel(option), "Provider policy")
+        XCTAssertEqual(vm.externalEngineOptionDetail(option), "Provider detail")
+        XCTAssertEqual(vm.externalEngineOptionChoice("position_coupled_v1", for: option), "Provider choice")
+        vm.setExternalEngineEnumOption(option, "position_coupled_v1")
+        XCTAssertEqual(vm.externalEngineEnumOption(option), "position_coupled_v1")
+    }
+
     func testExternalEnginePrefillOptionsSplitFromGeneralAndSupportPresetsAndTelemetry() throws {
         let vm = ModelSettingsScreenVM()
         let m5Opt = ExternalEngineOption(

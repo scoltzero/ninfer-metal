@@ -61,8 +61,9 @@ struct ModelSettingsScreen: View {
                 let backend = config.speculativeBackend == "none"
                     ? "AR" : "\(config.speculativeBackend.uppercased()) K=\(config.maxDraftTokens)"
                 let prefillSuffix = mivPrefillSummary(config)
+                let context = String(localized: "settings.miv.context_tokens", defaultValue: "\(config.maxContext) tokens")
                 Text(String(localized: "settings.miv.loaded", defaultValue: "Loaded by miv")
-                     + ": \(backend) · \(config.kvDtype) · \(config.maxContext) tokens"
+                     + ": \(backend) · \(config.kvDtype) · \(context)"
                      + " · B=\(config.maxConcurrency) (\(mivConcurrencySource(config.concurrencySource)))"
                      + " · \(config.samplingContractId)"
                      + prefillSuffix)
@@ -83,10 +84,11 @@ struct ModelSettingsScreen: View {
         }
         if config.prefillCacheBlend == true { tags.append("CacheBlend") }
         if config.prefillAneOffload == true {
-            tags.append(config.prefillAneActive == true ? "Dual-ANE" : "ANE(idle)")
+            tags.append(config.prefillAneActive == true ? "Dual-ANE" : String(localized: "settings.miv.ane_idle", defaultValue: "ANE (idle)"))
         }
         guard !tags.isEmpty else { return "" }
-        return " · Prefill: " + tags.joined(separator: "+")
+        let modes = tags.joined(separator: "+")
+        return " · " + String(localized: "settings.miv.prefill_summary", defaultValue: "Prefill: \(modes)")
     }
 
     private func mivConcurrencySource(_ source: String) -> String {
@@ -2242,7 +2244,7 @@ private struct ExternalEngineOptionsRows: View {
     var body: some View {
         ForEach(vm.externalEngineGeneralOptions) { opt in
             Row(label: vm.externalEngineOptionDisplayLabel(opt),
-                sublabel: opt.description ?? "",
+                sublabel: vm.externalEngineOptionDetail(opt),
                 mivSetting: vm.usesMiv) {
                 control(for: opt)
             }
@@ -2270,7 +2272,7 @@ private struct ExternalEngineOptionsRows: View {
                     }
                 ),
                 width: .controlWide,
-                options: opt.options.map { ($0, opt.optionLabels[$0] ?? $0) }
+                options: opt.options.map { ($0, vm.externalEngineOptionChoice($0, for: opt)) }
             )
         case "int" where (opt.minValue != nil && opt.maxValue != nil && (opt.maxValue! - opt.minValue!) <= 16):
             let lo = Int(opt.minValue!.rounded())
@@ -2312,7 +2314,7 @@ private struct ExternalEngineOptionsRows: View {
                     get: { draftTexts[opt.key] ?? vm.externalEngineStringOption(opt) },
                     set: { draftTexts[opt.key] = $0 }
                 ),
-                placeholder: "(Auto)",
+                placeholder: String(localized: "external_engine.auto.short", defaultValue: "Auto"),
                 mono: true,
                 width: .controlWide
             )

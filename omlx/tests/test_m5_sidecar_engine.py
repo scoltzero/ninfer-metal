@@ -2836,21 +2836,28 @@ class TestPathBMultiMicrokernelSidecars:
         # Auto-routed miv Core Backend model
         assert by_id["Qwen3.5-Auto"]["auto_external_engine"] == "m5rt"
         assert by_id["Qwen3.5-Auto"]["active_engine_id"] == "m5rt"
+        assert by_id["Qwen3.5-Auto"]["miv_route_enabled"] is True
+        assert by_id["Qwen3.5-Auto"]["miv_artifact_format"] == "omlxm5"
         assert by_id["Qwen3.5-Auto"]["active_engine_label"] == "miv Core Backend"
 
         # Adapted model overridden to "stock" MUST still report auto_external_engine="m5rt"
         assert by_id["Qwen3.5-StockOverride"]["auto_external_engine"] == "m5rt"
         assert by_id["Qwen3.5-StockOverride"]["active_engine_id"] == "mlx"
+        assert by_id["Qwen3.5-StockOverride"]["miv_route_enabled"] is False
+        assert by_id["Qwen3.5-StockOverride"]["miv_artifact_format"] == "omlxm5"
         assert by_id["Qwen3.5-StockOverride"]["active_engine_label"] == "MLX"
 
         # Auto-routed Path B microkernel model
         assert by_id["Llama3-PathB"]["auto_external_engine"] == "llama-metal"
         assert by_id["Llama3-PathB"]["active_engine_id"] == "llama-metal"
+        assert by_id["Llama3-PathB"]["miv_route_enabled"] is False
+        assert by_id["Llama3-PathB"]["miv_artifact_format"] is None
         assert by_id["Llama3-PathB"]["active_engine_label"] == "Llama Metal 4 (Path B)"
 
         # Unadapted model stays 100% Stock MLX
         assert by_id["Plain-MLX"]["auto_external_engine"] is None
         assert by_id["Plain-MLX"]["active_engine_id"] == "mlx"
+        assert by_id["Plain-MLX"]["miv_artifact_format"] is None
         assert by_id["Plain-MLX"]["active_engine_label"] == "MLX"
 
     def test_shared_default_ninfer_metal_toml_reuse_and_precedence(
@@ -3152,6 +3159,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_before["weight_format"] == "safetensors"
+        assert fmt_before["miv_artifact_format"] is None
         assert fmt_before["pending_auto_repack"] is True
         assert fmt_before["repack_target_format"] == "miv"
 
@@ -3169,6 +3177,7 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="m5rt", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_after["weight_format"] == "miv"
+        assert fmt_after["miv_artifact_format"] == "miv"
         assert fmt_after["has_miv_weights"] is True
         assert fmt_after["pending_auto_repack"] is False
 
@@ -3177,10 +3186,31 @@ class TestMivDiscoveryAutoRepackAndFoundryConverter:
             qwen_dir, active_external_engine="stock", configured_m5rt_binary=str(fake_bin)
         )
         assert fmt_stock["weight_format"] == "safetensors"
+        assert fmt_stock["miv_artifact_format"] == "miv"
         assert fmt_stock["has_miv_weights"] is True
 
         ok_after, _ = m5_mod.can_convert_to_miv(qwen_dir, str(fake_bin))
         assert ok_after is False
+
+    def test_stock_format_badge_recognizes_cached_target_but_not_mtp_companion(
+        self, tmp_path, monkeypatch
+    ):
+        model = tmp_path / "Model"
+        model.mkdir()
+        (model / "model.safetensors").touch()
+        (model / "mtp.miv").touch()
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setenv("OMLX_M5RT_ARTIFACT_DIR", str(cache))
+        monkeypatch.setattr(m5_mod, "_REPO_ROOT", tmp_path)
+        assert m5_mod.detect_model_weight_format_info(
+            model, active_external_engine="stock"
+        )["miv_artifact_format"] is None
+
+        (cache / "Model.miv").touch()
+        info = m5_mod.detect_model_weight_format_info(model, active_external_engine="stock")
+        assert info["miv_artifact_format"] == "miv"
+        assert info["weight_format"] == "safetensors"
 
     async def test_auto_repack_on_first_load_and_foundry_path_b_converter(
         self, tmp_path: Path, monkeypatch

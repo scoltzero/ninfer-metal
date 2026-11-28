@@ -162,6 +162,33 @@ final class LocalizationSmokeTests: XCTestCase {
         )
     }
 
+    func testMivSettingsAndRouteBadgesExistInEveryAppLanguage() throws {
+        let languages = try XCTUnwrap(Bundle.main.object(forInfoDictionaryKey: "CFBundleLocalizations") as? [String])
+        XCTAssertTrue(languages.contains("zh-Hans"))
+        let keys = [
+            "settings.advanced.external_engine.opt.max_context",
+            "settings.advanced.external_engine.opt.speculative_backend",
+            "settings.advanced.external_engine.hint.sampling_contract",
+            "settings.advanced.external_engine.choice.position_coupled",
+            "settings.advanced.lora_mode.bypass", "settings.miv.forwarded",
+            "settings.miv.prefill.hint.cache_blend", "external_engine.auto.short",
+            "models.format.miv_available.help", "models.format.miv_routed.help",
+        ]
+        for language in languages {
+            let url = try XCTUnwrap(Bundle.main.url(forResource: "Localizable", withExtension: "strings",
+                                                    subdirectory: nil, localization: language))
+            let table = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: url),
+                                                                             format: nil) as? [String: String])
+            for key in keys {
+                XCTAssertFalse(table[key, default: ""].isEmpty, "\(language) is missing \(key)")
+            }
+            if language == "zh-Hans" {
+                XCTAssertEqual(table["settings.advanced.external_engine.opt.max_context"], "最大上下文长度")
+                XCTAssertEqual(table["settings.advanced.external_engine.choice.position_coupled"], "按位置耦合 v1（GPU）")
+            }
+        }
+    }
+
     func testCatalogIsValidJSON() {
         // Direct file-level parse so a catalog corruption (extra trailing
         // comma, bad nesting) shows up here rather than as a missing-string

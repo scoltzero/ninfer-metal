@@ -2986,6 +2986,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "source_repo_id": model_info.get("source_repo_id"),
             "model_format": model_info.get("model_format"),
             "weight_format": fmt_info["weight_format"],
+            "miv_artifact_format": fmt_info["miv_artifact_format"],
+            "miv_route_enabled": active_ext_engine == M5RT_ENGINE_ID,
             "has_miv_weights": fmt_info["has_miv_weights"],
             "pending_auto_repack": fmt_info["pending_auto_repack"],
             "repack_target_format": fmt_info["repack_target_format"],
