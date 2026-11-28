@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+base=$(cd "$(dirname "$0")" && pwd)
+export PYTHONHOME="$base/Python/cpython-3.11"
+export PYTHONPATH="$base:$base/Python/framework-mlx-base/lib/python3.11/site-packages"
+export PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+exec "$PYTHONHOME/bin/python3" "$base/launch.py" "$@"

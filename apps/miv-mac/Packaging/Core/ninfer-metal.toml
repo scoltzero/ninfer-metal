@@ -1,0 +1,45 @@
+# Default configuration for the standalone MIV app.
+# Explicit model profiles and the selected external TOML are managed in MIV.
+
+[server]
+host = "127.0.0.1"
+port = 8080
+cors = true
+providers_dir = ["~/Library/Application Support/MIV/Providers"]
+
+[engine]
+max_concurrency = 4
+max_context = 262144
+kv_dtype = "affine4_g128"
+rolling_prefix_cache = true
+prefix_cache_gb = 4.0
+sampling_contract = "position_coupled_v1"
+prefill_linear_mode = "bf16"
+prefill_attention_mode = "exact_nax"
+prefill_sparse_minference = false
+prefill_cache_blend = false
+prefill_ane_offload = false
+lora_adapter = ""
+lora_mode = "merge"
+
+[speculative]
+# "auto" enables dflash2 if a companion dflash2/ artifact exists,
+# else mtp if mtp.miv (or legacy mtp.omlxm5) or embedded MTP weights exist, else none.
+backend = "auto"
+# 0 = automatic depth tuned for the detected backend & silicon profile.
+draft_tokens = 0
+
+[sidecar]
+# Prefer in-process miv mainline in standalone mode and io.ninfer.metal in oMLX-extend.
+prefer_inproc_miv = true
+# lora_adapter = ""
+# lora_mode = "merge"
+
+# Optional per-model sidecar overrides (keyed by oMLX model_id):
+# [sidecar.models."Qwen3.8-27B-oQ4e-mtp"]
+# max_concurrency = 4
+# max_context = 131072
+# kv_dtype = "affine4_g128"
+# prefix_cache_gb = 8.0
+# lora_adapter = "/path/to/lora-adapter"
+# lora_mode = "merge"

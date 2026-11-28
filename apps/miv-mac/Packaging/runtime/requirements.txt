@@ -1,0 +1,18 @@
+mlx
+huggingface-hub
+hf-xet
+modelscope
+httpx[socks]
+requests
+numpy
+safetensors
+transformers
+gguf
+psutil
+pillow
+jinja2
+pydantic
+tomlkit
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d
+mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm@36494b42c7676081aa3c14878b3175b90c2fedf4
+aiohttp

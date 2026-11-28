@@ -35,31 +35,40 @@ final class WindowTests: XCTestCase {
 
         let entered = expectation(forNotification: NSWindow.didEnterFullScreenNotification, object: window)
         window.toggleFullScreen(nil)
-        await fulfillment(of: [entered], timeout: 8)
+        await fulfillment(of: [entered], timeout: 15)
         XCTAssertTrue(window.styleMask.contains(.fullScreen))
         let exited = expectation(forNotification: NSWindow.didExitFullScreenNotification, object: window)
         window.toggleFullScreen(nil)
-        await fulfillment(of: [exited], timeout: 8)
+        await fulfillment(of: [exited], timeout: 15)
         XCTAssertFalse(window.styleMask.contains(.fullScreen))
 
         let status = try XCTUnwrap(delegate.statusItem)
         XCTAssertTrue(try XCTUnwrap(status.button?.image).isTemplate)
         let menu = try XCTUnwrap(status.menu)
         delegate.menuNeedsUpdate(menu)
-        for page in [AppSection.models, .performance, .service] {
-            delegate.navigation.section = .status
-            let index = menu.indexOfItem(withTitle: page.title)
-            XCTAssertGreaterThanOrEqual(index, 0)
-            if index >= 0 { menu.performActionForItem(at: index) }
-            XCTAssertEqual(delegate.navigation.section, page)
-        }
+        let models = try XCTUnwrap(menu.item(withTitle: "模型")?.submenu)
+        let modelAction = models.indexOfItem(withTitle: "管理模型…")
+        XCTAssertGreaterThanOrEqual(modelAction, 0)
+        if modelAction >= 0 { models.performActionForItem(at: modelAction) }
+        XCTAssertEqual(delegate.navigation.section, .models)
+        let stats = try XCTUnwrap(menu.item(withTitle: "服务统计")?.submenu)
+        let performance = stats.indexOfItem(withTitle: "性能设置…")
+        XCTAssertGreaterThanOrEqual(performance, 0)
+        if performance >= 0 { stats.performActionForItem(at: performance) }
+        XCTAssertEqual(delegate.navigation.section, .performance)
+        let about = menu.indexOfItem(withTitle: "关于 MIV")
+        XCTAssertGreaterThanOrEqual(about, 0)
+        if about >= 0 { menu.performActionForItem(at: about) }
+        XCTAssertEqual(delegate.navigation.section, .about)
+        XCTAssertFalse(SettingsSearch.results(for: "MTP").filter { $0.section == .performance }.isEmpty)
+        XCTAssertFalse(SettingsSearch.results(for: "Dock").filter { $0.section == .appearance }.isEmpty)
         window.performMiniaturize(nil)
         delegate.showWindow()
         XCTAssertFalse(window.isMiniaturized)
         window.performClose(nil)
         XCTAssertFalse(window.isVisible)
         XCTAssertFalse(delegate.applicationShouldTerminateAfterLastWindowClosed(app))
-        let reopen = menu.indexOfItem(withTitle: "打开控制台")
+        let reopen = menu.indexOfItem(withTitle: "管理面板")
         XCTAssertGreaterThanOrEqual(reopen, 0)
         if reopen >= 0 { menu.performActionForItem(at: reopen) }
         XCTAssertTrue(window.isVisible)

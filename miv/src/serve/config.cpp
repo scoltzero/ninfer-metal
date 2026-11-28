@@ -382,13 +382,8 @@ find_sidecar_model_override(const ServeConfig &config,
   return nullptr;
 }
 
-void apply_sidecar_model_override(ModelServeConfig &m,
-                                  const ServeConfig &config,
-                                  bool respect_cli_overrides) {
-  const SidecarModelOverride *ov = find_sidecar_model_override(config, m);
-  if (ov == nullptr) {
-    return;
-  }
+void apply_model_override(ModelServeConfig &m, const ServeConfig &config,
+                          const SidecarModelOverride *ov, bool respect_cli_overrides) {
   if (ov->artifact.has_value() &&
       !(respect_cli_overrides && config.cli_artifact_override)) {
     m.artifact = *ov->artifact;
@@ -504,6 +499,16 @@ void apply_sidecar_model_override(ModelServeConfig &m,
       !(respect_cli_overrides && config.cli_draft_tokens_override)) {
     m.draft_tokens = *ov->draft_tokens;
   }
+}
+
+void apply_sidecar_model_override(ModelServeConfig &m,
+                                  const ServeConfig &config,
+                                  bool respect_cli_overrides) {
+  const SidecarModelOverride *ov = find_sidecar_model_override(config, m);
+  if (ov == nullptr) {
+    return;
+  }
+  apply_model_override(m, config, ov, respect_cli_overrides);
 }
 
 ModelServeConfig default_model_from_serve_config(const ServeConfig &config,
@@ -806,6 +811,118 @@ SidecarModelOverride parse_sidecar_model_override(const toml::table &entry,
     ov.draft_tokens = static_cast<std::uint32_t>(*v);
   }
   return ov;
+}
+
+void assign_unique_names(std::vector<ModelServeConfig> &models) {
+  std::unordered_set<std::string> seen;
+  for (auto &model : models) {
+    const auto base = resolve_model_id(model);
+    auto id = base;
+    for (int suffix = 2; !seen.insert(id).second; ++suffix)
+      id = base + "-" + std::to_string(suffix);
+    model.id = std::move(id);
+  }
+}
+
+nlohmann::json generation_defaults(const nlohmann::json &object, const std::string &key) {
+  using Json = nlohmann::json;
+  auto values = object.value(key, Json::object());
+  if (!values.is_object()) throw std::invalid_argument(key + " must be an object");
+  static const std::unordered_set<std::string> supported{
+      "max_tokens", "temperature", "top_p", "top_k", "seed", "repetition_penalty",
+      "presence_penalty", "frequency_penalty", "repetition_context_size",
+      "enable_thinking", "thinking_budget", "reasoning_effort", "chat_template_kwargs", "stop"};
+  for (const auto &[name, value] : values.items()) {
+    if (!supported.contains(name))
+      throw std::invalid_argument("Unsupported generation default: " + name);
+  }
+  if (values.contains("chat_template_kwargs") && !values.at("chat_template_kwargs").is_object())
+    throw std::invalid_argument("chat_template_kwargs must be an object");
+  for (const std::string field : {"enable_thinking", "reasoning_effort"}) {
+    if (values.contains(field)) {
+      values["chat_template_kwargs"][field] = values.at(field);
+      values.erase(field);
+    }
+  }
+  return values;
+}
+
+// App preferences are a separate layer. Read the shared TOML normally, then
+// apply only explicit edits for the matching directory; never rewrite the TOML.
+void apply_library_config(ServeConfig &config, const std::string &file) {
+  using Json = nlohmann::json;
+  std::ifstream stream(file);
+  if (!stream) throw std::invalid_argument("Cannot open model overrides: " + file);
+  const Json library = Json::parse(stream);
+  const auto defaults = generation_defaults(library, "defaults");
+  auto models = config.models;
+  if (models.empty() && !config.model_dir.empty())
+    models.push_back(default_model_from_serve_config(config));
+  assign_unique_names(models);
+  for (auto &model : models) model.generation_defaults = defaults;
+
+  const auto canonical = [](const std::string &path) {
+    return std::filesystem::weakly_canonical(expand_user_path(path));
+  };
+  for (const auto &entry : library.at("models")) {
+    const auto directory = entry.at("directory").get<std::string>();
+    if (directory.empty()) throw std::invalid_argument("Empty model directory");
+    const auto key = canonical(directory);
+    auto match = std::find_if(models.begin(), models.end(), [&](const auto &m) {
+      return canonical(m.model_dir) == key &&
+             (!entry.contains("source_id") || resolve_model_id(m) == entry.at("source_id").get<std::string>());
+    });
+    const bool enabled = entry.value("enabled", match != models.end());
+    if (!enabled) {
+      if (match != models.end()) models.erase(match);
+      continue;
+    }
+    if (match == models.end()) {
+      ModelServeConfig model = default_model_from_serve_config(config, false);
+      model.model_dir = directory;
+      model.id = entry.value("source_id", std::string{});
+      // The artifact, draft, template and adapter of a different [model]
+      // must never bind to an additional library model.
+      if (config.model_dir.empty() || canonical(config.model_dir) != key) {
+        model.artifact.clear();
+        model.draft_dir.clear();
+        model.draft_artifact.clear();
+        model.mtp_artifact.clear();
+        model.chat_template.clear();
+        model.lora_adapter.clear();
+      }
+      apply_sidecar_model_override(model, config, true);
+      model.generation_defaults = defaults;
+      models.push_back(std::move(model));
+      match = std::prev(models.end());
+    }
+    auto &m = *match;
+    if (entry.contains("alias")) m.api_alias = entry.at("alias").get<std::string>();
+    const auto options = entry.value("engine", Json::object());
+    toml::table values;
+    for (const auto &[name, value] : options.items()) {
+      if (value.is_boolean()) values.insert(name, value.get<bool>());
+      else if (value.is_number_integer()) values.insert(name, value.get<std::int64_t>());
+      else if (value.is_number_float()) values.insert(name, value.get<double>());
+      else if (value.is_string()) values.insert(name, value.get<std::string>());
+      else throw std::invalid_argument("Invalid model setting: " + name);
+    }
+    const auto overrides = parse_sidecar_model_override(values, "App model");
+    apply_model_override(m, config, &overrides, false);
+    if (const auto path = values["chat_template"].value<std::string>()) m.chat_template = *path;
+    const auto local = generation_defaults(entry, "generation");
+    for (const auto &[name, value] : local.items()) {
+      if (name == "chat_template_kwargs" && m.generation_defaults.contains(name) &&
+          m.generation_defaults.at(name).is_object() && value.is_object()) {
+        m.generation_defaults[name].update(value);
+      } else {
+        m.generation_defaults[name] = value;
+      }
+    }
+    validate_model_config(m);
+  }
+  config.models = std::move(models);
+  config.model_dir.clear(); // all models may have been explicitly unloaded
 }
 
 } // namespace
@@ -1559,6 +1676,8 @@ void load_serve_toml_file(const std::string &path, ServeConfig &config) {
 
 ServeConfig parse_serve_config(int argc, char **argv) {
   ServeConfig config;
+  if (const char *path = std::getenv("MIV_MODEL_FALLBACK_FILE"))
+    config.model_fallback_file = path;
 
   // Pass 1: discover --config / --no-default-config / --version / --help first
   // so CLI flags always override TOML regardless of argument ordering.
@@ -1596,6 +1715,7 @@ ServeConfig parse_serve_config(int argc, char **argv) {
     }
   }
 
+  std::string library_file;
   std::vector<std::string> cli_model_dirs;
   std::vector<std::string> cli_providers_dirs;
   struct CliModelOverrides {
@@ -1705,6 +1825,12 @@ ServeConfig parse_serve_config(int argc, char **argv) {
       (void)next_val();
     } else if (flag == "--no-default-config") {
       config.no_default_config = true;
+    } else if (flag == "--model-overrides") {
+      library_file = std::string(next_val());
+    } else if (flag == "--explicit-providers-only") {
+      config.explicit_providers_only = true;
+    } else if (flag == "--describe-models") {
+      config.describe_models = true;
     } else if (flag == "--model-dir") {
       cli_model_dirs.emplace_back(next_val());
     } else if (flag == "--providers-dir") {
@@ -2008,6 +2134,7 @@ ServeConfig parse_serve_config(int argc, char **argv) {
   }
 
   expand_serve_config_paths(config);
+  if (!library_file.empty()) apply_library_config(config, library_file);
   validate_serve_config(config);
   return config;
 }
@@ -2072,7 +2199,7 @@ std::vector<ModelServeConfig> resolve_model_configs(const ServeConfig &config) {
     result.push_back(default_model_from_serve_config(config));
   }
 
-  std::unordered_set<std::string> seen_ids;
+  assign_unique_names(result);
   for (auto &m : result) {
     expand_model_paths(m);
     resolve_auto_speculative(m);
@@ -2084,13 +2211,6 @@ std::vector<ModelServeConfig> resolve_model_configs(const ServeConfig &config) {
       m.memory_budget_bytes = gb_to_bytes(*m.memory_budget_gb);
     }
 
-    std::string base_id = resolve_model_id(m);
-    std::string unique_id = base_id;
-    int suffix = 2;
-    while (!seen_ids.insert(unique_id).second) {
-      unique_id = base_id + "-" + std::to_string(suffix++);
-    }
-    m.id = std::move(unique_id);
   }
   return result;
 }
@@ -2226,6 +2346,8 @@ std::string format_help_string() {
          "[--providers-dir DIR] [options]\n"
       << "  ninfer-metal-serve --config ninfer-metal.toml [overrides]\n\n"
       << "Configuration:\n"
+      << "  --model-overrides FILE            App model library and per-model JSON overrides\n"
+      << "  --describe-models                 Print selected model IDs and directories without loading weights\n"
       << "  --config PATH                    Load TOML config ([server], "
          "[model], [[models]], [engine], [speculative], [sidecar])\n"
       << "                                   Auto-discovers ninfer-metal.toml "

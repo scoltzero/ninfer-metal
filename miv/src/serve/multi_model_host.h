@@ -19,6 +19,8 @@ namespace omlx::m5::serve {
 
 struct ModelInstance {
   std::string id;
+  std::string api_alias;
+  nlohmann::json generation_defaults = nlohmann::json::object();
   std::string provider_id = "io.ninfer.metal";
   std::string backend_mode = "inproc"; // "inproc" | "sidecar"
   std::shared_ptr<EngineRouter> router;

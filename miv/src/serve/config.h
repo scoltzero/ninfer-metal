@@ -2,6 +2,8 @@
 
 #include "omlx_m5/types.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -13,6 +15,8 @@ namespace omlx::m5::serve {
 
 struct ModelServeConfig {
   std::string id;
+  std::string api_alias;
+  nlohmann::json generation_defaults = nlohmann::json::object();
   std::string model_dir;
   std::string provider = "auto";
   std::string artifact;
@@ -85,6 +89,9 @@ struct ServeConfig {
   // Meta flags
   bool show_version = false;
   bool show_help = false;
+  bool describe_models = false;
+  bool explicit_providers_only = false;
+  std::string model_fallback_file;
   bool no_default_config = false;
   bool config_auto_discovered = false;
   std::string config_path;

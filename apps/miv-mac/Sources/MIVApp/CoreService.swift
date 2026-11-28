@@ -17,13 +17,26 @@ final class CoreService: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var dashboardAvailable = false
     @Published private(set) var outputRate: Double?
+    @Published private(set) var modelUsageCounters: CoreConnection.UsageCounters = [:]
     @Published private(set) var logText = ""
     private(set) var apiKey = ""
 
-    private let defaults: UserDefaults
+    @Published var hfDiscoveryEnabled: Bool
+    @Published var hfCacheModels: [HFCachedModel] = []
+    @Published var fallbackPolicy: MIVFallbackPolicy
+    private(set) var runningRoutingFile: URL?
+    @Published var modelLibrary: [MIVLibraryModel]
+    @Published var globalGeneration: [String:String]
+    @Published var configuredModels: [MIVConfiguredModel] = []
+    @Published var scannedModelPaths: [String] = []
+    @Published var libraryError: String?
+    @Published var isChangingModels = false
+    var libraryRevision = 0
+    private var runningModelOverlay: URL?
+    let defaults: UserDefaults
     private let explicitExecutable: URL?
     private var process: Process?
-    private var logReader: FileHandle?
+    private var outputTail: ManagedOutputTail?
     private var hasBoundListener = false
     private var generation = 0
     private var lastSample: (time: TimeInterval, tokens: Double)?
@@ -31,39 +44,38 @@ final class CoreService: ObservableObject {
 
     init(defaults: UserDefaults = .standard, executable: URL? = nil) {
         self.defaults = defaults
+        hfDiscoveryEnabled = defaults.object(forKey: "hfCacheDiscovery") as? Bool ?? true
+        fallbackPolicy = defaults.data(forKey: "modelFallbackPolicy").flatMap {
+            try? JSONDecoder().decode(MIVFallbackPolicy.self, from: $0)
+        } ?? MIVFallbackPolicy()
         self.explicitExecutable = executable
+        self.globalGeneration = defaults.dictionary(forKey: "globalGeneration") as? [String:String] ?? [:]
+        self.modelLibrary = defaults.data(forKey: "modelLibrary").flatMap {
+            try? JSONDecoder().decode([MIVLibraryModel].self, from: $0)
+        } ?? []
         settings = defaults.data(forKey: Self.defaultsKey)
             .flatMap { try? JSONDecoder().decode(CoreSettings.self, from: $0) } ?? CoreSettings()
     }
 
     var browserURL: URL? { try? settings.baseURL() }
 
-    private var coreExecutable: URL? {
+    var coreExecutable: URL? {
         if let explicitExecutable { return explicitExecutable }
-        let env = ProcessInfo.processInfo.environment
-        let providers = env["OMLX_PROVIDERS_DIR"].map { ($0 as NSString).expandingTildeInPath }
-        let providerPath = "Library/Application Support/oMLX/Providers/io.ninfer.metal/current/bin/ninfer-metal-serve"
-        let locations = [
-            Bundle.main.resourceURL?.appendingPathComponent("Core/bin/ninfer-metal-serve"),
-            providers.map { URL(fileURLWithPath: $0).appendingPathComponent("io.ninfer.metal/current/bin/ninfer-metal-serve") },
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(providerPath)
-        ]
-        return locations.compactMap { $0 }.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        let fm = FileManager.default
+        let urls = [Bundle.main.resourceURL?.appendingPathComponent("Core/bin/ninfer-metal-serve"),
+                    fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MIV/Providers/io.ninfer.metal/current/bin/ninfer-metal-serve")]
+        return urls.compactMap { $0 }.first { fm.isExecutableFile(atPath: $0.path) }
     }
 
-    /// Mirrors the locations supported by both the native core and the oMLX-extend launcher.
     var effectiveConfigURL: URL? {
         guard settings.mode == .managed else { return nil }
-        func file(_ path: String) -> URL { URL(fileURLWithPath: (path as NSString).expandingTildeInPath) }
-        if !settings.configPath.isEmpty { return file(settings.configPath) }
-        let candidates = [
-            ProcessInfo.processInfo.environment["NINFER_METAL_CONFIG"].map(file),
-            file("ninfer-metal.toml"),
-            file("~/.config/ninfer-metal/ninfer-metal.toml"),
-            file("~/Library/Application Support/oMLX/Providers/io.ninfer.metal/current/config/ninfer-metal.toml"),
-            coreExecutable?.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("config/ninfer-metal.toml")
-        ]
-        return candidates.compactMap { $0 }.first { FileManager.default.isReadableFile(atPath: $0.path) }
+        if !settings.configPath.isEmpty {
+            return URL(fileURLWithPath: (settings.configPath as NSString).expandingTildeInPath)
+        }
+        let fm = FileManager.default
+        let urls = [fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MIV/ninfer-metal.toml"),
+                    coreExecutable?.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("config/ninfer-metal.toml")]
+        return urls.compactMap { $0 }.first { fm.isReadableFile(atPath: $0.path) }
     }
 
     func apply(_ newSettings: CoreSettings, apiKey newKey: String) throws {
@@ -86,6 +98,7 @@ final class CoreService: ObservableObject {
         health = nil
         models = []
         metrics = [:]
+        modelUsageCounters = [:]
         healthError = nil
         modelsError = nil
         metricsError = nil
@@ -103,17 +116,19 @@ final class CoreService: ObservableObject {
         guard !isRefreshing, let base = browserURL else { return }
         isRefreshing = true
         let version = generation
-        let client = CoreConnection(base: base, key: apiKey)
+        let key = settings.mode == .managed && apiKey.isEmpty ? MIVManagement.localMasterKey() : apiKey
+        let client = CoreConnection(base: base, key: key)
         async let healthResult = result { try await client.health() }
         async let modelsResult = result { try await client.models() }
-        async let metricsResult = result { try await client.metrics() }
+        async let metricsResult = result { try await client.metricsSnapshot() }
         async let hasDashboard = client.dashboardAvailable()
         let (h, m, stats, dashboard) = await (healthResult, modelsResult, metricsResult, hasDashboard)
         guard generation == version else { return }
         (health, healthError) = h
         models = m.0 ?? []
         modelsError = m.1
-        metrics = stats.0 ?? [:]
+        metrics = stats.0?.total ?? [:]
+        modelUsageCounters = stats.0?.perModel ?? [:]
         metricsError = stats.1
         let now = ProcessInfo.processInfo.systemUptime
         outputRate = nil
@@ -136,81 +151,102 @@ final class CoreService: ObservableObject {
 
     func start() throws {
         guard process == nil else { throw CoreFailure("托管服务已经启动。") }
-        let args = try settings.launchArguments()
+        var args = try settings.launchArguments()
         guard let binary = coreExecutable, FileManager.default.isExecutableFile(atPath: binary.path) else {
-            throw CoreFailure("未找到 ninfer-metal-serve。请使用配有核心的 MIV.app 或安装 oMLX 的 ninfer-metal provider。")
+            throw CoreFailure("未找到 ninfer-metal-serve。请使用配有核心的 MIV.app。")
         }
         try Self.checkPort(settings.port, host: settings.bindHost)
         let child = Process()
         child.executableURL = binary
+        if settings.configPath.isEmpty {
+            args += effectiveConfigURL.map { ["--config", $0.path] } ?? ["--no-default-config"]
+        }
+        args.append("--explicit-providers-only")
+        args += MIVManagement.launchArguments()
+        child.environment = try managementEnvironment(for: settings)
+        let routing = try createRoutingFile()
+        defer {
+            if process !== child { try? FileManager.default.removeItem(at: routing.deletingLastPathComponent()) }
+        }
+        child.environment?["MIV_MODEL_FALLBACK_FILE"] = routing.path
+        let overlay = try writeModelOverlay()
+        defer {
+            if process !== child, let overlay { try? FileManager.default.removeItem(at: overlay.deletingLastPathComponent()) }
+        }
+        if let overlay { args += ["--model-overrides", overlay.path] }
         child.arguments = args
-        // Keep only a private, unlinked log for the running child. The UI reads the most recent 48 KiB.
-        let path = FileManager.default.temporaryDirectory.appendingPathComponent("miv-\(UUID().uuidString).log").path
-        let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        guard fd >= 0 else { throw CoreFailure("无法创建服务日志。") }
-        let writer = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? writer.close() }
-        let reader: FileHandle
-        do { reader = try FileHandle(forReadingFrom: URL(fileURLWithPath: path)) }
-        catch { unlink(path); throw error }
-        unlink(path)
-        child.standardOutput = writer
-        child.standardError = writer
+        let output = try ManagedOutputTail(host: settings.bindHost, port: settings.port)
+        child.standardOutput = output.writer
+        child.standardError = output.writer
+        defer { try? output.writer.close() }
         child.terminationHandler = { [weak self] ended in
             Task { @MainActor in self?.finished(ended) }
         }
-        do { try child.run() }
-        catch { try? reader.close(); throw error }
+        try child.run()
         invalidateSnapshot()
         logText = ""
         serviceMessage = nil
         hasBoundListener = false
-        logReader = reader
+        outputTail = output
+        runningRoutingFile = routing
+        runningModelOverlay = overlay
         process = child
         isRunning = true
         isStopping = false
     }
 
     private static func checkPort(_ port: Int, host: String) throws {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let family = host == "::" ? AF_INET6 : AF_INET
+        let fd = socket(family, SOCK_STREAM, 0)
         guard fd >= 0 else { throw CoreFailure("无法检查本机端口。") }
         defer { close(fd) }
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr.s_addr = inet_addr(host)
-        let status = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        let status: Int32
+        if family == AF_INET6 {
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = in_port_t(port).bigEndian
+            status = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+        } else {
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(port).bigEndian
+            addr.sin_addr.s_addr = inet_addr(host)
+            status = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
         }
         guard status == 0 else { throw CoreFailure("无法监听本机端口 \(port)（\(String(cString: strerror(errno)))）。") }
     }
 
-    private func readLog() {
-        guard let reader = logReader,
-              let size = try? reader.seekToEnd() else { return }
-        let tailSize: UInt64 = 48 * 1024
-        do {
-            try reader.seek(toOffset: size > tailSize ? size - tailSize : 0)
-            let data = try reader.read(upToCount: Int(tailSize)) ?? Data()
-            let text = String(decoding: data, as: UTF8.self)
-            if text != logText { logText = text }
-            // Do not attach to a pre-existing listener while our child is still loading weights.
-            if !hasBoundListener {
-                hasBoundListener = text.contains("[ninfer-metal-serve] Listening on http://\(settings.bindHost):\(settings.port) (")
-            }
-        } catch { return }
+    private func readLog(final: Bool = false) {
+        guard let outputTail else { return }
+        let snapshot = outputTail.snapshot(final: final)
+        if logText != snapshot.text { logText = snapshot.text }
+        hasBoundListener = snapshot.listening
     }
 
     private func finished(_ child: Process) {
         guard process === child else { return }
-        readLog()
-        try? logReader?.close()
-        logReader = nil
+        readLog(final: true)
+        outputTail = nil
+        if let url = runningRoutingFile {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+            runningRoutingFile = nil
+        }
+        if let url = runningModelOverlay {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+            runningModelOverlay = nil
+        }
         process = nil
         if !isStopping {
             serviceMessage = "核心已退出（\(child.terminationStatus)），详情见运行日志。"
@@ -244,5 +280,92 @@ final class CoreService: ObservableObject {
         if child.isRunning { kill(child.processIdentifier, SIGKILL) }
         child.waitUntilExit()
         finished(child)
+    }
+}
+
+/// A single pipe preserves the ordering of the child's stdout and stderr writes.
+/// A serial queue owns the fixed-size ring, independently of UI polling.
+private final class ManagedOutputTail {
+    private static let capacity = 48 * 1024
+    let writer: FileHandle
+    private let reader: FileHandle
+    private let source: DispatchSourceRead
+    private let queue = DispatchQueue(label: "io.ninfer.miv.core-output", qos: .utility)
+    private var ring = [UInt8](repeating: 0, count: capacity)
+    private var scratch = [UInt8](repeating: 0, count: 8192)
+    private var cursor = 0
+    private var used = 0
+    private let marker: Data
+    private var overlap = Data()
+    private var listening = false
+
+    init(host: String, port: Int) throws {
+        let pipe = Pipe()
+        reader = pipe.fileHandleForReading
+        writer = pipe.fileHandleForWriting
+        marker = Data("[ninfer-metal-serve] Listening on http://\(host):\(port) (".utf8)
+        let fd = reader.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.drain(upTo: 64 * 1024) }
+        source.setCancelHandler { [reader] in try? reader.close() }
+        source.resume()
+    }
+
+    deinit { source.cancel() }
+
+    private func drain(upTo maximum: Int) {
+        guard !source.isCancelled else { return }
+        var remaining = maximum
+        while remaining > 0 {
+            let bytes = scratch.withUnsafeMutableBytes {
+                Darwin.read(reader.fileDescriptor, $0.baseAddress!, min(remaining, $0.count))
+            }
+            if bytes < 0 && errno == EINTR { continue }
+            if bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { return }
+            guard bytes > 0 else { source.cancel(); return }
+
+            if !listening {
+                overlap.append(contentsOf: scratch.prefix(bytes))
+                listening = overlap.range(of: marker) != nil
+                // Keep a possible partial marker even when it spans two reads.
+                overlap = listening ? Data() : Data(overlap.suffix(marker.count - 1))
+            }
+            let first = min(bytes, Self.capacity - cursor)
+            ring.replaceSubrange(cursor..<(cursor + first), with: scratch[..<first])
+            if first < bytes { ring.replaceSubrange(0..<(bytes - first), with: scratch[first..<bytes]) }
+            cursor = (cursor + bytes) % Self.capacity
+            used = min(Self.capacity, used + bytes)
+            remaining -= bytes
+        }
+    }
+
+    func snapshot(final: Bool) -> (text: String, listening: Bool) {
+        queue.sync {
+            if !source.isCancelled {
+                // Include bytes already written even if Dispatch has not delivered
+                // the next read event yet. Darwin reports queued pipe bytes in st_size.
+                // At exit this also avoids waiting for helpers that inherited the writer.
+                var status = stat()
+                if fstat(reader.fileDescriptor, &status) == 0 {
+                    drain(upTo: Int(status.st_size))
+                } else if final {
+                    drain(upTo: Int.max)
+                }
+                if final { source.cancel() }
+            }
+            let start = (cursor + Self.capacity - used) % Self.capacity
+            let first = min(used, Self.capacity - start)
+            var bytes = Array(ring[start..<(start + first)])
+            bytes.append(contentsOf: ring.prefix(used - first))
+            let decoded = String(decoding: bytes, as: UTF8.self)
+            // Malformed UTF-8 can expand during replacement. Keep the display
+            // string within the same byte limit and begin at a scalar boundary.
+            let suffix = decoded.utf8.suffix(Self.capacity).drop(while: { ($0 & 0xc0) == 0x80 })
+            return (String(decoding: suffix, as: UTF8.self), listening)
+        }
     }
 }
