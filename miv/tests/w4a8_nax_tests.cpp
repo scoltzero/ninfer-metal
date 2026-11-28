@@ -678,8 +678,7 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
   for (const char *fn : {"omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1",
                          "omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns32_sk1",
                          "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1",
-                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
-                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_1pass256_fwht64_a8"}) {
+                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
     const auto info = ctx.warmup_pipeline(
         {.key = std::string("w4a8.pso.") + fn,
          .library_key = "w4a8.audit.w4a8",
@@ -3601,8 +3600,7 @@ Json test_p31_nax_kernels_and_profiler(const MetalContext &ctx,
         eb.record_weight(wg.view, kN, kK, "w4a8", "test", "");
         auto pb = eb.finish(true);
         const std::string &fn = pb.weight_routes.back().function;
-        const bool expect_256 = (cap_t > 32u);
-        require((fn.find("1pass256") != std::string::npos) == expect_256,
+        require(fn == "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
                 "p31 8a MXFP4 ModeB dispatch routing mismatch: " + fn);
         submit_profile(ctx, pb, live_t, true);
       }
