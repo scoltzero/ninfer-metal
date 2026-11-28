@@ -105,7 +105,7 @@ def main() -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Audit all 12 prefill/NAX metallibs (default behavior; kept for CLI compatibility).",
+        help="Audit all 15 prefill/NAX/ANE metallibs (default behavior; kept for CLI compatibility).",
     )
     parser.add_argument(
         "--libs",

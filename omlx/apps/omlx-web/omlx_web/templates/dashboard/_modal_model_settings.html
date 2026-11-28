@@ -712,69 +712,101 @@
                         <div class="px-4 py-4 space-y-3 bg-neutral-50/60"
                              x-show="mivSettingIsForwarded() && externalEnginePrefillOptionsSchema().length > 0"
                              x-cloak>
-                            <div class="flex flex-wrap items-start justify-between gap-2">
-                                <div class="min-w-0">
-                                    <div class="flex items-baseline gap-1">
-                                        <span class="text-sm font-semibold text-neutral-800" x-text="externalEnginePrefillCardTitle()"></span>{{ miv_dot() }}
-                                    </div>
-                                    <p class="text-xs text-neutral-400/90 mt-0.5" x-text="externalEnginePrefillCardSubtitle()"></p>
+                            <div class="min-w-0">
+                                <div class="flex items-baseline gap-1">
+                                    <span class="text-sm font-semibold text-neutral-800" x-text="externalEnginePrefillCardTitle()"></span>{{ miv_dot() }}
                                 </div>
-                                <div class="flex flex-wrap items-center gap-1.5">
-                                    <template x-for="preset in externalEnginePrefillPresets()" :key="preset.id">
-                                        <button type="button"
-                                                @click="applyExternalEnginePrefillPreset(preset)"
-                                                :class="isExternalEnginePrefillPresetActive(preset)
-                                                    ? 'bg-neutral-900 text-white border-neutral-900'
-                                                    : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'"
-                                                class="px-2.5 py-1 text-xs font-medium rounded-full border transition-all"
-                                                x-text="preset.label"></button>
-                                    </template>
-                                </div>
+                                <p class="text-xs text-neutral-400/90 mt-0.5" x-text="externalEnginePrefillCardSubtitle()"></p>
                             </div>
                             <div class="rounded-xl bg-white border border-neutral-200/80 divide-y divide-neutral-100">
-                                <template x-for="opt in externalEnginePrefillOptionsSchema()" :key="opt.key">
+                                <!-- Control 1: 4-Tier Prefill Acceleration Mode Selector -->
+                                <div class="px-3.5 py-3 space-y-2.5">
+                                    <div>
+                                        <span class="text-sm font-medium text-neutral-700" x-text="externalEnginePrefillModeLabel()"></span>
+                                        <p class="text-xs text-neutral-400/80 leading-relaxed mt-0.5" x-text="externalEnginePrefillModeHint()"></p>
+                                    </div>
+                                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5" role="radiogroup">
+                                        <template x-for="tier in externalEnginePrefillTiers()" :key="tier.id">
+                                            <button type="button"
+                                                    role="radio"
+                                                    :aria-checked="activeExternalEnginePrefillTier() === tier.id ? 'true' : 'false'"
+                                                    @click="selectExternalEnginePrefillTier(tier)"
+                                                    :class="activeExternalEnginePrefillTier() === tier.id
+                                                        ? 'bg-neutral-900 text-white border-neutral-900'
+                                                        : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'"
+                                                    class="px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all text-center"
+                                                    x-text="tier.label"></button>
+                                        </template>
+                                    </div>
+                                </div>
+
+                                <!-- Control 3: Independent MInference Dynamic Sparse Sub-Switch -->
+                                <template x-if="externalEnginePrefillOptionByKey('prefill_sparse_minference')">
                                     <div class="px-3.5 py-3"
-                                         :class="externalEngineOptionContainerClass(opt)"
-                                         :title="externalEngineOptionTooltip(opt)">
-                                        <template x-if="externalEngineOptionIsToggle(opt)">
-                                            <div class="flex items-start justify-between gap-3">
-                                                <div class="min-w-0">
-                                                    <div class="flex items-baseline gap-1">
-                                                        <span class="text-sm font-medium text-neutral-700" x-text="externalEngineOptionLabel(opt)"></span>
-                                                    </div>
-                                                    <p x-show="externalEngineOptionHint(opt)"
-                                                       class="text-xs text-neutral-400/80 leading-relaxed mt-0.5"
-                                                       x-text="externalEngineOptionHint(opt)"></p>
-                                                </div>
-                                                <button type="button" role="switch"
-                                                        :disabled="externalEngineOptionDisabled(opt)"
-                                                        :aria-disabled="externalEngineOptionDisabled(opt) ? 'true' : 'false'"
-                                                        :aria-checked="externalEngineOptionToggleChecked(opt) ? 'true' : 'false'"
-                                                        @click="toggleExternalEngineOption(opt)"
-                                                        :class="[externalEngineOptionToggleChecked(opt) ? 'bg-black' : 'bg-neutral-200', externalEngineOptionDisabled(opt) ? 'cursor-not-allowed' : '']"
-                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                                    <span :class="externalEngineOptionToggleChecked(opt) ? 'translate-x-5' : 'translate-x-0'"
-                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                                </button>
+                                         :class="externalEngineOptionContainerClass(externalEnginePrefillOptionByKey('prefill_sparse_minference'))"
+                                         :title="externalEngineOptionTooltip(externalEnginePrefillOptionByKey('prefill_sparse_minference'))">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700"
+                                                      x-text="externalEngineOptionLabel(externalEnginePrefillOptionByKey('prefill_sparse_minference'))"></span>
+                                                <p class="text-xs text-neutral-400/80 leading-relaxed mt-0.5"
+                                                   x-text="externalEngineOptionHint(externalEnginePrefillOptionByKey('prefill_sparse_minference'))"></p>
                                             </div>
-                                        </template>
-                                        <template x-if="!externalEngineOptionIsToggle(opt) && opt.type === 'enum'">
-                                            <div>
-                                                <label class="block text-sm font-medium text-neutral-700 mb-1" x-text="externalEngineOptionLabel(opt)"></label>
-                                                <select :value="getExternalEngineOption(opt)"
-                                                        @change="setExternalEngineOption(opt, $event.target.value)"
-                                                        class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
-                                                    <template x-for="choice in (opt.options || [])" :key="choice">
-                                                        <option :value="choice"
-                                                                :selected="getExternalEngineOption(opt) === choice"
-                                                                x-text="externalEngineEnumOptionLabel(opt, choice)"></option>
-                                                    </template>
-                                                </select>
-                                                <p x-show="externalEngineOptionHint(opt)"
-                                                   class="text-xs text-neutral-400/80 leading-relaxed mt-1"
-                                                   x-text="externalEngineOptionHint(opt)"></p>
+                                            <button type="button" role="switch"
+                                                    :disabled="externalEngineOptionDisabled(externalEnginePrefillOptionByKey('prefill_sparse_minference'))"
+                                                    :aria-disabled="externalEngineOptionDisabled(externalEnginePrefillOptionByKey('prefill_sparse_minference')) ? 'true' : 'false'"
+                                                    :aria-checked="externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_sparse_minference')) ? 'true' : 'false'"
+                                                    @click="toggleExternalEngineOption(externalEnginePrefillOptionByKey('prefill_sparse_minference'))"
+                                                    :class="[
+                                                        externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_sparse_minference')) ? 'bg-black' : 'bg-neutral-200',
+                                                        externalEngineOptionDisabled(externalEnginePrefillOptionByKey('prefill_sparse_minference')) ? 'cursor-not-allowed' : ''
+                                                    ]"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_sparse_minference')) ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+
+                                <!-- Control 4: Standalone CacheBlend Cross-Chunk Reuse Toggle -->
+                                <template x-if="externalEnginePrefillOptionByKey('prefill_cache_blend')">
+                                    <div class="px-3.5 py-3">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700"
+                                                      x-text="externalEngineOptionLabel(externalEnginePrefillOptionByKey('prefill_cache_blend'))"></span>
+                                                <p class="text-xs text-neutral-400/80 leading-relaxed mt-0.5"
+                                                   x-text="externalEngineOptionHint(externalEnginePrefillOptionByKey('prefill_cache_blend'))"></p>
                                             </div>
-                                        </template>
+                                            <button type="button" role="switch"
+                                                    :aria-checked="externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_cache_blend')) ? 'true' : 'false'"
+                                                    @click="toggleExternalEngineOption(externalEnginePrefillOptionByKey('prefill_cache_blend'))"
+                                                    :class="externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_cache_blend')) ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="externalEngineOptionToggleChecked(externalEnginePrefillOptionByKey('prefill_cache_blend')) ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+
+                                <!-- Control 5: Standalone ANE Collaboration Mode Selector -->
+                                <template x-if="externalEnginePrefillAneOptionSchema()">
+                                    <div class="px-3.5 py-3">
+                                        <label class="block text-sm font-medium text-neutral-700 mb-1"
+                                               x-text="externalEngineOptionLabel(externalEnginePrefillAneOptionSchema())"></label>
+                                        <select :value="getExternalEngineOption(externalEnginePrefillAneOptionSchema())"
+                                                @change="setExternalEngineOption(externalEnginePrefillAneOptionSchema(), $event.target.value)"
+                                                class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
+                                            <template x-for="choice in (externalEnginePrefillAneOptionSchema().options || [])" :key="choice">
+                                                <option :value="choice"
+                                                        :selected="getExternalEngineOption(externalEnginePrefillAneOptionSchema()) === choice"
+                                                        x-text="externalEngineEnumOptionLabel(externalEnginePrefillAneOptionSchema(), choice)"></option>
+                                            </template>
+                                        </select>
+                                        <p class="text-xs text-neutral-400/80 leading-relaxed mt-1"
+                                           x-text="externalEngineOptionHint(externalEnginePrefillAneOptionSchema())"></p>
                                     </div>
                                 </template>
                             </div>

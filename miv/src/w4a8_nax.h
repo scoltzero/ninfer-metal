@@ -38,6 +38,16 @@ inline constexpr U32 kW4A8DefaultMinTokens = 32U;
   return false;
 }
 
+// Opt-in Apple10 native `int8_t x int4b_format` q4 channel (paired with q5/q6/q8 i8xi8 dual-channel).
+// Default (`0`) uses the faster 2x 32x32x32 i8xi8 channel across all bit-widths (166-173 TFLOPS on M5U).
+[[nodiscard]] inline bool w4a8_oq4_int4b_enabled() noexcept {
+  if (const char *env = std::getenv("OMLX_M5_OQ4_INT4B");
+      env != nullptr && std::string_view(env) == "1") {
+    return true;
+  }
+  return false;
+}
+
 [[nodiscard]] inline bool w4a8_nax_runtime_eligible(
     const MetalContext &ctx, const std::filesystem::path &libs) {
   return nax_apple10_eligible(ctx, libs, "omlx_m5_w4a8_nax.metallib",
@@ -178,7 +188,9 @@ inline void linear_affine_w4a8_nax(Encoder &e, const TiledAffineWeight &tw,
   const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
   const U32 eff_gs =
       (tw.group_size == 128u && (tw.k % 128u) == 0u) ? 128u : 64u;
-  const std::string tag = affine_nax_mode_tag(tw.bits);
+  const std::string tag = (tw.bits == 4u && w4a8_oq4_int4b_enabled())
+                              ? std::string("q4_int4b")
+                              : affine_nax_mode_tag(tw.bits);
   const std::string fn = "omlx_m5_affine_w4a8_nax_" + tag + "_g" +
                          std::to_string(eff_gs) + "_bm64_bn64_bns" +
                          std::to_string(tw.bn) + "_sk1";
@@ -231,8 +243,11 @@ inline void linear_affine_w4a8_nax_swiglu(Encoder &e,
                          : 64u;
   const std::string tag_g = affine_nax_mode_tag(gw.bits);
   const std::string tag_u = affine_nax_mode_tag(uw.bits);
+  const bool use_q4_int4b =
+      (gw.bits == 4u && uw.bits == 4u && w4a8_oq4_int4b_enabled());
   const std::string mode_tag =
-      (tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u);
+      use_q4_int4b ? std::string("q4_int4b")
+                   : ((tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u));
   const std::string fn = "omlx_m5_affine_w4a8_nax_" + mode_tag + "_g" +
                          std::to_string(eff_gs) +
                          "_swiglu_bm64_bn64_out64_sk1";
@@ -288,8 +303,11 @@ inline void linear_affine_w4a8_nax_swiglu_fwht64_a8(
                          : 64u;
   const std::string tag_g = affine_nax_mode_tag(gw.bits);
   const std::string tag_u = affine_nax_mode_tag(uw.bits);
+  const bool use_q4_int4b =
+      (gw.bits == 4u && uw.bits == 4u && w4a8_oq4_int4b_enabled());
   const std::string mode_tag =
-      (tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u);
+      use_q4_int4b ? std::string("q4_int4b")
+                   : ((tag_g == tag_u) ? tag_g : (tag_g + "_" + tag_u));
   const std::string fn = "omlx_m5_affine_w4a8_nax_" + mode_tag + "_g" +
                          std::to_string(eff_gs) +
                          "_swiglu_bm64_bn64_out64_sk1_fwht64_a8";
@@ -353,6 +371,7 @@ inline void linear_mxfp4_w4a8_nax(Encoder &e, const TiledMxfp4Weight &tw,
   e.dynamic(d, 5,
             words({eff_n, tw.k, mp, t, tw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
+  e.dynamic(d, 6, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 // Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU (BM=64, BN_out=64, k_sub=32, Dual-ANE row_offset).
@@ -390,6 +409,7 @@ inline void linear_mxfp4_w4a8_nax_swiglu(Encoder &e,
   e.dynamic(d, 7,
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
+  e.dynamic(d, 8, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 // Mode B Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU + FWHT-64 + GS64 INT8 epilogue.
@@ -430,6 +450,7 @@ inline void linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
                    flags}),
             tokens_patch);
+  e.dynamic(d, 11, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 } // namespace omlx::m5::detail::forward

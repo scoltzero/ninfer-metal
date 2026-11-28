@@ -1199,8 +1199,22 @@ class TestExt8SpiV2LoRAAndManifestContract:
         assert manifest["load_defaults"]["max_concurrency"] == 4
         assert manifest["load_defaults"]["kv_dtype"] == "affine4_g128"
         assert manifest["load_defaults"]["sampling_contract"] == "position_coupled_v1"
+        assert manifest["load_defaults"]["prefill_linear_mode"] == "bf16"
+        assert manifest["load_defaults"]["prefill_ane_mode"] == "off"
+        assert manifest["load_defaults"]["prefill_ane_offload"] is False
 
         by_key = {item["key"]: item for item in manifest["options_schema"]}
+        assert by_key["prefill_linear_mode"]["options"] == ["bf16", "w4a8"]
+        assert "w4a4" not in by_key["prefill_linear_mode"].get("option_labels", {})
+        assert by_key["prefill_ane_mode"]["type"] == "enum"
+        assert by_key["prefill_ane_mode"]["options"] == [
+            "off",
+            "auto",
+            "compact_int8",
+            "ultra_fp16_swiglu",
+        ]
+        assert by_key["prefill_ane_mode"]["default"] == "off"
+        assert "prefill_ane_offload" not in by_key
         assert by_key["max_concurrency"]["default"] == 4
         assert "speculative_backend" in by_key
         assert by_key["speculative_backend"]["default"] == "auto"

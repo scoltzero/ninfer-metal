@@ -4341,7 +4341,7 @@ def test_pre_convert_safetensors_mtp_detection_prevents_stripped_mtp_mismatch(
     assert p_mtp.speculative_backend == "mtp"
 
 
-def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
+def test_m4a_orthogonal_prefill_switches_all_96_combinations_and_legacy_shim(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setenv("NINFER_METAL_NO_DEFAULT_CONFIG", "1")
@@ -4351,12 +4351,22 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
     assert schema_by_key["max_context"]["max"] >= 262144
     assert schema_by_key["max_context"]["default"] == 262144
     assert schema_by_key["prefill_linear_mode"]["options"] == ["bf16", "w4a8"]
+    assert "w4a4" not in schema_by_key["prefill_linear_mode"].get("option_labels", {})
     assert schema_by_key["prefill_linear_mode"]["default"] == "bf16"
     assert schema_by_key["prefill_attention_mode"]["options"] == ["exact_nax", "sage2"]
     assert schema_by_key["prefill_attention_mode"]["default"] == "exact_nax"
-    for bkey in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
+    for bkey in ("prefill_sparse_minference", "prefill_cache_blend"):
         assert schema_by_key[bkey]["type"] == "bool"
         assert schema_by_key[bkey]["default"] is False
+    assert schema_by_key["prefill_ane_mode"]["type"] == "enum"
+    assert schema_by_key["prefill_ane_mode"]["options"] == [
+        "off",
+        "auto",
+        "compact_int8",
+        "ultra_fp16_swiglu",
+    ]
+    assert schema_by_key["prefill_ane_mode"]["default"] == "off"
+    assert "prefill_ane_offload" not in schema_by_key
 
     model_dir = _write_test_model(tmp_path / "Qwen3.8-27B-SPI")
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
@@ -4376,19 +4386,20 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
 
     combos = 0
     seen_sigs = set()
-    for lm in ("bf16", "w4a8"):
+    for lm in ("bf16", "w4a8", "w4a4"):
         for am in ("exact_nax", "sage2"):
             for sp in (False, True):
                 for cb in (False, True):
-                    for ane in (False, True):
+                    for ane_mode in ("off", "auto", "compact_int8", "ultra_fp16_swiglu"):
                         combos += 1
+                        ane_bool = ane_mode != "off"
                         raw = {
                             "max_context": 262144,
                             "prefill_linear_mode": lm,
                             "prefill_attention_mode": am,
                             "prefill_sparse_minference": sp,
                             "prefill_cache_blend": cb,
-                            "prefill_ane_offload": ane,
+                            "prefill_ane_mode": ane_mode,
                         }
                         validated = m5_mod.validate_m5rt_options(raw)
                         assert validated is not None
@@ -4396,7 +4407,8 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
                         assert validated["prefill_attention_mode"] == am
                         assert validated["prefill_sparse_minference"] is sp
                         assert validated["prefill_cache_blend"] is cb
-                        assert validated["prefill_ane_offload"] is ane
+                        assert validated["prefill_ane_mode"] == ane_mode
+                        assert validated["prefill_ane_offload"] is ane_bool
 
                         ms = ModelSettings(
                             external_engine=M5RT_ENGINE_ID,
@@ -4414,14 +4426,16 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
                         assert plan.prefill_attention_mode == am
                         assert plan.prefill_sparse_minference is sp
                         assert plan.prefill_cache_blend is cb
-                        assert plan.prefill_ane_offload is ane
+                        assert plan.prefill_ane_mode == ane_mode
+                        assert plan.prefill_ane_offload is ane_bool
 
                         rpc = plan.to_rpc_dict()
                         assert rpc["prefill_linear_mode"] == lm
                         assert rpc["prefill_attention_mode"] == am
                         assert rpc["prefill_sparse_minference"] is sp
                         assert rpc["prefill_cache_blend"] is cb
-                        assert rpc["prefill_ane_offload"] is ane
+                        assert rpc["prefill_ane_mode"] == ane_mode
+                        assert rpc["prefill_ane_offload"] is ane_bool
 
                         eng = M5SidecarEngine(
                             str(model_dir), "spi-test", target, tmp_path / "logs", plan
@@ -4431,7 +4445,8 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
                         assert load_params["prefill_attention_mode"] == am
                         assert load_params["prefill_sparse_minference"] is sp
                         assert load_params["prefill_cache_blend"] is cb
-                        assert load_params["prefill_ane_offload"] is ane
+                        assert load_params["prefill_ane_mode"] == ane_mode
+                        assert load_params["prefill_ane_offload"] is ane_bool
 
                         sig = m5_mod.m5rt_runtime_signature(
                             ms,
@@ -4442,23 +4457,25 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
                         )
                         seen_sigs.add(json.dumps(sig, sort_keys=True))
 
-    assert combos == 32
-    assert len(seen_sigs) == 32
+    assert combos == 96
+    assert len(seen_sigs) == 96
 
     # Invalid values must raise ValueError
     with pytest.raises(ValueError, match="prefill_linear_mode"):
         m5_mod.validate_m5rt_options({"prefill_linear_mode": "int4"})
     with pytest.raises(ValueError, match="prefill_attention_mode"):
         m5_mod.validate_m5rt_options({"prefill_attention_mode": "flash2"})
+    with pytest.raises(ValueError, match="prefill_ane_mode"):
+        m5_mod.validate_m5rt_options({"prefill_ane_mode": "turbo_ane"})
 
-    # Legacy prefill_engine = "nax_ane" shim maps prefill_ane_offload=True
-    # WITHOUT touching w4a8 / sage2 / minference / cache_blend!
+    # Legacy prefill_engine = "nax_ane" shim maps prefill_ane_mode="auto" & prefill_ane_offload=True
+    # WITHOUT touching w4a4 / sage2 / minference / cache_blend!
     ms_legacy = ModelSettings(
         external_engine=M5RT_ENGINE_ID,
         external_engine_options={
             M5RT_ENGINE_ID: {
                 "prefill_engine": "nax_ane",
-                "prefill_linear_mode": "w4a8",
+                "prefill_linear_mode": "w4a4",
                 "prefill_attention_mode": "sage2",
                 "prefill_sparse_minference": True,
                 "prefill_cache_blend": True,
@@ -4468,11 +4485,23 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
     plan_legacy = m5_mod.build_m5rt_options(
         model_dir, target, ms_legacy, default_context=32768, memory_budget_bytes=0
     )
+    assert plan_legacy.prefill_ane_mode == "auto"
     assert plan_legacy.prefill_ane_offload is True
-    assert plan_legacy.prefill_linear_mode == "w4a8"
+    assert plan_legacy.prefill_linear_mode == "w4a4"
     assert plan_legacy.prefill_attention_mode == "sage2"
     assert plan_legacy.prefill_sparse_minference is True
     assert plan_legacy.prefill_cache_blend is True
+
+    # Legacy prefill_ane_offload=True -> prefill_ane_mode="auto"; explicit prefill_ane_mode wins
+    ms_legacy_bool = ModelSettings(
+        external_engine=M5RT_ENGINE_ID,
+        external_engine_options={M5RT_ENGINE_ID: {"prefill_ane_offload": True}},
+    )
+    plan_legacy_bool = m5_mod.build_m5rt_options(
+        model_dir, target, ms_legacy_bool, default_context=32768, memory_budget_bytes=0
+    )
+    assert plan_legacy_bool.prefill_ane_mode == "auto"
+    assert plan_legacy_bool.prefill_ane_offload is True
 
     # Explicit prefill_ane_offload=False beats legacy prefill_engine="nax_ane"
     ms_override = ModelSettings(
@@ -4488,8 +4517,26 @@ def test_m4a_orthogonal_prefill_switches_all_32_combinations_and_legacy_shim(
     plan_override = m5_mod.build_m5rt_options(
         model_dir, target, ms_override, default_context=32768, memory_budget_bytes=0
     )
+    assert plan_override.prefill_ane_mode == "off"
     assert plan_override.prefill_ane_offload is False
     assert plan_override.prefill_linear_mode == "w4a8"
+
+    # Explicit prefill_ane_mode="off" beats legacy prefill_ane_offload=True & prefill_engine="nax_ane"
+    ms_mode_wins = ModelSettings(
+        external_engine=M5RT_ENGINE_ID,
+        external_engine_options={
+            M5RT_ENGINE_ID: {
+                "prefill_engine": "nax_ane",
+                "prefill_ane_offload": True,
+                "prefill_ane_mode": "off",
+            }
+        },
+    )
+    plan_mode_wins = m5_mod.build_m5rt_options(
+        model_dir, target, ms_mode_wins, default_context=32768, memory_budget_bytes=0
+    )
+    assert plan_mode_wins.prefill_ane_mode == "off"
+    assert plan_mode_wins.prefill_ane_offload is False
 
 
 def test_m4a_c5_max_context_policy_unclamping_and_c6_shared_kv_memory_estimate(
@@ -4591,10 +4638,11 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
         max_concurrency=4,
         kv_dtype="affine4_g128",
         concurrency_source="model",
-        prefill_linear_mode="w4a8",
+        prefill_linear_mode="w4a4",
         prefill_attention_mode="sage2",
         prefill_sparse_minference=True,
         prefill_cache_blend=True,
+        prefill_ane_mode="ultra_fp16_swiglu",
         prefill_ane_offload=True,
     )
     engine._last_stats = {
@@ -4604,15 +4652,23 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
         "sampling_contract_id": "position_coupled_v1",
         "speculative_backend": "dflash2",
         "max_draft_tokens": 7,
-        "prefill_linear_mode": "w4a8",
+        "prefill_linear_mode": "w4a4",
+        "prefill_linear_mode_effective": "w4a8",
+        "prefill_linear_fallback": True,
+        "prefill_linear_fallback_reason": "requires_mxfp4_model",
+        "model_quant_format": "oq_affine",
         "prefill_attention_mode": "sage2",
         "prefill_sparse_minference": True,
         "prefill_sparse_minference_effective": True,
         "prefill_cache_blend": True,
+        "prefill_ane_mode": "ultra_fp16_swiglu",
+        "prefill_ane_mode_effective": "ultra_fp16_swiglu",
+        "prefill_ane_inactive_reason": "",
         "prefill_ane_offload": True,
         "prefill_ane_active": True,
         "prefill_ane_split_alpha": 0.03,
         "prefill_w4a8_tokens": 4096,
+        "prefill_w4a4_tokens": 0,
         "prefill_sage2_tokens": 4096,
         "prefill_minference_blocks_skipped": 120,
         "prefill_minference_blocks_total": 256,
@@ -4623,15 +4679,119 @@ def test_effective_load_settings_forwards_live_prefill_telemetry(tmp_path: Path)
     }
     eff = engine.effective_load_settings()
     assert eff is not None
-    assert eff["prefill_linear_mode"] == "w4a8"
+    assert eff["prefill_linear_mode"] == "w4a4"
+    assert eff["prefill_linear_mode_effective"] == "w4a8"
+    assert eff["prefill_linear_fallback"] is True
+    assert eff["prefill_linear_fallback_reason"] == "requires_mxfp4_model"
+    assert eff["model_quant_format"] == "oq_affine"
     assert eff["prefill_attention_mode"] == "sage2"
     assert eff["prefill_sparse_minference_effective"] is True
     assert eff["prefill_cache_blend"] is True
+    assert eff["prefill_ane_mode"] == "ultra_fp16_swiglu"
+    assert eff["prefill_ane_mode_effective"] == "ultra_fp16_swiglu"
     assert eff["prefill_ane_active"] is True
     assert eff["prefill_w4a8_tokens"] == 4096
+    assert eff["prefill_w4a4_tokens"] == 0
     assert eff["prefill_minference_blocks_skipped"] == 120
     assert eff["prefill_cache_blend_hit_tokens"] == 2048
     assert eff["prefill_ane_offload_tokens"] == 4096
+
+
+def test_detect_model_weight_format_info_quant_format_and_mxfp4_w4a4_support(
+    tmp_path: Path,
+) -> None:
+    import struct
+    import zlib
+
+    def _write_miv(path: Path, *, magic: bytes, version: int, objects: list[dict]) -> None:
+        schema = (
+            ("omlx-m5-artifact-v2" if version == 2 else "omlx-m5-artifact-v1")
+            if magic == b"OMLXM5A1"
+            else ("miv-artifact-v2" if version == 2 else "miv-artifact-v1")
+        )
+        manifest = {
+            "schema": schema,
+            "container_version": version,
+            "objects": objects,
+        }
+        raw_manifest = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        manifest_crc = zlib.crc32(raw_manifest) & 0xFFFFFFFF
+        payload_offset = ((64 + len(raw_manifest) + 4095) // 4096) * 4096
+        prefix = struct.pack(
+            "<8sIIQQQQII",
+            magic,
+            version,
+            64,
+            64,
+            len(raw_manifest),
+            payload_offset,
+            0,
+            len(objects),
+            manifest_crc,
+        )
+        header_crc = zlib.crc32(prefix) & 0xFFFFFFFF
+        flags = 3 if version == 2 else 0
+        hdr = prefix + struct.pack("<II", header_crc, flags)
+        path.write_bytes(hdr + raw_manifest + b"\x00" * (payload_offset - 64 - len(raw_manifest)))
+
+    # 1) MXFP4 .miv v2 (MIV00001) with direct_bf16_v1 control/router projections -> "mxfp4"
+    mxfp4_dir = tmp_path / "Qwen3.8-27B-mxfp4"
+    mxfp4_dir.mkdir()
+    _write_miv(
+        mxfp4_dir / "model.miv",
+        magic=b"MIV00001",
+        version=2,
+        objects=[
+            {"name": "model.embed_tokens.weight", "format": "direct_bf16_v1"},
+            {"name": "model.layers.0.linear_attn.in_proj_a", "format": "direct_bf16_v1"},
+            {"name": "model.layers.0.mlp.gate", "format": "direct_bf16_v1"},
+            {"name": "model.layers.0.mlp.gate_proj", "format": "mxfp4_e2m1_g32_e8m0_v1"},
+            {"name": "model.layers.0.mlp.down_proj", "format": "mxfp4_e2m1_g32_e8m0_v1"},
+            {"name": "mtp.layers.0.mlp.gate_proj", "format": "oq_affine_4bit_g64_v1"},
+        ],
+    )
+    info_mxfp4 = m5_mod.detect_model_weight_format_info(mxfp4_dir, active_external_engine="m5rt")
+    assert info_mxfp4["quant_format"] == "mxfp4"
+    assert info_mxfp4["mxfp4_w4a4_supported"] is True
+
+    # 2) oQ4e .omlxm5 v1 (OMLXM5A1) -> "oq_affine", mxfp4_w4a4_supported == False
+    oq_dir = tmp_path / "Qwen3.8-27B-oQ4e"
+    oq_dir.mkdir()
+    _write_miv(
+        oq_dir / "model.omlxm5",
+        magic=b"OMLXM5A1",
+        version=1,
+        objects=[
+            {"name": "model.layers.0.mlp.gate_proj", "format": "oq_affine_4bit_g64_v1"},
+            {"name": "model.layers.0.mlp.down_proj", "format": "oq_affine_4bit_g64_v1"},
+        ],
+    )
+    info_oq = m5_mod.detect_model_weight_format_info(oq_dir, active_external_engine="m5rt")
+    assert info_oq["quant_format"] == "oq_affine"
+    assert info_oq["mxfp4_w4a4_supported"] is False
+
+    # 3) config.json fallback (no .miv file yet)
+    cfg_mxfp4_dir = tmp_path / "safetensors-mxfp4"
+    cfg_mxfp4_dir.mkdir()
+    (cfg_mxfp4_dir / "config.json").write_text(
+        json.dumps({"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32}}),
+        encoding="utf-8",
+    )
+    (cfg_mxfp4_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+    info_cfg_mxfp4 = m5_mod.detect_model_weight_format_info(cfg_mxfp4_dir)
+    assert info_cfg_mxfp4["quant_format"] == "mxfp4"
+    assert info_cfg_mxfp4["mxfp4_w4a4_supported"] is True
+
+    cfg_affine_dir = tmp_path / "safetensors-oq4e"
+    cfg_affine_dir.mkdir()
+    (cfg_affine_dir / "config.json").write_text(
+        json.dumps({"quantization": {"mode": "affine", "bits": 4, "group_size": 64}}),
+        encoding="utf-8",
+    )
+    (cfg_affine_dir / "model.safetensors").write_bytes(b"\x08\x00\x00\x00\x00\x00\x00\x00{}      ")
+    info_cfg_oq = m5_mod.detect_model_weight_format_info(cfg_affine_dir)
+    assert info_cfg_oq["quant_format"] == "oq_affine"
+    assert info_cfg_oq["mxfp4_w4a4_supported"] is False
 
 
 def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
@@ -4787,6 +4947,77 @@ def test_inspect_mtp_manifest_accepts_miv_v1_and_v2_and_rejects_invalid_headers(
                     mdir, source_repo=f"test/{label}", configured_binary=str(fake_bin)
                 )
             assert not (mdir / "model.miv").exists()
+
+
+def test_builtin_m5rt_manifest_strips_w4a4_from_stale_on_disk_provider_json_and_f16_quant_classifier(
+    tmp_path: Path, monkeypatch
+):
+    prov_dir = tmp_path / "Providers" / "io.ninfer.metal" / "current"
+    prov_dir.mkdir(parents=True)
+    (prov_dir / "provider.json").write_text(
+        json.dumps(
+            {
+                "provider_id": "io.ninfer.metal",
+                "engine_id": "m5rt",
+                "options_schema": [
+                    {
+                        "key": "prefill_linear_mode",
+                        "label": "Prefill Linear Mode",
+                        "type": "enum",
+                        "options": ["bf16", "w4a8", "w4a4"],
+                        "option_labels": {
+                            "bf16": "BF16 (Exact)",
+                            "w4a8": "A8 (Universal W4A8)",
+                            "w4a4": "A4 (Native W4A4, MXFP4 Only)",
+                        },
+                        "description": "Prefill linear GEMM precision including native W4A4.",
+                        "default": "bf16",
+                        "reload_required": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m5_mod, "_provider_root_dirs", lambda: [prov_dir])
+    manifest = m5_mod._builtin_m5rt_manifest()
+    by_key = {item["key"]: item for item in manifest["options_schema"]}
+    linear = by_key["prefill_linear_mode"]
+    assert linear["options"] == ["bf16", "w4a8"]
+    assert "w4a4" not in linear.get("option_labels", {})
+    assert "w4a4" not in str(linear.get("description", "")).lower()
+    # Underlying programmatic/experimental w4a4 validation remains intact.
+    assert "w4a4" in m5_mod.VALID_PREFILL_LINEAR_MODES
+    validated = m5_mod.validate_m5rt_options({"prefill_linear_mode": "w4a4"})
+    assert validated["prefill_linear_mode"] == "w4a4"
+
+    # Pure direct_f16_v1 .miv artifact must classify as "bf16" (dense float), not "mixed"/"unknown".
+    import struct
+
+    f16_dir = tmp_path / "dense_fp16_model"
+    f16_dir.mkdir()
+    (f16_dir / "config.json").write_text(
+        json.dumps({"model_type": "llama", "torch_dtype": "float16"}),
+        encoding="utf-8",
+    )
+    f16_manifest = json.dumps(
+        {
+            "schema": "miv-artifact-v1",
+            "objects": [
+                {"name": "model.layers.0.self_attn.q_proj", "format": "direct_f16_v1"},
+                {"name": "model.layers.0.mlp.gate_proj", "format": "direct_f16_v1"},
+            ],
+        }
+    ).encode("utf-8")
+    f16_art = f16_dir / "model.miv"
+    f16_art.write_bytes(
+        b"MIV00001"
+        + struct.pack("<IIIIQQQQ", 1, 0, 0, 0, 64, len(f16_manifest), 64 + len(f16_manifest), 0)
+        + b"\x00" * 8
+        + f16_manifest
+    )
+    assert m5_mod.inspect_model_quant_format(f16_dir, artifact_path=f16_art) == "bf16"
+
 
 
 

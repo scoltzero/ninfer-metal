@@ -955,6 +955,9 @@ void test_http_server_e2e() {
       check(text.find("ninfer_metal_prefix_cache_hits_total ") !=
                 std::string::npos,
             "/metrics missing prefix cache metrics");
+      check(text.find("ninfer_metal_prefill_w4a4_tokens_total ") !=
+                std::string::npos,
+            "/metrics missing ninfer_metal_prefill_w4a4_tokens_total");
     }
   } catch (...) {
     cleanup();
@@ -1830,7 +1833,9 @@ void test_default_config_auto_discovery_tilde_and_auto_spec() {
               auto_cfg.prefill_attention_mode ==
                   PrefillAttentionMode::ExactNax &&
               !auto_cfg.prefill_sparse_minference &&
-              !auto_cfg.prefill_cache_blend && !auto_cfg.prefill_ane_offload &&
+              !auto_cfg.prefill_cache_blend &&
+              auto_cfg.prefill_ane_mode == PrefillAneMode::Off &&
+              !auto_cfg.prefill_ane_offload &&
               auto_cfg.lora_adapter.empty() &&
               auto_cfg.lora_mode == "merge" &&
               auto_cfg.spec_backend_auto == true && auto_cfg.draft_tokens == 0,

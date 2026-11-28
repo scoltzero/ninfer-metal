@@ -138,6 +138,7 @@
     "prefill_attention_mode": "exact_nax",
     "prefill_sparse_minference": false,
     "prefill_cache_blend": false,
+    "prefill_ane_mode": "off",
     "prefill_ane_offload": false
   },
   "supported_standard_settings": [
@@ -200,7 +201,7 @@
         "bf16": "BF16 (Exact)",
         "w4a8": "W4A8 (INT8 Prefill)"
       },
-      "description": "INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). Decode remains exact W4A16.",
+      "description": "INT8 prefill linear matmul (universal across MXFP4 & oQ4e; down_proj stays W4A16). Decode remains exact W4A16.",
       "default": "bf16",
       "reload_required": true
     },
@@ -216,7 +217,7 @@
         "exact_nax": "Exact NAX",
         "sage2": "Sage2 (INT8 QK + FP16 PV)"
       },
-      "description": "Low-bit INT8 QK prefill attention; pair with MInference below (dense Sage2 alone is slower on affine4 KV).",
+      "description": "Low-bit INT8 QK prefill attention (dense full-receptive-field Sage2 by default; optionally enable MInference sparse below).",
       "default": "exact_nax",
       "reload_required": true
     },
@@ -224,7 +225,7 @@
       "key": "prefill_sparse_minference",
       "label": "MInference Sparse",
       "type": "bool",
-      "description": "Skips low-weight KV blocks (2.1x-2.35x faster at 64K-256K). Slight quality loss, but turning it off under Sage2 causes severe slowdown.",
+      "description": "Optional dynamic block-sparse KV skipping under Sage2 (off = dense full-receptive-field Sage2; on = dynamic block-sparse Sage2 + MInference).",
       "default": false,
       "reload_required": true
     },
@@ -237,11 +238,23 @@
       "reload_required": true
     },
     {
-      "key": "prefill_ane_offload",
-      "label": "Dual-ANE Offload",
-      "type": "bool",
-      "description": "Orthogonal Dual-ANE co-execution (never disables W4A8/Sage2); Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra.",
-      "default": false,
+      "key": "prefill_ane_mode",
+      "label": "ANE Collaboration Mode",
+      "type": "enum",
+      "options": [
+        "off",
+        "auto",
+        "compact_int8",
+        "ultra_fp16_swiglu"
+      ],
+      "option_labels": {
+        "off": "Off (GPU Only)",
+        "auto": "Auto",
+        "compact_int8": "Compact INT8",
+        "ultra_fp16_swiglu": "Ultra FP16 SwiGLU"
+      },
+      "description": "Orthogonal Dual-ANE co-execution mode (off, auto hardware crossover, balanced compact INT8, or Ultra direct FP16 SwiGLU). Dense-only and skips GDN recurrence.",
+      "default": "off",
       "reload_required": true
     },
     {

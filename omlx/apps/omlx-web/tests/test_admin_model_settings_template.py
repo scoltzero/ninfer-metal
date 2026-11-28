@@ -1246,12 +1246,17 @@ def test_external_engine_prefill_switches_orthogonality_labels_and_minference_ga
     acceleration = _section(template, "<!-- Acceleration -->", "<!-- Memory Saving -->")
     assert "<!-- miv Prefill Acceleration Card -->" in acceleration
     assert "externalEnginePrefillOptionsSchema()" in acceleration
-    assert "externalEnginePrefillPresets()" in acceleration
-    assert "externalEngineOptionHint(opt)" in acceleration
-    assert "toggleExternalEngineOption(opt)" in acceleration
-    assert "externalEngineOptionContainerClass(opt)" in template
-    assert "externalEngineOptionDisabled(opt)" in template
-    assert "externalEngineOptionTooltip(opt)" in template
+    assert "externalEnginePrefillTiers()" in acceleration
+    assert "selectExternalEnginePrefillTier(tier)" in acceleration
+    assert "externalEngineLinearSubTiers" not in template
+    assert "selectExternalEngineLinearSubTier" not in template
+    assert "仅 MXFP4 模型支持" not in template
+    assert "prefill_sparse_minference" in acceleration
+    assert "prefill_cache_blend" in acceleration
+    assert "externalEnginePrefillAneOptionSchema()" in acceleration
+    assert "externalEngineOptionContainerClass(" in template
+    assert "externalEngineOptionDisabled(" in template
+    assert "externalEngineOptionTooltip(" in template
     assert "mivEffectivePrefillBadges(selectedModel?.miv_effective_settings)" in template
 
     node = shutil.which("node")
@@ -1279,104 +1284,168 @@ const m5EngineRow = {
         {key: 'prefill_attention_mode', label: 'Sage2 Attention', type: 'enum', options: ['exact_nax', 'sage2'], default: 'exact_nax'},
         {key: 'prefill_sparse_minference', label: 'MInference Sparse', type: 'bool', default: false},
         {key: 'prefill_cache_blend', label: 'CacheBlend Reuse', type: 'bool', default: false},
-        {key: 'prefill_ane_offload', label: 'Dual-ANE Offload', type: 'bool', default: false},
+        {key: 'prefill_ane_mode', label: 'ANE Collaboration Mode', type: 'enum', options: ['off', 'auto', 'compact_int8', 'ultra_fp16_swiglu'], default: 'off'},
     ],
 };
-app.selectedModel = {id: 'qwen3.8-27b', config_model_type: 'qwen3_8'};
+
+// 1) Non-MXFP4 (oQ4e) model: pre-saved historical w4a4 silently normalizes to w4a8 on load & save
+const oqModel = {
+    id: 'Qwen3.8-27B-oQ4e-mtp',
+    config_model_type: 'qwen3_8',
+    quant_format: 'oq_affine',
+    mxfp4_w4a4_supported: false,
+    external_engines: [m5EngineRow],
+    auto_external_engine: 'm5rt',
+};
+app.selectedModel = oqModel;
 app.modelSettings = app.buildModelSettingsState(
-    {external_engines: [m5EngineRow], auto_external_engine: 'm5rt'},
-    {}
+    oqModel,
+    {external_engine_options: {m5rt: {prefill_linear_mode: 'w4a4'}}}
 );
+assert.equal(app.activeExternalEngineLinearMode(), 'w4a8');
+assert.equal(app.activeExternalEnginePrefillTier(), 'route_a');
+assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
+const oqPayload = app.buildModelSettingsPayload(app.modelSettings);
+assert.equal(oqPayload.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
 
-// Prefill switches live in the dedicated Acceleration card, NOT duplicated in ms-advanced general list
-const generalKeys = app.externalEngineGeneralOptionsSchema().map(o => o.key);
-assert.deepEqual(generalKeys, ['max_context']);
-const prefillSchema = app.externalEnginePrefillOptionsSchema();
-const opts = Object.fromEntries(prefillSchema.map(o => [o.key, o]));
-const maxCtxOpt = app.externalEngineGeneralOptionsSchema()[0];
+// Directly attempting to set w4a4 via setExternalEngineOption clamps to w4a8
+const linearItem = app.externalEnginePrefillOptionByKey('prefill_linear_mode');
+app.setExternalEngineOption(linearItem, 'w4a4');
+assert.equal(app.activeExternalEngineLinearMode(), 'w4a8');
+assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
 
-// Short EN labels + subtle hint text
-assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'W4A8 Linear');
-assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Sage2 Attention');
-assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
-assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'CacheBlend Reuse');
-assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), 'Dual-ANE Offload');
-assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).toLowerCase().includes('slowdown'));
-assert.ok(app.externalEngineOptionHint(opts.prefill_ane_offload).includes('W4A8'));
+// General options exclude all prefill switches (including prefill_ane_mode)
+assert.deepEqual(app.externalEngineGeneralOptionsSchema().map(o => o.key), ['max_context']);
 
-// Short ZH labels + subtle caution text (including MInference trade-off & slowdown warning)
+// 2) ZH labels for 4-Tier selector and 4-option ANE dropdown
 globalThis.document.documentElement.lang = 'zh-CN';
-assert.equal(app.externalEngineOptionLabel(opts.prefill_linear_mode), 'W4A8 线性');
-assert.equal(app.externalEngineOptionLabel(opts.prefill_attention_mode), 'Sage2 注意力');
-assert.ok(app.externalEngineOptionLabel(opts.prefill_sparse_minference).includes('MInference'));
-assert.equal(app.externalEngineOptionLabel(opts.prefill_cache_blend), 'CacheBlend 复用');
-assert.equal(app.externalEngineOptionLabel(opts.prefill_ane_offload), '双 ANE 协同');
-assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).includes('掉速'));
-assert.ok(app.externalEngineOptionHint(opts.prefill_sparse_minference).includes('精度'));
-app.selectedModel = {id: 'qwen3.6-35b-a3b', config_model_type: 'qwen3_6_moe'};
-assert.ok(app.externalEngineOptionHint(opts.prefill_ane_offload).includes('MoE'));
-app.selectedModel = {id: 'qwen3.8-27b', config_model_type: 'qwen3_8'};
+const zhTiers = app.externalEnginePrefillTiers();
+assert.deepEqual(zhTiers.map(t => t.label), [
+    '无损默认',
+    '路线 A（线性加速）',
+    '路线 B（注意力加速）',
+    '路线 A+B（全速）',
+]);
+const aneItem = app.externalEnginePrefillAneOptionSchema();
+assert.deepEqual(
+    aneItem.options.map(c => app.externalEngineEnumOptionLabel(aneItem, c)),
+    ['关闭', '自动', '均衡省存 INT8', 'Ultra 极速 FP16 SwiGLU']
+);
 globalThis.document.documentElement.lang = 'en';
 
-// Binary enum + bool options render as toggles in the Prefill card
-for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_sparse_minference', 'prefill_cache_blend', 'prefill_ane_offload']) {
-    assert.equal(app.externalEngineOptionIsToggle(opts[k]), true);
-    assert.equal(app.externalEngineOptionToggleChecked(opts[k]), false);
-}
+// 3) MXFP4 model: pre-saved historical w4a4 ALSO normalizes unconditionally to w4a8 on load & save;
+//    4-tier route_a & route_ab always map to w4a8 and NEVER modify MInference, CacheBlend, or ANE mode!
+const mxfp4Model = {
+    id: 'Qwen3.8-27B-mxfp4',
+    config_model_type: 'qwen3_8',
+    quant_format: 'mxfp4',
+    mxfp4_w4a4_supported: true,
+    external_engines: [m5EngineRow],
+    auto_external_engine: 'm5rt',
+};
+app.selectedModel = mxfp4Model;
+app.modelSettings = app.buildModelSettingsState(
+    mxfp4Model,
+    {external_engine_options: {m5rt: {prefill_linear_mode: 'w4a4'}}}
+);
+assert.equal(app.activeExternalEngineLinearMode(), 'w4a8');
+assert.equal(app.activeExternalEnginePrefillTier(), 'route_a');
+assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
+assert.equal(
+    app.buildModelSettingsPayload(app.modelSettings).external_engine_options.m5rt.prefill_linear_mode,
+    'w4a8'
+);
 
-// When prefill_attention_mode === 'exact_nax', ONLY prefill_sparse_minference is indented & disabled/dimmed
-assert.equal(app.externalEngineOptionIndented(opts.prefill_sparse_minference), true);
-assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), true);
-assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('opacity-50'));
-assert.ok(app.externalEngineOptionContainerClass(opts.prefill_sparse_minference).includes('pl-4'));
-assert.equal(app.externalEngineOptionTooltip(opts.prefill_sparse_minference), 'Active when Sage2 Attention is enabled');
+app.modelSettings = app.buildModelSettingsState(mxfp4Model, {});
+assert.equal(app.activeExternalEnginePrefillTier(), 'lossless');
+assert.equal(app.isExternalEngineLinearAccelActive(), false);
+const minfItem = app.externalEnginePrefillOptionByKey('prefill_sparse_minference');
+const blendItem = app.externalEnginePrefillOptionByKey('prefill_cache_blend');
+assert.equal(app.externalEngineOptionDisabled(minfItem), true);
 
-// All other switches stay 100% independent and never disabled
-for (const k of ['prefill_linear_mode', 'prefill_attention_mode', 'prefill_cache_blend', 'prefill_ane_offload']) {
-    assert.equal(app.externalEngineOptionDisabled(opts[k]), false);
-    assert.equal(app.externalEngineOptionIndented(opts[k]), false);
-}
+// Turn on CacheBlend & ANE=ultra_fp16_swiglu first; switching all 4 tiers MUST NOT touch them!
+app.toggleExternalEngineOption(blendItem);
+app.setExternalEngineOption(aneItem, 'ultra_fp16_swiglu');
+assert.equal(app.getExternalEngineOption(blendItem), true);
+assert.equal(app.getExternalEngineOption(aneItem), 'ultra_fp16_swiglu');
 
-// Toggling Sage2 ON auto-enables MInference, while MInference can still be manually toggled OFF afterwards
-app.toggleExternalEngineOption(opts.prefill_attention_mode);
-assert.equal(app.getExternalEngineOption(opts.prefill_attention_mode), 'sage2');
-assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), true);
-assert.equal(app.externalEngineOptionDisabled(opts.prefill_sparse_minference), false);
-app.toggleExternalEngineOption(opts.prefill_sparse_minference);
-assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), false);
+// Route B (Sage2) MUST NOT auto-enable MInference (independent sub-switch: off = dense Sage2)
+app.selectExternalEnginePrefillTier('route_b');
+assert.equal(app.activeExternalEnginePrefillTier(), 'route_b');
+assert.equal(app.activeExternalEngineLinearMode(), 'bf16');
+assert.equal(app.externalEngineOptionDisabled(minfItem), false);
+assert.equal(app.getExternalEngineOption(minfItem), false);
+assert.equal(app.getExternalEngineOption(blendItem), true);
+assert.equal(app.getExternalEngineOption(aneItem), 'ultra_fp16_swiglu');
 
-// Presets apply cleanly without locking orthogonal toggles (GPU Full = all 4 GPU switches ON, ANE OFF)
-const presets = Object.fromEntries(app.externalEnginePrefillPresets().map(p => [p.id, p]));
-app.applyExternalEnginePrefillPreset(presets.gpu_full);
-assert.equal(app.isExternalEnginePrefillPresetActive(presets.gpu_full), true);
-assert.equal(app.getExternalEngineOption(opts.prefill_linear_mode), 'w4a8');
-assert.equal(app.getExternalEngineOption(opts.prefill_attention_mode), 'sage2');
-assert.equal(app.getExternalEngineOption(opts.prefill_sparse_minference), true);
-assert.equal(app.getExternalEngineOption(opts.prefill_cache_blend), true);
-assert.equal(app.getExternalEngineOption(opts.prefill_ane_offload), false);
+// Route A and Route A+B map directly to w4a8 (even on MXFP4) and keep MInference/CacheBlend/ANE untouched
+app.selectExternalEnginePrefillTier('route_a');
+assert.equal(app.activeExternalEnginePrefillTier(), 'route_a');
+assert.equal(app.activeExternalEngineLinearMode(), 'w4a8');
 
-// Enabling Dual-ANE composes orthogonally with GPU Full (W4A8 + Sage2 + MInference + CacheBlend)
-app.toggleExternalEngineOption(opts.prefill_ane_offload);
-app.setExternalEngineOption(maxCtxOpt, '262144');
+app.selectExternalEnginePrefillTier('route_ab');
+assert.equal(app.activeExternalEnginePrefillTier(), 'route_ab');
+assert.equal(app.activeExternalEngineLinearMode(), 'w4a8');
+assert.equal(app.getExternalEngineOption(minfItem), false);
+assert.equal(app.getExternalEngineOption(blendItem), true);
+assert.equal(app.getExternalEngineOption(aneItem), 'ultra_fp16_swiglu');
+
+// Toggle MInference ON independently under Route A+B
+app.toggleExternalEngineOption(minfItem);
+assert.equal(app.getExternalEngineOption(minfItem), true);
 
 const payload = app.buildModelSettingsPayload(app.modelSettings);
-assert.equal(payload.external_engine_options.m5rt.max_context, 262144);
 assert.equal(payload.external_engine_options.m5rt.prefill_linear_mode, 'w4a8');
 assert.equal(payload.external_engine_options.m5rt.prefill_attention_mode, 'sage2');
 assert.equal(payload.external_engine_options.m5rt.prefill_sparse_minference, true);
 assert.equal(payload.external_engine_options.m5rt.prefill_cache_blend, true);
-assert.equal(payload.external_engine_options.m5rt.prefill_ane_offload, true);
+assert.equal(payload.external_engine_options.m5rt.prefill_ane_mode, 'ultra_fp16_swiglu');
 
-// Live header badge helper
+// Legacy prefill_ane_offload=true hydrates prefill_ane_mode as 'auto' and syncs when changed to 'off'
+app.modelSettings = app.buildModelSettingsState(
+    mxfp4Model,
+    {external_engine_options: {m5rt: {prefill_ane_offload: true}}}
+);
+assert.equal(app.getExternalEngineOption(aneItem), 'auto');
+app.setExternalEngineOption(aneItem, 'off');
+assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_ane_mode, 'off');
+assert.equal(app.modelSettings.external_engine_options.m5rt.prefill_ane_offload, false);
+
+// 4) Live header badge helper: effLinear='w4a4' renders 'W4A8' (never 'W4A4'); fallback/ANE badges intact
 assert.deepEqual(
     app.mivEffectivePrefillBadges({
-        prefill_linear_mode: 'w4a8',
+        prefill_linear_mode: 'w4a4',
+        prefill_linear_mode_effective: 'w4a4',
+        prefill_linear_fallback: false,
         prefill_attention_mode: 'sage2',
         prefill_sparse_minference_effective: true,
         prefill_cache_blend: true,
+        prefill_ane_mode: 'ultra_fp16_swiglu',
+        prefill_ane_mode_effective: 'ultra_fp16_swiglu',
         prefill_ane_active: true,
     }),
-    ['W4A8', 'SAGE2+MINF', 'BLEND', 'ANE']
+    ['W4A8', 'SAGE2+MINF', 'BLEND', 'ANE(FP16)']
+);
+assert.deepEqual(
+    app.mivEffectivePrefillBadges({
+        prefill_linear_mode: 'w4a4',
+        prefill_linear_mode_effective: 'w4a8',
+        prefill_linear_fallback: true,
+        prefill_attention_mode: 'sage2',
+        prefill_sparse_minference_effective: false,
+        prefill_ane_mode: 'compact_int8',
+        prefill_ane_mode_effective: 'compact_int8',
+        prefill_ane_active: true,
+    }),
+    ['W4A8(fallback)', 'SAGE2', 'ANE(INT8)']
+);
+assert.deepEqual(
+    app.mivEffectivePrefillBadges({
+        prefill_linear_mode: 'bf16',
+        prefill_ane_mode: 'auto',
+        prefill_ane_active: false,
+    }),
+    ['ANE(off)']
 );
 """
     )

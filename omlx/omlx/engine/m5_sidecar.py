@@ -261,8 +261,8 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
             "w4a8": "W4A8 (INT8 Prefill)",
         },
         "description": (
-            "INT8 prefill linear matmul (strongest on oQ4e; down_proj stays W4A16). "
-            "Decode remains exact W4A16."
+            "INT8 prefill linear matmul (universal across MXFP4 & oQ4e; "
+            "down_proj stays W4A16). Decode remains exact W4A16."
         ),
         "default": "bf16",
         "reload_required": True,
@@ -277,8 +277,8 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
             "sage2": "Sage2 (INT8 QK + FP16 PV)",
         },
         "description": (
-            "Low-bit INT8 QK prefill attention; pair with MInference below "
-            "(dense Sage2 alone is slower on affine4 KV)."
+            "Low-bit INT8 QK prefill attention (dense full-receptive-field Sage2 by default; "
+            "optionally enable MInference sparse below)."
         ),
         "default": "exact_nax",
         "reload_required": True,
@@ -288,8 +288,8 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "label": "MInference Sparse",
         "type": "bool",
         "description": (
-            "Skips low-weight KV blocks (2.1x-2.35x faster at 64K-256K). "
-            "Slight quality loss, but turning it off under Sage2 causes severe slowdown."
+            "Optional dynamic block-sparse KV skipping under Sage2 "
+            "(off = dense full-receptive-field Sage2; on = dynamic block-sparse Sage2 + MInference)."
         ),
         "default": False,
         "reload_required": True,
@@ -306,14 +306,21 @@ M5RT_DEFAULT_OPTIONS_SCHEMA: tuple[dict[str, Any], ...] = (
         "reload_required": True,
     },
     {
-        "key": "prefill_ane_offload",
-        "label": "Dual-ANE Offload",
-        "type": "bool",
+        "key": "prefill_ane_mode",
+        "label": "ANE Collaboration Mode",
+        "type": "enum",
+        "options": ["off", "auto", "compact_int8", "ultra_fp16_swiglu"],
+        "option_labels": {
+            "off": "Off (GPU Only)",
+            "auto": "Auto",
+            "compact_int8": "Compact INT8",
+            "ultra_fp16_swiglu": "Ultra FP16 SwiGLU",
+        },
         "description": (
-            "Orthogonal Dual-ANE co-execution (never disables W4A8/Sage2); "
-            "Dense-only and skips GDN recurrence. Pure GPU is faster on 80-core M5 Ultra."
+            "Orthogonal Dual-ANE co-execution mode (off, auto hardware crossover, "
+            "balanced compact INT8, or Ultra direct FP16 SwiGLU). Dense-only and skips GDN recurrence."
         ),
-        "default": False,
+        "default": "off",
         "reload_required": True,
     },
     {
@@ -407,8 +414,9 @@ LOG_TAIL_LINES = 8
 SUPPORTED_PROTOCOLS = frozenset({1, 2})
 VALID_KV_DTYPES = frozenset({"bf16", "affine4_g128"})
 VALID_PREFILL_ENGINES = frozenset({"auto", "nax", "nax_ane", "flash_nax"})
-VALID_PREFILL_LINEAR_MODES = frozenset({"bf16", "w4a8"})
+VALID_PREFILL_LINEAR_MODES = frozenset({"bf16", "w4a8", "w4a4"})
 VALID_PREFILL_ATTENTION_MODES = frozenset({"exact_nax", "sage2"})
+VALID_PREFILL_ANE_MODES = frozenset({"off", "auto", "compact_int8", "ultra_fp16_swiglu"})
 M5RT_DEFAULT_SAMPLING_CONTRACT = "position_coupled_v1"
 M5RT_MAX_DRAFT_TOKENS = {"mtp": 4, "dflash2": 7}
 M5RT_MAX_REPETITION_CONTEXT_SIZE = 4096
@@ -756,6 +764,7 @@ class M5Options:
     prefill_attention_mode: str = "exact_nax"
     prefill_sparse_minference: bool = False
     prefill_cache_blend: bool = False
+    prefill_ane_mode: str = "off"
     prefill_ane_offload: bool = False
     sampling_contract: str = M5RT_DEFAULT_SAMPLING_CONTRACT
     speculative_backend: str = "none"
@@ -776,6 +785,9 @@ class M5Options:
 
     def to_rpc_dict(self) -> dict[str, Any]:
         """Serialize resolved M5 options for the sidecar `load` RPC payload."""
+        eff_ane_mode = self.prefill_ane_mode
+        if eff_ane_mode == "off" and self.prefill_ane_offload:
+            eff_ane_mode = "auto"
         payload: dict[str, Any] = {
             "max_concurrency": self.max_concurrency,
             "max_context": self.max_context,
@@ -785,7 +797,8 @@ class M5Options:
             "prefill_attention_mode": self.prefill_attention_mode,
             "prefill_sparse_minference": bool(self.prefill_sparse_minference),
             "prefill_cache_blend": bool(self.prefill_cache_blend),
-            "prefill_ane_offload": bool(self.prefill_ane_offload),
+            "prefill_ane_mode": eff_ane_mode,
+            "prefill_ane_offload": bool(eff_ane_mode != "off"),
             "sampling_contract": self.sampling_contract,
             "lora_adapter": self.lora_adapter,
             "lora_mode": self.lora_mode,
@@ -1330,11 +1343,22 @@ def validate_m5rt_options(options: dict[str, Any] | None) -> dict[str, Any] | No
             )
         cleaned["prefill_attention_mode"] = raw_pam.strip().lower()
 
+    if "prefill_ane_mode" in options and options.get("prefill_ane_mode") is not None:
+        raw_pane = options.get("prefill_ane_mode")
+        if not isinstance(raw_pane, str) or raw_pane.strip().lower() not in VALID_PREFILL_ANE_MODES:
+            raise ValueError(
+                f"m5rt_options.prefill_ane_mode must be one of {sorted(VALID_PREFILL_ANE_MODES)}"
+            )
+        cleaned["prefill_ane_mode"] = raw_pane.strip().lower()
+
     for bool_key in ("prefill_sparse_minference", "prefill_cache_blend", "prefill_ane_offload"):
         if bool_key in options and options.get(bool_key) is not None:
             parsed = _parse_optional_toggle(options.get(bool_key), f"m5rt_options.{bool_key}")
             if parsed is not None:
                 cleaned[bool_key] = parsed
+
+    if "prefill_ane_mode" in cleaned:
+        cleaned["prefill_ane_offload"] = cleaned["prefill_ane_mode"] != "off"
 
     return cleaned
 
@@ -1616,6 +1640,7 @@ def _extract_toml_layered_options(
             "prefill_attention_mode",
             "prefill_sparse_minference",
             "prefill_cache_blend",
+            "prefill_ane_mode",
             "prefill_ane_offload",
             "spec_search",
             "speculative_backend",
@@ -1659,17 +1684,28 @@ def _extract_toml_layered_options(
 
     sidecar_sec = doc.get("sidecar")
     if isinstance(sidecar_sec, dict):
-        for key, val in _normalize_m5_aliases(sidecar_sec).items():
+        norm_sidecar = _normalize_m5_aliases(sidecar_sec)
+        for key, val in norm_sidecar.items():
             if key == "models" or val is None:
                 continue
             shared[key] = val
+        # Keep [sidecar] layer ANE keys synchronized when overriding [engine].
+        if norm_sidecar.get("prefill_ane_mode") is not None:
+            shared.pop("prefill_ane_offload", None)
+        elif norm_sidecar.get("prefill_ane_offload") is not None:
+            shared.pop("prefill_ane_mode", None)
         models_sec = sidecar_sec.get("models")
         if model_id and isinstance(models_sec, dict):
             model_entry = models_sec.get(model_id)
             if isinstance(model_entry, dict):
-                for key, val in _normalize_m5_aliases(model_entry).items():
+                norm_entry = _normalize_m5_aliases(model_entry)
+                for key, val in norm_entry.items():
                     if val is not None:
                         per_model[key] = val
+                if norm_entry.get("prefill_ane_mode") is not None:
+                    per_model.pop("prefill_ane_offload", None)
+                elif norm_entry.get("prefill_ane_offload") is not None:
+                    per_model.pop("prefill_ane_mode", None)
     return shared, per_model
 
 
@@ -1836,7 +1872,36 @@ def _builtin_m5rt_manifest() -> dict[str, Any]:
                 manifest[union_key] = merged_vals
         inst_schema = installed.get("options_schema")
         if isinstance(inst_schema, list) and inst_schema:
-            parsed_schema = [dict(s) for s in inst_schema if isinstance(s, dict)]
+            default_linear_schema = next(
+                (item for item in M5RT_DEFAULT_OPTIONS_SCHEMA if item.get("key") == "prefill_linear_mode"),
+                None,
+            )
+            parsed_schema: list[dict[str, Any]] = []
+            for s in inst_schema:
+                if not isinstance(s, dict):
+                    continue
+                entry = dict(s)
+                if entry.get("key") == "prefill_linear_mode":
+                    if isinstance(entry.get("options"), list):
+                        entry["options"] = [
+                            opt for opt in entry["options"]
+                            if str(opt).strip().lower() != "w4a4"
+                        ]
+                        if not entry["options"] and default_linear_schema is not None:
+                            entry["options"] = list(default_linear_schema["options"])
+                    if isinstance(entry.get("option_labels"), dict):
+                        entry["option_labels"] = {
+                            k: v for k, v in entry["option_labels"].items()
+                            if str(k).strip().lower() != "w4a4"
+                        }
+                    if default_linear_schema is not None:
+                        if "w4a4" in str(entry.get("description") or "").lower():
+                            entry["description"] = default_linear_schema["description"]
+                        if "a8" in str(entry.get("option_labels", {}).get("w4a8", "")).lower():
+                            entry["option_labels"] = dict(default_linear_schema["option_labels"])
+                        if str(entry.get("label") or "").strip() == "Prefill Linear Mode":
+                            entry["label"] = default_linear_schema["label"]
+                parsed_schema.append(entry)
             seen_keys = {str(s.get("key")) for s in parsed_schema if s.get("key")}
             for default_item in M5RT_DEFAULT_OPTIONS_SCHEMA:
                 if default_item["key"] not in seen_keys:
@@ -3047,8 +3112,10 @@ def inspect_omlxm5_has_mtp_weights(artifact_path: Path | None) -> bool | None:
     return _inspect_mtp_manifest(artifact_path, stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
 
-@lru_cache(maxsize=64)
-def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, file_size: int) -> bool | None:
+@lru_cache(maxsize=128)
+def _read_miv_manifest_dict(
+    artifact_path: Path, inode: int, modified_ns: int, file_size: int
+) -> dict[str, Any] | None:
     try:
         if file_size < _OMLXM5_HEADER_BYTES:
             return None
@@ -3104,6 +3171,14 @@ def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, fil
             return None
     if "container_version" in manifest and manifest["container_version"] != version:
         return None
+    return manifest
+
+
+@lru_cache(maxsize=64)
+def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, file_size: int) -> bool | None:
+    manifest = _read_miv_manifest_dict(artifact_path, inode, modified_ns, file_size)
+    if manifest is None:
+        return None
     objects = manifest.get("objects")
     if not isinstance(objects, list):
         return None
@@ -3114,6 +3189,174 @@ def _inspect_mtp_manifest(artifact_path: Path, inode: int, modified_ns: int, fil
         if isinstance(name, str) and (name.startswith("mtp.") or ".mtp." in name):
             return True
     return False
+
+
+_QUANT_EXCLUDED_SUBSTRINGS: tuple[str, ...] = (
+    "embed_tokens",
+    "lm_head",
+    "layernorm",
+    ".norm.",
+    "conv1d",
+    "a_log",
+    "dt_bias",
+    "in_proj_a",
+    "in_proj_b",
+    "shared_expert_gate",
+    "visual.",
+    "vision_tower.",
+)
+_QUANT_EXCLUDED_SUFFIXES: tuple[str, ...] = (
+    ".norm.weight",
+    ".norm",
+    ".mlp.gate.weight",
+    ".mlp.gate",
+    ".router.weight",
+    ".router",
+)
+
+
+def _is_trunk_linear_object_name(name: str) -> bool:
+    low = name.lower()
+    if low.startswith("mtp.") or ".mtp." in low:
+        return False
+    if low in ("embedding", "lm_head", "norm", "final_norm"):
+        return False
+    if any(sub in low for sub in _QUANT_EXCLUDED_SUBSTRINGS):
+        return False
+    if low.endswith(_QUANT_EXCLUDED_SUFFIXES):
+        return False
+    return True
+
+
+@lru_cache(maxsize=128)
+def _inspect_miv_quant_format_cached(
+    artifact_path: Path, inode: int, modified_ns: int, file_size: int
+) -> str | None:
+    manifest = _read_miv_manifest_dict(artifact_path, inode, modified_ns, file_size)
+    if manifest is None:
+        return None
+    objects = manifest.get("objects")
+    if not isinstance(objects, list):
+        return None
+    mxfp4_count = 0
+    oq_affine_count = 0
+    bf16_count = 0
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("name") or "")
+        fmt = str(obj.get("format") or "").strip().lower()
+        if not fmt or not _is_trunk_linear_object_name(name):
+            continue
+        if fmt == "mxfp4_e2m1_g32_e8m0_v1":
+            mxfp4_count += 1
+        elif fmt.startswith("oq_affine_"):
+            oq_affine_count += 1
+        elif fmt in ("direct_bf16_v1", "direct_f16_v1"):
+            bf16_count += 1
+    if oq_affine_count > 0:
+        return "oq_affine"
+    if mxfp4_count > 0 and bf16_count == 0:
+        return "mxfp4"
+    if bf16_count > 0 and mxfp4_count == 0:
+        return "bf16"
+    if mxfp4_count > 0:
+        return "mixed"
+    return None
+
+
+@lru_cache(maxsize=128)
+def _inspect_config_quant_format_cached(
+    config_path: Path, inode: int, modified_ns: int, file_size: int
+) -> str:
+    cfg = _read_json(config_path)
+    if not isinstance(cfg, dict):
+        return "unknown"
+    text_cfg = _text_config(cfg)
+    quant = (
+        cfg.get("quantization")
+        or cfg.get("quantization_config")
+        or text_cfg.get("quantization")
+        or text_cfg.get("quantization_config")
+        or {}
+    )
+    qcfg = cfg.get("quantization_config") or text_cfg.get("quantization_config") or {}
+    if not isinstance(quant, dict):
+        quant = {}
+    if not isinstance(qcfg, dict):
+        qcfg = {}
+    mode = str(quant.get("mode") or "").strip().lower()
+    fmt = str(qcfg.get("format") or quant.get("format") or "").strip().lower()
+    quant_method = str(qcfg.get("quant_method") or quant.get("quant_method") or "").strip().lower()
+    if mode == "mxfp4" or fmt == "mxfp4-pack-quantized" or quant_method == "mxfp4":
+        return "mxfp4"
+    if mode == "affine" or quant_method in ("oq", "paroquant", "awq", "gptq"):
+        return "oq_affine"
+    if not mode and not fmt and not quant_method:
+        dtype = str(
+            cfg.get("torch_dtype")
+            or cfg.get("dtype")
+            or text_cfg.get("torch_dtype")
+            or text_cfg.get("dtype")
+            or ""
+        ).strip().lower()
+        if dtype in ("bfloat16", "bf16", "float16", "fp16"):
+            return "bf16"
+    return "unknown"
+
+
+def _find_primary_miv_artifact(mdir: Path) -> Path | None:
+    for preferred in ("model.miv", "model.omlxm5"):
+        cand = mdir / preferred
+        if cand.is_file():
+            return cand
+    try:
+        matches: list[Path] = []
+        for f in mdir.iterdir():
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            low = f.name.lower()
+            if f.suffix.lower() in (".miv", ".omlxm5") and low not in ("mtp.miv", "mtp.omlxm5"):
+                matches.append(f)
+        if matches:
+            matches.sort()
+            return matches[0]
+    except OSError:
+        pass
+    return _search_artifact_cache(mdir)
+
+
+def inspect_model_quant_format(
+    model_dir: str | Path | None,
+    *,
+    model_format: str | None = None,
+    artifact_path: Path | None = None,
+) -> str:
+    """O(1) stat-cached weight quantization family classifier (`mxfp4` | `oq_affine` | `bf16` | `gguf` | `unknown`)."""
+    if model_format == "gguf":
+        return "gguf"
+    if not model_dir:
+        return "unknown"
+    mdir = Path(str(model_dir)).expanduser()
+    if not mdir.is_dir():
+        return "unknown"
+    art = artifact_path if (artifact_path is not None and artifact_path.is_file()) else _find_primary_miv_artifact(mdir)
+    if art is not None:
+        try:
+            st = art.stat()
+            miv_qfmt = _inspect_miv_quant_format_cached(art, st.st_ino, st.st_mtime_ns, st.st_size)
+            if miv_qfmt is not None:
+                return miv_qfmt
+        except OSError:
+            pass
+    cfg_path = mdir / "config.json"
+    try:
+        if cfg_path.is_file():
+            st = cfg_path.stat()
+            return _inspect_config_quant_format_cached(cfg_path, st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    return "unknown"
 
 
 def _config_json_has_mtp(config: dict[str, Any] | None) -> bool:
@@ -3996,19 +4239,29 @@ def build_m5rt_options(
         )
         or False
     )
-    prefill_ane_offload = False
+    prefill_ane_mode = "off"
     for layer in (explicit_opts, model_toml, shared_toml):
+        if layer.get("prefill_ane_mode") is not None:
+            raw_ane_mode = str(layer.get("prefill_ane_mode") or "").strip().lower()
+            if raw_ane_mode not in VALID_PREFILL_ANE_MODES:
+                raise ValueError(
+                    f"{eff_engine_id}.prefill_ane_mode must be one of {sorted(VALID_PREFILL_ANE_MODES)}"
+                )
+            prefill_ane_mode = raw_ane_mode
+            break
         if layer.get("prefill_ane_offload") is not None:
-            prefill_ane_offload = bool(
+            offload_val = bool(
                 _parse_optional_toggle(
                     layer.get("prefill_ane_offload"),
                     f"{eff_engine_id}.prefill_ane_offload",
                 )
             )
+            prefill_ane_mode = "auto" if offload_val else "off"
             break
         if str(layer.get("prefill_engine") or "").strip().lower() == "nax_ane":
-            prefill_ane_offload = True
+            prefill_ane_mode = "auto"
             break
+    prefill_ane_offload = prefill_ane_mode != "off"
 
     return M5Options(
         max_context=max_context,
@@ -4019,6 +4272,7 @@ def build_m5rt_options(
         prefill_attention_mode=raw_attn_mode,
         prefill_sparse_minference=prefill_sparse_minference,
         prefill_cache_blend=prefill_cache_blend,
+        prefill_ane_mode=prefill_ane_mode,
         prefill_ane_offload=prefill_ane_offload,
         sampling_contract=str(opts.get("sampling_contract") or (
             M5RT_DEFAULT_SAMPLING_CONTRACT if is_miv else "legacy_rejection_v1"
@@ -5438,6 +5692,7 @@ class M5SidecarEngine(BaseEngine):
                 "prefill_attention_mode": opts.prefill_attention_mode,
                 "prefill_sparse_minference": bool(opts.prefill_sparse_minference),
                 "prefill_cache_blend": bool(opts.prefill_cache_blend),
+                "prefill_ane_mode": opts.prefill_ane_mode,
                 "prefill_ane_offload": bool(opts.prefill_ane_offload),
                 "sampling_contract": "legacy_rejection_v1",
                 "lora_adapter": opts.lora_adapter,
@@ -7109,15 +7364,23 @@ class M5SidecarEngine(BaseEngine):
             "speculative_backend",
             "max_draft_tokens",
             "prefill_linear_mode",
+            "prefill_linear_mode_effective",
+            "prefill_linear_fallback",
+            "prefill_linear_fallback_reason",
+            "model_quant_format",
             "prefill_attention_mode",
             "prefill_sparse_minference",
             "prefill_sparse_minference_effective",
             "prefill_sparse_minference_inactive_reason",
             "prefill_cache_blend",
+            "prefill_ane_mode",
+            "prefill_ane_mode_effective",
+            "prefill_ane_inactive_reason",
             "prefill_ane_offload",
             "prefill_ane_active",
             "prefill_ane_split_alpha",
             "prefill_w4a8_tokens",
+            "prefill_w4a4_tokens",
             "prefill_sage2_tokens",
             "prefill_minference_blocks_skipped",
             "prefill_minference_blocks_total",
@@ -9846,13 +10109,20 @@ def detect_model_weight_format_info(
     model_settings: object | None = None,
     configured_m5rt_binary: str | None = None,
 ) -> dict[str, Any]:
-    """Return O(1) weight-format metadata for `/admin/api/models` UI badges."""
+    """Return O(1) weight-format & quantization metadata for `/admin/api/models` UI badges."""
+    quant_format = inspect_model_quant_format(model_path, model_format=model_format)
+    quant_meta = {
+        "quant_format": quant_format,
+        "mxfp4_w4a4_supported": quant_format == "mxfp4",
+    }
+
     if model_format == "gguf":
         return {
             "weight_format": "gguf",
             "has_miv_weights": False,
             "pending_auto_repack": False,
             "repack_target_format": None,
+            **quant_meta,
         }
     if not model_path:
         return {
@@ -9860,6 +10130,7 @@ def detect_model_weight_format_info(
             "has_miv_weights": False,
             "pending_auto_repack": False,
             "repack_target_format": None,
+            **quant_meta,
         }
     mdir = Path(str(model_path)).expanduser()
     if not mdir.is_dir():
@@ -9868,6 +10139,7 @@ def detect_model_weight_format_info(
             "has_miv_weights": False,
             "pending_auto_repack": False,
             "repack_target_format": None,
+            **quant_meta,
         }
 
     has_safetensors = False
@@ -9924,6 +10196,7 @@ def detect_model_weight_format_info(
                         "has_miv_weights": True,
                         "pending_auto_repack": False,
                         "repack_target_format": None,
+                        **quant_meta,
                     }
                 cached_df = _search_artifact_cache(mdir)
                 if cached_df is not None:
@@ -9932,6 +10205,7 @@ def detect_model_weight_format_info(
                         "has_miv_weights": True,
                         "pending_auto_repack": False,
                         "repack_target_format": None,
+                        **quant_meta,
                     }
                 if _can_convert_dflash2_draft_fast(mdir, configured_m5rt_binary):
                     return {
@@ -9939,6 +10213,7 @@ def detect_model_weight_format_info(
                         "has_miv_weights": False,
                         "pending_auto_repack": True,
                         "repack_target_format": "miv",
+                        **quant_meta,
                     }
 
     # When running on Stock MLX (or explicitly overridden to "stock"), the active format is safetensors
@@ -9953,6 +10228,7 @@ def detect_model_weight_format_info(
             "has_miv_weights": has_microkernel_weights,
             "pending_auto_repack": False,
             "repack_target_format": None,
+            **quant_meta,
         }
 
     # Active engine is m5rt or a Path B microkernel
@@ -9962,6 +10238,7 @@ def detect_model_weight_format_info(
             "has_miv_weights": True,
             "pending_auto_repack": False,
             "repack_target_format": None,
+            **quant_meta,
         }
 
     # Check `.cache/b0/artifacts` hit for m5rt
@@ -9973,6 +10250,7 @@ def detect_model_weight_format_info(
                 "has_miv_weights": True,
                 "pending_auto_repack": False,
                 "repack_target_format": None,
+                **quant_meta,
             }
         if can_auto_convert_m5rt_fast(mdir, configured_m5rt_binary, model_settings):
             return {
@@ -9980,6 +10258,7 @@ def detect_model_weight_format_info(
                 "has_miv_weights": False,
                 "pending_auto_repack": True,
                 "repack_target_format": "miv",
+                **quant_meta,
             }
     elif repack_target_fmt is not None:
         plugin = get_external_engine_plugin(active_external_engine)
@@ -9995,6 +10274,7 @@ def detect_model_weight_format_info(
                     "has_miv_weights": False,
                     "pending_auto_repack": True,
                     "repack_target_format": repack_target_fmt,
+                    **quant_meta,
                 }
 
     return {
@@ -10002,4 +10282,5 @@ def detect_model_weight_format_info(
         "has_miv_weights": has_microkernel_weights,
         "pending_auto_repack": False,
         "repack_target_format": None,
+        **quant_meta,
     }

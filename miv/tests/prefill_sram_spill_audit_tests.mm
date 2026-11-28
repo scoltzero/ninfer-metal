@@ -49,12 +49,15 @@ const std::vector<std::string> kAllPrefillLibs = {
     "omlx_m5_bf16_nax.metallib",
     "omlx_m5_w4a8_nax.metallib",
     "omlx_m5_w4a8_moe_nax.metallib",
+    "omlx_m5_w4a4_nax.metallib",
+    "omlx_m5_w4a4_moe_nax.metallib",
     "omlx_m5_attention_nax_prefill.metallib",
     "omlx_m5_attention_affine4.metallib",
     "omlx_m5_attention_sage2.metallib",
     "omlx_m5_attention_minference.metallib",
     "omlx_m5_gdn_chunk_nax.metallib",
     "omlx_m5_cache_blend.metallib",
+    "omlx_m5_ane_pack_unpack.metallib",
 };
 
 struct AgxSpillInfo {
@@ -108,7 +111,10 @@ AgxSpillInfo inspect_agx_runtime_state(id<MTLComputePipelineState> pso) {
 std::uint64_t expected_tg_sram_cap(std::string_view lib_name,
                                    std::string_view fn_name) {
   if (lib_name == "omlx_m5_w4a8_nax.metallib" ||
-      lib_name == "omlx_m5_w4a8_moe_nax.metallib") {
+      lib_name == "omlx_m5_w4a8_moe_nax.metallib" ||
+      lib_name == "omlx_m5_w4a4_nax.metallib" ||
+      lib_name == "omlx_m5_w4a4_moe_nax.metallib" ||
+      lib_name == "omlx_m5_ane_pack_unpack.metallib") {
     return kWp31Out64MaxTgSram;
   }
   if (fn_name.find("gqa_bk16_wn4") != std::string_view::npos) {
@@ -526,6 +532,663 @@ bool run_smoke_dispatches(id<MTLDevice> dev,
         executed.push_back("omlx_m5_gdn_extract_transition_m_c64");
       }
     }
+  }
+
+  // 5. Phase 3 WP 3A MXFP4 W4A8 Shift-Merge + LUT & WP 3B oQ4e 32x32x32 + INT8xINT4 smoke.
+  if (id<MTLLibrary> lib = load_lib("omlx_m5_w4a8_nax.metallib")) {
+    constexpr std::uint32_t kM = 64U;
+    constexpr std::uint32_t kN = 64U;
+    constexpr std::uint32_t kK = 128U;
+    id<MTLBuffer> x_buf = make_zero_buf(std::size_t(kM) * kK * 2ULL);
+    id<MTLBuffer> nw_buf = make_zero_buf(std::size_t(kK) * 2ULL);
+    id<MTLBuffer> out_bf16 = make_zero_buf(std::size_t(kM) * kK * 2ULL);
+    id<MTLBuffer> qa_buf = make_zero_buf(std::size_t(kM) * kK);
+    id<MTLBuffer> sa_buf = make_zero_buf(std::size_t(kK / 64U) * kM * 4ULL);
+    id<MTLBuffer> ra_buf = make_zero_buf(std::size_t(kK / 64U) * kM * 4ULL);
+    id<MTLBuffer> wc_buf = make_zero_buf(std::size_t(kN / 16U) * (kK / 128U) * 1024ULL);
+    id<MTLBuffer> ws_buf = make_zero_buf(std::size_t(kN / 16U) * (kK / 128U) * 64ULL);
+    std::memset(ws_buf.contents, 0x7F, ws_buf.length);
+    id<MTLBuffer> aff_wc = make_zero_buf(std::size_t(kN) * (kK / 2U));
+    id<MTLBuffer> aff_sb = make_zero_buf(std::size_t(kK / 64U) * kN * 4ULL);
+    id<MTLBuffer> y_buf = make_zero_buf(std::size_t(kM) * kN * 2ULL);
+    id<MTLBuffer> mid_qa = make_zero_buf(std::size_t(kM) * kN);
+    id<MTLBuffer> mid_sa = make_zero_buf(std::size_t(kN / 64U) * kM * 4ULL);
+    id<MTLBuffer> mid_ra = make_zero_buf(std::size_t(kN / 64U) * kM * 4ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
+
+    struct W4A8NormP {
+      std::uint32_t k, t, mp;
+      float eps, woff;
+      std::uint32_t write_bf16;
+    } np{kK, kM, kM, 1e-6f, 0.0f, 1U};
+    if (id<MTLComputePipelineState> pso = make_pso(lib, "omlx_m5_rmsnorm_a8_g64")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:x_buf offset:0 atIndex:0];
+      [enc setBuffer:nw_buf offset:0 atIndex:1];
+      [enc setBuffer:out_bf16 offset:0 atIndex:2];
+      [enc setBuffer:qa_buf offset:0 atIndex:3];
+      [enc setBuffer:sa_buf offset:0 atIndex:4];
+      [enc setBuffer:ra_buf offset:0 atIndex:5];
+      [enc setBytes:&np length:sizeof(np) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(1, kM, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back("Layer 4 smoke failed for omlx_m5_rmsnorm_a8_g64");
+      } else {
+        executed.push_back("omlx_m5_rmsnorm_a8_g64");
+      }
+    }
+
+    struct W4A8GemmP {
+      std::uint32_t n, k, mp, t, padded_n, row_offset, out_stride, flags;
+    } gp{kN, kK, kM, kM, kN, 0U, kN, 1U};
+    if (id<MTLComputePipelineState> pso =
+            make_pso(lib, "omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:qa_buf offset:0 atIndex:0];
+      [enc setBuffer:sa_buf offset:0 atIndex:1];
+      [enc setBuffer:wc_buf offset:0 atIndex:2];
+      [enc setBuffer:ws_buf offset:0 atIndex:3];
+      [enc setBuffer:y_buf offset:0 atIndex:4];
+      [enc setBytes:&gp length:sizeof(gp) atIndex:5];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back("Layer 4 smoke failed for omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1");
+      } else {
+        executed.push_back("omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1");
+      }
+    }
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:qa_buf offset:0 atIndex:0];
+      [enc setBuffer:sa_buf offset:0 atIndex:1];
+      [enc setBuffer:wc_buf offset:0 atIndex:2];
+      [enc setBuffer:ws_buf offset:0 atIndex:3];
+      [enc setBuffer:wc_buf offset:0 atIndex:4];
+      [enc setBuffer:ws_buf offset:0 atIndex:5];
+      [enc setBuffer:mid_qa offset:0 atIndex:6];
+      [enc setBuffer:mid_sa offset:0 atIndex:7];
+      [enc setBuffer:mid_ra offset:0 atIndex:8];
+      [enc setBuffer:y_buf offset:0 atIndex:9];
+      [enc setBytes:&gp length:sizeof(gp) atIndex:10];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:11];
+      [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8");
+      } else {
+        executed.push_back(
+            "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8");
+      }
+    }
+    for (const char *aff_fn : {
+             "omlx_m5_affine_w4a8_nax_q4_g64_bm64_bn64_bns16_sk1",
+             "omlx_m5_affine_w4a8_nax_q4_int4b_g64_bm64_bn64_bns16_sk1"}) {
+      if (id<MTLComputePipelineState> pso = make_pso(lib, aff_fn)) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:qa_buf offset:0 atIndex:0];
+        [enc setBuffer:sa_buf offset:0 atIndex:1];
+        [enc setBuffer:ra_buf offset:0 atIndex:2];
+        [enc setBuffer:aff_wc offset:0 atIndex:3];
+        [enc setBuffer:aff_sb offset:0 atIndex:4];
+        [enc setBuffer:y_buf offset:0 atIndex:5];
+        [enc setBytes:&gp length:sizeof(gp) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+          failures.emplace_back(std::string("Layer 4 smoke failed for ") + aff_fn);
+        } else {
+          executed.push_back(aff_fn);
+        }
+      }
+    }
+    for (const char *aff_sw : {
+             "omlx_m5_affine_w4a8_nax_q4_g64_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
+             "omlx_m5_affine_w4a8_nax_q4_int4b_g64_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
+      if (id<MTLComputePipelineState> pso = make_pso(lib, aff_sw)) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:qa_buf offset:0 atIndex:0];
+        [enc setBuffer:sa_buf offset:0 atIndex:1];
+        [enc setBuffer:ra_buf offset:0 atIndex:2];
+        [enc setBuffer:aff_wc offset:0 atIndex:3];
+        [enc setBuffer:aff_sb offset:0 atIndex:4];
+        [enc setBuffer:aff_wc offset:0 atIndex:5];
+        [enc setBuffer:aff_sb offset:0 atIndex:6];
+        [enc setBuffer:mid_qa offset:0 atIndex:7];
+        [enc setBuffer:mid_sa offset:0 atIndex:8];
+        [enc setBuffer:mid_ra offset:0 atIndex:9];
+        [enc setBuffer:y_buf offset:0 atIndex:10];
+        [enc setBytes:&gp length:sizeof(gp) atIndex:11];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+          failures.emplace_back(std::string("Layer 4 smoke failed for ") + aff_sw);
+        } else {
+          executed.push_back(aff_sw);
+        }
+      }
+    }
+  }
+
+  // 6. Phase 3 WP 3A Native MXFP4 W4A4 Dense + Prologues smoke.
+  if (id<MTLLibrary> lib = load_lib("omlx_m5_w4a4_nax.metallib")) {
+    constexpr std::uint32_t kM = 64U;
+    constexpr std::uint32_t kN = 128U;
+    constexpr std::uint32_t kK = 128U;
+    id<MTLBuffer> h_buf = make_zero_buf(std::size_t(kM) * kK * 2ULL);
+    id<MTLBuffer> d_buf = make_zero_buf(std::size_t(kM) * kK * 2ULL);
+    id<MTLBuffer> nw_buf = make_zero_buf(std::size_t(kK) * 2ULL);
+    id<MTLBuffer> out_bf16 = make_zero_buf(std::size_t(kM) * kK * 2ULL);
+    id<MTLBuffer> a4_c = make_zero_buf(std::size_t(kM / 16U) * (kK / 128U) * 1024ULL);
+    id<MTLBuffer> a4_s = make_zero_buf(std::size_t(kM / 16U) * (kK / 128U) * 64ULL);
+    std::memset(a4_s.contents, 0x7F, a4_s.length);
+    id<MTLBuffer> wc_16 = make_zero_buf(std::size_t(kN / 16U) * (kK / 128U) * 1024ULL);
+    id<MTLBuffer> ws_16 = make_zero_buf(std::size_t(kN / 16U) * (kK / 128U) * 64ULL);
+    std::memset(ws_16.contents, 0x7F, ws_16.length);
+    id<MTLBuffer> wc_32 = make_zero_buf(std::size_t(kN / 32U) * (kK / 128U) * 2048ULL);
+    id<MTLBuffer> ws_32 = make_zero_buf(std::size_t(kN / 32U) * (kK / 128U) * 128ULL);
+    std::memset(ws_32.contents, 0x7F, ws_32.length);
+    id<MTLBuffer> mid_c = make_zero_buf(std::size_t(kM / 16U) * (kN / 128U) * 1024ULL);
+    id<MTLBuffer> mid_s = make_zero_buf(std::size_t(kM / 16U) * (kN / 128U) * 64ULL);
+    id<MTLBuffer> y_buf = make_zero_buf(std::size_t(kM) * kN * 2ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
+
+    struct W4A4NormP {
+      std::uint32_t k, t, mp;
+      float eps, woff;
+      std::uint32_t write_bf16;
+    } np{kK, kM, kM, 1e-6f, 0.0f, 1U};
+    if (id<MTLComputePipelineState> pso =
+            make_pso(lib, "omlx_m5_rmsnorm_a4_bm16_bk128")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:h_buf offset:0 atIndex:0];
+      [enc setBuffer:nw_buf offset:0 atIndex:1];
+      [enc setBuffer:out_bf16 offset:0 atIndex:2];
+      [enc setBuffer:a4_c offset:0 atIndex:3];
+      [enc setBuffer:a4_s offset:0 atIndex:4];
+      [enc setBytes:&np length:sizeof(np) atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(1, kM, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back("Layer 4 smoke failed for omlx_m5_rmsnorm_a4_bm16_bk128");
+      } else {
+        executed.push_back("omlx_m5_rmsnorm_a4_bm16_bk128");
+      }
+    }
+    if (id<MTLComputePipelineState> pso =
+            make_pso(lib, "omlx_m5_add_rmsnorm_a4_bm16_bk128")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:h_buf offset:0 atIndex:0];
+      [enc setBuffer:d_buf offset:0 atIndex:1];
+      [enc setBuffer:nw_buf offset:0 atIndex:2];
+      [enc setBuffer:out_bf16 offset:0 atIndex:3];
+      [enc setBuffer:a4_c offset:0 atIndex:4];
+      [enc setBuffer:a4_s offset:0 atIndex:5];
+      [enc setBytes:&np length:sizeof(np) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(1, kM, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back("Layer 4 smoke failed for omlx_m5_add_rmsnorm_a4_bm16_bk128");
+      } else {
+        executed.push_back("omlx_m5_add_rmsnorm_a4_bm16_bk128");
+      }
+    }
+    struct W4A4QuantP {
+      std::uint32_t k, mp, pad, t;
+    } qp{kK, kM, 0U, kM};
+    if (id<MTLComputePipelineState> pso =
+            make_pso(lib, "omlx_m5_quantize_a4_bm16_bk128_fwht64")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:h_buf offset:0 atIndex:0];
+      [enc setBuffer:a4_c offset:0 atIndex:1];
+      [enc setBuffer:a4_s offset:0 atIndex:2];
+      [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+      [enc dispatchThreadgroups:MTLSizeMake(1, kM, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back("Layer 4 smoke failed for omlx_m5_quantize_a4_bm16_bk128_fwht64");
+      } else {
+        executed.push_back("omlx_m5_quantize_a4_bm16_bk128_fwht64");
+      }
+    }
+    struct W4A4GdnP {
+      std::uint32_t kh, vh, kd, vd, cw, ck, t;
+      float eps;
+      std::uint32_t mp, write_bf16;
+    } gdn_p{1U, 1U, 128U, 128U, 384U, 4U, kM, 1e-6f, kM, 1U};
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_gdn_chunk_norm_gate_inplace_a4_bm16_bk128_c64")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:h_buf offset:0 atIndex:0];
+      [enc setBuffer:d_buf offset:0 atIndex:1];
+      [enc setBuffer:nw_buf offset:0 atIndex:2];
+      [enc setBuffer:a4_c offset:0 atIndex:3];
+      [enc setBuffer:a4_s offset:0 atIndex:4];
+      [enc setBytes:&gdn_p length:sizeof(gdn_p) atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(1, (kM + 3U) / 4U, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_gdn_chunk_norm_gate_inplace_a4_bm16_bk128_c64");
+      } else {
+        executed.push_back(
+            "omlx_m5_gdn_chunk_norm_gate_inplace_a4_bm16_bk128_c64");
+      }
+    }
+    struct W4A4GemmP {
+      std::uint32_t n, k, mp, t, padded_n, row_offset, out_stride, flags;
+    } gp4{kN, kK, kM, kM, kN, 0U, kN, 1U};
+    for (const auto &lin : std::vector<std::tuple<const char *, id<MTLBuffer>, id<MTLBuffer>>>{
+             {"omlx_m5_mxfp4_w4a4_nax_bm64_bn64_bns16_sk1", wc_16, ws_16},
+             {"omlx_m5_mxfp4_w4a4_nax_bm64_bn64_bns32_sk1", wc_32, ws_32}}) {
+      id<MTLComputePipelineState> pso = make_pso(lib, std::get<0>(lin));
+      if (!pso) {
+        continue;
+      }
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:a4_c offset:0 atIndex:0];
+      [enc setBuffer:a4_s offset:0 atIndex:1];
+      [enc setBuffer:std::get<1>(lin) offset:0 atIndex:2];
+      [enc setBuffer:std::get<2>(lin) offset:0 atIndex:3];
+      [enc setBuffer:y_buf offset:0 atIndex:4];
+      [enc setBytes:&gp4 length:sizeof(gp4) atIndex:5];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(kN / 64U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(std::string("Layer 4 smoke failed for ") + std::get<0>(lin));
+      } else {
+        executed.push_back(std::get<0>(lin));
+      }
+    }
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:a4_c offset:0 atIndex:0];
+      [enc setBuffer:a4_s offset:0 atIndex:1];
+      [enc setBuffer:wc_16 offset:0 atIndex:2];
+      [enc setBuffer:ws_16 offset:0 atIndex:3];
+      [enc setBuffer:wc_16 offset:0 atIndex:4];
+      [enc setBuffer:ws_16 offset:0 atIndex:5];
+      [enc setBuffer:y_buf offset:0 atIndex:6];
+      [enc setBytes:&gp4 length:sizeof(gp4) atIndex:7];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:8];
+      [enc dispatchThreadgroups:MTLSizeMake(kN / 32U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1");
+      } else {
+        executed.push_back(
+            "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1");
+      }
+    }
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a4")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:a4_c offset:0 atIndex:0];
+      [enc setBuffer:a4_s offset:0 atIndex:1];
+      [enc setBuffer:wc_16 offset:0 atIndex:2];
+      [enc setBuffer:ws_16 offset:0 atIndex:3];
+      [enc setBuffer:wc_16 offset:0 atIndex:4];
+      [enc setBuffer:ws_16 offset:0 atIndex:5];
+      [enc setBuffer:mid_c offset:0 atIndex:6];
+      [enc setBuffer:mid_s offset:0 atIndex:7];
+      [enc setBuffer:y_buf offset:0 atIndex:8];
+      [enc setBytes:&gp4 length:sizeof(gp4) atIndex:9];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:10];
+      [enc dispatchThreadgroups:MTLSizeMake(kN / 64U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a4");
+      } else {
+        executed.push_back(
+            "omlx_m5_mxfp4_w4a4_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a4");
+      }
+    }
+  }
+
+  // 7. Phase 3 WP 3A Native MoE MXFP4 W4A4 smoke.
+  if (id<MTLLibrary> lib = load_lib("omlx_m5_w4a4_moe_nax.metallib")) {
+    constexpr std::uint32_t kMp = 64U;
+    constexpr std::uint32_t kH = 128U;
+    constexpr std::uint32_t kF = 128U;
+    id<MTLBuffer> a4_c = make_zero_buf(std::size_t(kMp / 16U) * (kH / 128U) * 1024ULL);
+    id<MTLBuffer> a4_s = make_zero_buf(std::size_t(kMp / 16U) * (kH / 128U) * 64ULL);
+    std::memset(a4_s.contents, 0x7F, a4_s.length);
+    id<MTLBuffer> tile_assign = make_zero_buf(64ULL * 4ULL);
+    id<MTLBuffer> tile_expert = make_zero_buf(4ULL);
+    id<MTLBuffer> tile_valid = make_zero_buf(4ULL);
+    id<MTLBuffer> total_tiles = make_zero_buf(16ULL);
+    auto *ta_p = static_cast<std::uint32_t *>(tile_assign.contents);
+    for (std::uint32_t i = 0U; i < 16U; ++i) {
+      ta_p[i] = i << 3U;
+    }
+    static_cast<std::uint32_t *>(tile_valid.contents)[0] = 16U;
+    static_cast<std::uint32_t *>(total_tiles.contents)[0] = 1U;
+    static_cast<std::uint32_t *>(total_tiles.contents)[1] = 1U;
+    id<MTLBuffer> w_c = make_zero_buf(std::size_t(kF) * (kH / 2U));
+    id<MTLBuffer> w_s = make_zero_buf(std::size_t(kF) * (kH / 32U));
+    std::memset(w_s.contents, 0x7F, w_s.length);
+    id<MTLBuffer> mid_bf16 = make_zero_buf(64ULL * kF * 2ULL);
+    id<MTLBuffer> mid_qa = make_zero_buf(64ULL * kF);
+    id<MTLBuffer> mid_sa = make_zero_buf(64ULL * (kF / 32U));
+    std::memset(mid_sa.contents, 0x7F, mid_sa.length);
+    id<MTLBuffer> scores = make_zero_buf(128ULL * 2ULL);
+    id<MTLBuffer> exp_out = make_zero_buf(128ULL * kH * 2ULL);
+    id<MTLBuffer> mxfp4_lut = make_zero_buf(4ULL * 256ULL * 2ULL);
+
+    struct W4A4MoeP {
+      std::uint32_t n, k, padded_k, max_tiles, mp, reserved;
+    } mp_up{kF, kH, kH, 1U, kMp, 64U}, mp_dn{kH, kF, kF, 1U, 64U, 0U};
+
+    if (id<MTLComputePipelineState> pso =
+            make_pso(lib, "omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:a4_c offset:0 atIndex:0];
+      [enc setBuffer:a4_s offset:0 atIndex:1];
+      [enc setBuffer:tile_assign offset:0 atIndex:2];
+      [enc setBuffer:tile_expert offset:0 atIndex:3];
+      [enc setBuffer:tile_valid offset:0 atIndex:4];
+      [enc setBuffer:total_tiles offset:0 atIndex:5];
+      [enc setBuffer:w_c offset:0 atIndex:6];
+      [enc setBuffer:w_s offset:0 atIndex:7];
+      [enc setBuffer:w_c offset:0 atIndex:8];
+      [enc setBuffer:w_s offset:0 atIndex:9];
+      [enc setBuffer:mid_bf16 offset:0 atIndex:10];
+      [enc setBytes:&mp_up length:sizeof(mp_up) atIndex:11];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:12];
+      [enc dispatchThreadgroups:MTLSizeMake(kF / 32U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1");
+      } else {
+        executed.push_back("omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1");
+      }
+    }
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1_fwht64_a4")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:a4_c offset:0 atIndex:0];
+      [enc setBuffer:a4_s offset:0 atIndex:1];
+      [enc setBuffer:tile_assign offset:0 atIndex:2];
+      [enc setBuffer:tile_expert offset:0 atIndex:3];
+      [enc setBuffer:tile_valid offset:0 atIndex:4];
+      [enc setBuffer:total_tiles offset:0 atIndex:5];
+      [enc setBuffer:w_c offset:0 atIndex:6];
+      [enc setBuffer:w_s offset:0 atIndex:7];
+      [enc setBuffer:w_c offset:0 atIndex:8];
+      [enc setBuffer:w_s offset:0 atIndex:9];
+      [enc setBuffer:mid_qa offset:0 atIndex:10];
+      [enc setBuffer:mid_sa offset:0 atIndex:11];
+      [enc setBytes:&mp_up length:sizeof(mp_up) atIndex:12];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:13];
+      [enc dispatchThreadgroups:MTLSizeMake(kF / 64U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1_fwht64_a4");
+      } else {
+        executed.push_back(
+            "omlx_m5_moe_mxfp4_w4a4_nax_swiglu_bm64_out64_sk1_fwht64_a4");
+      }
+    }
+    if (id<MTLComputePipelineState> pso = make_pso(
+            lib, "omlx_m5_moe_mxfp4_w4a4_nax_down_scatter_bm64_bn64_sk1")) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:mid_qa offset:0 atIndex:0];
+      [enc setBuffer:mid_sa offset:0 atIndex:1];
+      [enc setBuffer:tile_expert offset:0 atIndex:2];
+      [enc setBuffer:tile_valid offset:0 atIndex:3];
+      [enc setBuffer:tile_assign offset:0 atIndex:4];
+      [enc setBuffer:total_tiles offset:0 atIndex:5];
+      [enc setBuffer:scores offset:0 atIndex:6];
+      [enc setBuffer:w_c offset:0 atIndex:7];
+      [enc setBuffer:w_s offset:0 atIndex:8];
+      [enc setBuffer:exp_out offset:0 atIndex:9];
+      [enc setBytes:&mp_dn length:sizeof(mp_dn) atIndex:10];
+      [enc setBuffer:mxfp4_lut offset:0 atIndex:11];
+      [enc dispatchThreadgroups:MTLSizeMake(kH / 64U, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(
+            "Layer 4 smoke failed for omlx_m5_moe_mxfp4_w4a4_nax_down_scatter_bm64_bn64_sk1");
+      } else {
+        executed.push_back(
+            "omlx_m5_moe_mxfp4_w4a4_nax_down_scatter_bm64_bn64_sk1");
+      }
+    }
+  }
+
+  // 8. Phase 3 WP 3C Dual-ANE pack/unpack + fused fwht64_a8 & fwht64_a4 smoke.
+  if (id<MTLLibrary> lib = load_lib("omlx_m5_ane_pack_unpack.metallib")) {
+    struct AnePackParamsHost {
+      std::uint32_t T;
+      std::uint32_t K;
+      std::uint32_t src_stride;
+      std::uint32_t reserved;
+    };
+    struct AneUnpackParamsHost {
+      std::uint32_t T;
+      std::uint32_t ane0_n;
+      std::uint32_t ane1_n;
+      std::uint32_t out_stride;
+      std::uint32_t dst_col_offset;
+      std::uint32_t reserved;
+    };
+    struct AneUnpackQuantParamsHost {
+      std::uint32_t T;
+      std::uint32_t mp;
+      std::uint32_t ane0_n;
+      std::uint32_t ane1_n;
+      std::uint32_t out_stride;
+      std::uint32_t dst_col_offset;
+      std::uint32_t reserved0;
+      std::uint32_t reserved1;
+    };
+
+    constexpr std::uint32_t kT = 64U;
+    constexpr std::uint32_t kMp = 64U;
+    constexpr std::uint32_t kK = 128U;
+    constexpr std::uint32_t kDieN = 128U;
+    constexpr std::uint32_t kOutStride = 256U;
+
+    id<MTLBuffer> src_bf16 = make_zero_buf(std::size_t(kT) * kK * 2ULL);
+    id<MTLBuffer> in_fp16_0 = make_zero_buf(std::size_t(kK) * kT * 2ULL);
+    id<MTLBuffer> in_fp16_1 = make_zero_buf(std::size_t(kK) * kT * 2ULL);
+    id<MTLBuffer> out_fp16_0 = make_zero_buf(std::size_t(kDieN) * kT * 2ULL);
+    id<MTLBuffer> out_fp16_1 = make_zero_buf(std::size_t(kDieN) * kT * 2ULL);
+    id<MTLBuffer> dst_bf16 = make_zero_buf(std::size_t(kT) * kOutStride * 2ULL);
+    id<MTLBuffer> qa_out = make_zero_buf(std::size_t(kMp) * kOutStride);
+    id<MTLBuffer> sa_out =
+        make_zero_buf(std::size_t(kOutStride / 64U) * kMp * sizeof(float));
+    id<MTLBuffer> ra_out =
+        make_zero_buf(std::size_t(kOutStride / 64U) * kMp * sizeof(float));
+    id<MTLBuffer> a4_codes = make_zero_buf(std::size_t(kMp) * (kOutStride / 2U));
+    id<MTLBuffer> a4_scales =
+        make_zero_buf(std::size_t(kMp) * (kOutStride / 32U));
+
+    auto run_ane_smoke = [&](const char *fn_name, auto &&encode_fn) {
+      id<MTLComputePipelineState> pso = make_pso(lib, fn_name);
+      if (!pso) {
+        return;
+      }
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      encode_fn(enc);
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        failures.emplace_back(std::string("Layer 4 smoke failed for ") + fn_name);
+      } else {
+        executed.push_back(fn_name);
+      }
+    };
+
+    const AnePackParamsHost pp{kT, kK, kK, 0U};
+    run_ane_smoke("omlx_m5_ane_pack_bf16_to_fp16_planar_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:src_bf16 offset:0 atIndex:0];
+                    [enc setBuffer:in_fp16_0 offset:0 atIndex:1];
+                    [enc setBytes:&pp length:sizeof(pp) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(kK / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_pack_bf16_to_fp16_planar_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:src_bf16 offset:0 atIndex:0];
+                    [enc setBuffer:in_fp16_0 offset:0 atIndex:1];
+                    [enc setBuffer:in_fp16_1 offset:0 atIndex:2];
+                    [enc setBytes:&pp length:sizeof(pp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(kK / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+
+    const AneUnpackParamsHost up_s{kT, kDieN, 0U, kOutStride, 0U, 0U};
+    const AneUnpackParamsHost up_d{kT, kDieN, kDieN, kOutStride, 0U, 0U};
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_bf16_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:dst_bf16 offset:0 atIndex:1];
+                    [enc setBytes:&up_s length:sizeof(up_s) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_bf16_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:dst_bf16 offset:0 atIndex:2];
+                    [enc setBytes:&up_d length:sizeof(up_d) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 32U, kT / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(8U, 32U, 1U)];
+                  });
+
+    const AneUnpackQuantParamsHost qp_s{kT, kMp, kDieN, 0U, kOutStride, 0U, 0U, 0U};
+    const AneUnpackQuantParamsHost qp_d{kT, kMp, kDieN, kDieN, kOutStride, 0U, 0U, 0U};
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:qa_out offset:0 atIndex:1];
+                    [enc setBuffer:sa_out offset:0 atIndex:2];
+                    [enc setBuffer:ra_out offset:0 atIndex:3];
+                    [enc setBytes:&qp_s length:sizeof(qp_s) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 64U, kMp / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a8_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:qa_out offset:0 atIndex:2];
+                    [enc setBuffer:sa_out offset:0 atIndex:3];
+                    [enc setBuffer:ra_out offset:0 atIndex:4];
+                    [enc setBytes:&qp_d length:sizeof(qp_d) atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 64U, kMp / 32U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_single",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:a4_codes offset:0 atIndex:1];
+                    [enc setBuffer:a4_scales offset:0 atIndex:2];
+                    [enc setBytes:&qp_s length:sizeof(qp_s) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(kDieN / 128U, kMp / 16U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
+    run_ane_smoke("omlx_m5_ane_unpack_fp16_planar_to_fwht64_a4_dual",
+                  [&](id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:out_fp16_0 offset:0 atIndex:0];
+                    [enc setBuffer:out_fp16_1 offset:0 atIndex:1];
+                    [enc setBuffer:a4_codes offset:0 atIndex:2];
+                    [enc setBuffer:a4_scales offset:0 atIndex:3];
+                    [enc setBytes:&qp_d length:sizeof(qp_d) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake((2U * kDieN) / 128U, kMp / 16U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake(128U, 1U, 1U)];
+                  });
   }
 
   smoke_report = {{"executed_kernels", executed},

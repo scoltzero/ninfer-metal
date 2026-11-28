@@ -61424,19 +61424,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Orthogonal toggles that stack freely — changes save immediately and reload the model."
+            "value" : "Four orthogonal prefill modes plus independent CacheBlend & ANE collaboration — changes save immediately and reload the model."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "正交开关可自由叠加组合；修改后立即保存并重载模型生效。"
+            "value" : "四档正交预填加速模式，搭配独立的 CacheBlend 与 ANE 协同设置；修改后立即保存并重载模型生效。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "正交開關可自由疊加組合；修改後立即儲存並重載模型生效。"
+            "value" : "四檔正交預填加速模式，搭配獨立的 CacheBlend 與 ANE 協同設定；修改後立即儲存並重載模型生效。"
           }
         }
       }
@@ -61538,7 +61538,7 @@
       }
     },
     "settings.miv.prefill.opt.linear" : {
-      "comment" : "Short switch title for W4A8 prefill linear acceleration",
+      "comment" : "Short label for universal W4A8 prefill linear acceleration",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -61550,13 +61550,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "W4A8 线性"
+            "value" : "W4A8 线性加速"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "W4A8 線性"
+            "value" : "W4A8 線性加速"
           }
         }
       }
@@ -61592,19 +61592,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "MInference Sparse"
+            "value" : "MInference Dynamic Sparse"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "MInference 稀疏"
+            "value" : "MInference 动态稀疏"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "MInference 稀疏"
+            "value" : "MInference 動態稀疏"
           }
         }
       }
@@ -61616,19 +61616,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CacheBlend Reuse"
+            "value" : "CacheBlend Cross-Chunk Reuse"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CacheBlend 复用"
+            "value" : "CacheBlend 跨块复用"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CacheBlend 複用"
+            "value" : "CacheBlend 跨塊複用"
           }
         }
       }
@@ -61658,25 +61658,25 @@
       }
     },
     "settings.miv.prefill.hint.linear" : {
-      "comment" : "Subtle trade-off note under the W4A8 Linear prefill switch",
+      "comment" : "Subtle trade-off note under universal W4A8 prefill linear acceleration",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "INT8 activation quantization during prefill (decode stays W4A16). Near-lossless with minimal output drift."
+            "value" : "Universal W4A8 INT8 prefill matmul (down_proj stays W4A16; decode stays exact W4A16)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill 启用 INT8 激活量化（Decode 仍为 W4A16 无损），精度几乎无损，偶有轻微输出差异。"
+            "value" : "通用 W4A8 量化预填线性加速（down_proj 保持 W4A16，Decode 仍为 W4A16 无损）。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill 啟用 INT8 激活量化（Decode 仍為 W4A16 無損），精度幾乎無損，偶有輕微輸出差異。"
+            "value" : "通用 W4A8 量化預填線性加速（down_proj 保持 W4A16，Decode 仍為 W4A16 無損）。"
           }
         }
       }
@@ -61688,43 +61688,43 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Low-bit INT8 QK + FP16 PV attention. Slower alone on long prompts — pair with MInference below for 64K+ speedups."
+            "value" : "Low-bit INT8 QK + FP16 PV attention; pairs independently with MInference dynamic sparsity below."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "低位宽 INT8 QK + FP16 PV 注意力；单独开启长文本偏慢，64K+ 需配合下方 MInference 稀疏。"
+            "value" : "低位宽 INT8 QK + FP16 PV 注意力；可独立搭配下方 MInference 动态稀疏。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "低位寬 INT8 QK + FP16 PV 注意力；單獨開啟長文本偏慢，64K+ 需配合下方 MInference 稀疏。"
+            "value" : "低位寬 INT8 QK + FP16 PV 注意力；可獨立搭配下方 MInference 動態稀疏。"
           }
         }
       }
     },
     "settings.miv.prefill.hint.minference" : {
-      "comment" : "Subtle trade-off note under the MInference Sparse prefill switch",
+      "comment" : "Subtle trade-off note under the MInference Dynamic Sparse prefill switch",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Slight accuracy loss possible, but leaving it off under Sage2 causes severe slowdown (auto-activates at ≥4K tokens)."
+            "value" : "Off = dense full-receptive-field Sage2; On = dynamic block-sparse Sage2 + MInference."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "有轻微精度损失，但开启 Sage2 时不开会掉速严重（≥4K 长上下文自动跳过低权注意力块）。"
+            "value" : "关闭 = 稠密全感受野 Sage2；开启 = 动态块稀疏 Sage2 + MInference。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重（≥4K 長上下文自動跳過低權注意力塊）。"
+            "value" : "關閉 = 稠密全感受野 Sage2；開啟 = 動態塊稀疏 Sage2 + MInference。"
           }
         }
       }
@@ -61736,19 +61736,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Requires Sage2 Attention above. Slight accuracy loss, but leaving it off under Sage2 causes severe slowdown."
+            "value" : "Select Route B or Route A+B above to configure dense Sage2 vs dynamic block-sparse Sage2 + MInference."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "需先开启上方 Sage2 注意力。有轻微精度损失，但开启 Sage2 时不开会掉速严重。"
+            "value" : "选择上方「路线 B」或「路线 A+B」后可切换稠密 Sage2 或动态块稀疏 Sage2 + MInference。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "需先開啟上方 Sage2 注意力。有輕微精度損失，但開啟 Sage2 時不開會掉速嚴重。"
+            "value" : "選擇上方「路線 B」或「路線 A+B」後可切換稠密 Sage2 或動態塊稀疏 Sage2 + MInference。"
           }
         }
       }
@@ -61802,25 +61802,313 @@
       }
     },
     "settings.miv.prefill.hint.ane_moe" : {
-      "comment" : "Subtle note under Dual-ANE Offload for MoE models",
+      "comment" : "Subtle note under ANE Collaboration Mode for MoE models",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Dense MLP only — automatically skipped on MoE models (this model stays on GPU; stacks safely with W4A8/Sage2)."
+            "value" : "Dense MLP only — automatically skipped on MoE models (stacks orthogonally with Route A/B & CacheBlend)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仅作用于稠密 MLP，当前 MoE 模型会自动跳过（保持 GPU 执行，与 W4A8/Sage2 互不冲突）。"
+            "value" : "仅作用于稠密 MLP，当前 MoE 模型会自动跳过（与路线 A/B 及 CacheBlend 互不冲突）。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "僅作用於稠密 MLP，目前 MoE 模型會自動跳過（保持 GPU 執行，與 W4A8/Sage2 互不衝突）。"
+            "value" : "僅作用於稠密 MLP，目前 MoE 模型會自動跳過（與路線 A/B 及 CacheBlend 互不衝突）。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.label" : {
+      "comment" : "Row label for the 4-tier Prefill Acceleration Mode selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill Acceleration Mode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 加速模式"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill 加速模式"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.sub" : {
+      "comment" : "Subtitle explaining the 4-tier Prefill Acceleration Mode selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Orthogonal 2×2 selector over Linear (Route A) and Attention (Route B); never changes CacheBlend or ANE mode."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按线性计算（路线 A）与注意力（路线 B）正交组合，不影响下方 CacheBlend 与 ANE 协同设置。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按線性計算（路線 A）與注意力（路線 B）正交組合，不影響下方 CacheBlend 與 ANE 協同設定。"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.lossless" : {
+      "comment" : "4-tier prefill mode pill for lossless exact miv prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lossless Default"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无损默认"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無損預設"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.route_a" : {
+      "comment" : "4-tier prefill mode pill for Route A linear acceleration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Route A (Linear)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路线 A（线性加速）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路線 A（線性加速）"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.route_b" : {
+      "comment" : "4-tier prefill mode pill for Route B Sage2 attention acceleration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Route B (Attention)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路线 B（注意力加速）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路線 B（注意力加速）"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.mode.route_ab" : {
+      "comment" : "4-tier prefill mode pill combining Route A linear and Route B attention acceleration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Route A+B (Full Speed)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路线 A+B（全速）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路線 A+B（全速）"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.ane.off" : {
+      "comment" : "ANE collaboration mode option: disabled / pure GPU",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off (GPU Only)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.ane.auto" : {
+      "comment" : "ANE collaboration mode option: automatic topology policy",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自動"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.ane.compact_int8" : {
+      "comment" : "ANE collaboration mode option: G=64 compact INT8 shift-scale",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Compact INT8"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "均衡省存 INT8"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "均衡省存 INT8"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.ane.ultra_fp16_swiglu" : {
+      "comment" : "ANE collaboration mode option: Ultra direct FP16 SwiGLU Dual-ANE",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra FP16 SwiGLU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra 极速 FP16 SwiGLU"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ultra 極速 FP16 SwiGLU"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.opt.ane_mode" : {
+      "comment" : "Row label for the 4-way ANE collaboration mode selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE Collaboration Mode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 协同模式"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE 協同模式"
+          }
+        }
+      }
+    },
+    "settings.miv.prefill.hint.ane_mode" : {
+      "comment" : "Subtle trade-off note under the ANE Collaboration Mode selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Orthogonal GPU + Dual-ANE collaboration (Auto policy, Compact INT8 G=64, or Ultra FP16 SwiGLU)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "独立正交 GPU + 双 ANE 协同（自动策略、均衡省存 INT8 G=64 或 Ultra 极速 FP16 SwiGLU）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "獨立正交 GPU + 雙 ANE 協同（自動策略、均衡省存 INT8 G=64 或 Ultra 極速 FP16 SwiGLU）。"
           }
         }
       }

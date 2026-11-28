@@ -188,6 +188,7 @@ struct Profile {
   bool gdn_row_exact_eligible = false;
   bool fused_final_norm_t1 = false;
   bool used_w4a8 = false;
+  bool used_w4a4 = false;
   bool used_sage2 = false;
   bool used_minference = false;
   U32 minf_context_envelope = 0;
@@ -249,6 +250,20 @@ public:
     bool fwht64 = false;
     bool operator==(const A8QuantKey &) const = default;
   };
+  struct A4QuantKey {
+    const MetalBuffer *input_buffer = nullptr;
+    U64 input_offset = 0;
+    const MetalBuffer *codes_buffer = nullptr;
+    U64 codes_offset = 0;
+    const MetalBuffer *scales_buffer = nullptr;
+    U64 scales_offset = 0;
+    U32 k = 0;
+    U32 rows = 0;
+    U32 mp = 0;
+    bool dynamic_tokens = false;
+    bool fwht64 = false;
+    bool operator==(const A4QuantKey &) const = default;
+  };
 
   Encoder(const MetalContext &context, const std::filesystem::path &directory,
           U32 capacity, std::string prefix = "qwen.forward")
@@ -266,6 +281,7 @@ public:
     cached_group_sum.reset();
     cached_f16_cast.reset();
     cached_a8_quant.reset();
+    cached_a4_quant.reset();
     active_stage = std::move(name);
     stage_start = U32(descriptor.dispatches.size());
   }
@@ -290,11 +306,20 @@ public:
 
   void clear_a8_quant() { cached_a8_quant.reset(); }
 
+  [[nodiscard]] bool has_a4_quant(const A4QuantKey &key) const {
+    return cached_a4_quant.has_value() && *cached_a4_quant == key;
+  }
+
+  void set_a4_quant(A4QuantKey key) { cached_a4_quant = std::move(key); }
+
+  void clear_a4_quant() { cached_a4_quant.reset(); }
+
   void clear_dynamic_parameter_cache() {
     dynamic_parameters.clear();
     cached_group_sum.reset();
     cached_f16_cast.reset();
     cached_a8_quant.reset();
+    cached_a4_quant.reset();
   }
 
   void record_weight(const MaterializedWeightView &weight, U32 n, U32 k,
@@ -437,6 +462,16 @@ public:
         }
       }
     }
+    if (cached_a4_quant) {
+      for (const auto *buf : dispatch_writes) {
+        if (buf == cached_a4_quant->input_buffer ||
+            buf == cached_a4_quant->codes_buffer ||
+            buf == cached_a4_quant->scales_buffer) {
+          cached_a4_quant.reset();
+          break;
+        }
+      }
+    }
     command.barrier_before = need_barrier;
     descriptor.dispatches.push_back(std::move(command));
     return descriptor.dispatches.back();
@@ -533,6 +568,7 @@ private:
   std::optional<GroupSumKey> cached_group_sum;
   std::optional<F16CastKey> cached_f16_cast;
   std::optional<A8QuantKey> cached_a8_quant;
+  std::optional<A4QuantKey> cached_a4_quant;
 };
 struct ForwardLinearSelection {
   std::string library, function, group_function, family;

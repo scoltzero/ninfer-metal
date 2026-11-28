@@ -101,6 +101,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var modelFormat: String? = nil
     /// Active weight container format (`"miv"`, `"omlxm5"`, `"safetensors"`, `"gguf"`).
     var weightFormat: String? = nil
+    /// Weight quantization family (`"mxfp4"`, `"oq_affine"`, `"bf16"`, `"gguf"`, `"unknown"`).
+    var quantFormat: String? = nil
+    /// True when the model's weight quantization supports native W4A4 prefill (`MXFP4`).
+    var mxfp4W4A4Supported: Bool? = nil
     /// True when repacked microkernel weights (`.miv` / `.omlxm5`) exist in the model directory.
     var hasMivWeights: Bool? = nil
     /// True when the model currently has `.safetensors` and will auto-repack to `.miv` on first Load.
@@ -324,15 +328,23 @@ struct MivEffectiveSettings: Codable, Equatable, Sendable {
     let maxDraftTokens: Int
     let concurrencySource: String
     var prefillLinearMode: String? = nil
+    var prefillLinearModeEffective: String? = nil
+    var prefillLinearFallback: Bool? = nil
+    var prefillLinearFallbackReason: String? = nil
+    var modelQuantFormat: String? = nil
     var prefillAttentionMode: String? = nil
     var prefillSparseMinference: Bool? = nil
     var prefillSparseMinferenceEffective: Bool? = nil
     var prefillSparseMinferenceInactiveReason: String? = nil
     var prefillCacheBlend: Bool? = nil
+    var prefillAneMode: String? = nil
+    var prefillAneModeEffective: String? = nil
+    var prefillAneInactiveReason: String? = nil
     var prefillAneOffload: Bool? = nil
     var prefillAneActive: Bool? = nil
     var prefillAneSplitAlpha: Double? = nil
-    var prefillW4a8Tokens: Int? = nil
+    var prefillW4A8Tokens: Int? = nil
+    var prefillW4A4Tokens: Int? = nil
     var prefillSage2Tokens: Int? = nil
     var prefillMinferenceBlocksSkipped: Int? = nil
     var prefillMinferenceBlocksTotal: Int? = nil

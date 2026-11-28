@@ -77,13 +77,27 @@ struct ModelSettingsScreen: View {
 
     private func mivPrefillSummary(_ config: MivEffectiveSettings) -> String {
         var tags: [String] = []
-        if config.prefillLinearMode == "w4a8" { tags.append("W4A8") }
+        let rawLinear = (config.prefillLinearModeEffective ?? config.prefillLinearMode ?? "bf16").lowercased()
+        let effLinear = rawLinear == "w4a4" ? "w4a8" : rawLinear
+        if config.prefillLinearFallback == true {
+            tags.append("\(effLinear.uppercased())(fallback)")
+        } else if effLinear == "w4a8" {
+            tags.append("W4A8")
+        }
         if config.prefillAttentionMode == "sage2" {
             tags.append(config.prefillSparseMinferenceEffective == true ? "Sage2+MInf" : "Sage2")
         }
         if config.prefillCacheBlend == true { tags.append("CacheBlend") }
-        if config.prefillAneOffload == true {
-            tags.append(config.prefillAneActive == true ? "Dual-ANE" : "ANE(idle)")
+        let aneMode = (config.prefillAneMode ?? (config.prefillAneOffload == true ? "auto" : "off")).lowercased()
+        let aneEff = (config.prefillAneModeEffective ?? "").lowercased()
+        if config.prefillAneActive == true {
+            switch aneEff {
+            case "ultra_fp16_swiglu": tags.append("ANE(FP16)")
+            case "compact_int8": tags.append("ANE(INT8)")
+            default: tags.append("Dual-ANE")
+            }
+        } else if aneMode != "off" || config.prefillAneOffload == true {
+            tags.append("ANE(idle)")
         }
         guard !tags.isEmpty else { return "" }
         return " · Prefill: " + tags.joined(separator: "+")
@@ -2913,37 +2927,55 @@ private struct MivPrefillAccelerationCard: View {
                        defaultValue: "Prefill Acceleration (miv)",
                        comment: "Section header above the per-model miv Prefill Acceleration card"),
                 subtitle: String(localized: "settings.miv.prefill.section.sub",
-                                 defaultValue: "Orthogonal toggles that stack freely — changes save immediately and reload the model.",
+                                 defaultValue: "Four orthogonal prefill modes plus independent CacheBlend & ANE collaboration — changes save immediately and reload the model.",
                                  comment: "Subtitle for the miv Prefill Acceleration card")
             )
             ListGroup {
+                // Control 1: 4-Tier Prefill Mode Selector
                 FreeRow {
-                    HStack(spacing: 6) {
-                        ForEach(ModelSettingsScreenVM.MivPrefillPreset.allCases) { preset in
-                            let selected = vm.activeMivPrefillPreset == preset
-                            Button(preset.title) {
-                                Task { await vm.applyMivPrefillPreset(preset, client: client) }
-                            }
-                            .buttonStyle(.omlx(selected ? .primary : .normal, size: .small))
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 5) {
+                            Text(String(localized: "settings.miv.prefill.mode.label",
+                                        defaultValue: "Prefill Acceleration Mode",
+                                        comment: "Row label for the 4-tier Prefill Acceleration Mode selector"))
+                                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                .foregroundStyle(theme.text)
+                            Circle()
+                                .fill(theme.text)
+                                .frame(width: 5, height: 5)
+                                .accessibilityHidden(true)
                         }
-                        Spacer(minLength: 0)
+                        Text(String(localized: "settings.miv.prefill.mode.sub",
+                                    defaultValue: "Orthogonal 2×2 selector over Linear (Route A) and Attention (Route B); never changes CacheBlend or ANE mode.",
+                                    comment: "Subtitle explaining the 4-tier Prefill Acceleration Mode selector"))
+                            .font(.omlxText(11))
+                            .foregroundStyle(theme.textSecondary.opacity(0.68))
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 6) {
+                            ForEach(ModelSettingsScreenVM.MivPrefillMode.allCases) { mode in
+                                let selected = vm.activeMivPrefillMode == mode
+                                Button(mode.title) {
+                                    Task { await vm.applyMivPrefillMode(mode, client: client) }
+                                }
+                                .buttonStyle(.omlx(selected ? .primary : .normal, size: .small))
+                            }
+                            Spacer(minLength: 0)
+                        }
                     }
                 }
-                let opts = vm.externalEnginePrefillOptions
-                ForEach(Array(opts.enumerated()), id: \.element.id) { index, opt in
-                    let isSubToggle = opt.key == "prefill_sparse_minference"
-                    let isDisabled = isSubToggle && !vm.isExternalEngineSage2Active
-                    let isLast = index == opts.count - 1
+
+                // Control 3: Independent MInference Dynamic Sparse Sub-Switch
+                if let minfOpt = vm.externalEnginePrefillOption(forKey: "prefill_sparse_minference") {
+                    let isDisabled = !vm.isExternalEngineSage2Active
+                    let isLast = vm.externalEnginePrefillOption(forKey: "prefill_cache_blend") == nil && !vm.hasExternalEngineAneOption
                     FreeRow(isLast: isLast) {
                         HStack(alignment: .center, spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 5) {
-                                    if isSubToggle {
-                                        Text("↳")
-                                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                                            .foregroundStyle(theme.textSecondary.opacity(0.75))
-                                    }
-                                    Text(vm.externalEngineOptionDisplayLabel(opt))
+                                    Text("↳")
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                        .foregroundStyle(theme.textSecondary.opacity(0.75))
+                                    Text(vm.externalEngineOptionDisplayLabel(minfOpt))
                                         .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                         .foregroundStyle(theme.text)
                                     Circle()
@@ -2951,23 +2983,95 @@ private struct MivPrefillAccelerationCard: View {
                                         .frame(width: 5, height: 5)
                                         .accessibilityHidden(true)
                                 }
-                                Text(vm.externalEnginePrefillCautionHint(opt))
+                                Text(vm.externalEnginePrefillCautionHint(minfOpt))
                                     .font(.omlxText(11))
                                     .foregroundStyle(theme.textSecondary.opacity(0.68))
                                     .fixedSize(horizontal: false, vertical: true)
                             }
-                            .padding(.leading, isSubToggle ? 12 : 0)
+                            .padding(.leading, 12)
                             Spacer(minLength: 12)
                             RowSwitch(isOn: Binding(
-                                get: { vm.externalEnginePrefillToggleValue(for: opt) },
+                                get: { vm.externalEnginePrefillToggleValue(for: minfOpt) },
                                 set: { newValue in
-                                    let keys = vm.setExternalEnginePrefillToggle(opt, isOn: newValue)
+                                    let keys = vm.setExternalEnginePrefillToggle(minfOpt, isOn: newValue)
                                     Task { await vm.saveExternalEngineOptionsPatch(keys: keys, client: client) }
                                 }
                             ))
                             .disabled(isDisabled)
                         }
                         .opacity(isDisabled ? 0.45 : 1.0)
+                    }
+                }
+
+                // Control 4: Standalone CacheBlend Cross-Chunk Reuse Toggle
+                if let blendOpt = vm.externalEnginePrefillOption(forKey: "prefill_cache_blend") {
+                    let isLast = !vm.hasExternalEngineAneOption
+                    FreeRow(isLast: isLast) {
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 5) {
+                                    Text(vm.externalEngineOptionDisplayLabel(blendOpt))
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                        .foregroundStyle(theme.text)
+                                    Circle()
+                                        .fill(theme.text)
+                                        .frame(width: 5, height: 5)
+                                        .accessibilityHidden(true)
+                                }
+                                Text(vm.externalEnginePrefillCautionHint(blendOpt))
+                                    .font(.omlxText(11))
+                                    .foregroundStyle(theme.textSecondary.opacity(0.68))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 12)
+                            RowSwitch(isOn: Binding(
+                                get: { vm.externalEnginePrefillToggleValue(for: blendOpt) },
+                                set: { newValue in
+                                    let keys = vm.setExternalEnginePrefillToggle(blendOpt, isOn: newValue)
+                                    Task { await vm.saveExternalEngineOptionsPatch(keys: keys, client: client) }
+                                }
+                            ))
+                        }
+                    }
+                }
+
+                // Control 5: Standalone ANE Collaboration Mode Picker
+                if vm.hasExternalEngineAneOption {
+                    let aneOpt = vm.externalEnginePrefillOption(forKey: "prefill_ane_mode")
+                        ?? vm.externalEnginePrefillOption(forKey: "prefill_ane_offload")
+                    FreeRow(isLast: true) {
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 5) {
+                                    Text(aneOpt.map { vm.externalEngineOptionDisplayLabel($0) }
+                                         ?? String(localized: "settings.miv.prefill.opt.ane_mode",
+                                                   defaultValue: "ANE Collaboration Mode"))
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                                        .foregroundStyle(theme.text)
+                                    Circle()
+                                        .fill(theme.text)
+                                        .frame(width: 5, height: 5)
+                                        .accessibilityHidden(true)
+                                }
+                                if let aneOpt {
+                                    Text(vm.externalEnginePrefillCautionHint(aneOpt))
+                                        .font(.omlxText(11))
+                                        .foregroundStyle(theme.textSecondary.opacity(0.68))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer(minLength: 12)
+                            Popup(
+                                selection: Binding<ModelSettingsScreenVM.MivAneMode>(
+                                    get: { vm.activeMivAneMode },
+                                    set: { newMode in
+                                        Task { await vm.applyMivAneMode(newMode, client: client) }
+                                    }
+                                ),
+                                width: .controlMedium,
+                                options: ModelSettingsScreenVM.MivAneMode.allCases.map { ($0, $0.title) }
+                            )
+                        }
                     }
                 }
             }

@@ -600,7 +600,7 @@ omlx::m5::LoadOptions load_options(const Json &value,
   if (explicit_backend && result.speculative.backend == omlx::m5::SpeculativeBackend::none)
     result.path_overrides["enable_mtp"] = "off";
 
-  // Strictly orthogonal prefill switches: all 32 boolean/enum combinations are
+  // Strictly orthogonal prefill switches: all 96 enum/bool combinations are
   // accepted without mutual exclusion.
   if (value.contains("prefill_linear_mode") &&
       !value.at("prefill_linear_mode").is_null()) {
@@ -650,21 +650,45 @@ omlx::m5::LoadOptions load_options(const Json &value,
         parse_json_bool_or_toggle(Json(it->second), "prefill_cache_blend");
   }
 
-  bool ane_offload_explicit = false;
-  if (value.contains("prefill_ane_offload") &&
-      !value.at("prefill_ane_offload").is_null()) {
+  bool ane_explicit = false;
+  if (value.contains("prefill_ane_mode") &&
+      !value.at("prefill_ane_mode").is_null()) {
+    if (!value.at("prefill_ane_mode").is_string()) {
+      throw std::invalid_argument("prefill_ane_mode must be a string");
+    }
+    result.prefill_ane_mode = omlx::m5::parse_prefill_ane_mode(
+        value.at("prefill_ane_mode").get<std::string>());
+    result.prefill_ane_offload =
+        (result.prefill_ane_mode != omlx::m5::PrefillAneMode::Off);
+    ane_explicit = true;
+  } else if (const auto it = result.path_overrides.find("prefill_ane_mode");
+             it != result.path_overrides.end() && !it->second.empty()) {
+    result.prefill_ane_mode = omlx::m5::parse_prefill_ane_mode(it->second);
+    result.prefill_ane_offload =
+        (result.prefill_ane_mode != omlx::m5::PrefillAneMode::Off);
+    ane_explicit = true;
+  } else if (value.contains("prefill_ane_offload") &&
+             !value.at("prefill_ane_offload").is_null()) {
     result.prefill_ane_offload = parse_json_bool_or_toggle(
         value.at("prefill_ane_offload"), "prefill_ane_offload");
-    ane_offload_explicit = true;
+    result.prefill_ane_mode = result.prefill_ane_offload
+                                  ? omlx::m5::PrefillAneMode::Auto
+                                  : omlx::m5::PrefillAneMode::Off;
+    ane_explicit = true;
   } else if (const auto it = result.path_overrides.find("prefill_ane_offload");
              it != result.path_overrides.end() && !it->second.empty()) {
     result.prefill_ane_offload =
         parse_json_bool_or_toggle(Json(it->second), "prefill_ane_offload");
-    ane_offload_explicit = true;
+    result.prefill_ane_mode = result.prefill_ane_offload
+                                  ? omlx::m5::PrefillAneMode::Auto
+                                  : omlx::m5::PrefillAneMode::Off;
+    ane_explicit = true;
   }
   // Legacy compatibility shim: prefill_engine = "nax_ane" maps to
-  // prefill_ane_offload = true when unset, without altering any other switch.
-  if (!ane_offload_explicit && result.prefill_engine == "nax_ane") {
+  // prefill_ane_mode = "auto" (prefill_ane_offload = true) when unset, without
+  // altering any other switch.
+  if (!ane_explicit && result.prefill_engine == "nax_ane") {
+    result.prefill_ane_mode = omlx::m5::PrefillAneMode::Auto;
     result.prefill_ane_offload = true;
   }
   return result;
@@ -833,6 +857,10 @@ Json stats_json(const omlx::m5::StatsReport &value) {
       {"lora_buffer_bytes", value.lora_buffer_bytes},
       {"lora_adapted_layers", value.lora_adapted_layers},
       {"prefill_linear_mode", value.prefill_linear_mode},
+      {"prefill_linear_mode_effective", value.prefill_linear_mode_effective},
+      {"prefill_linear_fallback", value.prefill_linear_fallback},
+      {"prefill_linear_fallback_reason", value.prefill_linear_fallback_reason},
+      {"model_quant_format", value.model_quant_format},
       {"prefill_attention_mode", value.prefill_attention_mode},
       {"prefill_sparse_minference", value.prefill_sparse_minference},
       {"prefill_sparse_minference_effective",
@@ -840,10 +868,14 @@ Json stats_json(const omlx::m5::StatsReport &value) {
       {"prefill_sparse_minference_inactive_reason",
        value.prefill_sparse_minference_inactive_reason},
       {"prefill_cache_blend", value.prefill_cache_blend},
+      {"prefill_ane_mode", value.prefill_ane_mode},
+      {"prefill_ane_mode_effective", value.prefill_ane_mode_effective},
+      {"prefill_ane_inactive_reason", value.prefill_ane_inactive_reason},
       {"prefill_ane_offload", value.prefill_ane_offload},
       {"prefill_ane_active", value.prefill_ane_active},
       {"prefill_ane_split_alpha", value.prefill_ane_split_alpha},
       {"prefill_w4a8_tokens", value.prefill_w4a8_tokens},
+      {"prefill_w4a4_tokens", value.prefill_w4a4_tokens},
       {"prefill_sage2_tokens", value.prefill_sage2_tokens},
       {"prefill_minference_blocks_skipped",
        value.prefill_minference_blocks_skipped},
@@ -904,6 +936,7 @@ Json provider_contract() {
         {"prefill_attention_mode", "exact_nax"},
         {"prefill_sparse_minference", false},
         {"prefill_cache_blend", false},
+        {"prefill_ane_mode", "off"},
         {"prefill_ane_offload", false}}},
       {"supported_standard_settings",
        {"max_context_window", "lora_adapter", "mtp_enabled",
@@ -949,8 +982,8 @@ Json provider_contract() {
              {{"bf16", "BF16 (Exact)"},
               {"w4a8", "W4A8 (INT8 Prefill)"}}},
             {"description",
-             "INT8 prefill linear matmul (strongest on oQ4e; down_proj stays "
-             "W4A16). Decode remains exact W4A16."},
+             "INT8 prefill linear matmul (universal across MXFP4 & oQ4e; "
+             "down_proj stays W4A16). Decode remains exact W4A16."},
             {"default", "bf16"},
             {"reload_required", true}},
            {{"key", "prefill_attention_mode"},
@@ -961,17 +994,17 @@ Json provider_contract() {
              {{"exact_nax", "Exact NAX"},
               {"sage2", "Sage2 (INT8 QK + FP16 PV)"}}},
             {"description",
-             "Low-bit INT8 QK prefill attention; pair with MInference below "
-             "(dense Sage2 alone is slower on affine4 KV)."},
+             "Low-bit INT8 QK prefill attention (dense full-receptive-field "
+             "Sage2 by default; optionally enable MInference sparse below)."},
             {"default", "exact_nax"},
             {"reload_required", true}},
            {{"key", "prefill_sparse_minference"},
             {"label", "MInference Sparse"},
             {"type", "bool"},
             {"description",
-             "Skips low-weight KV blocks (2.1x-2.35x faster at 64K-256K). "
-             "Slight quality loss, but turning it off under Sage2 causes "
-             "severe slowdown."},
+             "Optional dynamic block-sparse KV skipping under Sage2 (off = "
+             "dense full-receptive-field Sage2; on = dynamic block-sparse "
+             "Sage2 + MInference)."},
             {"default", false},
             {"reload_required", true}},
            {{"key", "prefill_cache_blend"},
@@ -982,14 +1015,21 @@ Json provider_contract() {
              "Increase Prefix Cache Budget (e.g. 16-32 GiB) for long docs."},
             {"default", false},
             {"reload_required", true}},
-           {{"key", "prefill_ane_offload"},
-            {"label", "Dual-ANE Offload"},
-            {"type", "bool"},
+           {{"key", "prefill_ane_mode"},
+            {"label", "ANE Collaboration Mode"},
+            {"type", "enum"},
+            {"options", Json::array({"off", "auto", "compact_int8",
+                                     "ultra_fp16_swiglu"})},
+            {"option_labels",
+             {{"off", "Off (GPU Only)"},
+              {"auto", "Auto"},
+              {"compact_int8", "Compact INT8"},
+              {"ultra_fp16_swiglu", "Ultra FP16 SwiGLU"}}},
             {"description",
-             "Orthogonal Dual-ANE co-execution (never disables W4A8/Sage2); "
-             "Dense-only and skips GDN recurrence. Pure GPU is faster on "
-             "80-core M5 Ultra."},
-            {"default", false},
+             "Orthogonal Dual-ANE co-execution mode (off, auto hardware "
+             "crossover, balanced compact INT8, or Ultra direct FP16 SwiGLU). "
+             "Dense-only and skips GDN recurrence."},
+            {"default", "off"},
             {"reload_required", true}},
            {{"key", "speculative_backend"},
             {"label", "Speculative Backend"},
@@ -1065,6 +1105,7 @@ bool base_load_options_equal(const omlx::m5::LoadOptions &a,
          a.prefill_attention_mode == b.prefill_attention_mode &&
          a.prefill_sparse_minference == b.prefill_sparse_minference &&
          a.prefill_cache_blend == b.prefill_cache_blend &&
+         a.prefill_ane_mode == b.prefill_ane_mode &&
          a.prefill_ane_offload == b.prefill_ane_offload &&
          a.path_overrides == b.path_overrides &&
          a.sampling_contract == b.sampling_contract &&
