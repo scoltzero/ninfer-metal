@@ -471,6 +471,9 @@ public:
   [[nodiscard]] MetalSubmission
   replay_icb(MetalIcbProfile &profile,
              std::string_view range_key = "full") const;
+  [[nodiscard]] MetalSubmission
+  replay_icb_range(MetalIcbProfile &profile, std::uint32_t location,
+                   std::uint32_t length) const;
   [[nodiscard]] MetalPendingSubmission
   replay_icb_async(MetalIcbProfile &profile,
                    std::string_view range_key = "full") const;

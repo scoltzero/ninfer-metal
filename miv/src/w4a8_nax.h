@@ -312,7 +312,7 @@ inline void linear_affine_w4a8_nax_swiglu_fwht64_a8(
                          std::to_string(eff_gs) +
                          "_swiglu_bm64_bn64_out64_sk1_fwht64_a8";
   const U32 x_tiles = eff_n / 64u;
-  const U32 y_tiles = (t + 63u) / 64u;
+  const U32 y_tiles = (std::max(t, mp) + 31u) / 32u;
   const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
   const MetalDispatchSize threads{.width = 128u};
   const std::optional<U32> tokens_patch =
@@ -371,7 +371,6 @@ inline void linear_mxfp4_w4a8_nax(Encoder &e, const TiledMxfp4Weight &tw,
   e.dynamic(d, 5,
             words({eff_n, tw.k, mp, t, tw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
-  e.dynamic(d, 6, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 // Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU (BM=64, BN_out=64, k_sub=32, Dual-ANE row_offset).
@@ -409,10 +408,9 @@ inline void linear_mxfp4_w4a8_nax_swiglu(Encoder &e,
   e.dynamic(d, 7,
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride, 0u}),
             tokens_patch);
-  e.dynamic(d, 8, nax_mxfp4_byte_lut_sh_bytes());
 }
 
-// Mode B Dense MXFP4 W4A8 Fused Gate + Up + SwiGLU + FWHT-64 + GS64 INT8 epilogue.
+// Mode B Dense MXFP4 W4A8 Single-Pass Zero-DRAM Fused Gate + Up + SwiGLU + FWHT-64 + GS64 INT8.
 inline void linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
     Encoder &e, const TiledMxfp4Weight &gw, const TiledMxfp4Weight &uw,
     Ref qa, Ref sa, Ref qa_out, Ref sa_out, Ref ra_out, Ref opt_y_bf16,
@@ -434,23 +432,27 @@ inline void linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
   const U32 t = explicit_t.value_or(e.profile.capacity);
   const U32 mp = mp_override.value_or(w4a8_nax_mp(t));
   const U32 x_tiles = eff_n / 64u;
-  const U32 y_tiles = (t + 63u) / 64u;
-  const MetalDispatchSize grid{.width = U64(x_tiles) * 128u, .height = y_tiles};
-  const MetalDispatchSize threads{.width = 128u};
+  const bool use_256t = (t > 32u);
+  const U32 y_tiles = use_256t ? ((std::max(t, mp) + 63u) / 64u)
+                               : ((std::max(t, mp) + 31u) / 32u);
+  const U32 tptg = use_256t ? 256u : 128u;
+  const MetalDispatchSize grid{.width = U64(x_tiles) * U64(tptg),
+                               .height = y_tiles};
+  const MetalDispatchSize threads{.width = tptg};
   const std::optional<U32> tokens_patch =
       explicit_t.has_value() ? std::nullopt : std::optional<U32>(3u);
   const U32 flags = also_write_bf16 ? 1u : 0u;
+  const char *fn = use_256t
+      ? "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_1pass256_fwht64_a8"
+      : "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8";
   auto &d = e.emit(
-      "w4a8_nax",
-      "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
-      grid, threads,
+      "w4a8_nax", fn, grid, threads,
       {qa, sa, gw.codes, gw.scales, uw.codes, uw.scales, qa_out, sa_out, ra_out,
        opt_y_bf16});
   e.dynamic(d, 10,
             words({eff_n, gw.k, mp, t, gw.padded_n, row_offset, eff_stride,
                    flags}),
             tokens_patch);
-  e.dynamic(d, 11, nax_mxfp4_byte_lut_sh_bytes());
 }
 
 } // namespace omlx::m5::detail::forward

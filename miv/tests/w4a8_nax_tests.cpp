@@ -631,7 +631,8 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
   for (const char *fn : {"omlx_m5_rmsnorm_a8_g64", "omlx_m5_add_rmsnorm_a8_g64",
                          "omlx_m5_quantize_a8_g64",
                          "omlx_m5_quantize_a8_g64_fwht64",
-                         "omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64"}) {
+                         "omlx_m5_gdn_chunk_norm_gate_inplace_a8_g64_c64",
+                         "omlx_m5_w4a8_split4_cols"}) {
     const auto info = ctx.warmup_pipeline(
         {.key = std::string("w4a8.pso.") + fn,
          .library_key = "w4a8.audit.w4a8",
@@ -677,7 +678,8 @@ Json test_pso_and_tg_sram_audit(const MetalContext &ctx,
   for (const char *fn : {"omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns16_sk1",
                          "omlx_m5_mxfp4_w4a8_nax_bm64_bn64_bns32_sk1",
                          "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1",
-                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8"}) {
+                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_fwht64_a8",
+                         "omlx_m5_mxfp4_w4a8_nax_swiglu_bm64_bn64_out64_sk1_1pass256_fwht64_a8"}) {
     const auto info = ctx.warmup_pipeline(
         {.key = std::string("w4a8.pso.") + fn,
          .library_key = "w4a8.audit.w4a8",
@@ -3402,6 +3404,503 @@ Json test_wp3b_oq4e_dual_channel_and_int4b_exact(
   return {{"checks", checks}, {"bit_exact_diffs", 0}, {"passed", true}};
 }
 
+// ============================================================================
+// Test 8 (Phase 3.1): MXFP4 Zero-Block Exemption + Sw1_s Mixed Fast/Slow,
+// Single-Pass Zero-DRAM Mode B (MXFP4 128t_bm32 + 256t_ovlp & All 7 Affine),
+// omlx_m5_w4a8_split4_cols, and Encoder::mark_sublayer / replay_icb_range
+// ============================================================================
+Json test_p31_nax_kernels_and_profiler(const MetalContext &ctx,
+                                       const std::filesystem::path &libs) {
+  U32 checks = 0;
+  U32 wid = 11000u;
+
+  auto zero_buf = ctx.make_buffer(256);
+  zero_buf.write(std::vector<std::byte>(256));
+  Ref zero_ref{&zero_buf, 0, zero_buf.size()};
+
+  // 8a. MXFP4 Zero-Block Exemption + Mixed Slow/Fast Rows (Sw1_s invariant) + ep=0/255
+  {
+    constexpr U32 kM = 65u;
+    constexpr U32 kCapM = 128u;
+    constexpr U32 kN = 128u;
+    constexpr U32 kK = 512u;
+    constexpr U32 kBlocks128 = kK / 128u;
+
+    auto make_stress_mxfp4 = [&](U32 obj_id, U32 bn, U32 seed) {
+      OwnedWeight w;
+      const U32 padded_n = ((kN + bn - 1u) / bn) * bn;
+      w.view = {.object_id = obj_id,
+                .name = "p31.stress.mxfp4." + std::to_string(obj_id),
+                .format = "mxfp4_e2m1_g32_e8m0_v1",
+                .layout = "mx_nax_tiled_bk128_v1",
+                .parent_shape = {kN, kK},
+                .padded_k = kK,
+                .row_count = kN,
+                .in_features = kK,
+                .input_transform = "none"};
+      std::vector<std::uint8_t> raw_codes(U64(kN) * (kK / 2u), 0);
+      std::vector<std::uint8_t> raw_scales(U64(kN) * (kK / 32u), 127);
+      w.ref_w.assign(U64(kN) * kK, 0.0f);
+      for (U32 r = 0; r < kN; ++r) {
+        for (U32 g = 0; g < kK / 32u; ++g) {
+          raw_scales[U64(r) * (kK / 32u) + g] =
+              std::uint8_t(125u + ((r + g + seed) % 3u));
+        }
+        for (U32 c = 0; c < kK; ++c) {
+          const U32 code = (r * 7u + c * 11u + seed * 5u) & 0x0Fu;
+          raw_codes[U64(r) * (kK / 2u) + (c >> 1u)] |=
+              std::uint8_t(code << ((c & 1u) * 4u));
+        }
+        // Rows 0..15: all-zero g=32 half-blocks (+0.0 = 0x00 and -0.0 = 0x88) with |de|=128
+        if (r < 16u) {
+          const U32 z_half = r & 1u;
+          const std::uint8_t zbyte = (r & 2u) ? 0x88u : 0x00u;
+          for (U32 kb = 0; kb < kK / 64u; ++kb) {
+            const U32 g0 = kb * 2u;
+            raw_scales[U64(r) * (kK / 32u) + g0 + z_half] = 0u;
+            raw_scales[U64(r) * (kK / 32u) + g0 + (1u - z_half)] = 128u;
+            std::memset(raw_codes.data() + U64(r) * (kK / 2u) +
+                            (g0 + z_half) * 16u,
+                        zbyte, 16u);
+          }
+        }
+        // Rows 16..31: row 17 has |de|=6 (triggers slow_flag for SG tile),
+        // while rows 16, 18..31 are fast rows with |de|=2 (must still write Sw1_s!).
+        if (r >= 16u && r < 32u) {
+          for (U32 kb = 0; kb < kK / 64u; ++kb) {
+            const U32 g0 = kb * 2u;
+            if (r == 17u) {
+              raw_scales[U64(r) * (kK / 32u) + g0] = 122u;
+              raw_scales[U64(r) * (kK / 32u) + g0 + 1u] = 128u;
+            } else {
+              raw_scales[U64(r) * (kK / 32u) + g0] = 124u;
+              raw_scales[U64(r) * (kK / 32u) + g0 + 1u] = 126u;
+            }
+          }
+        }
+        // Rows 32..47: ep=255 (NaN -> 0.0f) and ep=0 with non-zero nibbles
+        if (r == 33u) {
+          raw_scales[U64(r) * (kK / 32u) + 0u] = 255u;
+          raw_scales[U64(r) * (kK / 32u) + 1u] = 127u;
+        } else if (r == 34u) {
+          raw_scales[U64(r) * (kK / 32u) + 0u] = 0u;
+          raw_scales[U64(r) * (kK / 32u) + 1u] = 127u;
+        }
+        for (U32 c = 0; c < kK; ++c) {
+          const U32 byte_v = raw_codes[U64(r) * (kK / 2u) + (c >> 1u)];
+          const U32 code = (byte_v >> ((c & 1u) * 4u)) & 0x0Fu;
+          const std::uint8_t sc_b = raw_scales[U64(r) * (kK / 32u) + c / 32u];
+          const float sc = (sc_b == 255u) ? 0.0f : decode_e8m0(sc_b);
+          w.ref_w[U64(r) * kK + c] = decode_e2m1(code) * sc;
+        }
+      }
+      std::vector<std::uint8_t> nax_codes(U64(padded_n / bn) * kBlocks128 * bn * 64u, 0);
+      std::vector<std::uint8_t> nax_scales(U64(padded_n / bn) * kBlocks128 * bn * 4u, 0x7Fu);
+      for (U32 r = 0; r < kN; ++r) {
+        const U32 tn = r / bn;
+        const U32 rn = r % bn;
+        for (U32 blk = 0; blk < kBlocks128; ++blk) {
+          const U64 idx = U64(tn) * kBlocks128 + blk;
+          std::memcpy(nax_codes.data() + idx * bn * 64u + rn * 64u,
+                      raw_codes.data() + U64(r) * (kK / 2u) + blk * 64u, 64u);
+          std::memcpy(nax_scales.data() + idx * bn * 4u + rn * 4u,
+                      raw_scales.data() + U64(r) * (kK / 32u) + blk * 4u, 4u);
+        }
+      }
+      w.add_plane(ctx, "nax_data", nax_codes.data(), nax_codes.size(), 0);
+      w.add_plane(ctx, "nax_scale", nax_scales.data(), nax_scales.size(), 0);
+      return w;
+    };
+
+    std::vector<std::uint16_t> x_u16;
+    const auto x_f32 = make_activations(kCapM, kK, 1101u, x_u16);
+    auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+    const auto lay = w4a8_nax_workspace_layout(kCapM, kK);
+    auto qa_buf = ctx.make_buffer(lay.qa_bytes);
+    auto sa_buf = ctx.make_buffer(lay.sa_bytes);
+    auto ra_buf = ctx.make_buffer(lay.ra_bytes);
+    auto y_buf = ctx.make_buffer(U64(kCapM) * kN * 2ULL);
+    Ref x_ref{&x_buf, 0, x_buf.size()};
+    Ref qa_ref{&qa_buf, 0, qa_buf.size()};
+    Ref sa_ref{&sa_buf, 0, sa_buf.size()};
+    Ref ra_ref{&ra_buf, 0, ra_buf.size()};
+    Ref y_ref{&y_buf, 0, y_buf.size()};
+    {
+      Encoder eq(ctx, libs, kCapM, "p31.8a.quant");
+      eq.begin_stage("quant");
+      emit_quantize_a8_g64(eq, x_ref, qa_ref, sa_ref, ra_ref, kK);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, kM);
+    }
+
+    for (U32 bn : {16u, 32u}) {
+      auto wm = make_stress_mxfp4(wid++, bn, 13u + bn);
+      const TiledMxfp4Weight tw{plane(wm.view, "nax_data"),
+                                plane(wm.view, "nax_scale"), kN, kK, bn,
+                                ((kN + bn - 1u) / bn) * bn, 1u};
+      Encoder e(ctx, libs, kCapM, "p31.8a.lin");
+      e.begin_stage("lin");
+      linear_mxfp4_w4a8_nax(e, tw, qa_ref, sa_ref, y_ref);
+      auto p = e.finish(true);
+      submit_profile(ctx, p, kM, true);
+      const auto ref = cpu_linear_ref(std::span(x_f32).first(U64(kM) * kK),
+                                      wm.ref_w, kM, kN, kK);
+      const double cs = cosine_similarity_bf16(
+          read_u16(y_buf, U64(kM) * kN), ref,
+          "p31 8a zero_block+slow_mix bns" + std::to_string(bn));
+      require(cs >= 0.9990,
+              "p31 8a MXFP4 stress cos_sim=" + std::to_string(cs));
+      ++checks;
+    }
+
+    // Also verify MXFP4 Single-Pass Mode B (both t=16 128t_bm32 AND t=65 256t_ovlp) on stress weights!
+    auto wg = make_stress_mxfp4(wid++, 16u, 21u);
+    auto wu = make_stress_mxfp4(wid++, 16u, 37u);
+    const TiledMxfp4Weight twg{plane(wg.view, "nax_data"),
+                               plane(wg.view, "nax_scale"), kN, kK, 16u, kN, 1u};
+    const TiledMxfp4Weight twu{plane(wu.view, "nax_data"),
+                               plane(wu.view, "nax_scale"), kN, kK, 16u, kN, 1u};
+    for (U32 cap_t : {32u, 128u}) {
+      const U32 live_t = (cap_t == 32u) ? 17u : 65u;
+      const auto in_l = w4a8_nax_workspace_layout(cap_t, kK);
+      const auto mid_l = w4a8_nax_workspace_layout(cap_t, kN);
+      auto qai = ctx.make_buffer(in_l.qa_bytes);
+      auto sai = ctx.make_buffer(in_l.sa_bytes);
+      auto rai = ctx.make_buffer(in_l.ra_bytes);
+      auto qao = ctx.make_buffer(mid_l.qa_bytes);
+      auto sao = ctx.make_buffer(mid_l.sa_bytes);
+      auto rao = ctx.make_buffer(mid_l.ra_bytes);
+      auto y_a = ctx.make_buffer(U64(cap_t) * kN * 2ULL);
+      auto y_b = ctx.make_buffer(U64(cap_t) * kN * 2ULL);
+      Ref qai_r{&qai, 0, qai.size()}, sai_r{&sai, 0, sai.size()}, rai_r{&rai, 0, rai.size()};
+      Ref qao_r{&qao, 0, qao.size()}, sao_r{&sao, 0, sao.size()}, rao_r{&rao, 0, rao.size()};
+      Ref ya_r{&y_a, 0, y_a.size()}, yb_r{&y_b, 0, y_b.size()};
+      {
+        Encoder eq(ctx, libs, cap_t, "p31.8a.q");
+        eq.begin_stage("q");
+        emit_quantize_a8_g64(eq, x_ref, qai_r, sai_r, rai_r, kK);
+        auto pq = eq.finish();
+        submit_profile(ctx, pq, live_t);
+      }
+      {
+        Encoder ea(ctx, libs, cap_t, "p31.8a.swiA");
+        ea.begin_stage("a");
+        linear_mxfp4_w4a8_nax_swiglu(ea, twg, twu, qai_r, sai_r, ya_r);
+        auto pa = ea.finish(true);
+        submit_profile(ctx, pa, live_t, true);
+      }
+      {
+        qao.write(std::vector<std::byte>(qao.size(), std::byte{0x5A}));
+        sao.write(std::vector<std::byte>(sao.size(), std::byte{0x5A}));
+        rao.write(std::vector<std::byte>(rao.size(), std::byte{0x5A}));
+        fill_sentinel_bf16(y_b, U64(cap_t) * kN);
+        Encoder eb(ctx, libs, cap_t, "p31.8a.swiB");
+        eb.begin_stage("b");
+        linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
+            eb, twg, twu, qai_r, sai_r, qao_r, sao_r, rao_r, yb_r, true);
+        eb.record_weight(wg.view, kN, kK, "w4a8", "test", "");
+        auto pb = eb.finish(true);
+        const std::string &fn = pb.weight_routes.back().function;
+        const bool expect_256 = (cap_t > 32u);
+        require((fn.find("1pass256") != std::string::npos) == expect_256,
+                "p31 8a MXFP4 ModeB dispatch routing mismatch: " + fn);
+        submit_profile(ctx, pb, live_t, true);
+      }
+      require(read_u16(y_a, U64(live_t) * kN) == read_u16(y_b, U64(live_t) * kN),
+              "p31 8a MXFP4 1-pass ModeB opt_y_bf16 != ModeA 0-ULP");
+      // Verify padded rows [live_t, mp) are strictly 0
+      const auto qa_got = read_i8(qao, mid_l.qa_bytes);
+      const auto sa_got = read_f32(sao, mid_l.sa_bytes / 4ULL);
+      const auto ra_got = read_f32(rao, mid_l.ra_bytes / 4ULL);
+      for (U32 r = live_t; r < mid_l.mp; ++r) {
+        for (U32 g = 0; g < kN / 64u; ++g) {
+          require(sa_got[U64(g) * mid_l.mp + r] == 0.0f &&
+                      ra_got[U64(g) * mid_l.mp + r] == 0.0f,
+                  "p31 8a MXFP4 ModeB padded sa/ra non-zero");
+        }
+        for (U32 c = 0; c < kN; ++c) {
+          require(qa_got[U64(r) * kN + c] == 0,
+                  "p31 8a MXFP4 ModeB padded qa non-zero");
+        }
+      }
+      ++checks;
+    }
+  }
+
+  // 8b. Single-Pass Zero-DRAM Mode B ANE row_offset=128 non-clobber (MXFP4 + Affine)
+  {
+    constexpr U32 kCapM = 128u;
+    constexpr U32 kLiveM = 73u;
+    constexpr U32 kK = 512u;
+    constexpr U32 kN = 256u;
+    std::vector<std::uint16_t> x_u16;
+    (void)make_activations(kCapM, kK, 1201u, x_u16);
+    auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+    const auto in_l = w4a8_nax_workspace_layout(kCapM, kK);
+    const auto mid_l = w4a8_nax_workspace_layout(kCapM, kN);
+    auto qai = ctx.make_buffer(in_l.qa_bytes);
+    auto sai = ctx.make_buffer(in_l.sa_bytes);
+    auto rai = ctx.make_buffer(in_l.ra_bytes);
+    auto qao_full = ctx.make_buffer(mid_l.qa_bytes);
+    auto sao_full = ctx.make_buffer(mid_l.sa_bytes);
+    auto rao_full = ctx.make_buffer(mid_l.ra_bytes);
+    auto qao_sl = ctx.make_buffer(mid_l.qa_bytes);
+    auto sao_sl = ctx.make_buffer(mid_l.sa_bytes);
+    auto rao_sl = ctx.make_buffer(mid_l.ra_bytes);
+    auto y_full = ctx.make_buffer(U64(kCapM) * kN * 2ULL);
+    auto y_sl = ctx.make_buffer(U64(kCapM) * kN * 2ULL);
+    Ref qai_r{&qai, 0, qai.size()}, sai_r{&sai, 0, sai.size()}, rai_r{&rai, 0, rai.size()};
+    {
+      Encoder eq(ctx, libs, kCapM, "p31.8b.q");
+      eq.begin_stage("q");
+      emit_quantize_a8_g64(eq, Ref{&x_buf, 0, x_buf.size()}, qai_r, sai_r, rai_r, kK);
+      auto pq = eq.finish();
+      submit_profile(ctx, pq, kLiveM);
+    }
+
+    auto verify_slice = [&](std::string_view tag) {
+      const auto qf = read_i8(qao_full, mid_l.qa_bytes);
+      const auto qs = read_i8(qao_sl, mid_l.qa_bytes);
+      const auto sf = read_f32(sao_full, mid_l.sa_bytes / 4ULL);
+      const auto ss = read_f32(sao_sl, mid_l.sa_bytes / 4ULL);
+      const auto rf = read_f32(rao_full, mid_l.ra_bytes / 4ULL);
+      const auto rs = read_f32(rao_sl, mid_l.ra_bytes / 4ULL);
+      const auto yf = read_u16(y_full, U64(kLiveM) * kN);
+      const auto ys = read_u16(y_sl, U64(kLiveM) * kN);
+      for (U32 r = 0; r < mid_l.mp; ++r) {
+        for (U32 c = 0; c < 128u; ++c) {
+          require(qs[U64(r) * kN + c] == int8_t(0x5A),
+                  std::string(tag) + " ModeB slice clobbered qa prefix [0,128)");
+        }
+        for (U32 c = 128u; c < kN; ++c) {
+          require(qs[U64(r) * kN + c] == qf[U64(r) * kN + c],
+                  std::string(tag) + " ModeB slice qa suffix != full");
+        }
+        for (U32 g = 2u; g < kN / 64u; ++g) {
+          require(ss[U64(g) * mid_l.mp + r] == sf[U64(g) * mid_l.mp + r] &&
+                      rs[U64(g) * mid_l.mp + r] == rf[U64(g) * mid_l.mp + r],
+                  std::string(tag) + " ModeB slice sa/ra suffix != full");
+        }
+      }
+      for (U32 r = 0; r < kLiveM; ++r) {
+        for (U32 c = 0; c < 128u; ++c) {
+          require(ys[U64(r) * kN + c] == 0xA5A5u,
+                  std::string(tag) + " ModeB slice clobbered bf16 prefix [0,128)");
+        }
+        for (U32 c = 128u; c < kN; ++c) {
+          require(ys[U64(r) * kN + c] == yf[U64(r) * kN + c],
+                  std::string(tag) + " ModeB slice bf16 suffix != full");
+        }
+      }
+    };
+
+    // MXFP4 256t_ovlp Mode B row_offset=128
+    {
+      auto mg = make_mxfp4_weight(ctx, wid++, kN, kK, 1211u, true, 16u);
+      auto mu = make_mxfp4_weight(ctx, wid++, kN, kK, 1212u, true, 16u);
+      Mxfp4NaxCache mc;
+      mc.register_weight(mg.view);
+      mc.register_weight(mu.view);
+      mc.build(ctx, libs);
+      const auto *twg = mc.find(mg.view.object_id);
+      const auto *twu = mc.find(mu.view.object_id);
+      {
+        Encoder e(ctx, libs, kCapM, "p31.8b.mx.full");
+        e.begin_stage("f");
+        linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
+            e, *twg, *twu, qai_r, sai_r, Ref{&qao_full, 0, qao_full.size()},
+            Ref{&sao_full, 0, sao_full.size()}, Ref{&rao_full, 0, rao_full.size()},
+            Ref{&y_full, 0, y_full.size()}, true);
+        auto p = e.finish(true);
+        submit_profile(ctx, p, kLiveM, true);
+      }
+      {
+        qao_sl.write(std::vector<std::byte>(qao_sl.size(), std::byte{0x5A}));
+        sao_sl.write(std::vector<std::byte>(sao_sl.size(), std::byte{0x5A}));
+        rao_sl.write(std::vector<std::byte>(rao_sl.size(), std::byte{0x5A}));
+        fill_sentinel_bf16(y_sl, U64(kCapM) * kN);
+        Encoder e(ctx, libs, kCapM, "p31.8b.mx.sl");
+        e.begin_stage("s");
+        linear_mxfp4_w4a8_nax_swiglu_fwht64_a8(
+            e, *twg, *twu, qai_r, sai_r, Ref{&qao_sl, 0, qao_sl.size()},
+            Ref{&sao_sl, 0, sao_sl.size()}, Ref{&rao_sl, 0, rao_sl.size()},
+            Ref{&y_sl, 0, y_sl.size()}, true, {}, 128u, kN, 128u);
+        auto p = e.finish(true);
+        submit_profile(ctx, p, kLiveM, true);
+      }
+      verify_slice("mxfp4_256t");
+      ++checks;
+    }
+
+    // Affine 128t_bm32 Mode B row_offset=128 across q4/q56/q3/q8/q4_q56/q56_q4
+    for (const auto &[gb, ub, gs] : std::array<std::tuple<U32, U32, U32>, 6>{{
+             {4u, 4u, 64u}, {5u, 6u, 64u}, {3u, 3u, 64u},
+             {8u, 8u, 128u}, {4u, 5u, 64u}, {6u, 4u, 128u}}}) {
+      auto wg = make_affine_weight(ctx, wid++, kN, kK, gb, gs, 1220u + gb * 7u, true, 16u, false, true);
+      auto wu = make_affine_weight(ctx, wid++, kN, kK, ub, gs, 1230u + ub * 7u, true, 16u, false, true);
+      AffineNaxCache ac;
+      ac.register_weight(wg.view, zero_ref);
+      ac.register_weight(wu.view, zero_ref);
+      ac.build(ctx, libs, zero_ref);
+      const auto *twg = ac.find(wg.view.object_id);
+      const auto *twu = ac.find(wu.view.object_id);
+      {
+        Encoder e(ctx, libs, kCapM, "p31.8b.aff.full");
+        e.begin_stage("f");
+        linear_affine_w4a8_nax_swiglu_fwht64_a8(
+            e, *twg, *twu, qai_r, sai_r, rai_r,
+            Ref{&qao_full, 0, qao_full.size()}, Ref{&sao_full, 0, sao_full.size()},
+            Ref{&rao_full, 0, rao_full.size()}, Ref{&y_full, 0, y_full.size()}, true);
+        auto p = e.finish(true);
+        submit_profile(ctx, p, kLiveM, true);
+      }
+      {
+        qao_sl.write(std::vector<std::byte>(qao_sl.size(), std::byte{0x5A}));
+        sao_sl.write(std::vector<std::byte>(sao_sl.size(), std::byte{0x5A}));
+        rao_sl.write(std::vector<std::byte>(rao_sl.size(), std::byte{0x5A}));
+        fill_sentinel_bf16(y_sl, U64(kCapM) * kN);
+        Encoder e(ctx, libs, kCapM, "p31.8b.aff.sl");
+        e.begin_stage("s");
+        linear_affine_w4a8_nax_swiglu_fwht64_a8(
+            e, *twg, *twu, qai_r, sai_r, rai_r,
+            Ref{&qao_sl, 0, qao_sl.size()}, Ref{&sao_sl, 0, sao_sl.size()},
+            Ref{&rao_sl, 0, rao_sl.size()}, Ref{&y_sl, 0, y_sl.size()},
+            true, {}, 128u, kN, 128u);
+        auto p = e.finish(true);
+        submit_profile(ctx, p, kLiveM, true);
+      }
+      verify_slice("affine_q" + std::to_string(gb) + "_q" + std::to_string(ub));
+      ++checks;
+    }
+  }
+
+  // 8c. omlx_m5_w4a8_split4_cols (4-aligned bfloat4 fast path + unaligned scalar fallback)
+  {
+    constexpr U32 kCapM = 65u;
+    for (const auto &dims : std::array<std::array<U32, 4>, 2>{{
+             {64u, 48u, 16u, 16u}, {35u, 29u, 11u, 7u}}}) {
+      const U32 n0 = dims[0], n1 = dims[1], n2 = dims[2], n3 = dims[3];
+      const U32 stride = n0 + n1 + n2 + n3;
+      std::vector<std::uint16_t> src_u16(U64(kCapM) * stride);
+      for (U64 i = 0; i < src_u16.size(); ++i) {
+        src_u16[i] = std::uint16_t(0x3C00u + (i * 17u) % 512u);
+      }
+      auto src_b = ctx.upload(std::as_bytes(std::span(src_u16)));
+      auto d0_b = ctx.make_buffer(U64(kCapM) * n0 * 2ULL);
+      auto d1_b = ctx.make_buffer(U64(kCapM) * n1 * 2ULL);
+      auto d2_b = ctx.make_buffer(U64(kCapM) * n2 * 2ULL);
+      auto d3_b = ctx.make_buffer(U64(kCapM) * n3 * 2ULL);
+
+      Encoder e(ctx, libs, kCapM, "p31.8c.split4");
+      e.begin_stage("split4");
+      auto &d = e.emit("w4a8_nax", "omlx_m5_w4a8_split4_cols",
+                       {.width = (U64(stride) + 3ULL) / 4ULL, .height = kCapM},
+                       {.width = 128u},
+                       {Ref{&src_b, 0, src_b.size()}, Ref{&d0_b, 0, d0_b.size()},
+                        Ref{&d1_b, 0, d1_b.size()}, Ref{&d2_b, 0, d2_b.size()},
+                        Ref{&d3_b, 0, d3_b.size()}});
+      e.dynamic(d, 5, words({kCapM, n0, n1, n2, n3}), 0u);
+      auto p = e.finish(true);
+
+      for (U32 live : {1u, 17u, 65u}) {
+        fill_sentinel_bf16(d0_b, U64(kCapM) * n0);
+        fill_sentinel_bf16(d1_b, U64(kCapM) * n1);
+        fill_sentinel_bf16(d2_b, U64(kCapM) * n2);
+        fill_sentinel_bf16(d3_b, U64(kCapM) * n3);
+        submit_profile(ctx, p, live, true);
+        const auto g0 = read_u16(d0_b, U64(live) * n0);
+        const auto g1 = read_u16(d1_b, U64(live) * n1);
+        const auto g2 = read_u16(d2_b, U64(live) * n2);
+        const auto g3 = read_u16(d3_b, U64(live) * n3);
+        for (U32 r = 0; r < live; ++r) {
+          const U64 row_off = U64(r) * stride;
+          for (U32 c = 0; c < n0; ++c)
+            require(g0[U64(r) * n0 + c] == src_u16[row_off + c], "split4 d0 mismatch");
+          for (U32 c = 0; c < n1; ++c)
+            require(g1[U64(r) * n1 + c] == src_u16[row_off + n0 + c], "split4 d1 mismatch");
+          for (U32 c = 0; c < n2; ++c)
+            require(g2[U64(r) * n2 + c] == src_u16[row_off + n0 + n1 + c], "split4 d2 mismatch");
+          for (U32 c = 0; c < n3; ++c)
+            require(g3[U64(r) * n3 + c] == src_u16[row_off + n0 + n1 + n2 + c], "split4 d3 mismatch");
+        }
+        check_tail_sentinel(d0_b, U64(live) * n0, U64(kCapM) * n0, "split4 d0 tail");
+        check_tail_sentinel(d3_b, U64(live) * n3, U64(kCapM) * n3, "split4 d3 tail");
+        ++checks;
+      }
+    }
+  }
+
+  // 8d. Encoder::mark_sublayer (zero cache invalidation) & MetalContext::replay_icb_range
+  {
+    constexpr U32 kM = 16u;
+    constexpr U32 kK = 128u;
+    std::vector<std::uint16_t> x_u16;
+    (void)make_activations(kM, kK, 1301u, x_u16);
+    auto x_buf = ctx.upload(std::as_bytes(std::span(x_u16)));
+    const auto lay = w4a8_nax_workspace_layout(kM, kK);
+    auto qa_b = ctx.make_buffer(lay.qa_bytes);
+    auto sa_b = ctx.make_buffer(lay.sa_bytes);
+    auto ra_b = ctx.make_buffer(lay.ra_bytes);
+    auto d0_b = ctx.make_buffer(U64(kM) * 32u * 2ULL);
+    auto d1_b = ctx.make_buffer(U64(kM) * 32u * 2ULL);
+    auto d2_b = ctx.make_buffer(U64(kM) * 32u * 2ULL);
+    auto d3_b = ctx.make_buffer(U64(kM) * 32u * 2ULL);
+
+    Encoder e(ctx, libs, kM, "p31.8d.sublayer");
+    e.begin_stage("all");
+    e.mark_sublayer("quant_span", 0u);
+    emit_quantize_a8_g64(e, Ref{&x_buf, 0, x_buf.size()}, Ref{&qa_b, 0, qa_b.size()},
+                         Ref{&sa_b, 0, sa_b.size()}, Ref{&ra_b, 0, ra_b.size()}, kK, kM);
+    Encoder::A8QuantKey k_a8{.input_buffer = &x_buf, .qa_buffer = &qa_b,
+                             .sa_buffer = &sa_b, .ra_buffer = &ra_b,
+                             .k = kK, .rows = kM, .mp = lay.mp};
+    e.set_a8_quant(k_a8);
+    e.mark_sublayer("split_span", 0u);
+    require(e.has_a8_quant(k_a8),
+            "p31 8d mark_sublayer MUST NOT invalidate cached_a8_quant!");
+    auto &sd = e.emit("w4a8_nax", "omlx_m5_w4a8_split4_cols",
+                      {.width = kK / 4u, .height = kM}, {.width = 128u},
+                      {Ref{&x_buf, 0, x_buf.size()}, Ref{&d0_b, 0, d0_b.size()},
+                       Ref{&d1_b, 0, d1_b.size()}, Ref{&d2_b, 0, d2_b.size()},
+                       Ref{&d3_b, 0, d3_b.size()}});
+    e.dynamic(sd, 5, words({kM, 32u, 32u, 32u, 32u}));
+    auto prof = e.finish(true);
+    require(prof.icb.has_value(), "p31 8d expected recorded ICB");
+    require(prof.sublayers.size() == 2u, "p31 8d expected 2 sublayer spans");
+    require(prof.sublayers[0].location == 0u && prof.sublayers[0].length == 1u &&
+                prof.sublayers[1].location == 1u && prof.sublayers[1].length == 1u,
+            "p31 8d unexpected sublayer span locations/lengths");
+
+    prof.parameters.write("step", prof.parameter_data);
+    (void)ctx.replay_icb(*prof.icb);
+    const auto whole_qa = read_i8(qa_b, lay.qa_bytes);
+    const auto whole_d3 = read_u16(d3_b, U64(kM) * 32u);
+
+    qa_b.write(std::vector<std::byte>(qa_b.size(), std::byte{0x77}));
+    fill_sentinel_bf16(d3_b, U64(kM) * 32u);
+    for (const auto &sp : prof.sublayers) {
+      const auto sub = ctx.replay_icb_range(*prof.icb, sp.location, sp.length);
+      require(sub.dispatch_count == sp.length, "p31 8d replay_icb_range dispatch count mismatch");
+      require(std::isfinite(sub.timing.gpu_ms) && sub.timing.gpu_ms >= 0.0,
+              "p31 8d replay_icb_range invalid gpu_ms");
+    }
+    require(read_i8(qa_b, lay.qa_bytes) == whole_qa &&
+                read_u16(d3_b, U64(kM) * 32u) == whole_d3,
+            "p31 8d replay_icb_range output != whole replay_icb");
+
+    bool threw_oob = false;
+    try {
+      (void)ctx.replay_icb_range(*prof.icb, 2u, 1u);
+    } catch (const std::out_of_range &) {
+      threw_oob = true;
+    }
+    require(threw_oob, "p31 8d replay_icb_range did not reject out-of-bounds range");
+    ++checks;
+  }
+
+  return {{"checks", checks}, {"passed", true}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -3435,6 +3934,8 @@ int main(int argc, char **argv) {
         test_miv2_fwht64_and_all_runtime_consumers(ctx, libs);
     report["wp3b_oq4e_dual_channel_and_int4b_exact"] =
         test_wp3b_oq4e_dual_channel_and_int4b_exact(ctx, libs);
+    report["p31_nax_kernels_and_profiler"] =
+        test_p31_nax_kernels_and_profiler(ctx, libs);
     report["all_passed"] = true;
     std::cout << report.dump(2) << "\n";
     return 0;
