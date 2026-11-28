@@ -1389,6 +1389,8 @@ void test_multi_microkernel_parallel_e2e(
   cfg_a.max_context = 4096;
 
   ModelServeConfig cfg_b;
+  cfg_b.prefill_ane_mode = omlx::m5::PrefillAneMode::CompactInt8;
+  cfg_b.prefill_ane_mode_explicit = true;
   cfg_b.id = "llama-sidecar";
   cfg_b.model_dir = model_b_dir.string();
   cfg_b.provider = "auto";
@@ -1541,6 +1543,34 @@ void test_multi_microkernel_parallel_e2e(
             "multi /health backend_mode mismatch");
     }
 
+    // The requested load setting comes from the host. An older SPI provider
+    // may not implement any, or all, of the per-model runtime fields.
+    const auto sidecar_model_from = [&](const char *path) {
+      const auto response = client.Get(path);
+      check(response && response->status == 200, std::string("GET failed: ") + path);
+      auto doc = Json::parse(response->body);
+      if (doc.contains("data")) return Json(doc.at("data").at(1));
+      if (doc.contains("models")) return Json(doc.at("models").at(1));
+      return doc;
+    };
+    const auto extra_stats = model_b_dir / ".mock_optional_stats.json";
+    for (const Json &report : {Json::object(), Json{{"prefill_ane_active", false}},
+                              Json{{"prefill_ane_active", true}, {"prefill_ane_mode_effective", "compact_int8"},
+                                   {"prefill_ane_inactive_reason", ""}},
+                              Json{{"prefill_ane_active", false}, {"prefill_ane_mode_effective", "off"},
+                                   {"prefill_ane_inactive_reason", "moe_unsupported"}}}) {
+      std::ofstream(extra_stats) << report;
+      for (const auto *path : {"/v1/models", "/v1/models/llama-sidecar", "/health"}) {
+        const auto model = sidecar_model_from(path);
+        check(model.at("prefill_ane_mode") == "compact_int8", "lost configured sidecar ANE mode");
+        for (const auto *key : {"prefill_ane_active", "prefill_ane_mode_effective", "prefill_ane_inactive_reason"}) {
+          check(model.contains(key) == report.contains(key) &&
+                    (!report.contains(key) || model.at(key) == report.at(key)),
+                std::string(path) + " misrepresented optional provider statistic " + key);
+        }
+      }
+    }
+    std::filesystem::remove(extra_stats);
     // 4c) Unknown model -> 404, missing model in multi-model mode -> 400
     {
       auto r404 = client.Post(

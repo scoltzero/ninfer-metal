@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
     if (config.describe_models) {
       nlohmann::json list = nlohmann::json::array();
       for (const auto &m : model_configs) {
+        const auto ane_mode = omlx::m5::serve::configured_prefill_ane_mode(m);
         nlohmann::json engine = {
             {"max_context", m.max_context}, {"max_concurrency", m.max_concurrency},
             {"kv_dtype", m.kv_dtype}, {"draft_tokens", m.draft_tokens},
@@ -55,7 +56,8 @@ int main(int argc, char **argv) {
             {"prefill_linear_mode", omlx::m5::prefill_linear_mode_to_string(m.prefill_linear_mode)},
             {"prefill_attention_mode", omlx::m5::prefill_attention_mode_to_string(m.prefill_attention_mode)},
             {"prefill_sparse_minference", m.prefill_sparse_minference}, {"prefill_cache_blend", m.prefill_cache_blend},
-            {"prefill_ane_offload", m.prefill_ane_offload},
+            {"prefill_ane_mode", omlx::m5::prefill_ane_mode_to_string(ane_mode)},
+            {"prefill_ane_offload", ane_mode != omlx::m5::PrefillAneMode::Off},
         };
         if (m.rolling_prefix_cache) engine["rolling_prefix_cache"] = *m.rolling_prefix_cache;
         if (m.prefix_cache_gb) engine["prefix_cache_gb"] = *m.prefix_cache_gb;

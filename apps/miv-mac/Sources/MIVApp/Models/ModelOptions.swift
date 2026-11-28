@@ -1,5 +1,38 @@
 import Foundation
 
+enum MIVANEMode: String, CaseIterable {
+    case off, auto
+    case compactInt8 = "compact_int8"
+    case ultraFP16SwiGLU = "ultra_fp16_swiglu"
+
+    static let key = "prefill_ane_mode"
+    static let legacyKey = "prefill_ane_offload"
+
+    var label: String {
+        switch self {
+        case .off: "关闭（仅 GPU）"
+        case .auto: "自动选择"
+        case .compactInt8: "紧凑 INT8"
+        case .ultraFP16SwiGLU: "Ultra FP16 SwiGLU"
+        }
+    }
+
+    // An explicit mode takes precedence, including an empty selection for inheritance.
+    static func selection(in engine: [String: String]) -> String? {
+        if let mode = engine[key] { return mode.isEmpty ? nil : mode }
+        guard let old = engine[legacyKey], !old.isEmpty else { return nil }
+        switch old {
+        case "true", "on": return MIVANEMode.auto.rawValue
+        case "false", "off": return MIVANEMode.off.rawValue
+        default: return old
+        }
+    }
+
+    static func reported(_ raw: String) -> String? {
+        raw.isEmpty ? nil : (MIVANEMode(rawValue: raw)?.label ?? raw)
+    }
+}
+
 struct ModelField: Identifiable {
     enum Kind {
         case integer(ClosedRange<Int>), number, choice([(String, String)]), text, file, directory
@@ -53,7 +86,7 @@ struct ModelField: Identifiable {
         ModelField("prefill_attention_mode","预填充注意力","精确 NAX 使用原计算；Sage2 使用低位宽 QK 和 FP16 PV。",.choice([("exact_nax","精确 NAX"),("sage2","Sage2 低位注意力")])),
         ModelField("prefill_sparse_minference","MInference 稀疏注意力","配合 Sage2 跳过低权重的 KV 块，可改变输出。",switchValues),
         ModelField("prefill_cache_blend","CacheBlend 分段复用","尝试复用提示中分散匹配的 KV 和 GDN 状态。",switchValues),
-        ModelField("prefill_ane_offload","双 ANE 协同计算","对支持的稠密模型分配部分预填充计算给神经网络引擎。",switchValues),
+        ModelField(MIVANEMode.key, "ANE 协同模式", "自动模式按模型和硬件选择。也可指定紧凑 INT8 或 Ultra FP16 SwiGLU；重新加载模型后生效。", .choice(MIVANEMode.allCases.map { ($0.rawValue, $0.label) })),
         ModelField("batch_mode","批处理","允许核心将兼容的并发请求组合到同一批次。",.choice([("on","开启"),("off","关闭")])),
         ModelField("sampling_contract","推测采样契约","位置耦合在 GPU 上校验；旧版拒绝采样用于对照调试。",.choice([("position_coupled_v1","位置耦合 v1"),("legacy_rejection_v1","旧版拒绝采样 v1")]))
     ]

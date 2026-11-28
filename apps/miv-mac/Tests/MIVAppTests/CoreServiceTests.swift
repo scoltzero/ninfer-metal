@@ -27,11 +27,13 @@ private final class CoreResponseFixture: URLProtocol {
         case "/health":
             status = modern ? 200 : 503
             body = modern
-                ? #"{"status":"ok","version":"test","backend":"metal","models":[{"id":"test","max_context":2048,"max_concurrency":4,"kv_dtype":"affine4_g128","spec_backend":"mtp","resident_memory_bytes":64}]}"#
+                ? #"{"status":"ok","version":"test","backend":"metal","models":[{"id":"test","max_context":2048,"max_concurrency":4,"kv_dtype":"affine4_g128","spec_backend":"mtp","resident_memory_bytes":64,"prefill_ane_mode":"auto","prefill_ane_mode_effective":"off","prefill_ane_active":false,"prefill_ane_inactive_reason":"calibration_bypassed"}]}"#
                 : #"{"status":"shutting_down","version":"old","model":"test"}"#
         case "/v1/models":
             if key == "Bearer sample" {
-                body = #"{"data":[{"id":"test","max_model_len":2048,"provider_id":"io.ninfer.metal","backend_mode":"inproc","spec_backend":"mtp"}]}"#
+                body = modern
+                    ? #"{"data":[{"id":"test","max_model_len":2048,"provider_id":"io.ninfer.metal","backend_mode":"inproc","spec_backend":"mtp","prefill_ane_mode":"auto","prefill_ane_mode_effective":"compact_int8","prefill_ane_active":true}]}"#
+                    : #"{"data":[{"id":"test","max_model_len":2048,"backend_mode":"inproc","prefill_ane_offload":true}]}"#
             } else { status = 401 }
         default: status = 404
         }
@@ -65,8 +67,24 @@ final class CoreServiceTests: XCTestCase {
         XCTAssertEqual(model?.maxModelLen, 2048)
         XCTAssertEqual(model?.specBackend, "mtp")
         XCTAssertEqual(model?.providerId, "io.ninfer.metal")
+        XCTAssertEqual(model?.prefillAneMode, "auto")
+        XCTAssertEqual(model?.prefillAneModeEffective, "compact_int8")
+        XCTAssertEqual(model?.prefillAneActive, true)
+        XCTAssertNil(model?.prefillAneInactiveReason)
+        XCTAssertEqual(health.models?.first?.prefillAneModeEffective, "off")
+        XCTAssertEqual(health.models?.first?.prefillAneActive, false)
+        XCTAssertEqual(health.models?.first?.prefillAneInactiveReason, "calibration_bypassed")
         XCTAssertEqual(stats, ["ninfer_metal_generated_tokens_total": 42])
         XCTAssertTrue(hasDashboard)
+    }
+
+    func testLegacyOffloadFlagDoesNotImplyANERuntimeTelemetry() async throws {
+        let models = try await client(host: "older.test", key: "sample").models()
+        let model = try XCTUnwrap(models.first)
+        XCTAssertNil(model.prefillAneMode)
+        XCTAssertNil(model.prefillAneModeEffective)
+        XCTAssertNil(model.prefillAneActive)
+        XCTAssertNil(model.prefillAneInactiveReason)
     }
 
     func testOlderCoreAndRejectedKeyRemainDistinctFromHealth() async throws {

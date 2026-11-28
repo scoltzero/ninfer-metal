@@ -14,9 +14,17 @@ struct MIVLibraryModel: Codable, Equatable, Identifiable {
     var apiID: String { sourceID ?? URL(fileURLWithPath: directory).lastPathComponent }
     var title: String { displayName.isEmpty ? apiID : displayName }
 
+    var migratingLegacyANE: Self {
+        guard engine[MIVANEMode.legacyKey] != nil || engine[MIVANEMode.key]?.isEmpty == true else { return self }
+        var model = self
+        model.engine[MIVANEMode.key] = MIVANEMode.selection(in: engine)
+        model.engine.removeValue(forKey: MIVANEMode.legacyKey)
+        return model
+    }
+
     func overlay() throws -> [String: Any] {
         var record: [String: Any] = ["directory": directory,
-                                      "engine": try ModelField.typed(engine, fields: ModelField.engine),
+                                      "engine": try ModelField.typed(migratingLegacyANE.engine, fields: ModelField.engine),
                                       "generation": try ModelField.typed(generation, fields: ModelField.generation)]
         if let sourceID { record["source_id"] = sourceID }
         if let enabled { record["enabled"] = enabled }
@@ -105,7 +113,8 @@ extension CoreService {
         globalGeneration = cleaned
     }
 
-    func saveModel(_ model: MIVLibraryModel) throws {
+    func saveModel(_ edited: MIVLibraryModel) throws {
+        let model = edited.migratingLegacyANE
         _ = try model.overlay()
         var records = modelLibrary.filter {
             $0.id != model.id && !(model.sourceID != nil && $0.sourceID == nil && $0.directory == model.directory)

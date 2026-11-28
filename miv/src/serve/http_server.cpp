@@ -497,9 +497,20 @@ struct ServeHttpServer::Impl {
     register_routes();
   }
 
+  static void add_ane_request(Json &object, const ModelInstance &model) {
+    if (model.configured_ane_mode)
+      object["prefill_ane_mode"] = prefill_ane_mode_to_string(*model.configured_ane_mode);
+  }
+
   // These optional fields describe the active engine, including the result
   // of automatic speculative backend selection. Older SPI providers may omit them.
   static void add_runtime_settings(Json &model, const StatsReport &stats) {
+    if (stats.prefill_ane_effective_reported)
+      model["prefill_ane_mode_effective"] = stats.prefill_ane_mode_effective;
+    if (stats.prefill_ane_active_reported)
+      model["prefill_ane_active"] = stats.prefill_ane_active;
+    if (stats.prefill_ane_reason_reported)
+      model["prefill_ane_inactive_reason"] = stats.prefill_ane_inactive_reason;
     if (!stats.kv_dtype.empty()) {
       model["kv_dtype"] = stats.kv_dtype;
     }
@@ -529,6 +540,7 @@ struct ServeHttpServer::Impl {
         {"provider_id", m.provider_id},
         {"backend_mode", m.backend_mode},
     };
+    add_ane_request(result, m);
     if (m.router != nullptr && m.router->is_running()) {
       try {
         const auto st = m.router->stats();
@@ -791,6 +803,7 @@ struct ServeHttpServer::Impl {
             {"provider_id", m->provider_id},
             {"backend_mode", m->backend_mode},
         });
+        add_ane_request(models_json.back(), *m);
       }
       write_json_response(
           res, 503,
@@ -887,6 +900,7 @@ struct ServeHttpServer::Impl {
             {"lora_adapted_layers", 0U},
         });
       }
+      add_ane_request(models_json.back(), *m);
     }
     const int http_status = unhealthy_count == 0 ? 200 : 503;
     const char *health_status =
@@ -2002,6 +2016,7 @@ ServeHttpServer::ServeHttpServer(ServeConfig config,
   inst.max_concurrency = config.max_concurrency;
   inst.lora_adapter = config.lora_adapter;
   inst.lora_mode = config.lora_mode;
+  inst.configured_ane_mode = effective_load_prefill_ane_mode(to_load_options(config));
   host->add_model(std::move(inst));
   impl_ = std::make_unique<Impl>(std::move(config), std::move(host));
 }

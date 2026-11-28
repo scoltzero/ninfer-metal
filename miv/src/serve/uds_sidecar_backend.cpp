@@ -1227,11 +1227,18 @@ StatsReport UdsSidecarBackend::stats() const {
   st.prefill_ane_mode = res.value(
       "prefill_ane_mode",
       st.prefill_ane_offload ? std::string("auto") : std::string("off"));
-  st.prefill_ane_mode_effective =
-      res.value("prefill_ane_mode_effective", std::string("off"));
-  st.prefill_ane_inactive_reason =
-      res.value("prefill_ane_inactive_reason", std::string{});
-  st.prefill_ane_active = res.value("prefill_ane_active", false);
+  if (const auto it = res.find("prefill_ane_mode_effective"); it != res.end() && it->is_string()) {
+    st.prefill_ane_mode_effective = it->get<std::string>();
+    st.prefill_ane_effective_reported = !st.prefill_ane_mode_effective.empty();
+  }
+  if (const auto it = res.find("prefill_ane_inactive_reason"); it != res.end() && it->is_string()) {
+    st.prefill_ane_inactive_reason = it->get<std::string>();
+    st.prefill_ane_reason_reported = true;
+  }
+  if (const auto it = res.find("prefill_ane_active"); it != res.end() && it->is_boolean()) {
+    st.prefill_ane_active = it->get<bool>();
+    st.prefill_ane_active_reported = true;
+  }
   st.prefill_ane_split_alpha = res.value("prefill_ane_split_alpha", 0.0);
   st.prefill_w4a8_tokens = read_u64_field(res, "prefill_w4a8_tokens");
   st.prefill_w4a4_tokens = read_u64_field(res, "prefill_w4a4_tokens");

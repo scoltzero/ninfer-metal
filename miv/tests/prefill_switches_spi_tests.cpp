@@ -465,6 +465,55 @@ void test_serve_config_toml_env_cli_and_legacy_shim() {
           "explicit --prefill-ane-mode must override legacy prefill_ane_offload");
   }
 
+  // Compare the App's configuration description with the options consumed
+  // by the engine at every layer. Edits to A must leave B on its own settings.
+  const auto profiles = tmp_dir / "ane-profiles.toml";
+  std::ofstream(profiles) << R"(
+[engine]
+prefill_ane_mode = "compact_int8"
+prefill_ane_offload = false
+[sidecar.models.a]
+prefill_ane_offload = true
+[[models]]
+id = "a"
+model_dir = "/models/a"
+[[models]]
+id = "b"
+model_dir = "/models/b"
+)";
+  const auto overlay = tmp_dir / "model-options.json";
+  auto check_modes = [&](std::vector<std::string> overrides, PrefillAneMode a, PrefillAneMode b) {
+    std::vector<std::string> args{"ninfer-metal-serve", "--config", profiles.string()};
+    args.insert(args.end(), overrides.begin(), overrides.end());
+    const auto models = resolve_model_configs(parse_args(std::move(args)));
+    check(models.size() == 2, "expected two independent model configs");
+    for (std::size_t index = 0; index < models.size(); ++index) {
+      const auto expected = index == 0 ? a : b;
+      const auto &m = models[index];
+      const auto opts = to_load_options(m);
+      check(configured_prefill_ane_mode(m) == expected && opts.prefill_ane_mode == expected &&
+                opts.prefill_ane_offload == (expected != PrefillAneMode::Off),
+            "configured/loaded ANE modes diverged for " + m.id);
+    }
+  };
+  {
+    check_modes({}, PrefillAneMode::Auto, PrefillAneMode::CompactInt8);
+    for (const auto value : {PrefillAneMode::Off, PrefillAneMode::Auto, PrefillAneMode::CompactInt8,
+                             PrefillAneMode::UltraFp16SwiGlu}) {
+      Json engine{{"prefill_ane_mode", prefill_ane_mode_to_string(value)},
+                  {"prefill_ane_offload", value == PrefillAneMode::Off}};
+      std::ofstream(overlay) << Json{{"models", {{{"directory", "/models/a"}, {"engine", engine}}}}};
+      check_modes({"--prefill-ane-mode", "compact_int8", "--no-prefill-ane-offload",
+                   "--model-overrides", overlay.string()}, value, PrefillAneMode::CompactInt8);
+    }
+    for (bool legacy : {true, false}) {
+      std::ofstream(overlay) << Json{{"models", {{{"directory", "/models/a"},
+                                                 {"engine", {{"prefill_ane_offload", legacy}}}}}}};
+      check_modes({"--model-overrides", overlay.string()}, legacy ? PrefillAneMode::Auto : PrefillAneMode::Off,
+                  PrefillAneMode::CompactInt8);
+    }
+  }
+
   std::error_code ec;
   std::filesystem::remove_all(tmp_dir, ec);
   std::cout << "[spi] PASS: TOML, NINFER_PREFILL_* env, CLI & legacy shim\n";

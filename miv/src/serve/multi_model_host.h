@@ -31,6 +31,7 @@ struct ModelInstance {
   std::uint64_t allocated_budget_bytes = 0;
   std::string lora_adapter;
   std::string lora_mode = "merge";
+  std::optional<PrefillAneMode> configured_ane_mode;
 };
 
 // Queries total physical RAM via sysctl hw.memsize on Apple Silicon.

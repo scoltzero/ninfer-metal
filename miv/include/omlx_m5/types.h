@@ -428,6 +428,12 @@ struct StatsReport {
   std::uint64_t prefill_cache_blend_recomputed_tokens = 0;
   std::uint64_t prefill_ane_offload_tokens = 0;
   std::uint64_t prefill_ane_fallback_tokens = 0;
+
+  // Old SPI providers may report activity without reporting an effective mode.
+  // Keep field presence independent of the default values used by existing callers.
+  bool prefill_ane_effective_reported = false;
+  bool prefill_ane_active_reported = false;
+  bool prefill_ane_reason_reported = false;
 };
 
 using RuntimeStats = StatsReport;

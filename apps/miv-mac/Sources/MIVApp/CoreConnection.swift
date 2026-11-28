@@ -87,6 +87,8 @@ struct CoreModel: Decodable, Identifiable {
     let maxModelLen, maxContext, maxConcurrency, activeRequests, residentMemoryBytes: Int?
     let status, backend: String?
     let providerId, backendMode, loraAdapter, loraMode, kvDtype, specBackend: String?
+    let prefillAneMode, prefillAneModeEffective, prefillAneInactiveReason: String?
+    let prefillAneActive: Bool?
 }
 
 struct CoreFailure: LocalizedError {

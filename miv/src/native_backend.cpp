@@ -5784,6 +5784,9 @@ void NativeBackend::populate_stats(StatsReport &stats) const {
   stats.prefill_sparse_minference_inactive_reason =
       backend_stats_.prefill_sparse_minference_inactive_reason;
   stats.prefill_cache_blend = backend_stats_.prefill_cache_blend;
+  stats.prefill_ane_effective_reported = true;
+  stats.prefill_ane_active_reported = true;
+  stats.prefill_ane_reason_reported = true;
   stats.prefill_ane_mode = backend_stats_.prefill_ane_mode;
   stats.prefill_ane_mode_effective = backend_stats_.prefill_ane_mode_effective;
   stats.prefill_ane_inactive_reason =

@@ -26,6 +26,39 @@ final class ModelLibraryTests: XCTestCase {
         XCTAssertEqual(record["engine"] as? [String:Int], ["max_context":8192])
     }
 
+    @MainActor func testLegacyANESettingsMigrateAndCanReturnToInheritance() throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = MIVANEMode.key
+        let oldKey = MIVANEMode.legacyKey
+        for (old, expected) in [("false", "off"), ("true", "auto")] {
+            var oldModel = MIVLibraryModel(directory: "/models/dense")
+            oldModel.engine = [oldKey: old, "prefill_attention_mode": "sage2"]
+            defaults.set(try JSONEncoder().encode([oldModel]), forKey: "modelLibrary")
+            let service = CoreService(defaults: defaults)
+            var edited = try XCTUnwrap(service.modelLibrary.first)
+            XCTAssertEqual(edited.engine[key], expected)
+            XCTAssertNil(edited.engine[oldKey])
+            for mode in MIVANEMode.allCases {
+                edited.engine[key] = mode.rawValue
+                try service.saveModel(edited)
+                let restored = try XCTUnwrap(CoreService(defaults: defaults).modelLibrary.first)
+                let overlay = try XCTUnwrap(try restored.overlay()["engine"] as? [String: Any])
+                XCTAssertEqual(overlay[key] as? String, mode.rawValue)
+                XCTAssertNil(overlay[oldKey])
+            }
+            edited.engine[key] = ""
+            try service.saveModel(edited)
+            let restored = try XCTUnwrap(CoreService(defaults: defaults).modelLibrary.first)
+            XCTAssertEqual(restored.engine, ["prefill_attention_mode": "sage2"])
+            XCTAssertEqual(try restored.overlay()["engine"] as? [String: String], ["prefill_attention_mode": "sage2"])
+        }
+        XCTAssertEqual(MIVANEMode.selection(in: [key: "compact_int8", oldKey: "false"]), "compact_int8")
+        XCTAssertNil(MIVANEMode.selection(in: [key: "", oldKey: "true"]))
+        XCTAssertEqual(MIVANEMode.allCases.map(\.rawValue), ["off", "auto", "compact_int8", "ultra_fp16_swiglu"])
+    }
+
     func testModelOptionsRejectInvalidNumbersAndPreserveInheritedFields() throws {
         XCTAssertThrowsError(try ModelField.typed(["temperature":"nan"], fields: ModelField.generation))
         XCTAssertThrowsError(try ModelField.typed(["top_p":"0"], fields: ModelField.generation))

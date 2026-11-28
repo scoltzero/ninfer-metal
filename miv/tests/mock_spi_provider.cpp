@@ -453,7 +453,7 @@ public:
 
 private:
   Json stats_locked() const {
-    return {
+    Json stats = {
         {"pid", static_cast<std::int64_t>(::getpid())},
         {"phys_footprint_bytes", current_phys_footprint()},
         {"submitted", submitted_},
@@ -467,6 +467,10 @@ private:
         {"contended_prefill_chunks", contended_hint_trues_},
         {"memory_budget_bytes", memory_budget_bytes_},
     };
+    // A test can model a provider that implements only some optional stats.
+    std::ifstream extra(std::filesystem::path(model_dir_) / ".mock_optional_stats.json");
+    if (extra) stats.update(Json::parse(extra));
+    return stats;
   }
 
   void write_audit_locked() const {

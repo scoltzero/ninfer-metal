@@ -221,6 +221,9 @@ std::vector<ModelServeConfig> resolve_model_configs(const ServeConfig &config);
 // Resolves total server-wide UMA memory budget cap in bytes (0 = auto).
 std::uint64_t resolve_total_memory_budget_bytes(const ServeConfig &config);
 
+// Canonical ANE request for both the load plan and the App's model description.
+PrefillAneMode configured_prefill_ane_mode(const ModelServeConfig &model) noexcept;
+
 // Converts ModelServeConfig or ServeConfig into omlx::m5::LoadOptions.
 LoadOptions to_load_options(const ModelServeConfig &model_cfg);
 LoadOptions to_load_options(const ServeConfig &config);

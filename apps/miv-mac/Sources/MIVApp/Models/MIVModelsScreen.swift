@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 struct MIVModelsScreen: View {
     @ObservedObject var service: CoreService
     @State private var selected: MIVLibraryModel?
-    @State private var inspected: CoreModel?
+    @State private var inspectedID: String?
     @State private var search = ""
     @State private var notice: String?
     private var managed: Bool { service.settings.mode == .managed }
@@ -15,15 +15,20 @@ struct MIVModelsScreen: View {
             if let model = selected, managed {
                 MIVModelSettings(service: service, initial: model) { selected = nil }
                     .id(model.id)
-            } else if let model = inspected {
-                Button("‹  模型") { inspected = nil }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24)
-                SectionHeader(model.id)
-                ListGroup {
-                    Row(label: "上下文窗口") { Text(model.maxModelLen.map(String.init) ?? "—") }
-                    Row(label: "并发槽位") { Text(model.maxConcurrency.map(String.init) ?? "—") }
-                    Row(label: "KV 缓存格式") { Text(model.kvDtype ?? "—") }
-                    Row(label: "推测解码后端") { Text(model.specBackend ?? "—") }
-                    Row(label: "运行后端", isLast: true) { Text(model.backendMode ?? "—") }
+            } else if let id = inspectedID {
+                Button("‹  模型") { inspectedID = nil }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24)
+                SectionHeader(id)
+                if let model = service.models.first(where: { $0.id == id }) {
+                    ListGroup {
+                        Row(label: "上下文窗口") { Text(model.maxModelLen.map(String.init) ?? "—") }
+                        Row(label: "并发槽位") { Text(model.maxConcurrency.map(String.init) ?? "—") }
+                        Row(label: "KV 缓存格式") { Text(model.kvDtype ?? "—") }
+                        Row(label: "推测解码后端") { Text(model.specBackend ?? "—") }
+                        Row(label: "运行后端", isLast: true) { Text(model.backendMode ?? "—") }
+                    }
+                    PrefillRuntimeSection(model: model)
+                } else {
+                    FooterBar(hint: service.modelsError ?? "当前模型列表中没有此模型。")
                 }
             } else {
                 SectionHeader("已加载的模型") { Text("\(service.models.count)").foregroundStyle(.secondary) }
@@ -37,7 +42,7 @@ struct MIVModelsScreen: View {
                                 Button("卸载") { change(local, load: false) }
                                 Button("设置") { selected = local }
                             } else {
-                                Button("详情") { inspected = model }
+                                Button("详情") { inspectedID = model.id }
                             }
                         }
                     }
@@ -209,6 +214,7 @@ private struct MIVModelSettings: View {
                         }
                     }
                 }
+                if let running { PrefillRuntimeSection(model: running) }
                 fields(ModelField.miv, title: "MIV 核心参数")
             case .profiles:
                 SectionHeader("生成配置", subtitle: "配置按此模型单独保存。应用配置后请保存设置并重新加载。")
@@ -292,7 +298,9 @@ private struct MIVModelSettings: View {
     private func inherited(_ field: ModelField, generation: Bool) -> String {
         if generation { return service.globalGeneration[field.id].map { "继承 · " + $0 } ?? "继承" }
         guard let configured else { return "继承" }
-        if let raw = configured.engine?[field.id], !raw.isEmpty {
+        let inherited = configured.engine ?? [:]
+        let setting = field.id == MIVANEMode.key ? MIVANEMode.selection(in: inherited) : inherited[field.id]
+        if let raw = setting, !raw.isEmpty {
             if case .choice(let options) = field.kind, let localized = options.first(where: { $0.0 == raw })?.1 {
                 return "继承 · " + localized
             }

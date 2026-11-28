@@ -234,6 +234,7 @@ MultiModelHost::load_model(const ModelServeConfig &model_cfg,
   inst.allocated_budget_bytes = budget_bytes;
   inst.lora_adapter = load_options.lora_adapter;
   inst.lora_mode = load_options.lora_mode;
+  inst.configured_ane_mode = effective_load_prefill_ane_mode(load_options);
   return add_model(std::move(inst));
 }
 

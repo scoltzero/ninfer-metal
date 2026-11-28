@@ -2225,6 +2225,14 @@ std::uint64_t resolve_total_memory_budget_bytes(const ServeConfig &config) {
   return 0;
 }
 
+PrefillAneMode configured_prefill_ane_mode(const ModelServeConfig &m) noexcept {
+  if (m.prefill_ane_mode_explicit) return m.prefill_ane_mode;
+  if (m.prefill_ane_offload_explicit)
+    return m.prefill_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
+  return effective_requested_prefill_ane_mode(
+      m.prefill_ane_mode, m.prefill_ane_offload || m.prefill_engine == "nax_ane");
+}
+
 LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   ModelServeConfig resolved = model_cfg;
   expand_model_paths(resolved);
@@ -2241,26 +2249,8 @@ LoadOptions to_load_options(const ModelServeConfig &model_cfg) {
   opts.prefill_attention_mode = resolved.prefill_attention_mode;
   opts.prefill_sparse_minference = resolved.prefill_sparse_minference;
   opts.prefill_cache_blend = resolved.prefill_cache_blend;
-  if (resolved.prefill_ane_mode_explicit) {
-    opts.prefill_ane_mode = resolved.prefill_ane_mode;
-    opts.prefill_ane_offload = (opts.prefill_ane_mode != PrefillAneMode::Off);
-  } else if (resolved.prefill_ane_offload_explicit) {
-    opts.prefill_ane_offload = resolved.prefill_ane_offload;
-    opts.prefill_ane_mode =
-        resolved.prefill_ane_offload ? PrefillAneMode::Auto : PrefillAneMode::Off;
-  } else if (resolved.prefill_ane_mode != PrefillAneMode::Off) {
-    opts.prefill_ane_mode = resolved.prefill_ane_mode;
-    opts.prefill_ane_offload = true;
-  } else if (resolved.prefill_ane_offload) {
-    opts.prefill_ane_mode = PrefillAneMode::Auto;
-    opts.prefill_ane_offload = true;
-  } else if (resolved.prefill_engine == "nax_ane") {
-    opts.prefill_ane_mode = PrefillAneMode::Auto;
-    opts.prefill_ane_offload = true;
-  } else {
-    opts.prefill_ane_mode = PrefillAneMode::Off;
-    opts.prefill_ane_offload = false;
-  }
+  opts.prefill_ane_mode = configured_prefill_ane_mode(resolved);
+  opts.prefill_ane_offload = opts.prefill_ane_mode != PrefillAneMode::Off;
   opts.spec_search = resolved.spec_search;
   opts.sampling_contract = resolved.sampling_contract;
   opts.memory_budget_bytes = resolved.memory_budget_bytes;

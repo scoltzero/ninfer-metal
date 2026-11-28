@@ -18,7 +18,7 @@ prefill_linear_mode = "bf16"
 prefill_attention_mode = "exact_nax"
 prefill_sparse_minference = false
 prefill_cache_blend = false
-prefill_ane_offload = false
+prefill_ane_mode = "off" # off | auto | compact_int8 | ultra_fp16_swiglu
 lora_adapter = ""
 lora_mode = "merge"
 

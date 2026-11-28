@@ -51,7 +51,7 @@ final class CoreService: ObservableObject {
         self.explicitExecutable = executable
         self.globalGeneration = defaults.dictionary(forKey: "globalGeneration") as? [String:String] ?? [:]
         self.modelLibrary = defaults.data(forKey: "modelLibrary").flatMap {
-            try? JSONDecoder().decode([MIVLibraryModel].self, from: $0)
+            try? JSONDecoder().decode([MIVLibraryModel].self, from: $0).map(\.migratingLegacyANE)
         } ?? []
         settings = defaults.data(forKey: Self.defaultsKey)
             .flatMap { try? JSONDecoder().decode(CoreSettings.self, from: $0) } ?? CoreSettings()
