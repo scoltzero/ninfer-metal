@@ -58,15 +58,16 @@ struct W4A8MoeMxfp4SwiTgStorage {
       float Sa_s[64u];                                  //   256 B
       float Sw0_s[64u];                                 //   256 B
       float Sw1_s[64u];                                 //   256 B
+      ushort tg_lut[256u];                              //   512 B (B1_swar byte LUT)
       uint slow_flag[4u];                               //    16 B (per-SG race-free flag)
-    } kloop;
+    } kloop;                                            // 9,488 B
     alignas(16) bfloat SwiBuf[64u * kW4A8MoeEpiStride]; // 8,704 B
   };
   uint tg_tok[64u];                                     //   256 B
   uint tg_meta[4u];                                     //    16 B {expert, rb, valid_rows, tg_n0_base}
 };
-static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) == 9248ul,
-              "W4A8MoeMxfp4SwiTgStorage must be 9,248 B (9.03 KiB)");
+static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) == 9760ul,
+              "W4A8MoeMxfp4SwiTgStorage must be 9,760 B (9.53 KiB)");
 static_assert(sizeof(W4A8MoeMxfp4SwiTgStorage) <= kApple10HighOccTgSramBytes,
               "W4A8MoeMxfp4SwiTgStorage exceeds 10.0 KiB");
 
@@ -88,10 +89,11 @@ struct W4A8MoeDownMxfp4TgStorage {
   float Sa_s[64u];                                  //   256 B
   float Sw0_s[64u];                                 //   256 B
   float Sw1_s[64u];                                 //   256 B
+  ushort tg_lut[256u];                              //   512 B (B1_swar byte LUT)
   uint slow_flag[4u];                               //    16 B (per-SG race-free flag)
 };
-static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) == 8976ul,
-              "W4A8MoeDownMxfp4TgStorage must be 8,976 B (8.77 KiB)");
+static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) == 9488ul,
+              "W4A8MoeDownMxfp4TgStorage must be 9,488 B (9.27 KiB)");
 static_assert(sizeof(W4A8MoeDownMxfp4TgStorage) <= kApple10HighOccTgSramBytes,
               "W4A8MoeDownMxfp4TgStorage exceeds 10.0 KiB");
 
@@ -112,25 +114,34 @@ inline int8_t w4a8_moe_mxfp4_e2m1_to_i8_x2(uint nib) {
   return int8_t((nib & 8u) ? -mag2 : mag2);
 }
 
-// Constant-buffer 2 KiB pre-shifted byte LUT for lossless MXFP4 (2 * E2M1 << sh, sh in 0..3).
-// Passed via Encoder::dynamic(...) (icb=1 + MTL_SHADER_VALIDATION=1 clean, 0 B extra SRAM).
+// Phase 3.1 Zero-Global-Load MXFP4 Scheme B1_swar (512 B on-chip TG SRAM LUT + SWAR shift).
 inline float w4a8_moe_e8m0_safe(uchar code) {
   if (code == 255u) return 0.0f;
   return e8m0_to_float(code);
 }
 
-inline void w4a8_moe_unpack_mxfp4_lut_sh_u4(
-    uint4 raw_w, uint sh, constant ushort *mxfp4_lut,
+inline void w4a8_moe_init_tg_lut_b1_128(threadgroup ushort *tg_lut, uint tid) {
+  #pragma clang loop unroll(full)
+  for (uint it = 0u; it < 2u; ++it) {
+    const uint idx = tid + it * 128u;
+    const uchar v0 = uchar(w4a8_moe_mxfp4_e2m1_to_i8_x2(idx & 0xFu));
+    const uchar v1 = uchar(w4a8_moe_mxfp4_e2m1_to_i8_x2(idx >> 4u));
+    tg_lut[idx] = ushort(v0) | (ushort(v1) << 8u);
+  }
+}
+
+inline void w4a8_moe_unpack_mxfp4_b1_swar_u4(
+    uint4 raw_w, uint sh, threadgroup const ushort *lut,
     thread uint4 &wu0, thread uint4 &wu1) {
-  constant ushort *lut = mxfp4_lut + (sh << 8u);
-  wu0.x = uint(lut[(raw_w.x >>  0u) & 0xFFu]) | (uint(lut[(raw_w.x >>  8u) & 0xFFu]) << 16u);
-  wu0.y = uint(lut[(raw_w.x >> 16u) & 0xFFu]) | (uint(lut[(raw_w.x >> 24u) & 0xFFu]) << 16u);
-  wu0.z = uint(lut[(raw_w.y >>  0u) & 0xFFu]) | (uint(lut[(raw_w.y >>  8u) & 0xFFu]) << 16u);
-  wu0.w = uint(lut[(raw_w.y >> 16u) & 0xFFu]) | (uint(lut[(raw_w.y >> 24u) & 0xFFu]) << 16u);
-  wu1.x = uint(lut[(raw_w.z >>  0u) & 0xFFu]) | (uint(lut[(raw_w.z >>  8u) & 0xFFu]) << 16u);
-  wu1.y = uint(lut[(raw_w.z >> 16u) & 0xFFu]) | (uint(lut[(raw_w.z >> 24u) & 0xFFu]) << 16u);
-  wu1.z = uint(lut[(raw_w.w >>  0u) & 0xFFu]) | (uint(lut[(raw_w.w >>  8u) & 0xFFu]) << 16u);
-  wu1.w = uint(lut[(raw_w.w >> 16u) & 0xFFu]) | (uint(lut[(raw_w.w >> 24u) & 0xFFu]) << 16u);
+  const uint mask = 0xFFFFFFFFu - ((1u << sh) - 1u) * 0x01010101u;
+  wu0.x = ((uint(lut[(raw_w.x >>  0u) & 0xFFu]) | (uint(lut[(raw_w.x >>  8u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu0.y = ((uint(lut[(raw_w.x >> 16u) & 0xFFu]) | (uint(lut[(raw_w.x >> 24u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu0.z = ((uint(lut[(raw_w.y >>  0u) & 0xFFu]) | (uint(lut[(raw_w.y >>  8u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu0.w = ((uint(lut[(raw_w.y >> 16u) & 0xFFu]) | (uint(lut[(raw_w.y >> 24u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu1.x = ((uint(lut[(raw_w.z >>  0u) & 0xFFu]) | (uint(lut[(raw_w.z >>  8u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu1.y = ((uint(lut[(raw_w.z >> 16u) & 0xFFu]) | (uint(lut[(raw_w.z >> 24u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu1.z = ((uint(lut[(raw_w.w >>  0u) & 0xFFu]) | (uint(lut[(raw_w.w >>  8u) & 0xFFu]) << 16u)) << sh) & mask;
+  wu1.w = ((uint(lut[(raw_w.w >> 16u) & 0xFFu]) | (uint(lut[(raw_w.w >> 24u) & 0xFFu]) << 16u)) << sh) & mask;
 }
 
 inline void w4a8_moe_store_as_mx_u4(threadgroup int8_t *As_i8, uint a_r, uint a_col16, uint4 qa_v) {
@@ -1288,7 +1299,6 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
     device float *mid_sa,
     device float *mid_ra,
     constant W4A8MoeGemmParams &p,
-    constant ushort *mxfp4_lut,
     threadgroup W4A8MoeMxfp4SwiTgStorage &tg_mem,
     uint lane,
     uint sg,
@@ -1331,6 +1341,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
       tg_mem.tg_meta[2] = valid_rows;
       tg_mem.tg_meta[3] = tg_n0_base;
     }
+    w4a8_moe_init_tg_lut_b1_128(tg_mem.kloop.tg_lut, tid);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1402,15 +1413,21 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
             const uint st = tg_mem.tg_tok[tid];
             if (st != 0xFFFFFFFFu) sa_v = sa[ulong(kb) * p.mp + st];
           }
-          const int de = (w_live && ep.x != 255u && ep.y != 255u)
-              ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+          const ushort my_z = (((raw_w.x | raw_w.y | raw_w.z | raw_w.w) & 0x77777777u) == 0u) ? 1u : 0u;
+          const ushort ot_z = simd_shuffle_xor(my_z, ushort(1u));
+          const bool z0 = ((col32 == 0u) ? my_z : ot_z) != 0u;
+          const bool z1 = ((col32 == 0u) ? ot_z : my_z) != 0u;
+          const uchar eff_x = z0 ? ep.y : ep.x;
+          const uchar eff_y = z1 ? ep.x : ep.y;
+          const int de = (w_live && eff_x != 255u && eff_y != 255u)
+              ? (int(eff_y) - int(eff_x)) : (w_live ? 255 : 0);
           const bool row_fast = (abs(de) <= 3);
           const uint sh = row_fast
               ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
               : 0u;
           const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
           uint4 wu0, wu1;
-          w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
+          w4a8_moe_unpack_mxfp4_b1_swar_u4(raw_w, sh, tg_mem.kloop.tg_lut, wu0, wu1);
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
           w4a8_moe_store_as_mx_u4(tg_mem.kloop.As_i8, a_r0, a_col16, qa0);
@@ -1418,7 +1435,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
           *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
           if (col32 == 0u) {
             if (row_fast) {
-              const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+              const float sw = (w_live && !(z0 && z1)) ? (0.5f * w4a8_moe_e8m0_safe(min(eff_x, eff_y))) : 0.0f;
               tg_mem.kloop.Sw0_s[w_row] = sw;
               tg_mem.kloop.Sw1_s[w_row] = sw;
             } else {
@@ -1616,15 +1633,21 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
           const uint st = tg_mem.tg_tok[tid];
           if (st != 0xFFFFFFFFu) sa_v = sa[ulong(kb) * p.mp + st];
         }
-        const int de = (w_live && ep.x != 255u && ep.y != 255u)
-            ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+        const ushort my_z = (((raw_w.x | raw_w.y | raw_w.z | raw_w.w) & 0x77777777u) == 0u) ? 1u : 0u;
+        const ushort ot_z = simd_shuffle_xor(my_z, ushort(1u));
+        const bool z0 = ((col32 == 0u) ? my_z : ot_z) != 0u;
+        const bool z1 = ((col32 == 0u) ? ot_z : my_z) != 0u;
+        const uchar eff_x = z0 ? ep.y : ep.x;
+        const uchar eff_y = z1 ? ep.x : ep.y;
+        const int de = (w_live && eff_x != 255u && eff_y != 255u)
+            ? (int(eff_y) - int(eff_x)) : (w_live ? 255 : 0);
         const bool row_fast = (abs(de) <= 3);
         const uint sh = row_fast
             ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
             : 0u;
         const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
         uint4 wu0, wu1;
-        w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
+        w4a8_moe_unpack_mxfp4_b1_swar_u4(raw_w, sh, tg_mem.kloop.tg_lut, wu0, wu1);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         w4a8_moe_store_as_mx_u4(tg_mem.kloop.As_i8, a_r0, a_col16, qa0);
@@ -1633,7 +1656,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
         *reinterpret_cast<threadgroup uint4 *>(tg_mem.kloop.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
         if (col32 == 0u) {
           if (row_fast) {
-            const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+            const float sw = (w_live && !(z0 && z1)) ? (0.5f * w4a8_moe_e8m0_safe(min(eff_x, eff_y))) : 0.0f;
             tg_mem.kloop.Sw0_s[w_row] = sw;
             tg_mem.kloop.Sw1_s[w_row] = sw;
           } else {
@@ -1863,7 +1886,7 @@ inline void moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl(
             ? *reinterpret_cast<device const uint4 *>(wc_row + ulong(sub32_abs) * 16ul)
             : uint4(0u);
         const float sw_v = ws_row
-            ? (0.5f * e8m0_to_float(ws_row[sub32_abs]))
+            ? (0.5f * w4a8_moe_e8m0_safe(ws_row[sub32_abs]))
             : 0.0f;
         float sa_v = 0.0f;
         if (tid < BM_TG) {
@@ -2278,7 +2301,6 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
     device const uchar *d_scales,
     device bfloat *expert_output,
     constant W4A8MoeGemmParams &p,
-    constant ushort *mxfp4_lut,
     threadgroup W4A8MoeDownMxfp4TgStorage &tg_mem,
     uint lane,
     uint sg,
@@ -2304,6 +2326,8 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
   const uint tid = sg * 32u + lane;
 
   if (w4a8_moe_has_apple10_i8_layout()) {
+    w4a8_moe_init_tg_lut_b1_128(tg_mem.tg_lut, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     constexpr auto desc16_m = matmul2d_descriptor(
         16, 32, 32, false, true, false,
         matmul2d_descriptor::mode::multiply);
@@ -2364,15 +2388,21 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
                   d_scales + w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul)
             : uchar2(0u, 0u);
         const float sa_v = (tid < 32u && tid < valid_rows) ? mid_sa[ulong(kb) * p.mp + rb + tid] : 0.0f;
-        const int de = (w_live && ep.x != 255u && ep.y != 255u)
-            ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+        const ushort my_z = (((raw_w.x | raw_w.y | raw_w.z | raw_w.w) & 0x77777777u) == 0u) ? 1u : 0u;
+        const ushort ot_z = simd_shuffle_xor(my_z, ushort(1u));
+        const bool z0 = ((col32 == 0u) ? my_z : ot_z) != 0u;
+        const bool z1 = ((col32 == 0u) ? ot_z : my_z) != 0u;
+        const uchar eff_x = z0 ? ep.y : ep.x;
+        const uchar eff_y = z1 ? ep.x : ep.y;
+        const int de = (w_live && eff_x != 255u && eff_y != 255u)
+            ? (int(eff_y) - int(eff_x)) : (w_live ? 255 : 0);
         const bool row_fast = (abs(de) <= 3);
         const uint sh = row_fast
             ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
             : 0u;
         const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
         uint4 wu0, wu1;
-        w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
+        w4a8_moe_unpack_mxfp4_b1_swar_u4(raw_w, sh, tg_mem.tg_lut, wu0, wu1);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         w4a8_moe_store_as_mx_u4(tg_mem.As_i8, a_r0, a_col16, qa0);
@@ -2380,7 +2410,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
         *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
         if (col32 == 0u) {
           if (row_fast) {
-            const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+            const float sw = (w_live && !(z0 && z1)) ? (0.5f * w4a8_moe_e8m0_safe(min(eff_x, eff_y))) : 0.0f;
             tg_mem.Sw0_s[w_row] = sw;
             tg_mem.Sw1_s[w_row] = sw;
           } else {
@@ -2480,15 +2510,21 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
                 d_scales + w_exp_row * ulong(p.padded_k >> 5u) + ulong(kb) * 2ul)
           : uchar2(0u, 0u);
       const float sa_v = (tid < BM_TG && tid < valid_rows) ? mid_sa[ulong(kb) * p.mp + rb + tid] : 0.0f;
-      const int de = (w_live && ep.x != 255u && ep.y != 255u)
-          ? (int(ep.y) - int(ep.x)) : (w_live ? 255 : 0);
+      const ushort my_z = (((raw_w.x | raw_w.y | raw_w.z | raw_w.w) & 0x77777777u) == 0u) ? 1u : 0u;
+      const ushort ot_z = simd_shuffle_xor(my_z, ushort(1u));
+      const bool z0 = ((col32 == 0u) ? my_z : ot_z) != 0u;
+      const bool z1 = ((col32 == 0u) ? ot_z : my_z) != 0u;
+      const uchar eff_x = z0 ? ep.y : ep.x;
+      const uchar eff_y = z1 ? ep.x : ep.y;
+      const int de = (w_live && eff_x != 255u && eff_y != 255u)
+          ? (int(eff_y) - int(eff_x)) : (w_live ? 255 : 0);
       const bool row_fast = (abs(de) <= 3);
       const uint sh = row_fast
           ? ((col32 == 0u) ? ((de < 0) ? uint(-de) : 0u) : ((de > 0) ? uint(de) : 0u))
           : 0u;
       const uint sg_slow_w = simd_any(!row_fast) ? 1u : 0u;
       uint4 wu0, wu1;
-      w4a8_moe_unpack_mxfp4_lut_sh_u4(raw_w, sh, mxfp4_lut, wu0, wu1);
+      w4a8_moe_unpack_mxfp4_b1_swar_u4(raw_w, sh, tg_mem.tg_lut, wu0, wu1);
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       w4a8_moe_store_as_mx_u4(tg_mem.As_i8, a_r0, a_col16, qa0);
@@ -2497,7 +2533,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
       *reinterpret_cast<threadgroup uint4 *>(tg_mem.Ws_i8 + w_row * kW4A8MoeMxStride + col32 * 32u + 16u) = wu1;
       if (col32 == 0u) {
         if (row_fast) {
-          const float sw = w_live ? (0.5f * w4a8_moe_e8m0_safe(min(ep.x, ep.y))) : 0.0f;
+          const float sw = (w_live && !(z0 && z1)) ? (0.5f * w4a8_moe_e8m0_safe(min(eff_x, eff_y))) : 0.0f;
           tg_mem.Sw0_s[w_row] = sw;
           tg_mem.Sw1_s[w_row] = sw;
         } else {
@@ -2629,7 +2665,7 @@ inline void moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
           ? *reinterpret_cast<device const uint4 *>(wc_row + ulong(sub32_abs) * 16ul)
           : uint4(0u);
       const float sw_v = ws_row
-          ? (0.5f * e8m0_to_float(ws_row[sub32_abs]))
+          ? (0.5f * w4a8_moe_e8m0_safe(ws_row[sub32_abs]))
           : 0.0f;
       const float sa_v = (tid < BM_TG && tid < valid_rows) ? mid_sa[ulong(kb) * p.mp + rb + tid] : 0.0f;
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2690,7 +2726,6 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1(
     device const uchar *u_scales [[buffer(9)]],
     device bfloat *mid_bf16 [[buffer(10)]],
     constant W4A8MoeGemmParams &p [[buffer(11)]],
-    constant ushort *mxfp4_lut [[buffer(12)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
@@ -2698,7 +2733,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1(
   moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl<false>(
       qa, sa, tile_assign, tile_expert, tile_valid_rows, total_tiles,
       g_codes, g_scales, u_codes, u_scales, mid_bf16, nullptr, nullptr, nullptr,
-      p, mxfp4_lut, tg_mem, lane, sg, tg);
+      p, tg_mem, lane, sg, tg);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2717,7 +2752,6 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1_fwht64_a8(
     device float *mid_sa [[buffer(11)]],
     device float *mid_ra [[buffer(12)]],
     constant W4A8MoeGemmParams &p [[buffer(13)]],
-    constant ushort *mxfp4_lut [[buffer(14)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
@@ -2725,7 +2759,7 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_swiglu_bm64_out64_sk1_fwht64_a8(
   moe_mxfp4_w4a8_nax_swiglu_bm64_out64_impl<true>(
       qa, sa, tile_assign, tile_expert, tile_valid_rows, total_tiles,
       g_codes, g_scales, u_codes, u_scales, nullptr, mid_qa, mid_sa, mid_ra,
-      p, mxfp4_lut, tg_mem, lane, sg, tg);
+      p, tg_mem, lane, sg, tg);
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -2741,14 +2775,13 @@ kernel void omlx_m5_moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_sk1(
     device const uchar *d_scales [[buffer(8)]],
     device bfloat *expert_output [[buffer(9)]],
     constant W4A8MoeGemmParams &p [[buffer(10)]],
-    constant ushort *mxfp4_lut [[buffer(11)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup W4A8MoeDownMxfp4TgStorage tg_mem;
   moe_mxfp4_w4a8_nax_down_scatter_bm64_bn64_impl(
       mid_qa, mid_sa, tile_expert, tile_valid_rows, tile_assign, total_tiles,
-      route_scores, d_codes, d_scales, expert_output, p, mxfp4_lut, tg_mem, lane, sg, tg);
+      route_scores, d_codes, d_scales, expert_output, p, tg_mem, lane, sg, tg);
 }
 
 #define OMLX_M5_MOE_AFFINE_W4A8_NO_HIGH(BITS, GS)                              \

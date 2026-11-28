@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -342,6 +344,7 @@ struct CliOptions {
   std::uint32_t blend_budget_mib = 4096U;
   std::optional<std::uint32_t> blend_delim_token;
   bool blend_cold_only = false;
+  bool profile_sublayers = false;
 };
 
 std::string format_help() {
@@ -384,6 +387,7 @@ Orthogonal prefill switches (for Wave 2/3 runtime builds):
   --blend-budget-mib N             ChunkBlendCache UMA budget in MiB (default: 4096)
   --blend-delim-token ID           Optional delimiter token ID for explicit chunk cuts
   --blend-cold-only                Skip CacheBlend warm priming pass (benchmark cold populate only)
+  --profile-sublayers              Run zero-invasive per-sublayer ICB GPU timing + matrix route audit
 )";
 }
 
@@ -509,6 +513,10 @@ CliOptions parse_args(int argc, char **argv) {
       o.blend_delim_token = parse_u32(value(), key);
     } else if (key == "--blend-cold-only") {
       o.blend_cold_only = true;
+    } else if (key == "--profile-sublayers") {
+      o.profile_sublayers = true;
+    } else if (key == "--no-profile-sublayers") {
+      o.profile_sublayers = false;
     } else {
       throw std::invalid_argument("unknown argument: " + key);
     }
@@ -1003,6 +1011,15 @@ int run_prefill_logits(const CliOptions &o) {
   std::size_t blend_cache_entries = 0;
   std::uint64_t blend_cache_bytes = 0;
   QwenPrefillTelemetry pf_tel{};
+  double whole_trunk_gpu_ms = 0.0;
+  double whole_head_gpu_ms = 0.0;
+  struct ChunkWholeTiming {
+    std::size_t offset = 0;
+    std::size_t tokens = 0;
+    double gpu_ms = 0.0;
+  };
+  std::vector<ChunkWholeTiming> whole_chunks;
+  Json sublayer_profile_json;
 
   if (o.prefill_cache_blend && loaded->forward->cache_blend_eligible()) {
     detail::ChunkBlendCache blend_cache(
@@ -1056,9 +1073,11 @@ int run_prefill_logits(const CliOptions &o) {
     while (offset < prefix_len) {
       const std::size_t step =
           std::min<std::size_t>(trunk_cap, prefix_len - offset);
-      static_cast<void>(loaded->forward->run_trunk(
+      const auto chunk_res = loaded->forward->run_trunk(
           std::span<const std::uint32_t>(tokens.data() + offset, step),
-          /*use_icb=*/true));
+          /*use_icb=*/true);
+      whole_trunk_gpu_ms += chunk_res.submission.timing.gpu_ms;
+      whole_chunks.push_back({offset, step, chunk_res.submission.timing.gpu_ms});
       peak_phys = std::max(peak_phys, current_phys_footprint_bytes());
       offset += step;
     }
@@ -1070,6 +1089,7 @@ int run_prefill_logits(const CliOptions &o) {
     last_res = loaded->forward->run(
         std::span<const std::uint32_t>(&last_prompt_tok, 1), pf_sampling,
         /*inspect_tensors=*/true, /*use_icb=*/true, /*profile_stages=*/false);
+    whole_head_gpu_ms = last_res.submission.timing.gpu_ms;
     prefill_s =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0)
             .count();
@@ -1107,6 +1127,212 @@ int run_prefill_logits(const CliOptions &o) {
     decode_s =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - dec_t0)
             .count();
+  }
+
+  // Pass 2 (Zero-Invasive Sublayer GPU Timing + Matrix Route Audit):
+  // Runs AFTER Pass 1 whole-chunk timing & optional decode so Pass 1 latency
+  // and logits remain 100% unperturbed.
+  if (o.profile_sublayers &&
+      !(o.prefill_cache_blend && loaded->forward->cache_blend_eligible())) {
+    struct SublayerEnvGuard {
+      std::optional<std::string> prev;
+      SublayerEnvGuard() {
+        if (const char *old = std::getenv("OMLX_M5_PROFILE_SUBLAYERS")) {
+          prev = std::string(old);
+        }
+        ::setenv("OMLX_M5_PROFILE_SUBLAYERS", "1", 1);
+      }
+      ~SublayerEnvGuard() {
+        if (prev.has_value()) {
+          ::setenv("OMLX_M5_PROFILE_SUBLAYERS", prev->c_str(), 1);
+        } else {
+          ::unsetenv("OMLX_M5_PROFILE_SUBLAYERS");
+        }
+      }
+    } env_guard;
+
+    loaded->forward->reset();
+    struct CatAgg {
+      std::string name;
+      double gpu_ms = 0.0;
+      double wall_ms = 0.0;
+      std::uint64_t dispatches = 0;
+    };
+    auto add_timings = [](std::vector<CatAgg> &list,
+                          std::unordered_map<std::string, std::size_t> &idx,
+                          const std::vector<QwenStageTiming> &src) -> double {
+      double s = 0.0;
+      for (const auto &st : src) {
+        if (!st.stage.starts_with("sublayer:"))
+          continue;
+        const std::string cat = st.stage.substr(9);
+        s += st.gpu_ms;
+        auto [it, ins] = idx.emplace(cat, list.size());
+        if (ins) {
+          list.push_back({cat, st.gpu_ms, st.wall_ms, st.dispatch_count});
+        } else {
+          list[it->second].gpu_ms += st.gpu_ms;
+          list[it->second].wall_ms += st.wall_ms;
+          list[it->second].dispatches += st.dispatch_count;
+        }
+      }
+      return s;
+    };
+
+    std::vector<CatAgg> trunk_cats;
+    std::unordered_map<std::string, std::size_t> trunk_idx;
+    std::vector<CatAgg> total_cats;
+    std::unordered_map<std::string, std::size_t> total_idx;
+    Json per_chunk_prof = Json::array();
+    double sum_trunk_sub_ms = 0.0;
+
+    for (const auto &wc : whole_chunks) {
+      const auto res = loaded->forward->run_trunk(
+          std::span<const std::uint32_t>(tokens.data() + wc.offset, wc.tokens),
+          /*use_icb=*/true);
+      const double c_sum = add_timings(trunk_cats, trunk_idx, res.stage_timings);
+      (void)add_timings(total_cats, total_idx, res.stage_timings);
+      sum_trunk_sub_ms += c_sum;
+      Json c_cats = Json::object();
+      for (const auto &st : res.stage_timings) {
+        if (st.stage.starts_with("sublayer:")) {
+          c_cats[st.stage.substr(9)] = st.gpu_ms;
+        }
+      }
+      per_chunk_prof.push_back({
+          {"offset", wc.offset},
+          {"tokens", wc.tokens},
+          {"whole_chunk_gpu_ms", wc.gpu_ms},
+          {"sum_sublayers_gpu_ms", c_sum},
+          {"cb_split_overhead_ms", c_sum - wc.gpu_ms},
+          {"categories_gpu_ms", std::move(c_cats)},
+      });
+    }
+    const std::uint32_t last_tok = tokens.back();
+    GpuSamplingOptions p2_samp{};
+    p2_samp.absolute_position = tokens.size() - 1;
+    p2_samp.contract = loaded->contract;
+    const auto last_p2 = loaded->forward->run(
+        std::span<const std::uint32_t>(&last_tok, 1), p2_samp,
+        /*inspect_tensors=*/false, /*use_icb=*/true, /*profile_stages=*/false);
+    const double sum_head_sub_ms =
+        add_timings(total_cats, total_idx, last_p2.stage_timings);
+    const double sum_total_sub_ms = sum_trunk_sub_ms + sum_head_sub_ms;
+    const double whole_total_gpu_ms = whole_trunk_gpu_ms + whole_head_gpu_ms;
+
+    // Analytical FLOPs per GEMM category for eff_tflops calculation.
+    const auto &cfg = loaded->config;
+    const double n_attn = double(cfg.full_attention_layers());
+    const double n_gdn = double(cfg.num_hidden_layers) - n_attn;
+    const double n_layers = double(cfg.num_hidden_layers);
+    const double H = double(cfg.hidden_size);
+    const double Q = double(cfg.num_attention_heads) * double(cfg.head_dim);
+    const double KV = double(cfg.num_key_value_heads) * double(cfg.head_dim);
+    const double KH = double(cfg.linear_num_key_heads);
+    const double KD = double(cfg.linear_key_head_dim);
+    const double HV = double(cfg.linear_num_value_heads);
+    const double VD = double(cfg.linear_value_head_dim);
+    const double CONV = 2.0 * KH * KD + HV * VD;
+    const double GV = HV * VD;
+    const double F = double(cfg.intermediate_size);
+    const double V = double(cfg.vocab_size);
+    auto category_flops = [&](const std::string &cat, double T_rows,
+                              bool include_head) -> double {
+      if (cat == "linear_attn_qkv")
+        return 2.0 * T_rows * H * (2.0 * Q + 2.0 * KV) * n_attn;
+      if (cat == "linear_attn_o")
+        return 2.0 * T_rows * Q * H * n_attn;
+      if (cat == "linear_gdn_qkvz_ab")
+        return 2.0 * T_rows * H * (CONV + GV + 2.0 * HV) * n_gdn;
+      if (cat == "linear_gdn_out")
+        return 2.0 * T_rows * GV * H * n_gdn;
+      if (cat == "mlp_swiglu_mode_b")
+        return 2.0 * T_rows * H * (2.0 * F) * n_layers;
+      if (cat == "linear_mlp_down")
+        return 2.0 * T_rows * F * H * n_layers;
+      if (cat == "head_sample" && include_head)
+        return 2.0 * 1.0 * H * V;
+      return 0.0;
+    };
+
+    auto build_cat_json = [&](const std::vector<CatAgg> &list, double denom_ms,
+                              double T_rows, bool include_head) -> Json {
+      Json arr = Json::array();
+      for (const auto &c : list) {
+        const double flops = category_flops(c.name, T_rows, include_head);
+        const double eff_tf =
+            (flops > 0.0 && c.gpu_ms > 0.0) ? ((flops * 1e-9) / c.gpu_ms) : 0.0;
+        const double pct =
+            (denom_ms > 0.0) ? (100.0 * c.gpu_ms / denom_ms) : 0.0;
+        arr.push_back({
+            {"category", c.name},
+            {"gpu_ms", c.gpu_ms},
+            {"wall_ms", c.wall_ms},
+            {"dispatches", c.dispatches},
+            {"pct_total", pct},
+            {"flops_g", flops * 1e-9},
+            {"eff_tflops", eff_tf},
+        });
+      }
+      return arr;
+    };
+
+    // Audit all trunk+head matrices via inspect_profile.
+    Json route_audit = Json::object();
+    try {
+      const std::uint32_t probe_t = std::min<std::uint32_t>(
+          static_cast<std::uint32_t>(tokens.size()), ws_rows);
+      const auto desc = loaded->forward->inspect_profile(probe_t, false);
+      std::map<std::string, std::size_t> by_family;
+      std::map<std::string, std::size_t> by_function;
+      std::size_t bf16_fallbacks = 0;
+      std::size_t non_empty_fallback_reasons = 0;
+      for (const auto &w : desc.weights) {
+        by_family[w.family]++;
+        by_function[w.function]++;
+        if (!w.fallback_reason.empty()) {
+          ++non_empty_fallback_reasons;
+        }
+        if (w.family.find("bf16") != std::string::npos ||
+            w.function.find("bf16") != std::string::npos ||
+            w.family.find("fallback") != std::string::npos) {
+          ++bf16_fallbacks;
+        }
+      }
+      route_audit = {
+          {"inspected_capacity", desc.capacity},
+          {"total_matrices", desc.weights.size()},
+          {"fast_path_matrices", desc.weights.size() - bf16_fallbacks},
+          {"bf16_fallback_matrices", bf16_fallbacks},
+          {"non_empty_fallback_reasons", non_empty_fallback_reasons},
+          {"dispatch_count", desc.dispatch_count},
+          {"by_family", by_family},
+          {"by_function", by_function},
+      };
+    } catch (const std::exception &ex) {
+      route_audit = {{"error", ex.what()}};
+    }
+
+    const double trunk_tokens_d = double(tokens.size() - 1);
+    sublayer_profile_json = {
+        {"trunk_tokens", tokens.size() - 1},
+        {"total_tokens", tokens.size()},
+        {"whole_trunk_gpu_ms", whole_trunk_gpu_ms},
+        {"whole_head_gpu_ms", whole_head_gpu_ms},
+        {"whole_total_gpu_ms", whole_total_gpu_ms},
+        {"sum_trunk_sublayers_gpu_ms", sum_trunk_sub_ms},
+        {"sum_head_sublayers_gpu_ms", sum_head_sub_ms},
+        {"sum_total_sublayers_gpu_ms", sum_total_sub_ms},
+        {"cb_split_overhead_ms", sum_trunk_sub_ms - whole_trunk_gpu_ms},
+        {"total_cb_split_overhead_ms", sum_total_sub_ms - whole_total_gpu_ms},
+        {"trunk_categories",
+         build_cat_json(trunk_cats, sum_trunk_sub_ms, trunk_tokens_d, false)},
+        {"all_categories",
+         build_cat_json(total_cats, sum_total_sub_ms, double(tokens.size()),
+                        true)},
+        {"chunks", std::move(per_chunk_prof)},
+        {"matrix_route_audit", std::move(route_audit)},
+    };
   }
 
   Json report = {
@@ -1178,6 +1404,9 @@ int run_prefill_logits(const CliOptions &o) {
   if (!o.compare_logits.empty()) {
     const auto ref = read_float_binary(o.compare_logits);
     report["logit_comparison"] = compare_logit_vectors(ref, last_res.logits);
+  }
+  if (!sublayer_profile_json.is_null()) {
+    report["sublayer_profile"] = std::move(sublayer_profile_json);
   }
   emit_json(report, o.out_file);
   return 0;

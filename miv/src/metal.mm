@@ -2719,6 +2719,24 @@ MetalSubmission MetalContext::replay_icb(MetalIcbProfile &profile,
   if (range == profile.impl_->plan->descriptor.ranges.end()) {
     throw std::out_of_range("Metal ICB profile range is absent");
   }
+  return replay_icb_range(profile, range->location, range->length);
+}
+
+MetalSubmission MetalContext::replay_icb_range(MetalIcbProfile &profile,
+                                               std::uint32_t location,
+                                               std::uint32_t length) const {
+  if (profile.impl_ == nullptr ||
+      profile.impl_->owner.get() != impl_->state.get()) {
+    throw std::invalid_argument("Metal ICB profile is empty or foreign");
+  }
+  const std::uint64_t total_dispatches =
+      profile.impl_->plan->descriptor.dispatches.size();
+  if (length == 0 ||
+      static_cast<std::uint64_t>(location) +
+              static_cast<std::uint64_t>(length) >
+          total_dispatches) {
+    throw std::out_of_range("Metal ICB profile subrange is out of bounds");
+  }
   std::unique_lock parameter_lock =
       profile.impl_->parameters == nullptr
           ? std::unique_lock<std::mutex>{}
@@ -2751,8 +2769,7 @@ MetalSubmission MetalContext::replay_icb(MetalIcbProfile &profile,
                                   beforeStages:queue_stages
                              visibilityOptions:MTL4VisibilityOptionDevice];
               [encoder executeCommandsInBuffer:profile.impl_->commands
-                                     withRange:NSMakeRange(range->location,
-                                                           range->length)];
+                                     withRange:NSMakeRange(location, length)];
               [encoder barrierAfterStages:queue_stages
                         beforeQueueStages:queue_stages
                         visibilityOptions:MTL4VisibilityOptionDevice];
@@ -2782,8 +2799,7 @@ MetalSubmission MetalContext::replay_icb(MetalIcbProfile &profile,
                                    MTLResourceUsageWrite];
             }
             [encoder executeCommandsInBuffer:profile.impl_->commands
-                                   withRange:NSMakeRange(range->location,
-                                                         range->length)];
+                                   withRange:NSMakeRange(location, length)];
             [encoder endEncoding];
           });
       timing = submitted.timing;
@@ -2801,12 +2817,12 @@ MetalSubmission MetalContext::replay_icb(MetalIcbProfile &profile,
       state.stats.last_shared_event_value =
           std::max(state.stats.last_shared_event_value, event_value);
     }
-    state.stats.dispatches_submitted += range->length;
+    state.stats.dispatches_submitted += length;
     ++state.stats.icb_profile_replays;
   }
   return {.timing = timing,
           .shared_event_value = event_value,
-          .dispatch_count = range->length};
+          .dispatch_count = length};
 }
 
 MetalSubmission

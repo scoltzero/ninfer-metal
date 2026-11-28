@@ -19,6 +19,7 @@
 #include <utility>
 
 namespace omlx::m5::detail::forward {
+using U16 = std::uint16_t;
 using U32 = std::uint32_t;
 using U64 = std::uint64_t;
 struct Ref {
@@ -152,6 +153,12 @@ struct ForwardStage {
   U32 location = 0;
   U32 length = 0;
 };
+struct SublayerSpan {
+  std::string category;
+  U16 layer = 0xFFFFu;
+  U32 location = 0;
+  U32 length = 0;
+};
 struct ForwardWeightRoute {
   std::string stage, object, format, library, function, family, source,
       fallback_reason;
@@ -170,6 +177,7 @@ struct Profile {
   std::string attention_kernel, attention_merge_kernel;
   MetalDispatchSize attention_grid, attention_merge_grid;
   std::vector<ForwardStage> stages;
+  std::vector<SublayerSpan> sublayers;
   std::vector<ForwardWeightRoute> weight_routes;
   U32 short_matrix_calls = 0;
   U32 short_lane_calls = 0;
@@ -284,6 +292,17 @@ public:
     cached_a4_quant.reset();
     active_stage = std::move(name);
     stage_start = U32(descriptor.dispatches.size());
+  }
+
+  // Zero-invasive sublayer range marker for Phase 3.1 GPU profiler:
+  // NEVER clears cached_* quant/cast state and emits zero extra barriers.
+  void mark_sublayer(const char *category, U16 layer = 0xFFFFu) {
+    close_sublayer();
+    if (category != nullptr && category[0] != '\0') {
+      active_sublayer_category = category;
+      active_sublayer_layer = layer;
+      sublayer_start = U32(descriptor.dispatches.size());
+    }
   }
 
   [[nodiscard]] bool has_group_sum(const GroupSumKey &key) const {
@@ -508,6 +527,7 @@ public:
 
   Profile finish(bool prepare_icb = false) {
     close_stage();
+    close_sublayer();
     descriptor.dispatches.front().barrier_before = false;
     descriptor.ranges.push_back(
         {"full", 0, static_cast<U32>(descriptor.dispatches.size())});
@@ -552,10 +572,24 @@ private:
     active_stage.clear();
   }
 
+  void close_sublayer() {
+    if (active_sublayer_category.empty())
+      return;
+    const U32 end = U32(descriptor.dispatches.size());
+    if (end > sublayer_start) {
+      profile.sublayers.push_back({std::move(active_sublayer_category),
+                                   active_sublayer_layer, sublayer_start,
+                                   end - sublayer_start});
+    }
+    active_sublayer_category.clear();
+  }
+
   const MetalContext &context;
-  std::string active_stage, last_library, last_function;
+  std::string active_stage, active_sublayer_category, last_library, last_function;
   MetalDispatchSize last_grid, last_threads;
   U32 stage_start = 0;
+  U32 sublayer_start = 0;
+  U16 active_sublayer_layer = 0xFFFFu;
   const std::filesystem::path &directory;
   MetalCommandPlanDescriptor descriptor;
   std::unordered_map<BindingKey, U32, BindingKeyHash> binding_slots_;

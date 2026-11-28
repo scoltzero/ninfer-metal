@@ -246,6 +246,8 @@ int main(int argc, char **argv) {
         {"alpha_256t_cta_s72",    "bench_alpha_256t_cta_s72",            64,  64, 256, 0, nil, nil, {}, {}},
         {"alpha_win_sm_blk128",   "bench_alpha_win_sm_lut_32x32",        64,  64, 128, 0, nil, nil, {}, {}},
         {"w4a8_win_128t_bk64_sm", "bench_w4a8_win_128t_bk64_sm",         64,  64, 128, 0, nil, nil, {}, {}},
+        {"w4a8_p31_b1_swar_opt",  "bench_w4a8_p31_b1_swar_opt",          64,  64, 128, 0, nil, nil, {}, {}},
+        {"w4a8_p31_c4_swar_opt",  "bench_w4a8_p31_c4_swar_opt",          64,  64, 128, 0, nil, nil, {}, {}},
         {"beta_mxfp8_tg_16x32",   "bench_beta_mxfp8_tg_256t",            64,  64, 256, 1, nil, nil, {}, {}},
         {"beta_mxfp8_32x32x64",   "bench_beta_mxfp8_32x32x64_128t",      64,  64, 128, 1, nil, nil, {}, {}},
         {"beta_mxfp8_256t_64x128","bench_beta_mxfp8_32x32x32_256t_64x128",64,128, 256, 1, nil, nil, {}, {}},
